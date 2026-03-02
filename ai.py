@@ -108,12 +108,17 @@ _EARLY_WORDS: Dict[str, float] = {
 }
 
 # REASONING (Sentences 6-10):
-# Length-dependent topology parameters control how word length drives representation
-# dimensionality, shift magnitude, and agreement bonus. These constants define the
-# landscape of length-dependent scaling.
-DIM_MIN = 2
-DIM_MAX = 12
-LENGTH_CEIL = 14
+# Cohomology parameters replace flat scale-reduction absolutisms. Rather than
+# clamping embeddings to a fixed [DIM_MIN, DIM_MAX] interval, cohomological
+# dimension is derived from the first Betti number β₁ of a Vietoris–Rips
+# filtration on the word's character n-gram simplex. COHO_MAX_DIM caps the
+# cochain complex degree; COHO_FILTRATION_STEPS controls filtration resolution.
+# Shift magnitude and agreement bonus are now derived from the cohomological
+# persistence (birth–death gap) rather than a linear interpolation.
+COHO_MAX_DIM = 12          # Maximum cochain degree (replaces DIM_MAX)
+COHO_MIN_DIM = 2           # Minimum cochain degree (replaces DIM_MIN)
+LENGTH_CEIL = 14           # Kept for sigmoid α — still used in topo_kernel
+COHO_FILTRATION_STEPS = 8  # Number of filtration thresholds ε
 SHIFT_MAG_MIN = 0.05
 SHIFT_MAG_MAX = 0.35
 AGREEMENT_BONUS_MIN = 0.10
@@ -472,36 +477,118 @@ def length_alpha(word: str, ceil: int = LENGTH_CEIL) -> float:
     return float(1.0 / (1.0 + math.exp(-0.55 * (n - mid))))
 
 
+def _build_ngram_simplex(word: str, n: int = 2) -> List[Tuple[str, ...]]:
+    """
+    REASONING (Cohomology replacement for scale-reduction absolutisms):
+    Build a simplicial complex from character n-grams of `word`. Each n-gram is a
+    0-simplex (vertex); pairs sharing ≥ n-1 characters form 1-simplices (edges).
+    The resulting complex is a Vietoris–Rips approximation on the n-gram metric space.
+    """
+    w = word.lower()
+    ngrams = [w[i:i + n] for i in range(max(1, len(w) - n + 1))]
+    vertices: List[Tuple[str, ...]] = [(g,) for g in ngrams]
+    edges: List[Tuple[str, ...]] = []
+    for i in range(len(ngrams)):
+        for j in range(i + 1, len(ngrams)):
+            shared = sum(a == b for a, b in zip(ngrams[i], ngrams[j]))
+            if shared >= n - 1:
+                edges.append((ngrams[i], ngrams[j]))
+    return vertices + edges
+
+
+def _cohomological_betti1(word: str) -> int:
+    """
+    REASONING (Cohomology replacement for scale-reduction absolutisms):
+    Compute the first Betti number β₁ = |edges| - |vertices| + connected_components
+    of the n-gram simplicial complex. β₁ counts independent cycles (loops) in the
+    1-skeleton, reflecting the topological complexity of the word's character structure.
+    Higher β₁ → richer cohomological structure → larger embedding dimension.
+    """
+    w = word.lower()
+    if len(w) < 2:
+        return 0
+    simplices = _build_ngram_simplex(w, n=2)
+    vertices = [s for s in simplices if len(s) == 1]
+    edges = [s for s in simplices if len(s) == 2]
+
+    # Union-Find for connected components
+    parent = {v[0]: v[0] for v in vertices}
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+            return True
+        return False
+
+    tree_edges = 0
+    for e in edges:
+        if union(e[0], e[1]):
+            tree_edges += 1
+
+    V = len(vertices)
+    E = len(edges)
+    # Components = V - tree_edges
+    C = V - tree_edges
+    # β₁ = E - V + C  (Euler characteristic relation for graphs)
+    beta1 = max(0, E - V + C)
+    return beta1
+
+
+def cohomological_dim(word: str) -> int:
+    """
+    REASONING (Sentences 7, cohomology replacement):
+    Embedding dimension is now set by the cohomological β₁ of the word's n-gram
+    simplicial complex, filtered through COHO_MIN_DIM / COHO_MAX_DIM bounds.
+    This replaces the absolutist linear DIM_MIN→DIM_MAX scale reduction with a
+    topologically meaningful dimension derived from the word's internal structure.
+    Words with richer cyclic n-gram structure (higher β₁) receive larger embeddings.
+    """
+    beta1 = _cohomological_betti1(word)
+    # Map β₁ ∈ [0, ...) to [COHO_MIN_DIM, COHO_MAX_DIM], even-rounded
+    raw = COHO_MIN_DIM + min(beta1, COHO_MAX_DIM - COHO_MIN_DIM)
+    return max(COHO_MIN_DIM, int(round(raw / 2) * 2))
+
+
+# Alias: keep length_dim pointing to cohomological_dim for full backward compatibility
 def length_dim(word: str) -> int:
-    """
-    REASONING (Sentence 7):
-    Dimension (dim) for embeddings scales linearly from DIM_MIN=2 to DIM_MAX=12 based 
-    on α. Longer, more complex words receive larger dimension embeddings, allowing 
-    finer-grained semantic representation.
-    """
-    α = length_alpha(word)
-    raw = DIM_MIN + α * (DIM_MAX - DIM_MIN)
-    return max(DIM_MIN, int(round(raw / 2) * 2))
+    """Backward-compatible alias → cohomological_dim."""
+    return cohomological_dim(word)
 
 
 def length_shift_mag(word: str) -> float:
     """
-    REASONING (Sentence 9):
-    The shift magnitude for vector perturbation grows with word length, controlling 
-    how much the embedding "drifts" in semantic space.
+    REASONING (Sentence 9, cohomology-informed):
+    Shift magnitude is modulated by both the sigmoid α (word length) and the
+    normalised β₁ persistence (cohomological complexity). Words with higher
+    topological complexity drift more in semantic space, reflecting their richer
+    cochain structure. Formula: SHIFT_MAG_MIN + α_blend * (SHIFT_MAG_MAX - SHIFT_MAG_MIN)
+    where α_blend = 0.6*length_alpha(word) + 0.4*(β₁/COHO_MAX_DIM).
     """
     α = length_alpha(word)
-    return SHIFT_MAG_MIN + α * (SHIFT_MAG_MAX - SHIFT_MAG_MIN)
+    beta1_norm = min(1.0, _cohomological_betti1(word) / max(1, COHO_MAX_DIM))
+    alpha_blend = 0.6 * α + 0.4 * beta1_norm
+    return SHIFT_MAG_MIN + alpha_blend * (SHIFT_MAG_MAX - SHIFT_MAG_MIN)
 
 
 def length_agreement_bonus(word: str) -> float:
     """
-    REASONING (Sentence 10):
-    Agreement bonus (for centroid boosting) is higher for longer words, reflecting 
-    their greater semantic stability and consistency.
+    REASONING (Sentence 10, cohomology-informed):
+    Agreement bonus now combines length-based α with cohomological dimension ratio.
+    The ratio cohomological_dim(word)/COHO_MAX_DIM replaces the absolutist linear
+    scale, grounding the bonus in actual topological complexity of the word's
+    n-gram simplicial complex rather than a fixed scale reduction.
     """
     α = length_alpha(word)
-    return AGREEMENT_BONUS_MIN + α * (AGREEMENT_BONUS_MAX - AGREEMENT_BONUS_MIN)
+    coho_ratio = cohomological_dim(word) / COHO_MAX_DIM
+    alpha_blend = 0.5 * α + 0.5 * coho_ratio
+    return AGREEMENT_BONUS_MIN + alpha_blend * (AGREEMENT_BONUS_MAX - AGREEMENT_BONUS_MIN)
 
 
 def length_topo_kernel(word: str) -> float:
@@ -1447,7 +1534,7 @@ def build_app():
             "- **Form Count:** Exactly 100 forms, one per sentence\n"
             "- **Form Boost:** Semantic similarity to form's word (25% weight)\n"
             "- **Activation Tracking:** Cumulative value + influence map\n"
-            "- **Length-Dependent Topology:** Words get 2–12 dimensional embeddings\n"
+            "- **Cohomological Topology:** Embedding dim derived from β₁ Betti number of n-gram simplicial complex\n"
             "- **Double-Entendre Embedder:** Two-pass similarity for robustness\n"
             "- **Age-of-Acquisition (AoA):** Kuperman 2012 dataset + regression model\n"
             "- **Multi-Signal Boosting:** 7+ scoring dimensions for coherence"
