@@ -45,13 +45,9 @@ STOP_WORDS = set(
     "when where which who will with you your"
     .split()
 )
-
+TOPO_KEYWORDS = [""]
 COGNITIVE_TOKENS = {"[PROBLEM]", "[SOLUTION]"}
 
-TOPO_KEYWORDS = {
-    "homology", "cohomology", "persistent", "filtration", "barcode", "betti",
-    "euler", "simplicial", "homotopy", "manifold", "morse", "sheaf"
-}
 
 _VOWELS = set("aeiouy")
 _COMMON_BIGRAMS: set = {
@@ -357,10 +353,16 @@ def centroid_boost(
         out = (out - mn) / (mx - mn + 1e-12)
     return out * strength
 
+
 # ────────────────────────────────────────────────────────────────────────────
-# TARGET ISOMORPHISM 1: Spiking Membrane Embedder 
+# TARGET ISOMORPHISM 1: Spiking Membrane Embedder (With Sine Wave Supplement)
 # ────────────────────────────────────────────────────────────────────────────
 class SpikingDependentEmbedder:
+    def __init__(self, osc_freq: float = 0.2, osc_amp: float = 0.5):
+        self.time_step = 0
+        self.osc_freq = osc_freq
+        self.osc_amp = osc_amp
+
     def _inject_current(self, token: str, dim: int) -> np.ndarray:
         raw_bytes = hashlib.sha256(token.encode("utf-8")).digest()
         repeated = (raw_bytes * ((dim // 32) + 2))[:dim]
@@ -384,18 +386,23 @@ class SpikingDependentEmbedder:
     def length_dependent_weights(
         self, w1: str, w2: str, candidates: List[str],
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        self.time_step += 1
+        theta_wave = math.sin(self.time_step * self.osc_freq) * self.osc_amp
+
         N = len(candidates)
         instant_response = np.zeros(N, dtype=np.float32)
         integrated_response = np.zeros(N, dtype=np.float32)
         topo_kernels = np.zeros(N, dtype=np.float32)
 
-        anchor_leak_mag = length_shift_mag(w2)
+        base_leak = length_shift_mag(w2)
+        anchor_leak_mag = base_leak * (1.0 + theta_wave)
         anchor_agree_bonus = length_agreement_bonus(w2)
 
         for i, c in enumerate(candidates):
             dim = length_dim(c)
             I_w2 = self._inject_current(w2, dim=dim)
             I_c = self._inject_current(c, dim=dim)
+            
             V_leak = self._leak_potential(w1, dim=dim, magnitude=anchor_leak_mag)
 
             V_membrane = I_w2 + V_leak
@@ -441,6 +448,7 @@ class HebbianReservoirLM:
             k = (tokens[i], tokens[i + 1], tokens[i + 2])
             self.tri_synapses[k] = self.tri_synapses.get(k, 0) + 1.0
         self.vocab = list(self.spontaneous_trace.keys())
+        TOPO_KEYWORDS = self.vocab
 
     def next_dist(self, w1: str, w2: str) -> Tuple[List[str], torch.Tensor]:
         cands: List[str] = []
@@ -535,12 +543,14 @@ def build_state(
     aoa: Dict[str, float],
     prompt: str = "Consider the nature of understanding",
     num_sentences: int = 100,
+    osc_freq: float = 0.2,
+    osc_amp: float = 0.5
 ) -> CorpusState:
     tokens = tokenize(text)
     lm = HebbianReservoirLM()
     lm.ingest(tokens)
 
-    embedder = SpikingDependentEmbedder()
+    embedder = SpikingDependentEmbedder(osc_freq=osc_freq, osc_amp=osc_amp)
 
     corpus_freq = {}
     for t in tokens:
@@ -743,6 +753,8 @@ def run_session(
     num_sentences: int,
     tokens_per_sentence: int,
     temp: float,
+    osc_freq: float,
+    osc_amp: float,
 ) -> Tuple[str, str]:
     """
     Orchestrates the UI run with the new dataset integration and Neuronal models.
@@ -762,7 +774,9 @@ def run_session(
         text=corpus_text,
         aoa=aoa,
         prompt=prompt,
-        num_sentences=int(num_sentences)
+        num_sentences=int(num_sentences),
+        osc_freq=float(osc_freq),
+        osc_amp=float(osc_amp)
     )
 
     generate_100_sentences(
@@ -839,7 +853,11 @@ def build_app():
                 tokens_per_sentence = gr.Slider(
                     8, 1800, value=92, step=2, label="Tokens per Sentence"
                 )
-                temp = gr.Slider(0.8, 12.5, value=2.5, step=0.1, label="Temperature")
+                temp = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
+
+                gr.Markdown("### Neuronal Sine Wave Controls")
+                osc_freq = gr.Slider(0.0, 1.0, value=0.2, step=0.05, label="Oscillation Frequency (Speed)")
+                osc_amp = gr.Slider(0.0, 2.0, value=0.5, step=0.1, label="Oscillation Amplitude (Power)")
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(
@@ -860,7 +878,8 @@ def build_app():
             inputs=[
                 use_hf, hf_dataset, hf_split, hf_max_rows,
                 hf_config, hf_col, hf_token, text_file,
-                prompt, seed, num_sentences, tokens_per_sentence, temp
+                prompt, seed, num_sentences, tokens_per_sentence, temp,
+                osc_freq, osc_amp
             ],
             outputs=[output_sentences, output_report],
         )
@@ -870,7 +889,8 @@ def build_app():
             "- **Spiking Membrane:** Hash logic replaced with Leaky Integrate-and-Fire mechanics\n"
             "- **Hebbian Synapses:** N-Grams modeled as synaptic plastic trace weights\n"
             "- **Form Count:** Exactly 100 forms, one per sentence\n"
-            "- **Dynamic HF Configs:** Direct pipeline to specific dataset slices and splits"
+            "- **Dynamic HF Configs:** Direct pipeline to specific dataset slices and splits\n"
+            "- **Sine Wave Modulation:** Temporal memory leak oscillates rhythmically like brain theta waves"
         )
 
         return demo
