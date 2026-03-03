@@ -910,8 +910,8 @@ def build_app():
                 use_hf = gr.Checkbox(label="Use Hugging Face Dataset?", value=False)
                 
                 with gr.Group(visible=False) as hf_group:
-                    hf_dataset = gr.Textbox(label="Dataset Path", value="wikitext")
-                    hf_config = gr.Textbox(label="Config (e.g. 'wikitext-2-raw-v1')", value="wikitext-2-raw-v1")
+                    hf_dataset = gr.Textbox(label="Dataset Path", value="AiresPucrs/stanford-encyclopedia-philosophy")
+                    hf_config = gr.Textbox(label="Config (e.g. '')", value="")
                     hf_split = gr.Textbox(label="Split", value="train")
                     hf_col = gr.Textbox(label="Text Column", value="text")
                     hf_max_rows = gr.Number(label="Max Rows", value=100)
