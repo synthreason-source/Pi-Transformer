@@ -192,61 +192,66 @@ class TetraGridIsomorphism(torch.nn.Module):
         return (vec / (norm + 1e-8)) * magnitude
 
     def forward(self, anchor_word: str, anchor_leak_mag: float, candidates: List[str], p_fields: torch.Tensor) -> torch.Tensor:
-        # Generate Tensors (1, D) and (N, D)
         E_A = self._get_E(anchor_word).unsqueeze(0)
         L_A = self._get_L(anchor_word, anchor_leak_mag).unsqueeze(0)
-        
+
         if not candidates:
             return torch.zeros(0)
 
         E_C = torch.stack([self._get_E(c) for c in candidates])
         L_C = torch.stack([self._get_L(c, length_shift_mag(c)) for c in candidates])
 
-        # Form the 2x2 interacting lattice for N candidates simultaneously
-        # Matrix Math: G_00 = E_C @ E_A.T
-        N_00 = torch.matmul(E_C, E_A.T).squeeze(-1)  # (N,)
+        N_00 = torch.matmul(E_C, E_A.T).squeeze(-1)  
         N_01 = torch.matmul(L_C, E_A.T).squeeze(-1)
         N_10 = torch.matmul(E_C, L_A.T).squeeze(-1)
         N_11 = torch.matmul(L_C, L_A.T).squeeze(-1)
 
-        # G shape: (N, 2, 2) Grid
         G = torch.stack([
             torch.stack([N_00, N_01], dim=-1),
             torch.stack([N_10, N_11], dim=-1)
         ], dim=-2)
 
-        # MATH 1: Adversarial Probability Filler (Element-wise inversion mapping)
-        # G' = G - \alpha * G^2
         G = G - self.adv_strength * (G ** 2)
 
-        # MATH 2: Independent Diagonal Shift Corrector
-        # G'' = G' + tanh( W_shift * G' )
         G_shifted = self.shift_matrix(G)
         G = G + 0.15 * torch.tanh(G_shifted)
-
-        # MATH 3: Bernoulli Anti-Sparsification
-        # det(G) = (N_00 * N_11) - (N_01 * N_10)
+        dot_R0_R1 = (G[:, 0, 0] * G[:, 1, 0]) + (G[:, 0, 1] * G[:, 1, 1])
+        norm_R0_sq = (G[:, 0, 0] ** 2) + (G[:, 0, 1] ** 2) + 1e-8
+        
+        # The Mathematical Subordination Factor
+        subordination_factor = torch.abs(dot_R0_R1 / norm_R0_sq)
+        
+        # We use the mathematical subordination to dynamically shift the readout.
+        # High dependency natively triggers a "Subordinate Clause" state, shifting 
+        # priority away from the Trace and heavily amplifying Leak Interference.
+        dep_gate = torch.tanh(subordination_factor)
+        
+        # Dynamic Continuous Readout bridging Independent and Dependent states
+        trace_weight = 1.0 - (0.5)  # Scales from 1.0 down to 0.5
+        leak_weight = 0.5 + (1.5 * dep_gate)   # Scales from 0.5 up to 2.0
         det = G[:, 0, 0] * G[:, 1, 1] - G[:, 0, 1] * G[:, 1, 0]
         threshold = det.median() if det.numel() > 0 else 0.0
         sparse_mask = (det < threshold).float()
 
         bernoulli_mask = torch.bernoulli(p_fields)
         inversified = 1.0 - bernoulli_mask
-
         injection = sparse_mask * inversified * self.densify_mag
-        
-        # Inject mass into the Trace of the Grid in-place
-        G[:, 0, 0] = G[:, 0, 0] + injection
-        G[:, 1, 1] = G[:, 1, 1] + injection
 
-        # READOUT: Trace + Cross-talk absolute magnitude
-        readout = (G[:, 0, 0] + G[:, 1, 1]) + 0.5 * (torch.abs(G[:, 0, 1]) + torch.abs(G[:, 1, 0]))
-        
-        # Normalize strictly to [0, 1]
+        G[:, 0, 0] = G[:, 0, 0]  * dep_gate
+        G[:, 1, 1] = G[:, 1, 1]  * dep_gate
+
+        subordinators = {"when", "where", "which", "who", "that", "as", "if", "because", "while"}
+        is_subordinate = anchor_word.strip("[]").lower() in subordinators
+
+        if is_subordinate:
+            readout = 0.5 * (G[:, 0, 0] + G[:, 1, 1]) + 2.0 * (torch.abs(G[:, 0, 1]) + trace_weight)
+        else:
+            readout = (G[:, 0, 0] + G[:, 1, 1]) + leak_weight * (torch.abs(G[:, 0, 1]) + torch.abs(G[:, 1, 0]))
+
         mn, mx = readout.min(), readout.max()
         if mx > mn:
             readout = (readout - mn) / (mx - mn + 1e-12)
-            
+
         return readout
 
 
