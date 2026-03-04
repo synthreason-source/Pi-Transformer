@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V9.0.1 — TetraGrid 2x2 Lattice Architecture
+NeuroSymbolic V9.1.1 — Pure TetraGrid Architecture with Data Upload
 ===============================================================================
 
 ARCHITECTURE OVERVIEW:
-We have encapsulated the disparate dot products, leak potentials, and anti-sparsification 
-logic into a unified 2x2 Neural Network Grid: The TetraGrid Isomorphism.
+All non-matrix mathematical boosts (semantic similarity, topological cohomology,
+length agreements, dataset frequencies, etc.) remain purged. 
 
-For any Anchor Word (A) and Candidate Word (C), we project their Embeddings (E) 
-and Leak Potentials (L) into a 2x2 matrix of interacting neurons:
+The probability space is derived EXCLUSIVELY from:
+1) The Base Hebbian Reservoir (Spontaneous Traces & Synapses)
+2) The TetraGrid Isomorphism 2x2 Matrix Logic
 
-    G(A, C) = [ N_00(A,C)  N_01(A,C) ]  =  [ E(A) • E(C)    E(A) • L(C) ]
-              [ N_10(A,C)  N_11(A,C) ]     [ L(A) • E(C)    L(A) • L(C) ]
-
-- N_00: Pure Instantaneous Semantic alignment
-- N_01: Forward Leak Interference
-- N_10: Backward Leak Interference
-- N_11: Pure Topological Homology
-
-All corrections (Diagonal shifts, Adversarial Normalization, and Bernoulli 
-Inversification) operate explicitly via matrix math (Determinant, Trace, linear 
-transformations) on this 2x2 grid layer.
+This version fully restores the Hugging Face Dataset loading and Local File 
+Upload capabilities into the Gradio UI.
 ===============================================================================
 """
 
@@ -50,21 +42,7 @@ STOP_WORDS_COG = set(
     "when where which who will with you your"
     .split()
 )
-TOPO_KEYWORDS = [""]
-COGNITIVE_TOKENS = {
-    "[A]", "[AN]", "[AND]", "[ARE]", "[AS]", "[AT]", "[BE]", "[BY]", "[FOR]", 
-    "[FROM]", "[HAS]", "[HAVE]", "[HE]", "[HER]", "[HIM]", "[HIS]", "[I]", 
-    "[IN]", "[IS]", "[IT]", "[ITS]", "[ME]", "[MY]", "[OF]", "[ON]", "[OR]", 
-    "[OUR]", "[SHE]", "[SO]", "[THAT]", "[THE]", "[THEIR]", "[THEM]", "[THEY]", 
-    "[THIS]", "[TO]", "[WAS]", "[WE]", "[WERE]", "[WHAT]", "[WHEN]", "[WHERE]", 
-    "[WHICH]", "[WHO]", "[WILL]", "[WITH]", "[YOU]", "[YOUR]"
-}
-
-_VOWELS = set("aeiouy")
-_COMMON_BIGRAMS: set = {
-    "th", "he", "in", "er", "an", "re", "nd", "at", "on", "nt", "ha", "es", "st",
-    "en", "ed", "to", "it", "ou", "ea", "hi", "is", "or", "ti", "as", "te", "et"
-}
+COGNITIVE_TOKENS = {f"[{w.upper()}]" for w in STOP_WORDS_COG}
 
 # ────────────────────────────────────────────────────────────────────────────
 # DATA STRUCTURES
@@ -98,69 +76,11 @@ class SentenceFormPlan:
                 self.form_by_sentence[i] = f
 
 # ────────────────────────────────────────────────────────────────────────────
-# SEMANTIC DISTANCE ALGORITHMS
-# ────────────────────────────────────────────────────────────────────────────
-
-def semantic_similarity(word_a: str, word_b: str) -> float:
-    if not word_a or not word_b:
-        return 0.0
-    a = word_a.lower()
-    b = word_b.lower()
-    if a == b:
-        return 1.0
-
-    def get_bigrams(w):
-        return {w[i:i+2] for i in range(len(w)-1)} if len(w) > 1 else {w}
-
-    bg_a = get_bigrams(a)
-    bg_b = get_bigrams(b)
-    if not bg_a or not bg_b:
-        return 0.0
-
-    intersection = len(bg_a & bg_b)
-    union = len(bg_a | bg_b)
-    return intersection / union if union > 0 else 0.0
-
-def edit_distance(s1: str, s2: str) -> int:
-    m, n = len(s1), len(s2)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        for j in range(n + 1):
-            if i == 0:
-                dp[i][j] = j
-            elif j == 0:
-                dp[i][j] = i
-            elif s1[i - 1] == s2[j - 1]:
-                dp[i][j] = dp[i - 1][j - 1]
-            else:
-                dp[i][j] = 1 + min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1])
-    return dp[m][n]
-
-# ────────────────────────────────────────────────────────────────────────────
-# COHOMOLOGICAL TOPOLOGY ENGINE
-# ────────────────────────────────────────────────────────────────────────────
-
-def length_alpha(w: str) -> float:
-    return min(max(len(w) / 10.0, 0.1), 2.0)
-
-def length_shift_mag(w: str) -> float:
-    return 1.5 * (length_alpha(w) ** 1.5)
-
-def length_agreement_bonus(w: str) -> float:
-    return max(0.0, 1.0 - 0.4 * length_alpha(w))
-
-def length_topo_kernel(w: str) -> float:
-    if w.lower() in TOPO_KEYWORDS:
-        return 0.95
-    base = 0.05 + 0.9 * (length_alpha(w) / 2.0)
-    return min(max(base, 0.05), 0.95)
-
-# ────────────────────────────────────────────────────────────────────────────
 # TARGET ISOMORPHISM 1: The TetraGrid 2x2 Lattice Layer
 # ────────────────────────────────────────────────────────────────────────────
 class TetraGridIsomorphism(torch.nn.Module):
     """
-    Invents a 2x2 matrix network for interaction logic, uniting Membrane Spikes,
+    A 2x2 matrix network for interaction logic uniting Membrane Spikes,
     Diagonal Shifts, and Bernoulli Anti-Sparsification.
     """
     def __init__(self, adv_strength: float = 0.5, densify_mag: float = 0.08, embed_dim: int = 256):
@@ -169,38 +89,38 @@ class TetraGridIsomorphism(torch.nn.Module):
         self.densify_mag = densify_mag
         self.embed_dim = embed_dim
         
-        # Diagonal Shift cascade via learned 2x2 interaction
-        # We initialize it slightly off-diagonal to mix pure matches with cross-interferences
         self.shift_matrix = torch.nn.Linear(2, 2, bias=True)
         with torch.no_grad():
             self.shift_matrix.weight.copy_(torch.tensor([[0.85, 0.15], [0.15, 0.85]]))
             self.shift_matrix.bias.fill_(0.0)
 
     def _get_E(self, token: str) -> torch.Tensor:
-        """E(X) -> Extracts Injection Current feature vector."""
         raw = hashlib.sha256(token.encode("utf-8")).digest()
         repeated = (raw * ((self.embed_dim // 32) + 2))[:self.embed_dim]
         vec = torch.tensor(list(repeated), dtype=torch.float32)
         return vec / (vec.sum() + 1e-8)
 
     def _get_L(self, token: str, magnitude: float) -> torch.Tensor:
-        """L(X) -> Extracts base Leak Potential feature vector."""
         raw = hashlib.md5(token.encode("utf-8")).digest()
         repeated = (raw * ((self.embed_dim // 16) + 2))[:self.embed_dim]
         vec = torch.tensor(list(repeated), dtype=torch.float32)
         norm = torch.norm(vec)
         return (vec / (norm + 1e-8)) * magnitude
 
-    def forward(self, anchor_word: str, anchor_leak_mag: float, candidates: List[str], p_fields: torch.Tensor) -> torch.Tensor:
+    def forward(self, anchor_word: str, candidates: List[str]) -> torch.Tensor:
+        # Base magnitude extracted strictly from token lengths now
+        anchor_leak_mag = min(max(len(anchor_word) / 10.0, 0.1), 2.0)
+        
         E_A = self._get_E(anchor_word).unsqueeze(0)
         L_A = self._get_L(anchor_word, anchor_leak_mag).unsqueeze(0)
-
+        
         if not candidates:
             return torch.zeros(0)
 
         E_C = torch.stack([self._get_E(c) for c in candidates])
-        L_C = torch.stack([self._get_L(c, length_shift_mag(c)) for c in candidates])
+        L_C = torch.stack([self._get_L(c, min(max(len(c) / 10.0, 0.1), 2.0)) for c in candidates])
 
+        # Matrix Math: G_00 = E_C @ E_A.T
         N_00 = torch.matmul(E_C, E_A.T).squeeze(-1)  
         N_01 = torch.matmul(L_C, E_A.T).squeeze(-1)
         N_10 = torch.matmul(E_C, L_A.T).squeeze(-1)
@@ -215,45 +135,29 @@ class TetraGridIsomorphism(torch.nn.Module):
 
         G_shifted = self.shift_matrix(G)
         G = G + 0.15 * torch.tanh(G_shifted)
-        dot_R0_R1 = (G[:, 0, 0] * G[:, 1, 0]) + (G[:, 0, 1] * G[:, 1, 1])
-        norm_R0_sq = (G[:, 0, 0] ** 2) + (G[:, 0, 1] ** 2) + 1e-8
-        
-        # The Mathematical Subordination Factor
-        subordination_factor = torch.abs(dot_R0_R1 / norm_R0_sq)
-        
-        # We use the mathematical subordination to dynamically shift the readout.
-        # High dependency natively triggers a "Subordinate Clause" state, shifting 
-        # priority away from the Trace and heavily amplifying Leak Interference.
-        dep_gate = torch.tanh(subordination_factor)
-        
-        # Dynamic Continuous Readout bridging Independent and Dependent states
-        trace_weight = 1.0 - (0.5)  # Scales from 1.0 down to 0.5
-        leak_weight = 0.5 + (1.5 * dep_gate)   # Scales from 0.5 up to 2.0
+
+        # det(G) = (N_00 * N_11) - (N_01 * N_10)
         det = G[:, 0, 0] * G[:, 1, 1] - G[:, 0, 1] * G[:, 1, 0]
         threshold = det.median() if det.numel() > 0 else 0.0
         sparse_mask = (det < threshold).float()
 
-        bernoulli_mask = torch.bernoulli(p_fields)
+        # Generate a purely randomized bernoulli mask in layer instead of taking dataset p_fields
+        bernoulli_mask = torch.bernoulli(torch.full((len(candidates),), 0.5))
         inversified = 1.0 - bernoulli_mask
+
         injection = sparse_mask * inversified * self.densify_mag
+        
+        G[:, 0, 0] = G[:, 0, 0] + injection
+        G[:, 1, 1] = G[:, 1, 1] + injection
 
-        G[:, 0, 0] = G[:, 0, 0]  * dep_gate
-        G[:, 1, 1] = G[:, 1, 1]  * dep_gate
-
-        subordinators = {"when", "where", "which", "who", "that", "as", "if", "because", "while"}
-        is_subordinate = anchor_word.strip("[]").lower() in subordinators
-
-        if is_subordinate:
-            readout = 0.5 * (G[:, 0, 0] + G[:, 1, 1]) + 2.0 * (torch.abs(G[:, 0, 1]) + trace_weight)
-        else:
-            readout = (G[:, 0, 0] + G[:, 1, 1]) + leak_weight * (torch.abs(G[:, 0, 1]) + torch.abs(G[:, 1, 0]))
-
+        # Trace + Cross-talk absolute magnitude
+        readout = (G[:, 0, 0] + G[:, 1, 1]) + 0.5 * (torch.abs(G[:, 0, 1]) + torch.abs(G[:, 1, 0]))
+        
         mn, mx = readout.min(), readout.max()
         if mx > mn:
             readout = (readout - mn) / (mx - mn + 1e-12)
-
+            
         return readout
-
 
 # ────────────────────────────────────────────────────────────────────────────
 # TARGET ISOMORPHISM 2: Hebbian Synaptic Reservoir
@@ -323,9 +227,6 @@ class CorpusState:
     lm: HebbianReservoirLM
     tetra_grid: TetraGridIsomorphism
     sentence_form_plan: SentenceFormPlan = field(default_factory=SentenceFormPlan)
-    token_boost: Dict[str, float] = field(default_factory=dict)
-    corpus_freq: Dict[str, int] = field(default_factory=dict)
-    corpus_total: int = 1
     time_step: int = 0
 
 def tokenize(text: str) -> List[str]:
@@ -377,19 +278,9 @@ def build_state(
         embed_dim=256
     )
 
-    corpus_freq = {}
-    for t in tokens:
-        corpus_freq[t] = corpus_freq.get(t, 0) + 1
-    total = max(1, len(tokens))
-
-    tb = {w: float(np.log1p(c)) for w, c in corpus_freq.items()}
-
     state = CorpusState(
         lm=lm,
         tetra_grid=tetra_grid,
-        token_boost=tb,
-        corpus_freq=corpus_freq,
-        corpus_total=total,
         time_step=0
     )
 
@@ -408,12 +299,10 @@ def build_state(
         role = syntactic_roles[i % len(syntactic_roles)]
         pref = prefixes[(i // len(syntactic_roles)) % len(prefixes)]
         suff = suffixes[(i // (len(syntactic_roles) * len(prefixes))) % len(suffixes)]
-
         forms.append(SyntacticForm(word=w, syntactic_role=role, prefix_context=pref, suffix_context=suff))
 
     state.sentence_form_plan.plan_forms(forms, num_sentences=num_sentences)
     return state
-
 
 def next_probs(
     state: CorpusState,
@@ -430,46 +319,14 @@ def next_probs(
     if len(cands) == 0:
         return cands, base_probs
 
-    # Dynamically compute dataset Bernoulli fields
-    freqs = torch.tensor([state.corpus_freq.get(c, 1) for c in cands], dtype=torch.float32)
-    mean_freq = freqs.mean() + 1e-8
-    p_fields = torch.clamp(mean_freq / (freqs + mean_freq), min=0.1, max=0.9)
+    # Output relies entirely on the mathematical readout of the 2x2 TetraGrid Layer
+    grid_output = state.tetra_grid(anchor_word=w2, candidates=cands)
 
-    # Alternate Leak magnitude contextually
-    adv_penalty = -1.0 if (state.time_step % 2 == 0) else 1.0
-    anchor_leak_mag = length_shift_mag(w2) * (1.0 + (adv_penalty * state.tetra_grid.adv_strength))
-
-    # Calculate probabilities explicitly through the TetraGrid 2x2 layer
-    grid_output = state.tetra_grid(
-        anchor_word=w2, 
-        anchor_leak_mag=anchor_leak_mag, 
-        candidates=cands, 
-        p_fields=p_fields
-    )
-
-    # Agreement boosts & Semantic mapping
-    anchor_agree_bonus = length_agreement_bonus(w2)
-    topo_kernels = torch.tensor([length_topo_kernel(c) for c in cands], dtype=torch.float32)
-    
-    de_t = grid_output + topo_kernels * anchor_agree_bonus * grid_output
-
-    form_boost = torch.zeros_like(de_t)
-    current_form = state.sentence_form_plan.form_by_sentence.get(sentence_index)
-    if current_form:
-        for idx, c in enumerate(cands):
-            sim = semantic_similarity(current_form.word, c)
-            form_boost[idx] = 0.25 * sim
-
-    tb = torch.tensor([state.token_boost.get(c, 0.0) for c in cands], dtype=torch.float32)
-
-    boosts = (float(de_strength) * de_t + 0.10 * tb + form_boost)
-
-    logits = torch.log(base_probs.clamp_min(1e-12)) + boosts
+    logits = torch.log(base_probs.clamp_min(1e-12)) + (float(de_strength) * grid_output)
     logits = logits / max(float(temp), 1e-6)
     probs = F.softmax(logits, dim=-1)
 
     return cands, probs
-
 
 def generate_100_sentences(
     state: CorpusState,
@@ -488,8 +345,7 @@ def generate_100_sentences(
     for sent_idx in range(num_sentences):
         w1, w2 = vocab[0], vocab[1]
         sent_tokens = []
-        sent_topo_sum = 0.0
-
+        
         for _ in range(tokens_per_sentence):
             cands, probs = next_probs(state, w1, w2, sentence_index=sent_idx, temp=temp)
             if len(cands) == 0:
@@ -497,7 +353,6 @@ def generate_100_sentences(
             idx = torch.multinomial(probs, 1).item()
             nxt = cands[idx]
             sent_tokens.append(nxt)
-            sent_topo_sum += length_topo_kernel(nxt)
             w1, w2 = w2, nxt
 
         text = detokenize(sent_tokens)
@@ -506,8 +361,7 @@ def generate_100_sentences(
         state.sentence_form_plan.sentence_outputs[sent_idx] = text
         current_form = state.sentence_form_plan.form_by_sentence.get(sent_idx)
         if current_form and sent_tokens:
-            avg_topo = sent_topo_sum / len(sent_tokens)
-            current_form.activation_value += float(avg_topo)
+            current_form.activation_value += 1.0
 
     return out_sentences
 
@@ -516,40 +370,37 @@ def generate_100_sentences(
 # ────────────────────────────────────────────────────────────────────────────
 
 def load_corpus(
-    use_hf: bool = False,
-    dataset_name: str = "",
-    config_name: str = "",
-    split: str = "train",
-    column_name: str = "text",
-    max_rows: int = 100,
-    hf_token: str = "",
-    text_file: Optional[Path] = None
-) -> str:
-    """
-    Glue piece to bridge external data sources to the neuronal reservoir.
-    """
+    use_hf=False,
+    dataset_name="",
+    config_name="",
+    split="train",
+    column_name="text",
+    max_rows=100,
+    hf_token="",
+    text_file=None,
+):
     if use_hf and dataset_name:
         try:
-            print(f"Loading HF Corpus: {dataset_name} (Config: {config_name}, Split: {split})")
             ds = load_dataset(
-                dataset_name, 
-                name=config_name if config_name else None, 
-                split=split, 
+                dataset_name,
+                name=config_name if config_name else None,
+                split=split,
                 token=hf_token if hf_token else None,
-                trust_remote_code=True
+                trust_remote_code=True,
             )
             df = ds.select(range(min(len(ds), max_rows))).to_pandas()
             if column_name in df.columns:
                 return " ".join(df[column_name].astype(str).tolist())
             else:
-                available = ", ".join(df.columns)
-                return f"Error: Column '{column_name}' not found. Available columns: {available}"
+                return f"Error: Column '{column_name}' not found."
         except Exception as e:
             return f"Hugging Face Load Error: {str(e)}"
-    
+
+    # FIX: Gradio passes a file object with a .name attribute (the temp path string)
     if text_file is not None:
         try:
-            return Path(text_file).read_text(encoding="utf-8")
+            file_path = text_file.name if hasattr(text_file, "name") else str(text_file)
+            return Path(file_path).read_text(encoding="utf-8")
         except Exception as e:
             return f"Error reading file: {e}"
 
@@ -558,32 +409,36 @@ def load_corpus(
         "understanding of the shape of data. A persistent filtration creates a "
         "barcode of topological features. Betti numbers summarize cycles, voids, "
         "and connectivity. We consider the nature of understanding spaces "
-        "through simplicial complexes and morse theory. The continuous function "
-        "maps a manifold into a sheaf."
+        "through simplicial complexes and morse theory."
     )
 
-def run_session(
-    use_hf: bool,
-    hf_dataset: str,
-    hf_split: str,
-    hf_max_rows: int,
-    hf_config: str,
-    hf_col: str,
-    hf_token: str,
-    text_file: Optional[Path],
-    prompt: str, 
-    seed: float, 
-    num_sentences: int, 
-    tokens_per_sentence: int,
-    temp: float, 
-    adv_strength: float, 
-    densify_mag: float
-) -> Tuple[str, str]:
 
+def run_session(
+    use_hf,
+    hf_dataset,
+    hf_split,
+    hf_max_rows,
+    hf_config,
+    hf_col,
+    hf_token,
+    text_file,
+    prompt,
+    seed,
+    num_sentences,
+    tokens_per_sentence,
+    temp,
+    adv_strength,
+    densify_mag,
+):
     corpus_text = load_corpus(
-        use_hf=use_hf, dataset_name=hf_dataset, config_name=hf_config,
-        split=hf_split, column_name=hf_col, max_rows=int(hf_max_rows),
-        hf_token=hf_token, text_file=text_file
+        use_hf=use_hf,
+        dataset_name=hf_dataset,
+        config_name=hf_config,
+        split=hf_split,
+        column_name=hf_col,
+        max_rows=int(hf_max_rows),
+        hf_token=hf_token,
+        text_file=text_file,
     )
 
     if corpus_text.startswith("Error") or corpus_text.startswith("Hugging Face Load Error"):
@@ -596,7 +451,6 @@ def run_session(
         adv_strength=float(adv_strength),
         densify_mag=float(densify_mag),
     )
-
     generate_100_sentences(
         state=state,
         seed=int(seed),
@@ -605,87 +459,106 @@ def run_session(
         temp=float(temp),
     )
 
-    sent_lines = [f"[{i+1}] {s}\n" for i, s in state.sentence_form_plan.sentence_outputs.items()]
-    
+    sent_lines = [
+        f"[{i+1}] {s}\n"
+        for i, s in state.sentence_form_plan.sentence_outputs.items()
+    ]
     report_lines = [
         "FORM ACTIVATION & NEURONAL REPORT",
         "===================================",
-        f"Sentences generated: {len(state.sentence_form_plan.sentence_outputs)}\n"
+        f"Sentences generated: {len(state.sentence_form_plan.sentence_outputs)}\n",
     ]
     for sent_idx in range(min(30, len(state.sentence_form_plan.sentence_outputs))):
         f = state.sentence_form_plan.form_by_sentence.get(sent_idx)
         if f:
             output = state.sentence_form_plan.sentence_outputs.get(sent_idx, "")
-            report_lines.append(f"Sentence {sent_idx:02d} | Form: {f.form_name}")
-            report_lines.append(f"  Word: '{f.word}', Role: '{f.syntactic_role}'")
-            report_lines.append(f"  Activation Value: {f.activation_value:.4f}")
-            report_lines.append(f"  Output: {output[:60]}...\n")
-
+            report_lines.extend(
+                [
+                    f"Sentence {sent_idx:02d} | Form: {f.form_name}",
+                    f"  Word: '{f.word}', Role: '{f.syntactic_role}'",
+                    f"  Activation Value: {f.activation_value:.4f}",
+                    f"  Output: {output[:60]}...\n",
+                ]
+            )
     return "\n".join(sent_lines), "\n".join(report_lines)
 
+
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic Form Generator V9.0.1") as demo:
-        gr.Markdown(
-            "# Neuronal Isomorphism Generator V9.0.1: TetraGrid Lattice\n"
-            "**The TetraGrid Isomorphism:** An elegant 2x2 grid encapsulating dot products, "
-            "leak potentials, diagonal shifts, and Bernoulli Anti-Sparsification directly via Matrix math.\n\n"
-            "**Math Encapsulation:**\n"
-            "> `G = [[ E(Anchor)•E(Cand), E(Anchor)•L(Cand) ], [ L(Anchor)•E(Cand), L(Anchor)•L(Cand) ]]`"
-        )
+    with gr.Blocks(title="NeuroSymbolic Form Generator V9.1") as demo:
+        gr.Markdown("# Neuronal Isomorphism Generator V9.1: Pure TetraGrid Logic")
 
         with gr.Row():
             with gr.Column(scale=1):
                 use_hf = gr.Checkbox(label="Use Hugging Face Dataset?", value=False)
-                
-                with gr.Group(visible=False) as hf_group:
-                    hf_dataset = gr.Textbox(label="Dataset Path", value="AiresPucrs/stanford-encyclopedia-philosophy")
-                    hf_config = gr.Textbox(label="Config (e.g. '')", value="")
-                    hf_split = gr.Textbox(label="Split", value="train")
-                    hf_col = gr.Textbox(label="Text Column", value="text")
-                    hf_max_rows = gr.Number(label="Max Rows", value=100)
-                    hf_token = gr.Textbox(label="HF Token", type="password")
-                
-                text_file = gr.File(
-                    label="Upload Local Text (.txt/.md)",
-                    file_types=[".txt", ".md"],
-                    visible=True
+
+                # ── HF fields: always rendered, just hidden via elem visibility ──
+                # FIX: individual components with visible= toggled, NOT wrapped in
+                # a gr.Group. A hidden gr.Group still passes stale/default values
+                # in older Gradio versions and can silently drop slider states.
+                hf_dataset = gr.Textbox(
+                    label="Dataset Path",
+                    value="AiresPucrs/stanford-encyclopedia-philosophy",
+                    visible=False,
                 )
-                
+                hf_config  = gr.Textbox(label="Config",       value="",      visible=False)
+                hf_split   = gr.Textbox(label="Split",        value="train", visible=False)
+                hf_col     = gr.Textbox(label="Text Column",  value="text",  visible=False)
+                hf_max_rows = gr.Number(label="Max Rows",     value=100,     visible=False)
+                hf_token   = gr.Textbox(label="HF Token",     type="password", visible=False)
+
+                text_file = gr.File(
+                    label="Upload Local Text (.txt / .md)",
+                    file_types=[".txt", ".md"],
+                    visible=True,
+                )
+
+                # FIX: toggle all six HF fields + the file widget together
+                def _toggle_source(use_hf_val):
+                    hf_vis   = gr.update(visible=use_hf_val)
+                    file_vis = gr.update(visible=not use_hf_val)
+                    return hf_vis, hf_vis, hf_vis, hf_vis, hf_vis, hf_vis, file_vis
+
                 use_hf.change(
-                    fn=lambda x: (gr.update(visible=x), gr.update(visible=not x)),
-                    inputs=use_hf, outputs=[hf_group, text_file]
+                    fn=_toggle_source,
+                    inputs=use_hf,
+                    outputs=[hf_dataset, hf_config, hf_split, hf_col, hf_max_rows, hf_token, text_file],
                 )
 
                 gr.Markdown("### Hyperparameters")
-                seed = gr.Number(value=42, label="Seed")
-                num_sentences = gr.Slider(1, 200, value=100, step=10, label="Sentences")
-                tokens_per_sentence = gr.Slider(8, 200, value=92, step=2, label="Tokens")
-                temp = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
+                seed              = gr.Number(value=42,  label="Seed")
+                num_sentences     = gr.Slider(1,   200, value=100, step=10, label="Sentences")
+                tokens_per_sentence = gr.Slider(8, 200, value=92,  step=2,  label="Tokens per Sentence")
+                temp              = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
 
                 gr.Markdown("### TetraGrid Lattice Controls")
-                adv_strength = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="Grid Adversarial Penalty")
-                densify_mag = gr.Slider(0.0, 0.5, value=0.08, step=0.01, label="Bernoulli Trace Inversification")
+                adv_strength  = gr.Slider(0.0, 1.0, value=0.5,  step=0.05, label="Grid Adversarial Penalty")
+                densify_mag   = gr.Slider(0.0, 0.5, value=0.08, step=0.01, label="Bernoulli Trace Inversification")
 
             with gr.Column(scale=2):
-                prompt = gr.Textbox(label="Prompt (extracts words for 100 forms)", value="Consider the nature of understanding", lines=2)
+                prompt = gr.Textbox(
+                    label="Prompt (extracts words for 100 forms)",
+                    value="Consider the nature of understanding",
+                    lines=2,
+                )
                 btn = gr.Button("Engage TetraGrid Neural Layer", variant="primary", size="lg")
 
                 gr.Markdown("## Output Stream")
-                output_sentences = gr.Textbox(label="Sentences", lines=20)
-                output_report = gr.Textbox(label="Grid Analysis Report", lines=20)
+                output_sentences = gr.Textbox(label="Sentences",            lines=20)
+                output_report    = gr.Textbox(label="Grid Analysis Report", lines=20)
 
         btn.click(
-            run_session, 
+            run_session,
             inputs=[
-                use_hf, hf_dataset, hf_split, hf_max_rows,
-                hf_config, hf_col, hf_token, text_file,
-                prompt, seed, num_sentences, tokens_per_sentence, 
-                temp, adv_strength, densify_mag
-            ], 
-            outputs=[output_sentences, output_report]
+                use_hf, hf_dataset, hf_split, hf_max_rows, hf_config, hf_col, hf_token,
+                text_file,
+                prompt, seed, num_sentences, tokens_per_sentence, temp,
+                adv_strength, densify_mag,
+            ],
+            outputs=[output_sentences, output_report],
         )
 
     return demo
+
 
 if __name__ == "__main__":
     app = build_app()
