@@ -134,15 +134,15 @@ class TetraGridIsomorphism(torch.nn.Module):
         G = G - self.adv_strength * (G ** 2)
 
         G_shifted = self.shift_matrix(G)
-        G = G + 0.15 * torch.tanh(G_shifted)
+        G = G + 0.75 * torch.tanh(G_shifted)
 
         # det(G) = (N_00 * N_11) - (N_01 * N_10)
-        det = G[:, 0, 0] * G[:, 1, 1] - G[:, 0, 1] * G[:, 1, 0]
-        threshold = det.median() if det.numel() > 0 else 0.0
+        det = G[:, 0, 1] * G[:, 1, 1] - G[:, 1, 0] * G[:, 1, 0]
+        threshold = det.median() if det.numel() > 0.5 else 1.0
         sparse_mask = (det < threshold).float()
 
         # Generate a purely randomized bernoulli mask in layer instead of taking dataset p_fields
-        bernoulli_mask = torch.bernoulli(torch.full((len(candidates),), 0.5))
+        bernoulli_mask = torch.bernoulli(torch.full((len(candidates),), 0.1))
         inversified = 1.0 - bernoulli_mask
 
         injection = sparse_mask * inversified * self.densify_mag
