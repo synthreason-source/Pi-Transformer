@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V9.1.4 — Pure TetraGrid Architecture with Upload & Fixed Prompts
+NeuroSymbolic V9.1.5 — Pure TetraGrid Architecture, Trigrams ONLY
 ===============================================================================
 
 ARCHITECTURE OVERVIEW:
 All non-matrix mathematical boosts (semantic similarity, topological cohomology,
-length agreements, dataset frequencies, etc.) remain purged. 
+length agreements, dataset frequencies, etc.) remain purged.
 
 The probability space is derived EXCLUSIVELY from:
 1) The Base Hebbian Reservoir (Spontaneous Traces & Synapses)
 2) The TetraGrid Isomorphism 2x2 Matrix Logic
 
-FIX: Sentence Starting Logic!
-Previously the words randomly sampled at the start of sentences were always drawn
-only from vocab[0] or very specific alphabetical sub-slices due to set/dict 
-ordering logic that was silently sorting by length or alphabetically. 
-The starting pool (`valid_starts`) is now properly shuffled globally.
+CHANGE vs V9.1.4:
+- next_dist() now uses TRIGRAMS ONLY.
+  No bigram fallback. No unigram fallback.
+  If no trigram (w1, w2, *) exists, candidates are drawn from ALL trigram
+  continuations seen in the corpus (context-agnostic trigram pool), keeping
+  frequency-weighted sampling inside the pure trigram probability space.
+- generate_100_sentences(): sentence starts are seeded from valid trigram heads
+  so the very first step always has at least one trigram continuation available.
 ===============================================================================
 """
 
@@ -90,12 +93,11 @@ class TetraGridIsomorphism(torch.nn.Module):
         self.adv_strength = adv_strength
         self.densify_mag = densify_mag
         self.embed_dim = embed_dim
-        
-        # NEW: Store index mapping and prepare PyTorch Embedding layers
+
         self.token_to_idx = token_to_idx
         vocab_size = len(token_to_idx) + 1  # +1 for unknown tokens fallback
         self.unk_idx = vocab_size - 1
-        
+
         self.E_embed = torch.nn.Embedding(vocab_size, embed_dim)
         self.L_embed = torch.nn.Embedding(vocab_size, embed_dim)
 
@@ -106,7 +108,6 @@ class TetraGridIsomorphism(torch.nn.Module):
 
     def _get_E(self, token: str) -> torch.Tensor:
         idx = self.token_to_idx.get(token, self.unk_idx)
-        # Using abs() to mimic the positive bounding of the old hashing approach
         vec = torch.abs(self.E_embed(torch.tensor(idx)))
         return vec / (vec.sum() + 1e-8)
 
@@ -115,7 +116,7 @@ class TetraGridIsomorphism(torch.nn.Module):
         vec = torch.abs(self.L_embed(torch.tensor(idx)))
         norm = torch.norm(vec)
         return (vec / (norm + 1e-8)) * magnitude
-        
+
     def forward(self, anchor_word: str, candidates: List[str]) -> torch.Tensor:
         anchor_leak_mag = 0.05 if anchor_word in PUNCT_TOKENS else min(max(len(anchor_word) / 10.0, 0.1), 2.0)
 
@@ -132,7 +133,7 @@ class TetraGridIsomorphism(torch.nn.Module):
 
         L_C = torch.stack([self._get_L(c, c_mag(c)) for c in candidates])
 
-        N_00 = torch.matmul(E_C, E_A.T).squeeze(-1)  
+        N_00 = torch.matmul(E_C, E_A.T).squeeze(-1)
         N_01 = torch.matmul(L_C, E_A.T).squeeze(-1)
         N_10 = torch.matmul(E_C, L_A.T).squeeze(-1)
         N_11 = torch.matmul(L_C, L_A.T).squeeze(-1)
@@ -168,76 +169,100 @@ class TetraGridIsomorphism(torch.nn.Module):
         return readout
 
 # ────────────────────────────────────────────────────────────────────────────
-# TARGET ISOMORPHISM 2: Hebbian Synaptic Reservoir
+# TARGET ISOMORPHISM 2: Hebbian Synaptic Reservoir — TRIGRAMS ONLY
 # ────────────────────────────────────────────────────────────────────────────
 class HebbianReservoirLM:
     def __init__(self, basal_k: float = 1.5):
         self.basal_k = float(basal_k)
         self.spontaneous_trace: Dict[str, float] = {}
-        self.synaptic_weights: Dict[Tuple[str, str], float] = {}
         self.tri_synapses: Dict[Tuple[str, str, str], float] = {}
+
+        # Index of which (w1,w2) pairs have at least one trigram continuation
+        self.trigram_heads: Dict[Tuple[str, str], List[str]] = {}
+
+        # Global pool of all trigram continuations (for context-agnostic fallback
+        # that stays inside the trigram probability space)
+        self._global_tri_continuations: List[str] = []
+        self._global_tri_weights: List[float] = []
+
         self.vocab: List[str] = []
-        self.token_to_idx: Dict[str, int] = {}  # NEW: Dataset index mapping
+        self.token_to_idx: Dict[str, int] = {}
         self.total_spikes = 0
 
+    # ------------------------------------------------------------------
     def ingest(self, tokens: List[str]) -> None:
         for t in tokens:
             self.spontaneous_trace[t] = self.spontaneous_trace.get(t, 0) + 1.0
             self.total_spikes += 1
-        for i in range(len(tokens) - 1):
-            k = (tokens[i], tokens[i + 1])
-            self.synaptic_weights[k] = self.synaptic_weights.get(k, 0) + 1.0
-        for i in range(len(tokens) - 2):
-            k = (tokens[i], tokens[i + 1], tokens[i + 2])
-            self.tri_synapses[k] = self.tri_synapses.get(k, 0) + 1.0
 
-        raw_vocab = list(self.spontaneous_trace.keys())
-        self.vocab = [v for v in raw_vocab if v not in PUNCT_TOKENS and v not in COGNITIVE_TOKENS]
-        
-        # NEW: Assign a unique dataset index to every token encountered
-        for token in raw_vocab:
+        # Build trigrams only
+        for i in range(len(tokens) - 2):
+            w1, w2, w3 = tokens[i], tokens[i + 1], tokens[i + 2]
+            k = (w1, w2, w3)
+            self.tri_synapses[k] = self.tri_synapses.get(k, 0) + 1.0
+            head = (w1, w2)
+            if head not in self.trigram_heads:
+                self.trigram_heads[head] = []
+            if w3 not in self.trigram_heads[head]:
+                self.trigram_heads[head].append(w3)
+
+        # Assign dataset indices
+        for token in self.spontaneous_trace:
             if token not in self.token_to_idx:
                 self.token_to_idx[token] = len(self.token_to_idx)
 
+        # Build global continuation pool from ALL trigrams (frequency-weighted)
+        cont_counts: Dict[str, float] = {}
+        for (_, _, w3), cnt in self.tri_synapses.items():
+            cont_counts[w3] = cont_counts.get(w3, 0) + cnt
+        self._global_tri_continuations = list(cont_counts.keys())
+        self._global_tri_weights = [cont_counts[w] for w in self._global_tri_continuations]
 
-        # FIX: The vocab list was being populated by dict.keys(), which is ordered by insertion.
-        # It needs to be uniquely collected, shuffled, or sorted by natural occurrence to prevent
-        # alphabetic or static 'a' or 'z' bias during random.sample() down the line.
         raw_vocab = list(self.spontaneous_trace.keys())
         self.vocab = [v for v in raw_vocab if v not in PUNCT_TOKENS and v not in COGNITIVE_TOKENS]
 
+    # ------------------------------------------------------------------
     def next_dist(self, w1: str, w2: str) -> Tuple[List[str], torch.Tensor]:
+        """
+        TRIGRAMS ONLY.
+        Primary: continuations of the exact (w1, w2) context.
+        Fallback (no matching trigram head): global trigram continuation pool,
+                 weighted by how often each token appears as a trigram third word.
+        No bigrams. No unigrams.
+        """
+        head = (w1, w2)
         cands: List[str] = []
-        for (a, b, c) in self.tri_synapses:
-            if a == w1 and b == w2:
-                cands.append(c)
+        weights: List[float] = []
 
-        if not cands:
-            for (a, b) in self.synaptic_weights:
-                if a == w2:
-                    cands.append(b)
+        if head in self.trigram_heads:
+            # Exact trigram context
+            for w3 in self.trigram_heads[head]:
+                cnt = self.tri_synapses.get((w1, w2, w3), 0)
+                cands.append(w3)
+                weights.append(cnt)
+        else:
+            # Context-agnostic fallback — still inside trigram probability space
+            cands = list(self._global_tri_continuations)
+            weights = list(self._global_tri_weights)
 
-        if not cands:
-            cands = [w for w, _ in sorted(self.spontaneous_trace.items(), key=lambda x: -x[1])[:150]]
+        # Deduplicate while preserving order & summing weights
+        seen: Dict[str, float] = {}
+        for w, wt in zip(cands, weights):
+            seen[w] = seen.get(w, 0) + wt
+        cands = list(seen.keys())[:400]
+        weights = [seen[w] for w in cands]
 
-        seen, out = set(), []
-        for w in cands:
-            if w not in seen:
-                seen.add(w)
-                out.append(w)
-
-        cands = out[:400]
-        V_total = len(self.vocab) + 1
         k = self.basal_k
+        V_total = len(self.vocab) + 1
 
-        def propagation_prob(w3: str) -> float:
-            c12 = self.synaptic_weights.get((w1, w2), 0)
-            c123 = self.tri_synapses.get((w1, w2, w3), 0)
-            if c12 > 0:
-                return (c123 + k) / (c12 + k * V_total)
-            return (self.spontaneous_trace.get(w3, 0) + k) / (self.total_spikes + k * V_total)
+        if head in self.trigram_heads:
+            c12_total = sum(weights)  # total count of (w1,w2,*) trigrams
+            probs_raw = [(wt + k) / (c12_total + k * V_total) for wt in weights]
+        else:
+            total_w = sum(weights)
+            probs_raw = [(wt + k) / (total_w + k * V_total) for wt in weights]
 
-        probs = torch.tensor([propagation_prob(w) for w in cands], dtype=torch.float32)
+        probs = torch.tensor(probs_raw, dtype=torch.float32)
         probs = probs / (probs.sum() + 1e-12)
 
         return cands, probs
@@ -307,20 +332,14 @@ def build_state(
     lm = HebbianReservoirLM()
     lm.ingest(tokens)
 
-    # NEW: Pass the generated dataset index mapping to the matrix grid
     tetra_grid = TetraGridIsomorphism(
         token_to_idx=lm.token_to_idx,
-        adv_strength=adv_strength, 
+        adv_strength=adv_strength,
         densify_mag=densify_mag,
         embed_dim=256
     )
 
-    state = CorpusState(
-        lm=lm,
-        tetra_grid=tetra_grid,
-        time_step=0
-    )
-    
+    state = CorpusState(lm=lm, tetra_grid=tetra_grid, time_step=0)
 
     prompt_tokens = tokenize(prompt.upper())
     base_words = [w for w in prompt_tokens if w not in COGNITIVE_TOKENS and w not in PUNCT_TOKENS and re.match(r"^[a-z]+$", w)]
@@ -363,7 +382,7 @@ def next_probs(
     punct_penalty = torch.zeros_like(grid_output)
     for idx, c in enumerate(cands):
         if c in PUNCT_TOKENS:
-            punct_bias[idx] = -3.5 
+            punct_bias[idx] = -3.5
             if w2 in PUNCT_TOKENS:
                 punct_penalty[idx] = -10000.0
 
@@ -383,17 +402,18 @@ def generate_100_sentences(
     torch.manual_seed(seed)
     random.seed(seed)
 
-    # FIX: Fully randomize the master vocabulary start pool so we don't just pick 'a' or 'z' from the dict keys.
-    valid_starts = list(set(state.lm.vocab)) 
-    random.shuffle(valid_starts)
+    # Sentence starts must be valid trigram heads so the first step is always
+    # inside the trigram probability space.
+    trigram_head_list = list(state.lm.trigram_heads.keys())
+    random.shuffle(trigram_head_list)
+
+    if not trigram_head_list:
+        return ["Not enough trigram data to generate sentences."]
 
     out_sentences = []
 
-    if len(valid_starts) < 2:
-        return ["Not enough vocabulary."]
-
     MIN_TOKENS_BEFORE_PUNCT = max(3, int(tokens_per_sentence * 0.15))
-    MIN_TOKENS_BEFORE_END   = max(4, int(tokens_per_sentence * 0.85)) 
+    MIN_TOKENS_BEFORE_END   = max(4, int(tokens_per_sentence * 0.85))
     WORDS_SINCE_PUNCT_MIN   = 3
     END_PUNCT = {".", "?", "!"}
 
@@ -408,8 +428,8 @@ def generate_100_sentences(
         sent_tokens = []
         words_since_punct = 999
 
-        # FIX: Draw a fresh random start purely from the shuffled vocabulary pool per sentence
-        w1, w2 = random.choice(valid_starts), random.choice(valid_starts)
+        # Pick a random trigram head as the sentence seed
+        w1, w2 = random.choice(trigram_head_list)
 
         for _ in range(tokens_per_sentence):
             cands, probs = next_probs(state, w1, w2, sentence_index=sent_idx, temp=temp)
@@ -525,19 +545,19 @@ def run_session(
     return "\n".join(sent_lines), "\n".join(report_lines)
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic Form Generator V9.1") as demo:
-        gr.Markdown("# Neuronal Isomorphism Generator V9.1: Pure TetraGrid Logic")
+    with gr.Blocks(title="NeuroSymbolic Form Generator V9.1.5 — Trigrams Only") as demo:
+        gr.Markdown("# Neuronal Isomorphism Generator V9.1.5: Pure TetraGrid × Trigram Logic")
 
         with gr.Row():
             with gr.Column(scale=1):
                 use_hf = gr.Checkbox(label="Use Hugging Face Dataset?", value=False)
 
-                hf_dataset = gr.Textbox(label="Dataset Path", value="AiresPucrs/stanford-encyclopedia-philosophy", visible=False)
-                hf_config  = gr.Textbox(label="Config",       value="",      visible=False)
-                hf_split   = gr.Textbox(label="Split",        value="train", visible=False)
-                hf_col     = gr.Textbox(label="Text Column",  value="text",  visible=False)
-                hf_max_rows = gr.Number(label="Max Rows",     value=100,     visible=False)
-                hf_token   = gr.Textbox(label="HF Token",     type="password", visible=False)
+                hf_dataset  = gr.Textbox(label="Dataset Path", value="AiresPucrs/stanford-encyclopedia-philosophy", visible=False)
+                hf_config   = gr.Textbox(label="Config",       value="",      visible=False)
+                hf_split    = gr.Textbox(label="Split",        value="train", visible=False)
+                hf_col      = gr.Textbox(label="Text Column",  value="text",  visible=False)
+                hf_max_rows = gr.Number( label="Max Rows",     value=100,     visible=False)
+                hf_token    = gr.Textbox(label="HF Token",     type="password", visible=False)
 
                 text_file = gr.File(label="Upload Local Text (.txt / .md)", file_types=[".txt", ".md"], visible=True)
 
@@ -549,14 +569,14 @@ def build_app():
                 use_hf.change(fn=_toggle_source, inputs=use_hf, outputs=[hf_dataset, hf_config, hf_split, hf_col, hf_max_rows, hf_token, text_file])
 
                 gr.Markdown("### Hyperparameters")
-                seed              = gr.Number(value=42,  label="Seed")
-                num_sentences     = gr.Slider(1,   200, value=100, step=10, label="Sentences")
-                tokens_per_sentence = gr.Slider(8, 200, value=92,  step=2,  label="Tokens per Sentence")
-                temp              = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
+                seed                = gr.Number(value=42,  label="Seed")
+                num_sentences       = gr.Slider(1,   200, value=100, step=10, label="Sentences")
+                tokens_per_sentence = gr.Slider(8,   200, value=92,  step=2,  label="Tokens per Sentence")
+                temp                = gr.Slider(0.8, 2.5, value=1.7, step=0.1, label="Temperature")
 
                 gr.Markdown("### TetraGrid Lattice Controls")
-                adv_strength  = gr.Slider(0.0, 1.0, value=0.5,  step=0.05, label="Grid Adversarial Penalty")
-                densify_mag   = gr.Slider(0.0, 0.5, value=0.08, step=0.01, label="Bernoulli Trace Inversification")
+                adv_strength = gr.Slider(0.0, 1.0, value=0.5,  step=0.05, label="Grid Adversarial Penalty")
+                densify_mag  = gr.Slider(0.0, 0.5, value=0.08, step=0.01, label="Bernoulli Trace Inversification")
 
             with gr.Column(scale=2):
                 prompt = gr.Textbox(label="Prompt (extracts words for 100 forms)", value="Consider the nature of understanding", lines=2)
