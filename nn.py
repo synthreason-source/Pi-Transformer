@@ -290,7 +290,8 @@ class CorpusState:
 
 def tokenize(text: str) -> List[str]:
     out = []
-    words = re.findall(r"\[[A-Z]+\]|\b[a-zA-Z]+\b|[.,!?;:]", text)
+    words = re.findall(r"\\[[A-Z]+\\]|\\b[a-zA-Z]+\\b|[.,!?;:]", text)
+
     for w in words:
         if w in COGNITIVE_TOKENS or w in PUNCT_TOKENS:
             out.append(w)
@@ -618,8 +619,7 @@ def load_corpus(
 # ────────────────────────────────────────────────────────────────────────────
 
 def _format_sentences(sentence_outputs: Dict[int, str]) -> str:
-    return "\n".join(f"[{i+1}] {s}" for i, s in sentence_outputs.items())
-
+    return "\\n".join(f"[{i+1}] {s}" for i, s in sentence_outputs.items())
 def _format_report(state: CorpusState, pass_label: str,
                    mirror_weights: Optional[Dict[str, float]] = None) -> str:
     lines = [
