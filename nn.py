@@ -290,8 +290,7 @@ class CorpusState:
 
 def tokenize(text: str) -> List[str]:
     out = []
-    words = re.findall(r"\\[[A-Z]+\\]|\\b[a-zA-Z]+\\b|[.,!?;:]", text)
-
+    words = re.findall(r"\[[A-Z]+\]|\b[a-zA-Z]+\b|[.,!?;:]", text)
     for w in words:
         if w in COGNITIVE_TOKENS or w in PUNCT_TOKENS:
             out.append(w)
@@ -619,7 +618,8 @@ def load_corpus(
 # ────────────────────────────────────────────────────────────────────────────
 
 def _format_sentences(sentence_outputs: Dict[int, str]) -> str:
-    return "\\n".join(f"[{i+1}] {s}" for i, s in sentence_outputs.items())
+    return "\n".join(f"[{i+1}] {s}" for i, s in sentence_outputs.items())
+
 def _format_report(state: CorpusState, pass_label: str,
                    mirror_weights: Optional[Dict[str, float]] = None) -> str:
     lines = [
@@ -744,8 +744,8 @@ def build_app():
                 btn = gr.Button("Run Dual-Pass TetraGrid ×  Mirror Inversion",
                                 variant="primary", size="lg")
 
-                with gr.Tab("Output"):
-                    p2_sentences_out = gr.Textbox(label="Output", lines=20)
+                p2_sentences_out = gr.Textbox(label="Output", lines=20)
+
 
         btn.click(
             run_session,
@@ -754,7 +754,7 @@ def build_app():
                 text_file, prompt, seed, num_sentences, tokens_per_sentence,
                 temp, adv_strength, densify_mag, mirror_strength,
             ],
-            outputs=[p2_sentences_out],
+            outputs=[gr.State(), gr.State(), p2_sentences_out, gr.State()],
         )
 
     return demo
