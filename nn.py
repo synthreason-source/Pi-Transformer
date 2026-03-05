@@ -85,11 +85,19 @@ class SentenceFormPlan:
 # TARGET ISOMORPHISM 1: The TetraGrid 2x2 Lattice Layer
 # ────────────────────────────────────────────────────────────────────────────
 class TetraGridIsomorphism(torch.nn.Module):
-    def __init__(self, adv_strength: float = 0.5, densify_mag: float = 0.08, embed_dim: int = 256):
+    def __init__(self, token_to_idx: Dict[str, int], adv_strength: float = 0.5, densify_mag: float = 0.08, embed_dim: int = 256):
         super().__init__()
         self.adv_strength = adv_strength
         self.densify_mag = densify_mag
         self.embed_dim = embed_dim
+        
+        # NEW: Store index mapping and prepare PyTorch Embedding layers
+        self.token_to_idx = token_to_idx
+        vocab_size = len(token_to_idx) + 1  # +1 for unknown tokens fallback
+        self.unk_idx = vocab_size - 1
+        
+        self.E_embed = torch.nn.Embedding(vocab_size, embed_dim)
+        self.L_embed = torch.nn.Embedding(vocab_size, embed_dim)
 
         self.shift_matrix = torch.nn.Linear(2, 2, bias=True)
         with torch.no_grad():
@@ -97,18 +105,17 @@ class TetraGridIsomorphism(torch.nn.Module):
             self.shift_matrix.bias.fill_(0.0)
 
     def _get_E(self, token: str) -> torch.Tensor:
-        raw = hashlib.sha256(token.encode("utf-8")).digest()
-        repeated = (raw * ((self.embed_dim // 32) + 2))[:self.embed_dim]
-        vec = torch.tensor(list(repeated), dtype=torch.float32)
+        idx = self.token_to_idx.get(token, self.unk_idx)
+        # Using abs() to mimic the positive bounding of the old hashing approach
+        vec = torch.abs(self.E_embed(torch.tensor(idx)))
         return vec / (vec.sum() + 1e-8)
 
     def _get_L(self, token: str, magnitude: float) -> torch.Tensor:
-        raw = hashlib.md5(token.encode("utf-8")).digest()
-        repeated = (raw * ((self.embed_dim // 16) + 2))[:self.embed_dim]
-        vec = torch.tensor(list(repeated), dtype=torch.float32)
+        idx = self.token_to_idx.get(token, self.unk_idx)
+        vec = torch.abs(self.L_embed(torch.tensor(idx)))
         norm = torch.norm(vec)
         return (vec / (norm + 1e-8)) * magnitude
-
+        
     def forward(self, anchor_word: str, candidates: List[str]) -> torch.Tensor:
         anchor_leak_mag = 0.05 if anchor_word in PUNCT_TOKENS else min(max(len(anchor_word) / 10.0, 0.1), 2.0)
 
@@ -170,6 +177,7 @@ class HebbianReservoirLM:
         self.synaptic_weights: Dict[Tuple[str, str], float] = {}
         self.tri_synapses: Dict[Tuple[str, str, str], float] = {}
         self.vocab: List[str] = []
+        self.token_to_idx: Dict[str, int] = {}  # NEW: Dataset index mapping
         self.total_spikes = 0
 
     def ingest(self, tokens: List[str]) -> None:
@@ -182,6 +190,15 @@ class HebbianReservoirLM:
         for i in range(len(tokens) - 2):
             k = (tokens[i], tokens[i + 1], tokens[i + 2])
             self.tri_synapses[k] = self.tri_synapses.get(k, 0) + 1.0
+
+        raw_vocab = list(self.spontaneous_trace.keys())
+        self.vocab = [v for v in raw_vocab if v not in PUNCT_TOKENS and v not in COGNITIVE_TOKENS]
+        
+        # NEW: Assign a unique dataset index to every token encountered
+        for token in raw_vocab:
+            if token not in self.token_to_idx:
+                self.token_to_idx[token] = len(self.token_to_idx)
+
 
         # FIX: The vocab list was being populated by dict.keys(), which is ordered by insertion.
         # It needs to be uniquely collected, shuffled, or sorted by natural occurrence to prevent
@@ -290,7 +307,9 @@ def build_state(
     lm = HebbianReservoirLM()
     lm.ingest(tokens)
 
+    # NEW: Pass the generated dataset index mapping to the matrix grid
     tetra_grid = TetraGridIsomorphism(
+        token_to_idx=lm.token_to_idx,
         adv_strength=adv_strength, 
         densify_mag=densify_mag,
         embed_dim=256
@@ -301,6 +320,7 @@ def build_state(
         tetra_grid=tetra_grid,
         time_step=0
     )
+    
 
     prompt_tokens = tokenize(prompt.upper())
     base_words = [w for w in prompt_tokens if w not in COGNITIVE_TOKENS and w not in PUNCT_TOKENS and re.match(r"^[a-z]+$", w)]
