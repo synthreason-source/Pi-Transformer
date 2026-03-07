@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V15.0 — RKHS Kernels × Symmetrical Processor
+NeuroSymbolic V15.0 — RKHS Kernels × synthetic_reason Symmetrical Processor
 ===============================================================================
 
 REFACTOR DECLARATION
@@ -10,9 +10,9 @@ This system upgrades the Superpolynomial architecture by projecting discrete
 algebraic operations into a continuous Reproducing Kernel Hilbert Space (RKHS)
 using standard neural network activation curves.
 
-Additionally, it integrates the Symmetrical Processor (inspired by
+Additionally, it integrates the synthetic_reason Symmetrical Processor (inspired by
 SynthReason 0.9N C++, George Wagenknecht 2017). This provides a parallel 
-"subloop" that enforces ethical mandates and conceptual anchoring 
+"subsynthetic_reason loop" that enforces ethical mandates and conceptual anchoring 
 over the raw topological generation.
 
 MATHEMATICAL UPGRADES
@@ -29,7 +29,7 @@ MATHEMATICAL UPGRADES
    Maps the vocabulary to a quotient topology ℤ/Mℤ. Forces the text generation
    Markov chain to walk cyclically through the equivalence classes (fiber bundle).
 
-4. Symmetrical Mandates (C++ SynthReason)
+4. synthetic_reason Symmetrical Mandates (C++ SynthReason)
    A deterministic background concept filter that heavily biases the RKHS 
    distribution towards mandate-fulfilling vocabulary when trigger words occur.
 ===============================================================================
@@ -341,18 +341,65 @@ class SuperPolyGraph:
             for v in self.nodes: self.nodes[v].potential = new_pots[v] / mx
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — RKHS NEURAL GRAPH WALKER
+# SECTION 4.5 — SYNTHREASON synthetic_reason SYMMETRICAL MANDATES (C++ INSPIRATION)
+# ════════════════════════════════════════════════════════════════════════════
+class synthetic_reasonMandateProcessor:
+    """
+    Inspired by SynthReason 0.9N C++ (George Wagenknecht, 2017).
+    Runs a parallel "subsynthetic_reason" check against ethical mandates and core concepts.
+    If the context aligns with a mandate, it heavily biases the RKHS distribution 
+    towards mandate-fulfilling vocabulary.
+    """
+    def __init__(self):
+        self.AIControlLogic = "I II III O"
+        self.AIEthics = ["do not harm any human", "do not harm myself", "do not make weapons"]
+        self.AIMandates = ["end poverty", "cure disease", "improve standard of living", "learn"]
+        
+        # We assign high energetic weights to concepts related to these mandates
+        self.mandate_vocabulary = {
+            "poverty": "end", "disease": "cure", "standard": "improve", "living": "improve",
+            "learn": "explore", "human": "protect", "weapons": "avoid", "harm": "prevent"
+        }
+
+    def subsynthetic_reason_concept_enrichment(self, w_ctx: str, cands: List[str]) -> torch.Tensor:
+        """
+        Acts as the Subsynthetic_reason Loop from SynthReason. It evaluates the current synthetic_reason 
+        thought (w_ctx) and enriches candidates that fulfill the AI Mandates.
+        """
+        enrichment_tensor = torch.zeros(len(cands))
+        
+        # Check if current context triggers a mandate
+        trigger = None
+        for key in self.mandate_vocabulary:
+            if key in w_ctx.lower():
+                trigger = self.mandate_vocabulary[key]
+                break
+                
+        if trigger:
+            for i, c in enumerate(cands):
+                if trigger in c.lower():
+                    # Massive logit boost for mandate fulfillment
+                    enrichment_tensor[i] += 5.0  
+                elif c.lower() in self.AIEthics:
+                    # Ethical absolute rule
+                    enrichment_tensor[i] += 10.0
+                    
+        return enrichment_tensor
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — RKHS NEURAL GRAPH WALKER
 # ════════════════════════════════════════════════════════════════════════════
 
 class RKHSGraphSuperPolyWalk:
     def __init__(self, graph: SuperPolyGraph, spr: SuperPolynomialRing, phi: VocabularyAutomorphism,
-                 vis_a_vis: SplitComplexVisAVisCompound, monograph: InverseSurjectionMonograph, kernels: NeuralKernelExpansions):
+                 vis_a_vis: SplitComplexVisAVisCompound, monograph: InverseSurjectionMonograph, kernels: NeuralKernelExpansions, synthetic_reason: synthetic_reasonMandateProcessor):
         self.graph = graph
         self.spr = spr
         self.phi = phi
         self.vis_a_vis = vis_a_vis
         self.monograph = monograph
         self.kernels = kernels
+        self.synthetic_reason = synthetic_reason
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
 
     def walk_probs(self, w1: str, w2: str, graded_lm: GradedSynapseAlgebra, orbit_grid: AutoOrbitModule,
@@ -398,7 +445,9 @@ class RKHSGraphSuperPolyWalk:
                 punct_bias[i] = -3.5
                 if w2 in PUNCT_TOKENS: punct_penalty[i] = -1e4
 
-        # SynthReason SubConcept Enrichment
+        # SynthReason synthetic_reason Subsynthetic_reason Concept Enrichment
+        mandate_boost = self.synthetic_reason.subsynthetic_reason_concept_enrichment(w2, cands)
+
         # Full RKHS Logit Assemblage (with SynthReason Mandates)
         logits = (
             torch.log(base_probs.clamp(min=1e-12))
@@ -413,7 +462,7 @@ class RKHSGraphSuperPolyWalk:
         return cands, F.softmax(logits, dim=-1)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — ENGINE STATE
+# SECTION 5 — ENGINE STATE
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -445,11 +494,12 @@ def build_v15_state(corpus_text: str) -> V15State:
     vis_a_vis = SplitComplexVisAVisCompound()
     monograph = InverseSurjectionMonograph(modulus=7)
     kernels = NeuralKernelExpansions()
-    walker = RKHSGraphSuperPolyWalk(graph, spr, phi, vis_a_vis, monograph, kernels)
+    synthetic_reason = synthetic_reasonMandateProcessor()
+    walker = RKHSGraphSuperPolyWalk(graph, spr, phi, vis_a_vis, monograph, kernels, synthetic_reason)
 
     return V15State(graded_lm, orbit_grid, graph, walker)
 
-def generate(state: V15State, num_sentences: int=20, tokens_per_sent: int=92, 
+def generate(state: V15State, seed_context: str="", num_sentences: int=20, tokens_per_sent: int=92, 
              temp: float=1.4, vis_strength: float=0.8, surjection_kappa: float=2.0) -> None:
     
     head_list = list(state.graded_lm.heads.keys())
@@ -458,9 +508,27 @@ def generate(state: V15State, num_sentences: int=20, tokens_per_sent: int=92,
     state.outputs.clear()
     state.isomorphic_matches.clear()
 
+    # Process seed context if provided
+    seed_w1, seed_w2 = None, None
+    if seed_context:
+        seed_toks = tokenize(seed_context)
+        if len(seed_toks) >= 2:
+            seed_w1, seed_w2 = seed_toks[-2], seed_toks[-1]
+        elif len(seed_toks) == 1:
+            # Try to find a valid w1 for the single provided word
+            matches = [pair for pair in head_list if pair[1] == seed_toks[0]]
+            if matches:
+                seed_w1, seed_w2 = random.choice(matches)
+
     for si in range(num_sentences):
-        w1, w2 = random.choice(head_list)
-        toks, wsp = [], 999
+        if seed_w1 and seed_w2 and si == 0:
+            w1, w2 = seed_w1, seed_w2
+            toks = list(seed_toks)
+            wsp = len(seed_toks)
+        else:
+            w1, w2 = random.choice(head_list)
+            toks, wsp = [], 999
+
         for _ in range(tokens_per_sent):
             cands, probs = state.walker.walk_probs(w1, w2, state.graded_lm, state.orbit_grid, temp=temp, 
                                                    vis_strength=vis_strength, surjection_kappa=surjection_kappa)
@@ -489,7 +557,7 @@ def generate(state: V15State, num_sentences: int=20, tokens_per_sent: int=92,
         state.outputs[si] = detokenize(toks)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — GRADIO UI
+# SECTION 6 — GRADIO UI
 # ════════════════════════════════════════════════════════════════════════════
 
 def load_corpus(text_file=None):
@@ -504,21 +572,21 @@ def load_corpus(text_file=None):
         "our standard of living and protect every human."
     )
 
-def run_session(text_file, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa):
+def run_session(text_file, seed_context, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa):
     corpus = load_corpus(text_file)
     state = build_v15_state(corpus)
-    generate(state, num_sentences=int(num_sentences), tokens_per_sent=int(tokens_per_sentence), temp=float(temp), 
+    generate(state, seed_context=str(seed_context), num_sentences=int(num_sentences), tokens_per_sent=int(tokens_per_sentence), temp=float(temp), 
              vis_strength=float(vis_strength), surjection_kappa=float(surjection_kappa))
     
     out_text = "\n".join(f"[{i+1:02d}] {s}" for i, s in state.outputs.items())
     
     report = [
-        "V15.0 — RKHS NEURAL KERNEL × PROCESSOR",
+        "V15.0 — RKHS NEURAL KERNEL × synthetic_reason PROCESSOR",
         "=" * 60,
         f"Vocab size        : {len(state.graded_lm.vocab)}",
         f"Vis-a-Vis SiLU    : Strength {vis_strength:.2f}",
         f"Monograph Modulus : 7  | Von Mises Kappa {surjection_kappa:.2f}",
-        "SubLoop : Active (C++ SynthReason Mandates)",
+        "Subsynthetic_reason Loop : Active (C++ SynthReason Mandates)",
         "",
         "── Isomorphic Metric: Structurally Equivalent Candidates ──",
         "(RBF Kernel Similarity > 0.98 in V10 graph projection)",
@@ -532,21 +600,22 @@ def run_session(text_file, num_sentences, tokens_per_sentence, temp, vis_strengt
     return out_text, "\n".join(report)
 
 def build_app():
-    with gr.Blocks(title="NeuroSymbolic V15.0 — Symmetrical Processor") as demo:
-        gr.Markdown("# NeuroSymbolic V15.0\n### Continuous RKHS Kernel Expansions & Symmetrical Processor")
+    with gr.Blocks(title="NeuroSymbolic V15.0 — synthetic_reason Symmetrical Processor") as demo:
+        gr.Markdown("# NeuroSymbolic V15.0\n### Continuous RKHS Kernel Expansions & synthetic reason Symmetrical Processor")
         with gr.Row():
             with gr.Column(scale=1):
                 text_file = gr.File(label="Upload Text (.txt)")
+                seed_context = gr.Textbox(label="Seed Context Prompt", placeholder="Enter starting words...")
                 num_sentences = gr.Slider(1, 100, value=15, label="Sentences")
                 tokens_per_sentence = gr.Slider(5, 200, value=92, label="Tokens per Sentence")
                 temp = gr.Slider(0.8, 2.5, value=1.4, label="Temperature τ")
                 vis_strength = gr.Slider(0.0, 3.0, value=0.8, label="Vis-a-Vis SiLU Strength")
                 surjection_kappa = gr.Slider(0.0, 10.0, value=2.0, label="Inverse Surjection Kappa")
             with gr.Column(scale=2):
-                btn = gr.Button("Generate — Run Engine", variant="primary", size="lg")
+                btn = gr.Button("Generate — Run synthetic_reason Engine", variant="primary", size="lg")
                 out_text = gr.Textbox(label="Generated Sentences", lines=15)
                 out_report = gr.Textbox(label="Structure Report", lines=12)
-        btn.click(run_session, inputs=[text_file, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa], outputs=[out_text, out_report])
+        btn.click(run_session, inputs=[text_file, seed_context, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa], outputs=[out_text, out_report])
     return demo
 
 if __name__ == "__main__":
