@@ -21,11 +21,18 @@ three geometric quantities:
 
 TOKEN GEOMETRY
 ──────────────
-Each vocabulary token t is assigned a canonical parallelogram via two
-deterministic 2-D points derived from the token's hash:
+Each vocabulary token t is assigned a canonical parallelogram derived
+exclusively from its corpus statistics: raw frequency f and vocabulary
+index k (first-occurrence rank).
 
-    P_t = (p_x, p_y)    ← hash bytes 0-3, 4-7
-    Q_t = (q_x, q_y)    ← hash bytes 8-11, 12-15
+    f̂  = f / F          normalised frequency   ∈ (0, 1]
+    k̂  = k / (K − 1)   normalised rank        ∈ [0, 1]
+
+    P_t = ( f̂ · cos(2π·k̂),  f̂ · sin(2π·k̂) )
+          radius = relative frequency, angle = relative rank
+
+    Q_t = ( k̂ · cos(2π·f̂),  k̂ · sin(2π·f̂) )
+          radius = relative rank, angle = relative frequency
 
 The parallelogram is:
     A = (0, 0)
@@ -34,7 +41,7 @@ The parallelogram is:
     D = Q_t
 
 Its Thébault triple  (ρ_t, θ_t, σ_t)  is the token's entire geometric
-identity.  No embeddings, no weight matrices, no learned parameters.
+identity.  No hashes, no embeddings, no weight matrices.
 
 FIVE MATHEMATICAL MODULES — ALL THÉBAULT
 ─────────────────────────────────────────
@@ -94,7 +101,7 @@ as an ethical overlay on top of the geometric selection.
 """
 
 from __future__ import annotations
-import re, math, random, hashlib, unicodedata
+import re, math, random, unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Tuple, Set
@@ -255,30 +262,92 @@ class ThebaultTriple:
 
 class ThebaultTokenGeometry:
     """
-    Assigns each token a canonical parallelogram from its hash and computes
-    the Thébault triple (ρ, θ, σ).
+    Assigns each token a canonical parallelogram derived exclusively from its
+    corpus statistics — raw frequency and vocabulary index — then computes the
+    Thébault triple (ρ, θ, σ).
 
-    Hash layout (MD5, 16 bytes):
-        bytes  0-3  → P.x  ∈ [-1, 1]
-        bytes  4-7  → P.y  ∈ [-1, 1]
-        bytes  8-11 → Q.x  ∈ [-1, 1]
-        bytes 12-15 → Q.y  ∈ [-1, 1]
+    Parallelogram construction from corpus statistics
+    ──────────────────────────────────────────────────
+    Let:
+        f  = raw frequency of token t  (count of occurrences in corpus)
+        k  = vocabulary index of token t  (rank by first-occurrence order)
+        F  = maximum raw frequency across all tokens
+        K  = vocabulary size (total unique tokens)
+
+    Normalised values:
+        f̂  = f / F          ∈ (0, 1]   — relative frequency
+        k̂  = k / (K − 1)   ∈ [0, 1]   — relative rank
+
+    The two defining vectors are then:
+
+        P_t = ( f̂ · cos(2π · k̂),   f̂ · sin(2π · k̂) )
+            — a point on a circle of radius f̂, at angle 2π·k̂.
+            High-frequency tokens have long P vectors (large circle radius).
+            Rank distributes them evenly around the circle.
+
+        Q_t = ( k̂ · cos(2π · f̂),   k̂ · sin(2π · f̂) )
+            — roles swapped: radius = relative rank, angle driven by frequency.
+            Rare tokens cluster near the origin; common ones spread outward.
+
+    The parallelogram is:
+        A = (0, 0)
+        B = P_t
+        C = P_t + Q_t
+        D = Q_t
+
+    Geometry intuition:
+        • Two tokens with the same frequency but different ranks → same |P|
+          but different angles → different θ (orientation).
+        • Two tokens with the same rank but different frequencies → same θ_P
+          angle but different |P| → different σ (side-length).
+        • ρ (regularity) measures how "square-like" the Thébault figure is,
+          capturing the interaction between the two corpus dimensions.
+
+    Composition (trigram context):
+        P_composed = P_t1 + P_t2     Q_composed = Q_t1 + Q_t2
+        Vector addition in each plane; the composed parallelogram's Thébault
+        triple represents the joint corpus geometry of the bigram context.
+
+    Registration:
+        call  geo.register(token, freq, index, max_freq, vocab_size)
+        before calling  geo.triple(token)  or  geo.composed_triple(t1, t2).
     """
 
     def __init__(self):
-        self._cache: Dict[str, ThebaultTriple] = {}
+        self._vecs  : Dict[str, Tuple[float, float, float, float]] = {}  # px,py,qx,qy
+        self._cache : Dict[str, ThebaultTriple]                    = {}
 
-    def _hash_to_vec(self, token: str, salt: str) -> Tuple[float, float]:
-        raw = hashlib.md5((token + salt).encode()).digest()
-        x = (int.from_bytes(raw[0:4],  "big") / 0xFFFFFFFF) * 2.0 - 1.0
-        y = (int.from_bytes(raw[4:8],  "big") / 0xFFFFFFFF) * 2.0 - 1.0
-        return x, y
+    def register(
+        self,
+        token     : str,
+        freq      : float,
+        index     : int,
+        max_freq  : float,
+        vocab_size: int,
+    ) -> None:
+        """Compute and store the (P, Q) corpus vectors for one token."""
+        f_hat = freq / max(max_freq, 1e-9)
+        k_hat = index / max(vocab_size - 1, 1)
+
+        angle_p = 2.0 * math.pi * k_hat   # rank → angle
+        angle_q = 2.0 * math.pi * f_hat   # freq → angle
+
+        px = f_hat * math.cos(angle_p)
+        py = f_hat * math.sin(angle_p)
+        qx = k_hat * math.cos(angle_q)
+        qy = k_hat * math.sin(angle_q)
+
+        self._vecs[token] = (px, py, qx, qy)
+        self._cache.pop(token, None)   # invalidate if re-registered
+
+    def _vec(self, token: str) -> Tuple[float, float, float, float]:
+        """Return stored (px, py, qx, qy); fall back to origin if unregistered."""
+        return self._vecs.get(token, (0.0, 0.0, 0.0, 0.0))
 
     def triple(self, token: str) -> ThebaultTriple:
         if token in self._cache:
             return self._cache[token]
-        px, py = self._hash_to_vec(token, "P")
-        qx, qy = self._hash_to_vec(token, "Q")
+        px, py, qx, qy = self._vec(token)
         rho, theta, sigma = _thebault_triple(px, py, qx, qy)
         t = ThebaultTriple(rho, theta, sigma)
         self._cache[token] = t
@@ -286,16 +355,13 @@ class ThebaultTokenGeometry:
 
     def composed_triple(self, t1: str, t2: str) -> ThebaultTriple:
         """
-        Compose two token parallelograms by vector addition of their P-vectors.
-        The composed parallelogram uses:
+        Compose two token parallelograms by vector addition:
             P_composed = P_t1 + P_t2
             Q_composed = Q_t1 + Q_t2
-        This represents the trigram context (t1, t2) as a single Thébault figure.
+        Represents the joint corpus geometry of bigram context (t1, t2).
         """
-        p1x, p1y = self._hash_to_vec(t1, "P")
-        q1x, q1y = self._hash_to_vec(t1, "Q")
-        p2x, p2y = self._hash_to_vec(t2, "P")
-        q2x, q2y = self._hash_to_vec(t2, "Q")
+        p1x, p1y, q1x, q1y = self._vec(t1)
+        p2x, p2y, q2x, q2y = self._vec(t2)
         rho, theta, sigma = _thebault_triple(p1x + p2x, p1y + p2y, q1x + q2x, q1y + q2y)
         return ThebaultTriple(rho, theta, sigma)
 
@@ -739,6 +805,21 @@ def build_v16_state(
     kernels = ThebaultKernels(lambda_reg=lambda_reg, gamma_side=gamma_side)
     lm      = ThebaultCompositionLM(geo, kernels)
     lm.ingest(tokens)
+
+    # ── Register every token's corpus geometry (freq + index) ────────────────
+    # Vocabulary index = first-occurrence order, preserved in raw_freq insertion
+    # order (Python 3.7+ dict guarantees insertion order).
+    all_tokens = list(lm.raw_freq.keys())
+    max_freq   = max(lm.raw_freq.values(), default=1.0)
+    vocab_size = len(all_tokens)
+    for idx, tok in enumerate(all_tokens):
+        geo.register(
+            token      = tok,
+            freq       = lm.raw_freq[tok],
+            index      = idx,
+            max_freq   = max_freq,
+            vocab_size = vocab_size,
+        )
 
     orbit  = ThebaultConjugateOrbit()
     graph  = ThebaultPotentialGraph(geo, kernels)
