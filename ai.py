@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 NeuroSymbolic V15.0 — RKHS Kernels × synthetic_reason Symmetrical Processor
+    + Rhomboid Soft Shear Deformation on Main Candidate Matrix
 ===============================================================================
 
 REFACTOR DECLARATION
@@ -11,18 +12,20 @@ algebraic operations into a continuous Reproducing Kernel Hilbert Space (RKHS)
 using standard neural network activation curves.
 
 Additionally, it integrates the synthetic_reason Symmetrical Processor (inspired by
-SynthReason 0.9N C++, George Wagenknecht 2017). This provides a parallel 
-"subsynthetic_reason loop" that enforces ethical mandates and conceptual anchoring 
+SynthReason 0.9N C++, George Wagenknecht 2017). This provides a parallel
+"subsynthetic_reason loop" that enforces ethical mandates and conceptual anchoring
 over the raw topological generation.
 
 MATHEMATICAL UPGRADES
 ─────────────────────
-1. Isomorphic Metric -> RBF Kernel
-   Calculates an L2 distance between candidate structural vectors (Probability,
-   Orbit Injection, Graph Potential) and projects it through an RBF kernel.
+1. Isomorphic Metric -> RBF Kernel (in Rhomboid-Deformed Space)
+   Builds N×3 structural vectors [prob, orbit, potential], then applies a soft
+   shear transform S (3×3) so the basis axes lean into each other — producing a
+   parallelotope (rhomboid) geometry. RBF similarity is then computed in this
+   skewed space, yielding a Mahalanobis-style anisotropic distance.
 
 2. 1:-1 Vis-a-Vis Compound -> SiLU (Swish) Kernel
-   Maps tokens to split-complex numbers Z = α + jβ. Computes the indefinite 
+   Maps tokens to split-complex numbers Z = α + jβ. Computes the indefinite
    hyperbolic inner product I(W,C) = α_w·α_c - β_w·β_c. Expands through SiLU.
 
 3. Inverse Surjection Monograph -> Von Mises Periodic Kernel
@@ -30,8 +33,14 @@ MATHEMATICAL UPGRADES
    Markov chain to walk cyclically through the equivalence classes (fiber bundle).
 
 4. synthetic_reason Symmetrical Mandates (C++ SynthReason)
-   A deterministic background concept filter that heavily biases the RKHS 
+   A deterministic background concept filter that heavily biases the RKHS
    distribution towards mandate-fulfilling vocabulary when trigger words occur.
+
+5. Rhomboid Soft Deformation
+   The rectangular N×3 candidate matrix is passed through a fixed shear matrix S
+   before RBF kernel evaluation. This tilts the three structural axes (probability,
+   orbit-grid, graph-potential) into a non-orthogonal parallelotope basis,
+   enriching the isomorphic similarity metric with cross-axis structural coupling.
 ===============================================================================
 """
 
@@ -151,7 +160,7 @@ class VocabularyAutomorphism:
     def image(self, t: str) -> str: return self.phi.get(t, t)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — ALGEBRAIC CONTINUOUS KERNEL EXPANSIONS
+# SECTION 2 — ALGEBRAIC CONTINUOUS KERNEL EXPANSIONS + RHOMBOID DEFORMATION
 # ════════════════════════════════════════════════════════════════════════════
 
 class SplitComplexVisAVisCompound:
@@ -162,8 +171,8 @@ class SplitComplexVisAVisCompound:
         if token in self._cache: return self._cache[token]
         h1 = int(hashlib.md5((token + "1").encode()).hexdigest()[:8], 16) / 0xffffffff
         h2 = int(hashlib.md5((token + "2").encode()).hexdigest()[:8], 16) / 0xffffffff
-        alpha = h1 * 2.0 - 0.5  # Real (1) continuation axis
-        beta  = h2 * 2.0 - 1.0  # Hyperbolic (-1) volatility axis
+        alpha = h1 * 2.0 - 0.5
+        beta  = h2 * 2.0 - 1.0
         self._cache[token] = (alpha, beta)
         return alpha, beta
 
@@ -183,6 +192,76 @@ class InverseSurjectionMonograph:
         self._cache[token] = omega
         return omega
 
+class RhomboidShearKernel:
+    """
+    Soft rhomboid (parallelogram / parallelotope) deformation of the rectangular
+    N×3 candidate structural matrix.
+
+    The three structural axes are:
+        dim-0 : normalised base trigram probability   (prob-axis)
+        dim-1 : orbit-grid AutoOrbit score            (orbit-axis)
+        dim-2 : SuperPolyGraph propagated potential   (potential-axis)
+
+    Applying the shear matrix S tilts these axes into each other so the space
+    becomes a non-orthogonal parallelotope (rhomboid in 3-D).  RBF distances
+    are then computed in this skewed basis, giving a Mahalanobis-style
+    anisotropic similarity that couples all three structural signals.
+
+    Shear matrix layout (row i leans into column j):
+        S = [ 1      s01    s02  ]     prob   → orbit, potential
+            [ s10    1      s12  ]     orbit  → prob,  potential
+            [ s20    s21    1    ]     pot    → prob,  orbit
+
+    Default coefficients are mild (0.12–0.28) to keep the deformation soft —
+    large values collapse dimensions and degenerate the kernel.
+    """
+    def __init__(
+        self,
+        shear_01: float = 0.25,   # prob leans into orbit
+        shear_02: float = 0.15,   # prob leans into potential
+        shear_10: float = 0.20,   # orbit leans into prob
+        shear_12: float = 0.18,   # orbit leans into potential
+        shear_20: float = 0.12,   # potential leans into prob
+        shear_21: float = 0.22,   # potential leans into orbit
+    ):
+        S = torch.eye(3)
+        S[0, 1] = shear_01
+        S[0, 2] = shear_02
+        S[1, 0] = shear_10
+        S[1, 2] = shear_12
+        S[2, 0] = shear_20
+        S[2, 1] = shear_21
+        self.S = S  # [3×3] fixed shear transform
+
+    def deform(self, rect_matrix: torch.Tensor) -> torch.Tensor:
+        """
+        rect_matrix : [N, 3]  axis-aligned rectangular candidate matrix
+        returns      : [N, 3]  rhomboid-deformed (parallelotope) matrix
+        """
+        return rect_matrix @ self.S.T   # [N,3] @ [3,3]^T → [N,3] in skewed basis
+
+    def rbf_rhomboid(self, deformed_matrix: torch.Tensor, gamma: float = 4.0) -> Tuple[torch.Tensor, List[Tuple[int, int, float]]]:
+        """
+        Computes pairwise RBF similarities in rhomboid space and returns the
+        upper-triangle pairs with similarity > 0.98 (structural isomorphs).
+
+        deformed_matrix : [N, 3]
+        returns         : (sim_matrix [N,N], isomorphic_pairs list)
+        """
+        N = deformed_matrix.shape[0]
+        # Pairwise L2 squared in deformed space
+        diff = deformed_matrix.unsqueeze(0) - deformed_matrix.unsqueeze(1)  # [N,N,3]
+        l2sq = (diff ** 2).sum(dim=-1)                                       # [N,N]
+        sim  = torch.exp(-gamma * l2sq)                                      # [N,N]
+
+        pairs: List[Tuple[int, int, float]] = []
+        for i in range(N):
+            for j in range(i + 1, N):
+                s = sim[i, j].item()
+                if s > 0.98:
+                    pairs.append((i, j, s))
+        return sim, pairs
+
 class NeuralKernelExpansions:
     @staticmethod
     def rbf_isomorphic_curve(v_anchor: torch.Tensor, v_cand: torch.Tensor, gamma: float = 4.0) -> torch.Tensor:
@@ -197,7 +276,6 @@ class NeuralKernelExpansions:
     def von_mises_surjection_curve(o_t: torch.Tensor, o_c: torch.Tensor, M: float, kappa: float) -> torch.Tensor:
         phase = (2.0 * math.pi / M) * (o_t - o_c)
         return kappa * (torch.cos(phase) - 1.0)
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — GRAPH & ALGEBRA MODULES (V10 Base)
@@ -343,19 +421,19 @@ class SuperPolyGraph:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 4.5 — SYNTHREASON synthetic_reason SYMMETRICAL MANDATES (C++ INSPIRATION)
 # ════════════════════════════════════════════════════════════════════════════
+
 class synthetic_reasonMandateProcessor:
     """
     Inspired by SynthReason 0.9N C++ (George Wagenknecht, 2017).
     Runs a parallel "subsynthetic_reason" check against ethical mandates and core concepts.
-    If the context aligns with a mandate, it heavily biases the RKHS distribution 
+    If the context aligns with a mandate, it heavily biases the RKHS distribution
     towards mandate-fulfilling vocabulary.
     """
     def __init__(self):
         self.AIControlLogic = "I II III O"
         self.AIEthics = ["do not harm any human", "do not harm myself", "do not make weapons"]
         self.AIMandates = ["end poverty", "cure disease", "improve standard of living", "learn"]
-        
-        # We assign high energetic weights to concepts related to these mandates
+
         self.mandate_vocabulary = {
             "poverty": "end", "disease": "cure", "standard": "improve", "living": "improve",
             "learn": "explore", "human": "protect", "weapons": "avoid", "harm": "prevent"
@@ -363,36 +441,35 @@ class synthetic_reasonMandateProcessor:
 
     def subsynthetic_reason_concept_enrichment(self, w_ctx: str, cands: List[str]) -> torch.Tensor:
         """
-        Acts as the Subsynthetic_reason Loop from SynthReason. It evaluates the current synthetic_reason 
-        thought (w_ctx) and enriches candidates that fulfill the AI Mandates.
+        Acts as the Subsynthetic_reason Loop from SynthReason. Evaluates the current
+        synthetic_reason thought (w_ctx) and enriches candidates that fulfil AI Mandates.
         """
         enrichment_tensor = torch.zeros(len(cands))
-        
-        # Check if current context triggers a mandate
+
         trigger = None
         for key in self.mandate_vocabulary:
             if key in w_ctx.lower():
                 trigger = self.mandate_vocabulary[key]
                 break
-                
+
         if trigger:
             for i, c in enumerate(cands):
                 if trigger in c.lower():
-                    # Massive logit boost for mandate fulfillment
-                    enrichment_tensor[i] += 5.0  
+                    enrichment_tensor[i] += 5.0
                 elif c.lower() in self.AIEthics:
-                    # Ethical absolute rule
                     enrichment_tensor[i] += 10.0
-                    
+
         return enrichment_tensor
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — RKHS NEURAL GRAPH WALKER
+# SECTION 4 — RKHS NEURAL GRAPH WALKER (with Rhomboid Deformation)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RKHSGraphSuperPolyWalk:
     def __init__(self, graph: SuperPolyGraph, spr: SuperPolynomialRing, phi: VocabularyAutomorphism,
-                 vis_a_vis: SplitComplexVisAVisCompound, monograph: InverseSurjectionMonograph, kernels: NeuralKernelExpansions, synthetic_reason: synthetic_reasonMandateProcessor):
+                 vis_a_vis: SplitComplexVisAVisCompound, monograph: InverseSurjectionMonograph,
+                 kernels: NeuralKernelExpansions, synthetic_reason: synthetic_reasonMandateProcessor,
+                 rhomboid: RhomboidShearKernel):
         self.graph = graph
         self.spr = spr
         self.phi = phi
@@ -400,45 +477,64 @@ class RKHSGraphSuperPolyWalk:
         self.monograph = monograph
         self.kernels = kernels
         self.synthetic_reason = synthetic_reason
+        self.rhomboid = rhomboid
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
 
     def walk_probs(self, w1: str, w2: str, graded_lm: GradedSynapseAlgebra, orbit_grid: AutoOrbitModule,
                    temp: float = 1.4, de_strength: float = 0.22, graph_strength: float = 0.35,
                    vis_strength: float = 0.8, surjection_kappa: float = 2.0) -> Tuple[List[str], torch.Tensor]:
-        
+
         cands, base_probs = graded_lm.next_dist(w1, w2)
         if not cands: return cands, base_probs
 
-        # Base structural evaluations
         grid_out = orbit_grid(anchor=w2, cands=cands)
-        pots = torch.tensor([self.graph.nodes[c].potential if c in self.graph.nodes else 0.0 for c in cands], dtype=torch.float32)
+        pots = torch.tensor([self.graph.nodes[c].potential if c in self.graph.nodes else 0.0
+                             for c in cands], dtype=torch.float32)
 
-        # ── 1. ISOMORPHIC METRIC (RBF KERNEL) ──
-        # Build multi-dimensional structural vectors
+        # ── 1. ISOMORPHIC METRIC — RHOMBOID RBF KERNEL ──────────────────────
+        # Normalise the three structural axes into [0,1]
         norm_base = (base_probs - base_probs.min()) / (base_probs.max() - base_probs.min() + 1e-8)
-        norm_grid = (grid_out - grid_out.min()) / (grid_out.max() - grid_out.min() + 1e-8) if grid_out.numel() else torch.zeros_like(norm_base)
+        norm_grid = ((grid_out - grid_out.min()) / (grid_out.max() - grid_out.min() + 1e-8)
+                     if grid_out.numel() else torch.zeros_like(norm_base))
         norm_pots = (pots - pots.min()) / (pots.max() - pots.min() + 1e-8)
-        cand_vectors = torch.stack([norm_base, norm_grid * de_strength, norm_pots * graph_strength], dim=1)
+
+        # Stack into rectangular N×3 candidate matrix
+        rect_matrix = torch.stack(
+            [norm_base, norm_grid * de_strength, norm_pots * graph_strength], dim=1
+        )  # shape: [N, 3]  — rectangular / axis-aligned
+
+        # ── SOFT RHOMBOID DEFORMATION ─────────────────────────────────────────
+        # Apply shear transform S so axes lean into each other → parallelotope
+        rhomboid_matrix = self.rhomboid.deform(rect_matrix)  # shape: [N, 3] in skewed basis
+
+        # RBF similarity computed in rhomboid space (anisotropic / Mahalanobis-style)
+        _, rhomboid_pairs = self.rhomboid.rbf_rhomboid(rhomboid_matrix, gamma=4.0)
 
         self.current_isomorphic_pairs = []
-        for i in range(len(cands)):
-            for j in range(i + 1, len(cands)):
-                if cands[i] in PUNCT_TOKENS or cands[j] in PUNCT_TOKENS: continue
-                rbf_sim = self.kernels.rbf_isomorphic_curve(cand_vectors[i], cand_vectors[j]).item()
-                if rbf_sim > 0.98:  # RBF > 0.98 means heavily structurally isomorphic
-                    self.current_isomorphic_pairs.append((cands[i], cands[j], rbf_sim))
+        for i, j, sim in sorted(rhomboid_pairs, key=lambda x: -x[2])[:10]:
+            if cands[i] not in PUNCT_TOKENS and cands[j] not in PUNCT_TOKENS:
+                self.current_isomorphic_pairs.append((cands[i], cands[j], sim))
 
-        # ── 2. VIS-A-VIS COMPOUND (SiLU KERNEL) ──
-        z_vals = torch.tensor([self.vis_a_vis.hyperbolic_inner_product(w2, c) if c not in PUNCT_TOKENS else 0.0 for c in cands], dtype=torch.float32)
+        # ── 2. VIS-A-VIS COMPOUND (SiLU KERNEL) ──────────────────────────────
+        z_vals = torch.tensor(
+            [self.vis_a_vis.hyperbolic_inner_product(w2, c) if c not in PUNCT_TOKENS else 0.0
+             for c in cands], dtype=torch.float32
+        )
         silu_scores = self.kernels.silu_vis_a_vis_curve(z_vals)
 
-        # ── 3. INVERSE SURJECTION MONOGRAPH (VON MISES KERNEL) ──
-        omega_t = torch.tensor([(self.monograph.surjection(w2) + 1) % self.monograph.modulus], dtype=torch.float32)
-        omega_c = torch.tensor([self.monograph.surjection(c) if c not in PUNCT_TOKENS else omega_t.item() for c in cands], dtype=torch.float32)
-        von_mises_mask = self.kernels.von_mises_surjection_curve(omega_t, omega_c, float(self.monograph.modulus), surjection_kappa)
+        # ── 3. INVERSE SURJECTION MONOGRAPH (VON MISES KERNEL) ───────────────
+        omega_t = torch.tensor([(self.monograph.surjection(w2) + 1) % self.monograph.modulus],
+                               dtype=torch.float32)
+        omega_c = torch.tensor(
+            [self.monograph.surjection(c) if c not in PUNCT_TOKENS else omega_t.item()
+             for c in cands], dtype=torch.float32
+        )
+        von_mises_mask = self.kernels.von_mises_surjection_curve(
+            omega_t, omega_c, float(self.monograph.modulus), surjection_kappa
+        )
 
         # Punctuation bounds
-        punct_bias = torch.zeros(len(cands))
+        punct_bias    = torch.zeros(len(cands))
         punct_penalty = torch.zeros(len(cands))
         for i, c in enumerate(cands):
             if c in PUNCT_TOKENS:
@@ -448,7 +544,7 @@ class RKHSGraphSuperPolyWalk:
         # SynthReason synthetic_reason Subsynthetic_reason Concept Enrichment
         mandate_boost = self.synthetic_reason.subsynthetic_reason_concept_enrichment(w2, cands)
 
-        # Full RKHS Logit Assemblage (with SynthReason Mandates)
+        # Full RKHS Logit Assemblage
         logits = (
             torch.log(base_probs.clamp(min=1e-12))
             + de_strength * grid_out
@@ -467,18 +563,18 @@ class RKHSGraphSuperPolyWalk:
 
 @dataclass
 class V15State:
-    graded_lm: GradedSynapseAlgebra
-    orbit_grid: AutoOrbitModule
-    graph: SuperPolyGraph
-    walker: RKHSGraphSuperPolyWalk
-    outputs: Dict[int, str] = field(default_factory=dict)
-    isomorphic_matches: Set[Tuple[str, str]] = field(default_factory=set)
+    graded_lm   : GradedSynapseAlgebra
+    orbit_grid  : AutoOrbitModule
+    graph       : SuperPolyGraph
+    walker      : RKHSGraphSuperPolyWalk
+    outputs     : Dict[int, str]              = field(default_factory=dict)
+    isomorphic_matches: Set[Tuple[str, str]]  = field(default_factory=set)
 
 def build_v15_state(corpus_text: str) -> V15State:
     tokens = tokenize(corpus_text)
-    
+
     spr = SuperPolynomialRing()
-    raw_freq = {}
+    raw_freq: Dict[str, float] = {}
     for t in tokens: raw_freq[t] = raw_freq.get(t, 0) + 1.0
     phi = VocabularyAutomorphism(raw_freq)
 
@@ -486,42 +582,48 @@ def build_v15_state(corpus_text: str) -> V15State:
     graded_lm.ingest(tokens)
 
     orbit_grid = AutoOrbitModule(graded_lm.token_to_idx, spr, phi, raw_freq)
-    
+
     graph = SuperPolyGraph(spr, phi)
     graph.build(graded_lm)
     graph.propagate(steps=2)
 
-    vis_a_vis = SplitComplexVisAVisCompound()
-    monograph = InverseSurjectionMonograph(modulus=7)
-    kernels = NeuralKernelExpansions()
-    synthetic_reason = synthetic_reasonMandateProcessor()
-    walker = RKHSGraphSuperPolyWalk(graph, spr, phi, vis_a_vis, monograph, kernels, synthetic_reason)
+    vis_a_vis  = SplitComplexVisAVisCompound()
+    monograph  = InverseSurjectionMonograph(modulus=7)
+    kernels    = NeuralKernelExpansions()
+    synth      = synthetic_reasonMandateProcessor()
+    rhomboid   = RhomboidShearKernel(
+        shear_01=0.25, shear_02=0.15,
+        shear_10=0.20, shear_12=0.18,
+        shear_20=0.12, shear_21=0.22,
+    )
+
+    walker = RKHSGraphSuperPolyWalk(graph, spr, phi, vis_a_vis, monograph, kernels, synth, rhomboid)
 
     return V15State(graded_lm, orbit_grid, graph, walker)
 
-def generate(state: V15State, seed_context: str="", num_sentences: int=20, tokens_per_sent: int=92, 
-             temp: float=1.4, vis_strength: float=0.8, surjection_kappa: float=2.0) -> None:
-    
+def generate(state: V15State, seed_context: str = "", num_sentences: int = 20,
+             tokens_per_sent: int = 92, temp: float = 1.4,
+             vis_strength: float = 0.8, surjection_kappa: float = 2.0) -> None:
+
     head_list = list(state.graded_lm.heads.keys())
     if not head_list: return
-    
+
     state.outputs.clear()
     state.isomorphic_matches.clear()
 
-    # Process seed context if provided
     seed_w1, seed_w2 = None, None
+    seed_toks: List[str] = []
     if seed_context:
         seed_toks = tokenize(seed_context)
         if len(seed_toks) >= 2:
             seed_w1, seed_w2 = seed_toks[-2], seed_toks[-1]
         elif len(seed_toks) == 1:
-            # Try to find a valid w1 for the single provided word
             matches = [pair for pair in head_list if pair[1] == seed_toks[0]]
             if matches:
                 seed_w1, seed_w2 = random.choice(matches)
 
     for si in range(num_sentences):
-        if seed_w1 and seed_w2 and si == 0:
+        if seed_w1 and seed_w2:
             w1, w2 = seed_w1, seed_w2
             toks = list(seed_toks)
             wsp = len(seed_toks)
@@ -530,29 +632,32 @@ def generate(state: V15State, seed_context: str="", num_sentences: int=20, token
             toks, wsp = [], 999
 
         for _ in range(tokens_per_sent):
-            cands, probs = state.walker.walk_probs(w1, w2, state.graded_lm, state.orbit_grid, temp=temp, 
-                                                   vis_strength=vis_strength, surjection_kappa=surjection_kappa)
+            cands, probs = state.walker.walk_probs(
+                w1, w2, state.graded_lm, state.orbit_grid,
+                temp=temp, vis_strength=vis_strength, surjection_kappa=surjection_kappa
+            )
             if not cands: break
-            
-            # Harvest isomorphic candidates found during projection
+
             for p1, p2, sim in sorted(state.walker.current_isomorphic_pairs, key=lambda x: -x[2])[:2]:
                 state.isomorphic_matches.add(tuple(sorted([p1, p2])))
 
             nxt = cands[torch.multinomial(probs, 1).item()]
-            
+
             if nxt in PUNCT_TOKENS:
-                if len(toks) < 3 or wsp < 3 or (nxt in {".","?","!"} and len(toks) < 5):
-                    # Filter punct
+                if len(toks) < 3 or wsp < 3 or (nxt in {".", "?", "!"} and len(toks) < 5):
                     bi, bp = None, -1.0
                     for i, (c, p) in enumerate(zip(cands, probs.tolist())):
                         if c not in PUNCT_TOKENS and p > bp: bi, bp = i, p
                     nxt = cands[bi] if bi is not None else "the"
-                else: wsp = 0
-            else: wsp += 1
+                else:
+                    wsp = 0
+            else:
+                wsp += 1
 
             toks.append(nxt)
             w1, w2 = w2, nxt
-            if nxt in {".","?","!"} and len(toks) >= max(4, int(tokens_per_sent * 0.85)): break
+            if nxt in {".", "?", "!"} and len(toks) >= max(4, int(tokens_per_sent * 0.85)):
+                break
 
         state.outputs[si] = detokenize(toks)
 
@@ -560,62 +665,129 @@ def generate(state: V15State, seed_context: str="", num_sentences: int=20, token
 # SECTION 6 — GRADIO UI
 # ════════════════════════════════════════════════════════════════════════════
 
-def load_corpus(text_file=None):
+def load_corpus(text_file=None) -> str:
     if text_file is not None:
         try:
             p = text_file.name if hasattr(text_file, "name") else str(text_file)
             return Path(p).read_text(encoding="utf-8")
-        except: pass
+        except:
+            pass
     return (
         "The geometry of space dictates the behavior of paths. Quantum entanglement "
         "forces non-local updates. To cure disease and end poverty, we must improve "
         "our standard of living and protect every human."
     )
 
-def run_session(text_file, seed_context, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa):
+def run_session(text_file, seed_context, num_sentences, tokens_per_sentence,
+                temp, vis_strength, surjection_kappa,
+                shear_01, shear_02, shear_10, shear_12, shear_20, shear_21):
     corpus = load_corpus(text_file)
-    state = build_v15_state(corpus)
-    generate(state, seed_context=str(seed_context), num_sentences=int(num_sentences), tokens_per_sent=int(tokens_per_sentence), temp=float(temp), 
-             vis_strength=float(vis_strength), surjection_kappa=float(surjection_kappa))
     
+    # Rebuild state with UI-controlled shear coefficients
+    tokens = tokenize(corpus)
+    spr = SuperPolynomialRing()
+    raw_freq: Dict[str, float] = {}
+    for t in tokens: raw_freq[t] = raw_freq.get(t, 0) + 1.0
+    phi = VocabularyAutomorphism(raw_freq)
+    graded_lm = GradedSynapseAlgebra(spr, phi)
+    graded_lm.ingest(tokens)
+    orbit_grid = AutoOrbitModule(graded_lm.token_to_idx, spr, phi, raw_freq)
+    graph = SuperPolyGraph(spr, phi)
+    graph.build(graded_lm)
+    graph.propagate(steps=2)
+
+    rhomboid = RhomboidShearKernel(
+        shear_01=float(shear_01), shear_02=float(shear_02),
+        shear_10=float(shear_10), shear_12=float(shear_12),
+        shear_20=float(shear_20), shear_21=float(shear_21),
+    )
+    walker = RKHSGraphSuperPolyWalk(
+        graph, spr, phi,
+        SplitComplexVisAVisCompound(),
+        InverseSurjectionMonograph(modulus=7),
+        NeuralKernelExpansions(),
+        synthetic_reasonMandateProcessor(),
+        rhomboid,
+    )
+    state = V15State(graded_lm, orbit_grid, graph, walker)
+
+    generate(state, seed_context=str(seed_context),
+             num_sentences=int(num_sentences), tokens_per_sent=int(tokens_per_sentence),
+             temp=float(temp), vis_strength=float(vis_strength),
+             surjection_kappa=float(surjection_kappa))
+
     out_text = "\n".join(f"[{i+1:02d}] {s}" for i, s in state.outputs.items())
-    
-    report = [
+
+    # Build shear matrix display
+    S = rhomboid.S
+    shear_display = (
+        f"Rhomboid Shear Matrix S:\n"
+        f"  [ {S[0,0]:.2f}  {S[0,1]:.2f}  {S[0,2]:.2f} ]\n"
+        f"  [ {S[1,0]:.2f}  {S[1,1]:.2f}  {S[1,2]:.2f} ]\n"
+        f"  [ {S[2,0]:.2f}  {S[2,1]:.2f}  {S[2,2]:.2f} ]"
+    )
+
+    report_lines = [
         "V15.0 — RKHS NEURAL KERNEL × synthetic_reason PROCESSOR",
         "=" * 60,
-        f"Vocab size        : {len(state.graded_lm.vocab)}",
-        f"Vis-a-Vis SiLU    : Strength {vis_strength:.2f}",
-        f"Monograph Modulus : 7  | Von Mises Kappa {surjection_kappa:.2f}",
-        "Subsynthetic_reason Loop : Active (C++ SynthReason Mandates)",
+        f"Vocab size            : {len(state.graded_lm.vocab)}",
+        f"Vis-a-Vis SiLU        : Strength {vis_strength:.2f}",
+        f"Monograph Modulus     : 7  | Von Mises Kappa {surjection_kappa:.2f}",
+        "Subsynthetic_reason   : Active (C++ SynthReason Mandates)",
         "",
-        "── Isomorphic Metric: Structurally Equivalent Candidates ──",
-        "(RBF Kernel Similarity > 0.98 in V10 graph projection)",
+        shear_display,
+        "",
+        "── Rhomboid Isomorphic Candidates (RBF > 0.98 in skewed basis) ──",
     ]
     if state.isomorphic_matches:
         for p1, p2 in list(state.isomorphic_matches)[:20]:
-            report.append(f"  {p1:<15s} ≈  {p2:<15s}")
+            report_lines.append(f"  {p1:<15s} ≈  {p2:<15s}")
     else:
-        report.append("  No strongly isomorphic candidates found.")
-        
-    return out_text, "\n".join(report)
+        report_lines.append("  No strongly isomorphic candidates found.")
+
+    return out_text, "\n".join(report_lines)
 
 def build_app():
     with gr.Blocks(title="NeuroSymbolic V15.0 — synthetic_reason Symmetrical Processor") as demo:
-        gr.Markdown("# NeuroSymbolic V15.0\n### Continuous RKHS Kernel Expansions & synthetic reason Symmetrical Processor")
+        gr.Markdown(
+            "# NeuroSymbolic V15.0\n"
+            "### Continuous RKHS Kernel Expansions · synthetic_reason Symmetrical Processor · Rhomboid Shear Deformation"
+        )
         with gr.Row():
+            # ── LEFT COLUMN — controls ──────────────────────────────────────
             with gr.Column(scale=1):
-                text_file = gr.File(label="Upload Text (.txt)")
-                seed_context = gr.Textbox(label="Seed Context Prompt", placeholder="Enter starting words...")
-                num_sentences = gr.Slider(1, 100, value=15, label="Sentences")
-                tokens_per_sentence = gr.Slider(5, 200, value=92, label="Tokens per Sentence")
-                temp = gr.Slider(0.8, 2.5, value=1.4, label="Temperature τ")
-                vis_strength = gr.Slider(0.0, 3.0, value=0.8, label="Vis-a-Vis SiLU Strength")
-                surjection_kappa = gr.Slider(0.0, 10.0, value=2.0, label="Inverse Surjection Kappa")
+                text_file          = gr.File(label="Upload Text (.txt)")
+                seed_context       = gr.Textbox(label="Seed Context Prompt", placeholder="Enter starting words...")
+                num_sentences      = gr.Slider(1,   100,  value=15,   label="Sentences")
+                tokens_per_sentence= gr.Slider(5,   200,  value=92,   label="Tokens per Sentence")
+                temp               = gr.Slider(0.8, 2.5,  value=1.4,  label="Temperature τ")
+                vis_strength       = gr.Slider(0.0, 3.0,  value=0.8,  label="Vis-a-Vis SiLU Strength")
+                surjection_kappa   = gr.Slider(0.0, 10.0, value=2.0,  label="Inverse Surjection Kappa")
+
+                gr.Markdown("#### Rhomboid Shear Coefficients")
+                gr.Markdown("*Tilt the structural axes into each other — 0 = rectangular, higher = more rhomboid*")
+                shear_01 = gr.Slider(0.0, 0.6, value=0.25, step=0.01, label="S[prob → orbit]")
+                shear_02 = gr.Slider(0.0, 0.6, value=0.15, step=0.01, label="S[prob → potential]")
+                shear_10 = gr.Slider(0.0, 0.6, value=0.20, step=0.01, label="S[orbit → prob]")
+                shear_12 = gr.Slider(0.0, 0.6, value=0.18, step=0.01, label="S[orbit → potential]")
+                shear_20 = gr.Slider(0.0, 0.6, value=0.12, step=0.01, label="S[potential → prob]")
+                shear_21 = gr.Slider(0.0, 0.6, value=0.22, step=0.01, label="S[potential → orbit]")
+
+            # ── RIGHT COLUMN — outputs ──────────────────────────────────────
             with gr.Column(scale=2):
-                btn = gr.Button("Generate — Run synthetic_reason Engine", variant="primary", size="lg")
-                out_text = gr.Textbox(label="Generated Sentences", lines=15)
-                out_report = gr.Textbox(label="Structure Report", lines=12)
-        btn.click(run_session, inputs=[text_file, seed_context, num_sentences, tokens_per_sentence, temp, vis_strength, surjection_kappa], outputs=[out_text, out_report])
+                btn        = gr.Button("Generate — Run synthetic_reason Engine", variant="primary", size="lg")
+                out_text   = gr.Textbox(label="Generated Sentences", lines=15)
+                out_report = gr.Textbox(label="Structure Report",    lines=14)
+
+        btn.click(
+            run_session,
+            inputs=[
+                text_file, seed_context, num_sentences, tokens_per_sentence,
+                temp, vis_strength, surjection_kappa,
+                shear_01, shear_02, shear_10, shear_12, shear_20, shear_21,
+            ],
+            outputs=[out_text, out_report],
+        )
     return demo
 
 if __name__ == "__main__":
