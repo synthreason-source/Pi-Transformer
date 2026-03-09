@@ -990,7 +990,7 @@ def launch_gui():
         gr.Markdown("### Text Generation")
         with gr.Row():
             sentences = gr.Slider(1, 10, value=4, step=1, label="Sentences")
-            tokens = gr.Slider(10, 1180, value=40, step=1, label="Tokens per sentence")
+            tokens = gr.Slider(100, 180, value=80, step=1, label="Tokens per sentence")
             
         seed_input = gr.Textbox(label="Seed Text (Optional)", placeholder="e.g. quantum entanglement")
             
