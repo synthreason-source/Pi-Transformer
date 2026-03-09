@@ -4,7 +4,7 @@ import re, random
 from collections import Counter, defaultdict
 import gradio as gr
 
-DEVICE = torch.device("cpu")
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 PUNCT = {",", ".", "!", "?", ";", ":"}
 
 def tokenize(text):
