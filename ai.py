@@ -3,7 +3,34 @@
 """
 NeuroSymbolic V17-CUDA — Thébault + MRV + Isomorphic Syntax Stacking
                         + Positional Vectorisation + Chunked Sum Generation
+                        + Petr–Douglas–Neumann (PDN) Theorem Integration
 ===============================================================================
+
+PDN THEOREM EXTENSION (new in this version)
+────────────────────────────────────────────
+The Petr–Douglas–Neumann (PDN) theorem generalises Thébault's theorem:
+  - Thébault: squares (n=4) on parallelogram sides → four equidistant centres
+  - PDN:      regular n-gons on any polygon's sides → nth DFT component = 0
+               implies the centre polygon is itself regular.
+
+In token space this manifests as:
+
+  1.  PDN_SPECTRAL_KERNEL  — each token's (rho, theta) pair is lifted into
+      a complex DFT coefficient Z_k = rho·exp(i·k·theta) for k=1…n_modes.
+      The PDN invariant is that the k-th Fourier mode of a "good" sequence
+      must be near-zero; we use deviation from this as a *penalty*.
+
+  2.  PDN_REGULARITY_SCORE — measures how close the current n-gram window's
+      centre-polygon is to a regular polygon (PDN convergence metric).
+      Used as a *bonus* for tokens that increase sequence regularity.
+
+  3.  PDN_ORBIT_FAMILIES — tokens are grouped by which n-gon orbit they
+      belong to (floor(theta / (2π/n))). The walker prefers tokens from
+      the next orbit in sequence, encoding the rotational structure of PDN.
+
+  4.  PDN_DATASET_STEM — the corpus is analysed for its dominant PDN mode
+      n* via spectral analysis of all trigram (rho, theta) triples. n* is
+      used globally as the governing symmetry order, making it *data-driven*.
 
 CUDA OPTIMISATION CHANGES (vs V17-CPU)
 ───────────────────────────────────────
@@ -22,8 +49,8 @@ All V17 mathematical semantics are preserved exactly.
 """
 
 from __future__ import annotations
-import re, math, random, unicodedata, pickle, argparse
-from dataclasses import dataclass
+import re, math, random, unicodedata, pickle, argparse, cmath
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Tuple, Set, Optional
 import torch
@@ -150,10 +177,10 @@ class ThebaultTokenGeometry:
         self._vecs  : Dict[str, Tuple[float, float, float, float]] = {}
         self._cache : Dict[str, ThebaultTriple]                    = {}
         self._tok2idx: Dict[str, int]        = {}
-        self._rho_t  : Optional[torch.Tensor] = None   
-        self._theta_t: Optional[torch.Tensor] = None   
-        self._sigma_t: Optional[torch.Tensor] = None   
-        self._pvec_t : Optional[torch.Tensor] = None   
+        self._rho_t  : Optional[torch.Tensor] = None
+        self._theta_t: Optional[torch.Tensor] = None
+        self._sigma_t: Optional[torch.Tensor] = None
+        self._pvec_t : Optional[torch.Tensor] = None
         self._idx_list: List[str]             = []
 
     def register(self, token, freq, index, max_freq, vocab_size):
@@ -184,7 +211,7 @@ class ThebaultTokenGeometry:
             self._theta_t / math.pi,
             self._sigma_t,
             torch.ones_like(self._rho_t),
-        ], dim=1) 
+        ], dim=1)
 
     def _vec(self, token):
         return self._vecs.get(token, (0.0, 0.0, 0.0, 0.0))
@@ -216,6 +243,262 @@ class ThebaultTokenGeometry:
     def tok_indices(self, toks: List[str]) -> torch.Tensor:
         idx = [self._tok2idx.get(t, 0) for t in toks]
         return torch.tensor(idx, dtype=torch.long, device=self.device)
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 2b — PETR–DOUGLAS–NEUMANN THEOREM ENGINE
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Mathematical Foundation
+# ───────────────────────
+# PDN Theorem: Given any polygon P with vertices v_0…v_{m-1}, construct a
+# regular n-gon on each side. Connect the outer centres C_0…C_{m-1}. Then:
+#
+#   The centre polygon is regular  ⟺  DFT_k(v) = 0  for k ≠ 0 (mod n)
+#
+# where DFT_k(v) = Σ_j v_j · exp(-2πi·j·k/m).
+#
+# Thébault's theorem is the n=4 case: squares on a quadrilateral's sides.
+# The canonical Thébault result (centres form a square) is equivalent to
+# the statement that the k=1 Fourier mode of the quadrilateral vanishes,
+# which happens automatically when the quadrilateral is a parallelogram.
+#
+# Token-Space Interpretation
+# ───────────────────────────
+# Each token t has a complex coordinate z_t = rho_t · exp(i · theta_t).
+# A token n-gram window W = [t_0, …, t_{n-1}] defines a "polygon" in this
+# complex plane. We compute:
+#
+#   F_k(W) = (1/n) Σ_{j=0}^{n-1}  z_{t_j} · exp(-2πi·j·k/n)
+#
+# The PDN regularity score for mode k is:
+#
+#   R_k(W) = exp(- |F_k(W)|² / sigma²_pdn )
+#
+# R_k → 1 means the k-th mode is suppressed, i.e. the token polygon is
+# "regular" w.r.t. that mode — precisely the PDN condition.
+#
+# Dataset-Derived n* (PDN stem from corpus)
+# ──────────────────────────────────────────
+# We compute the power spectrum P_k = Σ_{trigrams} |F_k(trigram)|² for
+# k = 3, 4, 5, 6. The dominant k = n* is the "natural symmetry order" of
+# the corpus. This makes the PDN mode *data-driven* rather than fixed.
+
+class PDNEngine:
+    """
+    Petr–Douglas–Neumann theorem engine for token sequences.
+
+    Attributes
+    ----------
+    n_modes   : int   — number of candidate PDN orders to probe (3 to 3+n_modes)
+    n_star    : int   — dominant PDN order determined from corpus
+    sigma_pdn : float — bandwidth for the regularity Gaussian
+    """
+
+    def __init__(
+        self,
+        n_modes   : int   = 4,   # probe n = 3,4,5,6
+        sigma_pdn : float = 0.25,
+        orbit_weight: float = 0.4,
+        regularity_weight: float = 0.5,
+        spectral_penalty_weight: float = 0.3,
+        device    : torch.device = DEVICE,
+        dtype     : torch.dtype  = torch.float32,
+    ):
+        self.n_modes   = n_modes
+        self.sigma_pdn = sigma_pdn
+        self.orbit_weight = orbit_weight
+        self.regularity_weight = regularity_weight
+        self.spectral_penalty_weight = spectral_penalty_weight
+        self.device    = device
+        self.dtype     = dtype
+        self.n_star    : int = 4          # default = Thébault (squares)
+        self.power_spectrum: Dict[int, float] = {}
+        # Precomputed orbit look-up: token → orbit index under n*
+        self._orbit_map: Dict[str, int] = {}
+
+    # ── 2b.1  DATASET STEM: find dominant PDN order from corpus trigrams ──
+
+    def fit_from_trigrams(self, geo: ThebaultTokenGeometry, tri_raw: Dict) -> None:
+        """
+        Compute power spectrum P_k for k in {3,4,5,6} over all corpus
+        trigrams.  Sets self.n_star to the dominant order.
+        """
+        candidate_ns = list(range(3, 3 + self.n_modes))
+        power: Dict[int, float] = {n: 0.0 for n in candidate_ns}
+
+        for (w1, w2, w3), cnt in tri_raw.items():
+            toks = [w1, w2, w3]
+            zs   = []
+            for t in toks:
+                tr  = geo.triple(t)
+                zs.append(complex(tr.rho * math.cos(tr.theta),
+                                  tr.rho * math.sin(tr.theta)))
+            # For each candidate n, compute the (n-1)th DFT mode of the
+            # 3-vertex sub-polygon (pad to length n with zeros)
+            for n in candidate_ns:
+                padded = zs + [0+0j] * (n - 3)
+                for k in range(1, n):
+                    F_k = sum(padded[j] * cmath.exp(-2j * math.pi * j * k / n)
+                              for j in range(n)) / n
+                    power[n] += cnt * abs(F_k) ** 2
+
+        self.power_spectrum = power
+        # n* is the order with LOWEST total power — most "regular" corpus
+        self.n_star = min(power, key=lambda k: power[k])
+        print(f"[PDN] Power spectrum: { {n: f'{p:.2f}' for n, p in power.items()} }")
+        print(f"[PDN] Dominant symmetry order n* = {self.n_star}  "
+              f"(stems from Thébault n=4 → generalised PDN)")
+
+    # ── 2b.2  ORBIT FAMILIES ──────────────────────────────────────────────
+
+    def build_orbit_map(self, vocab: List[str], geo: ThebaultTokenGeometry) -> None:
+        """
+        Partition vocabulary tokens into n* orbit families based on theta.
+        Orbit index = floor(theta / (2π / n*))
+        """
+        sector = 2.0 * math.pi / max(self.n_star, 2)
+        for tok in vocab:
+            tr = geo.triple(tok)
+            # theta is in [0, π]; map to full circle by mirroring
+            full_theta = tr.theta * 2.0   # ∈ [0, 2π)
+            self._orbit_map[tok] = int(full_theta / sector) % self.n_star
+        print(f"[PDN] Built orbit map for {len(self._orbit_map)} tokens "
+              f"across {self.n_star} orbit families.")
+
+    def orbit_of(self, token: str) -> int:
+        return self._orbit_map.get(token, 0)
+
+    # ── 2b.3  SPECTRAL REGULARITY SCORE (vectorised, CUDA) ───────────────
+
+    def regularity_scores(
+        self,
+        window_rho  : torch.Tensor,   # (W,) current n-gram window rhos
+        window_theta: torch.Tensor,   # (W,) current n-gram window thetas
+        c_rho       : torch.Tensor,   # (C,) candidate rhos
+        c_theta     : torch.Tensor,   # (C,) candidate thetas
+    ) -> torch.Tensor:
+        """
+        For each candidate c, compute the PDN regularity score of the
+        extended window [window_tokens..., c] under n=n_star.
+
+        Score = exp(- |F_{n*-1}(extended)|² / sigma²)
+
+        Higher score → appending this token makes the sequence *more
+        regular* in the PDN sense — i.e. closer to satisfying the theorem.
+        """
+        n   = self.n_star
+        W   = window_rho.shape[0]
+        C   = c_rho.shape[0]
+
+        if W == 0:
+            return torch.ones(C, dtype=self.dtype, device=self.device)
+
+        # Complex coordinates of existing window: (W,) complex128 → real pairs
+        # Re/Im for existing tokens
+        win_re = (window_rho * torch.cos(window_theta)).to(self.dtype)  # (W,)
+        win_im = (window_rho * torch.sin(window_theta)).to(self.dtype)  # (W,)
+
+        # Candidate complex coords: (C,)
+        c_re = (c_rho * torch.cos(c_theta)).to(self.dtype)
+        c_im = (c_rho * torch.sin(c_theta)).to(self.dtype)
+
+        # DFT mode k = n-1 (the critical PDN mode)
+        k = n - 1
+        # Precompute DFT coefficients for existing window positions 0..W-1
+        # exp(-2πi·j·k/n) for j=0..W-1  →  (cos, -sin) pairs
+        js        = torch.arange(W, dtype=self.dtype, device=self.device)
+        angle_w   = -2.0 * math.pi * js * k / n            # (W,)
+        cos_w     = torch.cos(angle_w)                      # (W,)
+        sin_w     = torch.sin(angle_w)                      # (W,)
+
+        # Partial sum for existing tokens
+        re_partial = (win_re * cos_w - win_im * sin_w).sum()   # scalar
+        im_partial = (win_re * sin_w + win_im * cos_w).sum()   # scalar
+
+        # Coefficient for the appended candidate at position W
+        angle_c = -2.0 * math.pi * W * k / n
+        cos_c   = math.cos(angle_c)
+        sin_c   = math.sin(angle_c)
+
+        # Full DFT mode k for each candidate
+        F_re = re_partial + c_re * cos_c - c_im * sin_c    # (C,)
+        F_im = im_partial + c_re * sin_c + c_im * cos_c    # (C,)
+
+        power = (F_re ** 2 + F_im ** 2) / (n ** 2)         # (C,) normalised
+
+        return torch.exp(-power / (self.sigma_pdn ** 2 + 1e-8))
+
+    # ── 2b.4  ORBIT SEQUENCE BONUS ────────────────────────────────────────
+
+    def orbit_bonus(
+        self,
+        current_orbit: int,
+        c_theta      : torch.Tensor,   # (C,)
+    ) -> torch.Tensor:
+        """
+        Prefer candidates whose orbit index is (current_orbit + 1) % n*.
+        This encodes the rotational traversal structure of PDN construction:
+        each successive token "turns" by one sector, analogous to rotating
+        the n-gon construction around the polygon's perimeter.
+        """
+        n        = self.n_star
+        target   = (current_orbit + 1) % n
+        sector   = 2.0 * math.pi / max(n, 2)
+        # Map candidate thetas to orbit index (continuous approximation)
+        full_theta = c_theta * 2.0              # mirror [0,π] → [0,2π)
+        orbit_cont = full_theta / sector         # continuous orbit index
+        # Cosine similarity to target orbit
+        bonus = torch.cos(2.0 * math.pi * (orbit_cont - target) / n) * 0.5 + 0.5
+        return bonus
+
+    # ── 2b.5  COMBINED PDN SCORE ──────────────────────────────────────────
+
+    @torch.no_grad()
+    def pdn_logit_bonus(
+        self,
+        window_rho  : torch.Tensor,
+        window_theta: torch.Tensor,
+        c_rho       : torch.Tensor,
+        c_theta     : torch.Tensor,
+        current_orbit: int,
+    ) -> torch.Tensor:
+        """
+        Fused PDN bonus = regularity_weight * R(c)
+                        + orbit_weight      * O(c)
+        Returned as a (C,) logit addition.
+        """
+        reg = self.regularity_scores(window_rho, window_theta, c_rho, c_theta)
+        orb = self.orbit_bonus(current_orbit, c_theta)
+
+        # Normalise each component to zero-mean unit-variance if possible
+        def _norm(x):
+            std = x.std()
+            return (x - x.mean()) / (std + 1e-8) if std.item() > 1e-8 else x - x.mean()
+
+        return self.regularity_weight * _norm(reg) + self.orbit_weight * _norm(orb)
+
+    # ── 2b.6  THÉBAULT→PDN BRIDGE REPORT ─────────────────────────────────
+
+    def theorem_bridge_report(self) -> str:
+        lines = [
+            "╔══════════════════════════════════════════════════════════════╗",
+            "║         Thébault → Petr–Douglas–Neumann Bridge Report        ║",
+            "╠══════════════════════════════════════════════════════════════╣",
+            f"║  Thébault case:  n = 4  (squares on parallelogram sides)     ║",
+            f"║  PDN n*:         n = {self.n_star:<2d}  (derived from corpus spectrum)    ║",
+            "║                                                              ║",
+            "║  Equivalence:                                                ║",
+            "║   Thébault → DFT_{k=3} of quad vertices = 0                 ║",
+            "║   PDN n*   → DFT_{k=n*-1} of token window = 0              ║",
+            "║                                                              ║",
+            "║  Power spectrum over corpus trigrams:                        ║",
+        ]
+        for n, p in sorted(self.power_spectrum.items()):
+            marker = " ← n* (dominant)" if n == self.n_star else ""
+            lines.append(f"║    n={n}: P={p:>10.2f}{marker:<28s}║")
+        lines.append("╚══════════════════════════════════════════════════════════════╝")
+        return "\n".join(lines)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 3 — THÉBAULT KERNELS
@@ -253,7 +536,7 @@ class ThebaultKernels:
         return k_r, k_o, k_s
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — MRV CONSTRAINT FILTER 
+# SECTION 4 — MRV CONSTRAINT FILTER
 # ════════════════════════════════════════════════════════════════════════════
 
 class MRVConstraintFilter:
@@ -262,12 +545,12 @@ class MRVConstraintFilter:
         self.mrv_cap_ratio  = mrv_cap_ratio
         self.max_vocab_scan = max_vocab_scan
         self.device         = device
-        self._v_rho  : Optional[torch.Tensor] = None   
-        self._v_sigma: Optional[torch.Tensor] = None   
+        self._v_rho  : Optional[torch.Tensor] = None
+        self._v_sigma: Optional[torch.Tensor] = None
         self._v_toks : List[str]              = []
 
     def prime(self, vocab: List[str], geo: ThebaultTokenGeometry) -> None:
-        scan = vocab[:self.max_vocab_scan]
+        scan  = vocab[:self.max_vocab_scan]
         trips = [geo.triple(v) for v in scan]
         self._v_rho   = torch.tensor([t.rho   for t in trips], dtype=torch.float32, device=self.device)
         self._v_sigma = torch.tensor([t.sigma for t in trips], dtype=torch.float32, device=self.device)
@@ -279,7 +562,7 @@ class MRVConstraintFilter:
         k_r = torch.exp(-kernels.lambda_reg * (c_rho.unsqueeze(1)   - self._v_rho.unsqueeze(0))   ** 2)
         k_s = torch.exp(-kernels.gamma_side * (c_sigma.unsqueeze(1) - self._v_sigma.unsqueeze(0)) ** 2)
         thr = self.threshold
-        domain_sizes = ((k_r > thr) & (k_s > thr)).float().sum(dim=1)  
+        domain_sizes = ((k_r > thr) & (k_s > thr)).float().sum(dim=1)
         mean_d = domain_sizes.mean() + 1e-6
         mrv    = 1.0 / (domain_sizes + 1.0)
         mrv[domain_sizes > self.mrv_cap_ratio * mean_d] *= 0.5
@@ -321,8 +604,8 @@ class ChunkedSumEngine:
         self.device      = device
         self.dtype       = dtype
         self._buf   = torch.zeros(window_size, VEC_DIM, dtype=dtype, device=device)
-        self._ptr   = 0    
-        self._count = 0    
+        self._ptr   = 0
+        self._count = 0
 
     def reset(self) -> None:
         self._buf.zero_()
@@ -351,16 +634,28 @@ class ChunkedSumEngine:
             window = torch.cat([window, torch.zeros(pad, VEC_DIM, dtype=self.dtype, device=self.device)])
         chunk_len = window.shape[0] // self.n_chunks
         chunks    = window.view(self.n_chunks, chunk_len, VEC_DIM)
-        return chunks.sum(dim=1).flatten()  
+        return chunks.sum(dim=1).flatten()
 
-    def chunk_bonus(self, c_pvec: torch.Tensor, scale : float = 1.0) -> torch.Tensor:
-        sig = self.chunk_signature()                   
-        cv_tiled = c_pvec.repeat(1, self.n_chunks)     
-        raw = cv_tiled @ sig                           
-        std = raw.std()
+    def chunk_bonus(self, c_pvec: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
+        sig      = self.chunk_signature()
+        cv_tiled = c_pvec.repeat(1, self.n_chunks)
+        raw      = cv_tiled @ sig
+        std      = raw.std()
         if std.item() > 1e-8:
             raw = (raw - raw.mean()) / std
         return raw * scale
+
+    def window_rho_theta(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return the current ring-buffer rho and theta columns for PDN."""
+        if self._count == 0:
+            empty = torch.zeros(0, dtype=self.dtype, device=self.device)
+            return empty, empty
+        if self._count < self.window_size:
+            window = self._buf[:self._count]
+        else:
+            window = torch.cat([self._buf[self._ptr:], self._buf[:self._ptr]], dim=0)
+        # col 0 = rho, col 1 = theta/π  →  recover theta
+        return window[:, 0], window[:, 1] * math.pi
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 6 — ISOMORPHIC SYNTAX STACKER
@@ -369,17 +664,17 @@ class ChunkedSumEngine:
 @dataclass
 class SentenceVector:
     tokens  : List[str]
-    rho_t   : torch.Tensor   
-    sigma_t : torch.Tensor   
+    rho_t   : torch.Tensor
+    sigma_t : torch.Tensor
     text    : str
 
 class IsomorphicSyntaxStacker:
     def __init__(self, top_k: int = 3, max_stored: int = 64, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
-        self.top_k     = top_k
+        self.top_k      = top_k
         self.max_stored = max_stored
-        self.device    = device
-        self.dtype     = dtype
-        self.store     : List[SentenceVector] = []
+        self.device     = device
+        self.dtype      = dtype
+        self.store      : List[SentenceVector] = []
 
     def add(self, tokens: List[str], geo: ThebaultTokenGeometry, text: str) -> None:
         clean = [t for t in tokens if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
@@ -404,7 +699,7 @@ class IsomorphicSyntaxStacker:
             stored_sigma[i, :l] = sv.sigma_t[:l]
         kr = torch.exp(-kernels.lambda_reg * (stored_rho   - cur_rho.unsqueeze(0))   ** 2)
         ks = torch.exp(-kernels.gamma_side * (stored_sigma - cur_sigma.unsqueeze(0)) ** 2)
-        return (kr * ks).mean(dim=1)   
+        return (kr * ks).mean(dim=1)
 
     def ranked_anchors(self, current_tokens: List[str], geo: ThebaultTokenGeometry, kernels: ThebaultKernels) -> List[Tuple[float, SentenceVector]]:
         if not self.store or not current_tokens:
@@ -414,7 +709,7 @@ class IsomorphicSyntaxStacker:
             return []
         cur_rho   = torch.tensor([geo.triple(t).rho   for t in clean], dtype=self.dtype, device=self.device)
         cur_sigma = torch.tensor([geo.triple(t).sigma for t in clean], dtype=self.dtype, device=self.device)
-        sims = self._batch_sim(cur_rho, cur_sigma, kernels)   
+        sims = self._batch_sim(cur_rho, cur_sigma, kernels)
         topk = torch.topk(sims, min(self.top_k, len(self.store)))
         return [(topk.values[i].item(), self.store[topk.indices[i].item()])
                 for i in range(topk.values.shape[0])]
@@ -470,12 +765,13 @@ class ThebaultConjugateOrbit:
         return congruence * antipodality
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — THÉBAULT COMPOSITION LM  
+# SECTION 8 — THÉBAULT COMPOSITION LM
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultCompositionLM:
-    BASAL_K    = 1.5
-    DENSE_THRESH = 512   
+    BASAL_K      = 1.5
+    DENSE_THRESH = 512
+
     def __init__(self, geo: ThebaultTokenGeometry, kernels: ThebaultKernels, device: torch.device = DEVICE):
         self.geo      = geo
         self.kernels  = kernels
@@ -485,8 +781,8 @@ class ThebaultCompositionLM:
         self.heads    : Dict[Tuple[str, str], List[str]]  = {}
         self.vocab    : List[str]                         = []
         self._tok2idx : Dict[str, int]                    = {}
-        self._head_cands : Dict[Tuple[str, str], torch.Tensor]  = {}   
-        self._head_probs : Dict[Tuple[str, str], torch.Tensor]  = {}   
+        self._head_cands : Dict[Tuple[str, str], torch.Tensor] = {}
+        self._head_probs : Dict[Tuple[str, str], torch.Tensor] = {}
 
     def ingest(self, tokens: List[str]) -> None:
         for t in tokens:
@@ -507,7 +803,7 @@ class ThebaultCompositionLM:
         self._tok2idx = {t: i for i, t in enumerate(self.vocab)}
         V_tot = len(self.vocab) + 1
         for (w1, w2), cands in self.heads.items():
-            total = sum(self.tri_raw.get((w1, w2, c), 1e-4) for c in cands)
+            total  = sum(self.tri_raw.get((w1, w2, c), 1e-4) for c in cands)
             counts = [self.tri_raw.get((w1, w2, c), 1e-4) for c in cands]
             basal  = torch.tensor(
                 [(cnt + self.BASAL_K) / (total + self.BASAL_K * V_tot) for cnt in counts],
@@ -570,7 +866,7 @@ class ThebaultPotentialGraph:
         self.nodes   : Dict[str, TGNode]       = {}
         self.adj     : Dict[str, List[TGEdge]] = {}
         self.radj    : Dict[str, List[TGEdge]] = {}
-        self._pot_t  : Optional[torch.Tensor]  = None 
+        self._pot_t  : Optional[torch.Tensor]  = None
         self._vocab  : List[str]               = []
 
     def build(self, lm: ThebaultCompositionLM) -> None:
@@ -651,11 +947,16 @@ class synthetic_reasonMandateProcessor:
         return enrichment
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — THÉBAULT WALKER V17-CUDA
+# SECTION 11 — THÉBAULT WALKER V17-CUDA  (+PDN)
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultWalker:
-    def __init__(self, geo, kernels, lm, orbit, graph, synth, mrv_filter, chunk_engine, iso_stacker, device: torch.device = DEVICE):
+    def __init__(
+        self, geo, kernels, lm, orbit, graph, synth,
+        mrv_filter, chunk_engine, iso_stacker,
+        pdn_engine: PDNEngine,                        # ← NEW
+        device: torch.device = DEVICE,
+    ):
         self.geo          = geo
         self.kernels      = kernels
         self.lm           = lm
@@ -665,13 +966,16 @@ class ThebaultWalker:
         self.mrv          = mrv_filter
         self.chunk_engine = chunk_engine
         self.iso_stacker  = iso_stacker
+        self.pdn          = pdn_engine               # ← NEW
         self.device       = device
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
-        self._cur_sent_toks: List[str] = []
+        self._cur_sent_toks : List[str] = []
+        self._cur_orbit     : int       = 0           # ← NEW: current PDN orbit
 
     def begin_sentence(self) -> None:
         self.chunk_engine.reset()
         self._cur_sent_toks.clear()
+        self._cur_orbit = 0
 
     @torch.no_grad()
     def walk_probs(
@@ -681,6 +985,7 @@ class ThebaultWalker:
         gammaorbit    : float = 0.6, psipot        : float = 0.35,
         zetamrv       : float = 0.9, etachunk      : float = 0.7,
         xiecho        : float = 0.6,
+        pdn_weight    : float = 0.8,                 # ← NEW weight for PDN bonus
     ) -> Tuple[List[str], torch.Tensor]:
 
         cands, base_probs = self.lm.next_dist(w1, w2)
@@ -688,9 +993,9 @@ class ThebaultWalker:
             return cands, base_probs
 
         try:
-            tok_idx = self.geo.tok_indices(cands)              
-            c_rho, c_theta, c_sigma = self.geo.batch_triples(tok_idx)  
-            c_pvec  = self.geo._pvec_t[tok_idx]               
+            tok_idx = self.geo.tok_indices(cands)
+            c_rho, c_theta, c_sigma = self.geo.batch_triples(tok_idx)
+            c_pvec  = self.geo._pvec_t[tok_idx]
         except Exception:
             triples  = [self.geo.triple(c) for c in cands]
             c_rho    = torch.tensor([t.rho   for t in triples], dtype=torch.float32, device=self.device)
@@ -707,17 +1012,22 @@ class ThebaultWalker:
         pots         = self.graph.potentials_for(cands)
         comp_bonus   = self.lm.composition_logit_bonus(w1, w2, c_rho, c_sigma)
         mrv_scores   = self.mrv.mrv_scores_batched(c_rho, c_sigma, self.kernels)
-
         chunk_bonus  = self.chunk_engine.chunk_bonus(c_pvec, scale=etachunk)
-
         echo_bonus   = self.iso_stacker.syntax_echo_bonus(
             c_rho, c_sigma, self._cur_sent_toks, self.geo, self.kernels, xiecho
         )
 
+        # ── PDN BONUS ────────────────────────────────────────────────────
+        win_rho, win_theta = self.chunk_engine.window_rho_theta()
+        pdn_bonus = self.pdn.pdn_logit_bonus(
+            win_rho, win_theta, c_rho, c_theta, self._cur_orbit
+        )
+        # ─────────────────────────────────────────────────────────────────
+
+        # Isomorphic pair detection (unchanged)
         self.current_isomorphic_pairs = []
         top_idx = torch.topk(k_reg * k_side, min(50, len(cands))).indices
-        sub_r   = k_reg[top_idx]
-        sub_s   = k_side[top_idx]
+        sub_r   = k_reg[top_idx];  sub_s = k_side[top_idx]
         iso_mask = (sub_r > 0.98) & (sub_s > 0.98)
         iso_idx  = top_idx[iso_mask].tolist()
         for ii in range(len(iso_idx)):
@@ -754,6 +1064,7 @@ class ThebaultWalker:
             + zetamrv     * mrv_scores
             + chunk_bonus
             + echo_bonus
+            + pdn_weight  * pdn_bonus     # ← NEW: PDN contribution
             + mandate_boost
             + punct_bias
             + punct_penalty
@@ -767,18 +1078,25 @@ class ThebaultWalker:
         self._cur_sent_toks.append(token)
         pos_norm = len(self._cur_sent_toks) / max(sentence_len, 1)
         self.chunk_engine.push(self.geo.triple(token), pos_norm)
+        # Advance PDN orbit
+        self._cur_orbit = self.pdn.orbit_of(token)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — TEXT GENERATION ENGINE (No Patches, No Downloaded LLMs)
+# SECTION 12 — TEXT GENERATION ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
-def generate_passage(walker: ThebaultWalker, lm: ThebaultCompositionLM, num_sentences: int = 4, tokens_per_sent: int = 40, seed_text: str = "") -> str:
-    """Core generator logic, now with seed support."""
-    outputs = []
+def generate_passage(
+    walker: ThebaultWalker,
+    lm: ThebaultCompositionLM,
+    num_sentences: int = 4,
+    tokens_per_sent: int = 40,
+    seed_text: str = "",
+) -> str:
+    outputs   = []
     head_list = list(lm.heads.keys())
     if not head_list:
         return ""
-        
+
     seed_w1, seed_w2 = None, None
     if seed_text:
         seed_toks = tokenize(seed_text)
@@ -788,30 +1106,28 @@ def generate_passage(walker: ThebaultWalker, lm: ThebaultCompositionLM, num_sent
             matches = [p for p in head_list if p[1] == seed_toks[0]]
             if matches:
                 seed_w1, seed_w2 = random.choice(matches)
-                
-    # If the user seed isn't in our vocab heads, we fall back to random
+
     if seed_w1 is None or seed_w2 is None or (seed_w1, seed_w2) not in lm.heads:
         seed_w1, seed_w2 = random.choice(head_list)
-    
+
     for sent_idx in range(num_sentences):
         walker.begin_sentence()
-        
-        # Use seed for the very first sentence, random head thereafter
+
         if sent_idx == 0:
             w1, w2 = seed_w1, seed_w2
-            toks = [w1, w2] if seed_text else []
-            wsp = len(toks)
+            toks   = [w1, w2] if seed_text else []
+            wsp    = len(toks)
         else:
             w1, w2 = random.choice(head_list)
             toks, wsp = [], 999
-            
+
         for _ in range(tokens_per_sent):
             cands, probs = walker.walk_probs(w1, w2)
             if not cands:
                 break
-                
+
             nxt = cands[torch.multinomial(probs, 1).item()]
-            
+
             if nxt in PUNCT_TOKENS:
                 if len(toks) < 3 or wsp < 3 or (nxt in {".", "?", "!"} and len(toks) < 5):
                     bi, bp = None, -1.0
@@ -830,72 +1146,86 @@ def generate_passage(walker: ThebaultWalker, lm: ThebaultCompositionLM, num_sent
 
             if nxt in {".", "?", "!"} and len(toks) >= max(4, int(tokens_per_sent * 0.85)):
                 break
-                
+
         outputs.append(detokenize(toks))
-        
+
     return " ".join(outputs)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — V17 ENGINE (with PDN)
+# ════════════════════════════════════════════════════════════════════════════
+
 class V17Engine:
     def __init__(self):
-        self.device = DEVICE if 'DEVICE' in globals() else torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        self.geo = ThebaultTokenGeometry(device=self.device)
-        self.kernels = ThebaultKernels()
-        self.lm = ThebaultCompositionLM(self.geo, self.kernels, device=self.device)
-        self.orbit = ThebaultConjugateOrbit()
-        self.graph = ThebaultPotentialGraph(self.geo, self.kernels, device=self.device)
-        self.mrv = MRVConstraintFilter(device=self.device)
-        self.chunk = ChunkedSumEngine(device=self.device)
-        self.synth = synthetic_reasonMandateProcessor()
+        self.device = DEVICE
+        self.geo         = ThebaultTokenGeometry(device=self.device)
+        self.kernels     = ThebaultKernels()
+        self.lm          = ThebaultCompositionLM(self.geo, self.kernels, device=self.device)
+        self.orbit       = ThebaultConjugateOrbit()
+        self.graph       = ThebaultPotentialGraph(self.geo, self.kernels, device=self.device)
+        self.mrv         = MRVConstraintFilter(device=self.device)
+        self.chunk       = ChunkedSumEngine(device=self.device)
+        self.synth       = synthetic_reasonMandateProcessor()
         self.iso_stacker = IsomorphicSyntaxStacker(device=self.device)
-        
-        self.walker = None
-        self.corpus_snippet = ""
-        
+        self.pdn         = PDNEngine(device=self.device)          # ← NEW
+
+        self.walker          = None
+        self.corpus_snippet  = ""
+
     def train(self, corpus_text: str):
         print(f"[*] Tokenizing corpus ({len(corpus_text)} chars)...")
-        self.corpus_snippet = corpus_text[:1000] 
+        self.corpus_snippet = corpus_text[:1000]
         tokens = tokenize(corpus_text)
         self.lm.ingest(tokens)
-        
+
         all_tokens = list(self.lm.raw_freq.keys())
-        max_freq = max(self.lm.raw_freq.values(), default=1.0)
+        max_freq   = max(self.lm.raw_freq.values(), default=1.0)
         vocab_size = len(all_tokens)
-        
-        print(f"[*] Registering {vocab_size} tokens in Thebault Geometry...")
+
+        print(f"[*] Registering {vocab_size} tokens in Thébault Geometry...")
         for idx, tok in enumerate(all_tokens):
             self.geo.register(tok, self.lm.raw_freq[tok], idx, max_freq, vocab_size)
-            
+
         print("[*] Building GPU Tensor Caches...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
-            
+
         print("[*] Building graph potentials...")
         self.graph.build(self.lm)
         self.graph.propagate(steps=2)
-        
+
         print("[*] Initializing MRV Filter...")
         self.mrv.prime(self.lm.vocab, self.geo)
-        
+
+        # ── PDN: fit from corpus ──────────────────────────────────────────
+        print("[*] Fitting PDN (Petr–Douglas–Neumann) symmetry order from corpus...")
+        self.pdn.fit_from_trigrams(self.geo, self.lm.tri_raw)
+        self.pdn.build_orbit_map(self.lm.vocab, self.geo)
+        print(self.pdn.theorem_bridge_report())
+        # ─────────────────────────────────────────────────────────────────
+
         self.walker = ThebaultWalker(
-            self.geo, self.kernels, self.lm, self.orbit, 
+            self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.synth, self.mrv, self.chunk, self.iso_stacker,
-            device=self.device
+            self.pdn,                                     # ← NEW
+            device=self.device,
         )
         print("[+] Training complete.")
 
     def save_cache(self, filename: str = "v17_model.pkl"):
         print(f"[*] Saving model state to {filename}...")
         state = {
-            "geo_vecs": self.geo._vecs,
-            "geo_cache": self.geo._cache,
-            "lm_raw_freq": self.lm.raw_freq,
-            "lm_tri_raw": self.lm.tri_raw,
-            "lm_heads": self.lm.heads,
-            "lm_vocab": self.lm.vocab,
-            "graph_nodes": self.graph.nodes,
-            "corpus_snippet": self.corpus_snippet,
+            "geo_vecs"        : self.geo._vecs,
+            "geo_cache"       : self.geo._cache,
+            "lm_raw_freq"     : self.lm.raw_freq,
+            "lm_tri_raw"      : self.lm.tri_raw,
+            "lm_heads"        : self.lm.heads,
+            "lm_vocab"        : self.lm.vocab,
+            "graph_nodes"     : self.graph.nodes,
+            "corpus_snippet"  : self.corpus_snippet,
+            "pdn_n_star"      : self.pdn.n_star,         # ← NEW
+            "pdn_power"       : self.pdn.power_spectrum,  # ← NEW
         }
         with open(filename, "wb") as f:
             pickle.dump(state, f)
@@ -905,46 +1235,41 @@ class V17Engine:
         print(f"[*] Loading model state from {filename}...")
         with open(filename, "rb") as f:
             state = pickle.load(f)
-            
-        self.geo._vecs = state["geo_vecs"]
-        self.geo._cache = state["geo_cache"]
-        self.lm.raw_freq = state["lm_raw_freq"]
-        self.lm.tri_raw = state["lm_tri_raw"]
-        self.lm.heads = state["lm_heads"]
-        self.lm.vocab = state["lm_vocab"]
-        self.graph.nodes = state["graph_nodes"]
-        self.corpus_snippet = state["corpus_snippet"]
-        
+
+        self.geo._vecs        = state["geo_vecs"]
+        self.geo._cache       = state["geo_cache"]
+        self.lm.raw_freq      = state["lm_raw_freq"]
+        self.lm.tri_raw       = state["lm_tri_raw"]
+        self.lm.heads         = state["lm_heads"]
+        self.lm.vocab         = state["lm_vocab"]
+        self.graph.nodes      = state["graph_nodes"]
+        self.corpus_snippet   = state["corpus_snippet"]
+        self.pdn.n_star       = state.get("pdn_n_star", 4)       # ← NEW
+        self.pdn.power_spectrum = state.get("pdn_power", {})      # ← NEW
+
         print("[*] Rebuilding GPU Tensors from loaded state...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
-        
         self.graph.build(self.lm)
         self.graph.propagate(steps=2)
-        
         self.mrv.prime(self.lm.vocab, self.geo)
-        
+        self.pdn.build_orbit_map(self.lm.vocab, self.geo)
+
         self.walker = ThebaultWalker(
-            self.geo, self.kernels, self.lm, self.orbit, 
+            self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.synth, self.mrv, self.chunk, self.iso_stacker,
-            device=self.device
+            self.pdn,
+            device=self.device,
         )
         print("[+] Load successful.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — GRADIO GUI
+# SECTION 14 — GRADIO GUI
 # ════════════════════════════════════════════════════════════════════════════
 
 class V17GUI:
     def __init__(self):
         self.engine = None
-
-    def init_engine_from_text(self, corpus_text):
-        if not corpus_text or not corpus_text.strip():
-            return "Error: Corpus text is empty."
-        self.engine = V17Engine()
-        self.engine.train(corpus_text)
-        return f"Engine initialised from text box. Vocab size: {len(self.engine.lm.vocab)}"
 
     def init_engine_from_file(self, file_obj):
         if file_obj is None:
@@ -954,58 +1279,68 @@ class V17GUI:
                 corpus_text = f.read()
             if not corpus_text.strip():
                 return "Error: Uploaded file is empty."
-            
             self.engine = V17Engine()
             self.engine.train(corpus_text)
-            return f"Engine initialised from file ({file_obj.name.split('/')[-1]}). Vocab size: {len(self.engine.lm.vocab)}"
+            report = self.engine.pdn.theorem_bridge_report()
+            return (f"Engine initialised from file ({file_obj.name.split('/')[-1]}). "
+                    f"Vocab size: {len(self.engine.lm.vocab)}\n\n{report}")
         except Exception as e:
             return f"Error reading file: {str(e)}"
 
     def generate_text(self, sentences, tokens, seed_text):
         if not self.engine or not self.engine.walker:
             return "Engine not initialised. Please load a corpus first."
-        passage = generate_passage(
-            self.engine.walker, 
-            self.engine.lm, 
-            num_sentences=int(sentences), 
+        return generate_passage(
+            self.engine.walker,
+            self.engine.lm,
+            num_sentences=int(sentences),
             tokens_per_sent=int(tokens),
-            seed_text=seed_text.strip()
+            seed_text=seed_text.strip(),
         )
-        return passage
+
+    def pdn_report(self):
+        if not self.engine:
+            return "Engine not initialised."
+        return self.engine.pdn.theorem_bridge_report()
+
 
 def launch_gui():
     gui = V17GUI()
-    
-    with gr.Blocks(title="NeuroSymbolic V17 CUDA") as app:
-        gr.Markdown("# NeuroSymbolic V17 CUDA: Thébault Geometry Engine")
-        
 
-        file_input = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
-        train_file_btn = gr.Button("Initialise from File", variant="primary")
-            
-        init_out = gr.Textbox(label="Engine Status", interactive=False)
-        
+    with gr.Blocks(title="NeuroSymbolic V17 CUDA + PDN") as app:
+        gr.Markdown(
+            "# NeuroSymbolic V17 CUDA\n"
+            "### Thébault Geometry Engine + Petr–Douglas–Neumann Theorem"
+        )
+
+        file_input      = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
+        train_file_btn  = gr.Button("Initialise from File", variant="primary")
+        init_out        = gr.Textbox(label="Engine Status / PDN Report", lines=20, interactive=False)
         train_file_btn.click(gui.init_engine_from_file, inputs=[file_input], outputs=init_out)
-        
+
         gr.Markdown("### Text Generation")
         with gr.Row():
             sentences = gr.Slider(1, 10, value=4, step=1, label="Sentences")
-            tokens = gr.Slider(100, 180, value=80, step=1, label="Tokens per sentence")
-            
+            tokens    = gr.Slider(20, 180, value=80, step=1, label="Tokens per sentence")
+
         seed_input = gr.Textbox(label="Seed Text (Optional)", placeholder="e.g. quantum entanglement")
-            
-        gen_btn = gr.Button("Generate Passage", variant="primary")
-        gen_out = gr.Textbox(lines=12, label="Generated Text")
-        
+        gen_btn    = gr.Button("Generate Passage", variant="primary")
+        gen_out    = gr.Textbox(lines=12, label="Generated Text")
         gen_btn.click(gui.generate_text, inputs=[sentences, tokens, seed_input], outputs=gen_out)
+
+        gr.Markdown("### PDN Theorem Report")
+        pdn_btn    = gr.Button("Show PDN Bridge Report")
+        pdn_out    = gr.Textbox(lines=18, label="PDN Report", interactive=False)
+        pdn_btn.click(gui.pdn_report, outputs=pdn_out)
 
     app.launch()
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gui", action="store_true", help="Launch Gradio GUI")
-    parser.add_argument("--corpus", type=str, help="Path to training text file")
-    parser.add_argument("--save", type=str, default="v17_model.pkl", help="Output pkl file")
+    parser.add_argument("--gui",    action="store_true", help="Launch Gradio GUI")
+    parser.add_argument("--corpus", type=str,            help="Path to training text file")
+    parser.add_argument("--save",   type=str, default="v17_model.pkl")
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -1021,6 +1356,6 @@ if __name__ == "__main__":
     engine = V17Engine()
     engine.train(corpus_text)
     engine.save_cache(args.save)
-    
+
     print("\n--- SAMPLE GENERATION ---")
     print(generate_passage(engine.walker, engine.lm, num_sentences=3, tokens_per_sent=30))
