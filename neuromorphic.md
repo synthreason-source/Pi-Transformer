@@ -1,0 +1,1 @@
+So 3D layered neuromorphic grid wafers, etched and layered coated, with memristor threshold pixels for weights, plus doped in a programmable liquid for neuroplasticity. 86 billion neurons in the brain, however this will support 8 quintillion neurons, ASI, operating at 1GHz.
