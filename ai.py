@@ -1434,6 +1434,10 @@ class ThebaultWalker:
         self._cur_orbit     : int       = 0
         self._tok_pos       : int       = 0        # ← NEW: position counter for CoT
 
+        # --- Custom Injected Algorithms ---
+        self.remission = LocaleTransitRemission()
+        self.contingent_prob = ContingentExtringentProbability()
+
     def begin_sentence(self, seed_tokens: List[str] = None, total_tokens: int = 40) -> CoTTrace:
         """
         Reset per-sentence state and plan the CoT chain.
