@@ -177,63 +177,12 @@ def detokenize(tokens: List[str]) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _perfect_square_cv() -> float:
-    # Keep for any legacy callers, but no longer used in rho computation
     s  = 1.0
     d  = [s, s, s, s, s * math.sqrt(2), s * math.sqrt(2)]
     mu = sum(d) / 6
     return math.sqrt(sum((x - mu) ** 2 for x in d) / 6) / mu
 
 _PERFECT_CV = _perfect_square_cv()
-
-def _thebault_triple(px: float, py: float, qx: float, qy: float):
-    """
-    Compute (rho, theta, sigma) from two 2-D vectors p and q.
-
-    The Thébault theorem guarantees that erecting squares on the four sides
-    of parallelogram (0, p, p+q, q) always yields a perfect square — so
-    measuring the CV of those centres gives 0 for every input.
-
-    Instead we measure how 'square-like' the INPUT parallelogram is:
-      rho   = perpendicularity × equal-length score  ∈ [0, 1]
-                1 when p⊥q and |p|=|q|  (square input → maximally ordered)
-                0 when p∥q              (degenerate)
-      theta = orientation of the Thébault diagonal (T[1]−T[0])
-      sigma = mean Thébault diagonal half-length (scale)
-    """
-    if abs(px) < 1e-9 and abs(py) < 1e-9 and abs(qx) < 1e-9 and abs(qy) < 1e-9:
-        return 0.0, 0.0, 0.0
-
-    len_p = math.sqrt(px*px + py*py)
-    len_q = math.sqrt(qx*qx + qy*qy)
-    if len_p < 1e-9 or len_q < 1e-9:
-        return 0.0, 0.0, 0.0
-
-    # Perpendicularity: 1 when p⊥q, 0 when parallel
-    cos_pq      = (px*qx + py*qy) / (len_p * len_q)
-    perp_score  = 1.0 - abs(cos_pq)
-
-    # Equal-length score: 1 when |p|==|q|, decays toward 0
-    ratio        = min(len_p, len_q) / max(len_p, len_q)  # ∈ (0, 1]
-    equal_score  = ratio
-
-    rho = perp_score * equal_score  # ∈ [0, 1]
-
-    # Thébault centres (unchanged — used for theta and sigma)
-    T = _thebault_centres(0.0, 0.0, px, py, px + qx, py + qy, qx, qy)
-
-    # Diagonal lengths of the Thébault-centre square
-    d1x = T[2][0] - T[0][0];  d1y = T[2][1] - T[0][1]
-    d2x = T[3][0] - T[1][0];  d2y = T[3][1] - T[1][1]
-    len1 = math.sqrt(d1x*d1x + d1y*d1y)
-    len2 = math.sqrt(d2x*d2x + d2y*d2y)
-    sigma = (len1 + len2) / 2.0
-
-    # Orientation from first Thébault edge
-    dx_ori = T[1][0] - T[0][0]
-    dy_ori = T[1][1] - T[0][1]
-    theta  = math.atan2(dy_ori, dx_ori) % math.pi
-
-    return rho, theta, sigma
 
 def _rotate90(vx: float, vy: float) -> Tuple[float, float]:
     return -vy, vx
@@ -249,6 +198,28 @@ def _thebault_centres(ax, ay, bx, by, cx, cy, dx, dy):
         rx, ry = _rotate90(hx, hy)
         centres.append((mx + rx, my + ry))
     return centres
+
+def _thebault_triple(px, py, qx, qy):
+    if abs(px) < 1e-9 and abs(py) < 1e-9 and abs(qx) < 1e-9 and abs(qy) < 1e-9:
+        return 0.0, 0.0, 0.0
+    T = _thebault_centres(0.0, 0.0, px, py, px + qx, py + qy, qx, qy)
+    dists = []
+    for i in range(4):
+        for j in range(i + 1, 4):
+            dx = T[i][0] - T[j][0]
+            dy = T[i][1] - T[j][1]
+            dists.append(math.sqrt(dx * dx + dy * dy))
+    mu = sum(dists) / 6
+    if mu < 1e-9:
+        return 0.0, 0.0, 0.0
+    cv  = math.sqrt(sum((d - mu) ** 2 for d in dists) / 6) / mu
+    rho = max(0.0, min(1.0, 1.0 - cv / (_PERFECT_CV + 1e-9)))
+    sides = dists[:4]
+    sigma = sum(sides) / 4.0
+    dx_ori = T[1][0] - T[0][0]
+    dy_ori = T[1][1] - T[0][1]
+    theta  = math.atan2(dy_ori, dx_ori) % math.pi
+    return rho, theta, sigma
 
 @dataclass
 class ThebaultTriple:
@@ -268,13 +239,8 @@ class ThebaultTokenGeometry:
         self._sigma_t: Optional[torch.Tensor] = None
         self._pvec_t : Optional[torch.Tensor] = None
         self._idx_list: List[str]             = []
-        self._min_freq : float                = 1.0
-        self._max_freq : float                = 1.0
 
     def register(self, token, freq, index, max_freq, vocab_size):
-        if freq < self._min_freq or self._min_freq == 1.0:
-            self._min_freq = max(freq, 1e-9)
-        self._max_freq = max(max_freq, 1e-9)
         f_hat   = freq / max(max_freq, 1e-9)
         k_hat   = index / max(vocab_size - 1, 1)
         angle_p = 2.0 * math.pi * k_hat
@@ -335,34 +301,6 @@ class ThebaultTokenGeometry:
         idx = [self._tok2idx.get(t, 0) for t in toks]
         return torch.tensor(idx, dtype=torch.long, device=self.device)
 
-    def stub_coords(self, token: str) -> tuple:
-        """
-        Return (lf_norm, k_hat, sigma) for stub clustering.
-
-        lf_norm: min-max normalisation of log(freq) across the corpus.
-          lf_norm = (log(freq+1) - log(min_freq+1)) / (log(max_freq+1) - log(min_freq+1))
-          This maps [min_freq, max_freq] -> [0, 1] in log-space, spreading
-          the Zipf distribution across all bins instead of collapsing to bin 0.
-
-        k_hat: vocab rank / (vocab_size-1), uniform [0,1] by construction,
-          recovered as sqrt(qx^2+qy^2) from the stored p/q vectors.
-
-        sigma: Thebault sigma, used for stub TYPE assignment.
-        """
-        px, py, qx, qy = self._vec(token)
-        f_hat = math.sqrt(px*px + py*py)   # = freq / max_freq
-        k_hat = math.sqrt(qx*qx + qy*qy)  # = rank / (vocab_size-1)
-
-        freq_raw = f_hat * self._max_freq  # recover raw freq
-        min_f    = self._min_freq
-        max_f    = self._max_freq
-        denom    = math.log(max_f + 1) - math.log(min_f + 1) + 1e-9
-        lf_norm  = (math.log(freq_raw + 1) - math.log(min_f + 1)) / denom
-        lf_norm  = max(0.0, min(1.0, lf_norm))
-
-        sigma = self.triple(token).sigma
-        return lf_norm, k_hat, sigma
-
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2b — PETR–DOUGLAS–NEUMANN THEOREM ENGINE
 # ════════════════════════════════════════════════════════════════════════════
@@ -403,22 +341,16 @@ class PDNEngine:
             zs   = []
             for t in toks:
                 tr = geo.triple(t)
-                zs.append(cmath.exp(1j * tr.theta))   # unit phasor, preserves angular structure
+                zs.append(complex(tr.rho * math.cos(tr.theta),
+                                  tr.rho * math.sin(tr.theta)))
             for n in candidate_ns:
                 padded = zs + [0+0j] * (n - 3)
-                mean_rho = sum(geo.triple(t).rho for t in toks) / 3
                 for k in range(1, n):
                     F_k = sum(padded[j] * cmath.exp(-2j * math.pi * j * k / n)
                               for j in range(n)) / n
-                    power[n] += cnt * mean_rho * abs(F_k) ** 2   # weight by rho
+                    power[n] += cnt * abs(F_k) ** 2
         self.power_spectrum = power
-        # AFTER (picks strongest mode — correct)
-        total_power = sum(power.values())
-        if total_power < 1e-10:
-            print("[PDN] Warning: power spectrum degenerate, defaulting to n*=4")
-            self.n_star = 4
-        else:
-            self.n_star = max(power, key=lambda k: power[k])
+        self.n_star = min(power, key=lambda k: power[k])
         print(f"[PDN] Power spectrum: { {n: f'{p:.2f}' for n, p in power.items()} }")
         print(f"[PDN] Dominant symmetry order n* = {self.n_star}")
 
@@ -574,101 +506,109 @@ class CoTTrace:
     def render(self) -> str:
         """Return a human-readable reasoning trace string."""
         lines = ["  ── Chain-of-Thought Trace ──"]
-        seed_str = ' '.join(self.seed_tokens[:6]) if self.seed_tokens else "(random)"
-        lines.append(f"  Seed: {seed_str}")
+        lines.append(f"  Seed: {' '.join(self.seed_tokens[:6])}")
         for s in self.steps:
-            # stub.rho=lf_norm, stub.theta=k_hat, stub.sigma=sigma
             lines.append(
                 f"  Hop {s.hop_index:02d} [{s.stub.stub_type:<11s}] "
                 f"score={s.stub_score:.3f}  orbit={s.pdn_orbit}  "
-                f"lf={s.stub.rho:.3f}  k={s.stub.theta:.3f}  sig={s.stub.sigma:.3f}"
+                f"ρ={s.stub.rho:.3f}  θ={s.stub.theta:.3f}  σ={s.stub.sigma:.3f}"
+                f"\n          → {s.stub.label}"
             )
-            lines.append(f"          → {s.stub.label}")
         if self.conclusion:
             lines.append(
-                f"  Conclusion lf={self.conclusion.rho:.3f}  k={self.conclusion.theta:.3f}  sig={self.conclusion.sigma:.3f}"
+                f"  Conclusion ρ={self.conclusion.rho:.3f}  θ={self.conclusion.theta:.3f}"
+                f"\n          → {self.conclusion.label}"
             )
-            lines.append(f"          → {self.conclusion.label}")
         return "\n".join(lines)
 
 
 class CoTStubLibrary:
     """
-    Contextual stubs clustered in (lf_norm, k_hat, sigma) space.
+    Builds and manages contextual stubs from a trained corpus.
 
-    Coordinate axes
-    ───────────────
-    lf_norm  — log-normalised frequency, uniform in [0,1] after transform
-    k_hat    — vocab rank / (vocab_size-1), uniform [0,1] by construction
-    sigma    — Thebault sigma (side-length scale)
+    Root problem fixed
+    ──────────────────
+    The previous implementation built ONE centroid per stub type (one stub
+    covering the entire sigma quartile).  Because every seed maps to the same
+    single stub, all chains were identical regardless of seed geometry.
 
-    Clustering
-    ──────────
-    Level 1 (TYPE)   : sigma quartile -> PREMISE / ELABORATION / CONTRAST / CONCLUSION
-    Level 2 (SUBTYPE): uniform grid over (lf_norm × k_hat) in [0,1]^2
-                       n_lf_bins × n_k_bins cells, each non-empty cell = one stub
+    Fix: two-level clustering
+    ─────────────────────────
+    1.  SIGMA QUARTILE (coarse) — divide vocabulary into four sigma bands
+        mapped to PREMISE / ELABORATION / CONTRAST / CONCLUSION.
+    2.  THETA ANGULAR BINS (fine) — within each sigma band, sub-divide by
+        Thébault theta into `n_theta_bins` angular sectors.  Each non-empty
+        sector becomes a separate ContextualStub with its own centroid.
 
-    This guarantees that seeds with different frequency and rank profiles
-    activate different stubs, producing varied CoT chains per-seed.
+    This yields ~n_theta_bins stubs per type (up to 4 × n_theta_bins total),
+    each occupying a distinct region of the (rho, theta, sigma) manifold.
+    `best_stub()` then selects whichever stub is *geometrically closest* to
+    the seed — so different seeds genuinely activate different stubs.
 
-    Selection kernel (in lf_norm × k_hat × sigma space)
-    ────────────────────────────────────────────────────
-    score(seed, stub) = exp(-al*(lf_s - lf_stub)^2)
-                      * exp(-ak*(k_s  - k_stub )^2)
-                      * exp(-as*(sig_s - sig_stub)^2)
-
-    All three axes contribute genuine discrimination because all three
-    are now spread across [0,1] with real population variance.
+    Additionally, rho is used as a secondary sub-dimension: within each
+    theta bin, tokens are sorted by rho and split into a high-rho and
+    low-rho sub-stub, doubling resolution without extra parameters.
     """
 
     def __init__(
         self,
-        n_theta_bins : int   = 8,    # repurposed as n_lf_bins
-        n_k_bins     : int   = 6,
-        min_bin_size : int   = 1,
-        rho_threshold: float = 0.0,  # unused, kept for API compat
-        device       : torch.device = DEVICE,
-        dtype        : torch.dtype  = torch.float32,
+        rho_threshold  : float = 0.20,   # lowered so more tokens qualify
+        n_theta_bins   : int   = 8,      # angular sectors per stub type
+        min_bin_size   : int   = 2,      # skip bins with fewer tokens
+        device         : torch.device = DEVICE,
+        dtype          : torch.dtype  = torch.float32,
     ):
-        self.n_lf_bins   = n_theta_bins
-        self.n_k_bins    = n_k_bins
-        self.min_bin_size = min_bin_size
-        self.device      = device
-        self.dtype       = dtype
-        self.stubs       : Dict[str, List[ContextualStub]] = {t: [] for t in _STUB_SEQUENCE}
-        self._stub_list  : List[ContextualStub] = []
-        # Tensor caches: lf_norm (rho field), k_hat (theta field), sigma
-        self._stub_lf_t  : Optional[torch.Tensor] = None
-        self._stub_k_t   : Optional[torch.Tensor] = None
-        self._stub_s_t   : Optional[torch.Tensor] = None
+        self.rho_threshold = rho_threshold
+        self.n_theta_bins  = n_theta_bins
+        self.min_bin_size  = min_bin_size
+        self.device        = device
+        self.dtype         = dtype
+        self.stubs         : Dict[str, List[ContextualStub]] = {
+            t: [] for t in _STUB_SEQUENCE
+        }
+        self._stub_rho_t  : Optional[torch.Tensor] = None
+        self._stub_theta_t: Optional[torch.Tensor] = None
+        self._stub_sigma_t: Optional[torch.Tensor] = None
+        self._stub_list   : List[ContextualStub]   = []
 
     # ── 2c.1  BUILD FROM CORPUS ──────────────────────────────────────────
 
     def build(
         self,
-        geo      : "ThebaultTokenGeometry",
+        geo      : ThebaultTokenGeometry,
         lm_vocab : List[str],
         raw_freq : Dict[str, float],
     ) -> None:
-        """Two-level grid clustering in (lf_norm, k_hat, sigma) space."""
-
-        entries = []
+        """
+        Two-level clustering:
+          Level 1 — sigma quartile  → stub TYPE (Premise/Elab/Contrast/Conc)
+          Level 2 — theta bin       → one stub per angular sector per type
+          Level 3 — rho split       → high/low rho sub-stub within each bin
+        """
+        # ── collect all vocab tokens with their triples ───────────────────
+        all_entries = []
         for tok in lm_vocab:
-            lf, kh, sig = geo.stub_coords(tok)
-            entries.append((tok, lf, kh, sig, raw_freq.get(tok, 1.0)))
+            tr = geo.triple(tok)
+            all_entries.append((tok, tr, raw_freq.get(tok, 1.0)))
 
-        if not entries:
-            print("[CoT] Warning: empty vocab — no stubs built.")
-            return
+        # Adaptive rho threshold: use the 20th percentile so we always get
+        # a healthy number of bridge tokens regardless of corpus size.
+        rhos_sorted = sorted(e[1].rho for e in all_entries)
+        adaptive_thr = rhos_sorted[max(0, int(len(rhos_sorted) * 0.20))]
+        thr = min(self.rho_threshold, adaptive_thr)
 
-        # Level 1: sigma quartile -> stub type
-        entries.sort(key=lambda x: x[3])
-        q = max(1, len(entries) // 4)
+        bridges = [(tok, tr, freq) for tok, tr, freq in all_entries if tr.rho >= thr]
+        if len(bridges) < 8:
+            bridges = all_entries   # fallback: use everything
+
+        # ── Level 1: sigma quartile → stub type ───────────────────────────
+        bridges.sort(key=lambda x: x[1].sigma)
+        q = max(1, len(bridges) // 4)
         quartile_map = {
-            STUB_PREMISE    : entries[:q],
-            STUB_ELABORATION: entries[q : 2*q],
-            STUB_CONTRAST   : entries[2*q : 3*q],
-            STUB_CONCLUSION : entries[3*q:],
+            STUB_PREMISE    : bridges[:q],
+            STUB_ELABORATION: bridges[q : 2 * q],
+            STUB_CONTRAST   : bridges[2 * q : 3 * q],
+            STUB_CONCLUSION : bridges[3 * q:],
         }
 
         self.stubs = {t: [] for t in _STUB_SEQUENCE}
@@ -677,116 +617,125 @@ class CoTStubLibrary:
             if not bucket:
                 continue
 
-            # Level 2: grid over (lf_norm × k_hat) in [0,1]^2
-            nlf, nk = self.n_lf_bins, self.n_k_bins
-            grid: Dict[Tuple[int, int], list] = {}
-            for tok, lf, kh, sig, freq in bucket:
-                li = min(int(lf * nlf), nlf - 1)
-                ki = min(int(kh * nk),  nk  - 1)
-                grid.setdefault((li, ki), []).append((tok, lf, kh, sig, freq))
+            # ── Level 2: theta angular bins ───────────────────────────────
+            # theta ∈ [0, π); divide into n_theta_bins equal sectors
+            bin_width = math.pi / self.n_theta_bins
+            theta_bins: Dict[int, list] = {}
+            for tok, tr, freq in bucket:
+                bin_idx = min(int(tr.theta / bin_width), self.n_theta_bins - 1)
+                theta_bins.setdefault(bin_idx, []).append((tok, tr, freq))
 
-            for (li, ki), members in grid.items():
+            for bin_idx, members in theta_bins.items():
                 if len(members) < self.min_bin_size:
                     continue
-                self._make_stub(stub_type, li, ki, members)
+
+                # ── Level 3: rho split (high / low) ──────────────────────
+                members.sort(key=lambda x: x[1].rho)
+                mid = max(1, len(members) // 2)
+                sub_groups = [members[:mid], members[mid:]]
+
+                for sub_idx, group in enumerate(sub_groups):
+                    if not group:
+                        continue
+                    self._make_stub(stub_type, bin_idx, sub_idx, group)
 
         self._rebuild_tensors()
         total = sum(len(v) for v in self.stubs.values())
         per   = {t: len(v) for t, v in self.stubs.items()}
-        print(f"[CoT] Built {total} contextual stubs in (lf_norm x k_hat) grid: {per}")
+        print(f"[CoT] Built {total} contextual stubs: {per}")
 
     def _make_stub(
         self,
         stub_type : str,
-        li        : int,
-        ki        : int,
+        bin_idx   : int,
+        sub_idx   : int,
         members   : list,
     ) -> None:
-        toks     = [m[0] for m in members]
-        lf_vals  = [m[1] for m in members]
-        k_vals   = [m[2] for m in members]
-        s_vals   = [m[3] for m in members]
-        freqs    = [m[4] for m in members]
+        """Compute centroid of `members` and store as a ContextualStub."""
+        toks    = [m[0] for m in members]
+        rhos    = [m[1].rho   for m in members]
+        thetas  = [m[1].theta for m in members]
+        sigmas  = [m[1].sigma for m in members]
+        weights = [m[2]       for m in members]
 
-        lf_mean  = sum(lf_vals) / len(lf_vals)
-        k_mean   = sum(k_vals)  / len(k_vals)
-        s_mean   = sum(s_vals)  / len(s_vals)
+        # Circular mean of theta (correct for wraparound at π)
+        sin_m    = sum(math.sin(th) for th in thetas) / len(thetas)
+        cos_m    = sum(math.cos(th) for th in thetas) / len(thetas)
+        theta_cm = math.atan2(sin_m, cos_m) % math.pi
 
-        # Store lf_mean in .rho field, k_mean in .theta field, s_mean in .sigma
+        rho_mean   = sum(rhos)   / len(rhos)
+        sigma_mean = sum(sigmas) / len(sigmas)
+
+        # Label encodes stub identity for the trace display
+        rho_tag   = "hi-ρ" if sub_idx == 1 else "lo-ρ"
         tok_preview = " ".join(toks[:3])
-        label = (f"[{stub_type}|lf{li}k{ki}] "
-                 f"lf={lf_mean:.2f} k={k_mean:.2f} sig={s_mean:.3f} | {tok_preview}...")
+        label = f"[{stub_type}|bin{bin_idx}|{rho_tag}] {tok_preview}…"
 
         stub = ContextualStub(
             stub_type = stub_type,
             tokens    = toks,
-            rho       = lf_mean,   # lf_norm centroid
-            theta     = k_mean,    # k_hat centroid  (repurposed theta field)
-            sigma     = s_mean,
-            weight    = sum(freqs),
+            rho       = rho_mean,
+            theta     = theta_cm,
+            sigma     = sigma_mean,
+            weight    = sum(weights),
             label     = label,
         )
         self.stubs[stub_type].append(stub)
 
     def _rebuild_tensors(self) -> None:
-        self._stub_list = [s for stype in _STUB_SEQUENCE for s in self.stubs[stype]]
+        self._stub_list    = [s for stype in _STUB_SEQUENCE for s in self.stubs[stype]]
         if not self._stub_list:
             return
-        self._stub_lf_t = torch.tensor([s.rho   for s in self._stub_list], dtype=self.dtype, device=self.device)
-        self._stub_k_t  = torch.tensor([s.theta for s in self._stub_list], dtype=self.dtype, device=self.device)
-        self._stub_s_t  = torch.tensor([s.sigma for s in self._stub_list], dtype=self.dtype, device=self.device)
+        self._stub_rho_t   = torch.tensor([s.rho   for s in self._stub_list], dtype=self.dtype, device=self.device)
+        self._stub_theta_t = torch.tensor([s.theta for s in self._stub_list], dtype=self.dtype, device=self.device)
+        self._stub_sigma_t = torch.tensor([s.sigma for s in self._stub_list], dtype=self.dtype, device=self.device)
 
-        # ── 2c.2  STUB SELECTION ─────────────────────────────────────────────
+    # ── 2c.2  STUB SELECTION ─────────────────────────────────────────────
 
     def best_stub(
         self,
-        stub_type  : str,
-        ctx_rho    : float,    # lf_norm of seed (stub.rho field)
-        ctx_theta  : float,    # k_hat of seed  (stub.theta field)
-        ctx_sigma  : float,    # sigma of seed
-        kernels    : "ThebaultKernels",
-        pdn_orbit  : int = 0,
-        pdn_engine : Optional["PDNEngine"] = None,
+        stub_type     : str,
+        ctx_rho       : float,
+        ctx_theta     : float,
+        ctx_sigma     : float,
+        kernels       : "ThebaultKernels",
+        pdn_orbit     : int = 0,
+        pdn_engine    : Optional[PDNEngine] = None,
     ) -> Optional[ContextualStub]:
         """
-        Score each candidate stub against the seed context in (lf, k, sigma) space.
+        Select the stub of `stub_type` whose geometry best matches the
+        current context triple (ctx_rho, ctx_theta, ctx_sigma).
 
-        Field mapping (stubs store in Thebault fields for compat):
-          stub.rho   = lf_norm centroid  (log-normalised frequency)
-          stub.theta = k_hat centroid    (vocab rank)
-          stub.sigma = sigma centroid
+        Kernel widths are relaxed vs the token-level kernels because stubs
+        are cluster centroids — they span a wider geometric range than
+        individual tokens. Using the raw lambda_reg=8 causes ALL stubs to
+        score near-zero and argmax collapses to index 0 regardless of seed.
 
-        Score = exp(-al*(lf_s - lf_stub)^2)
-              * exp(-ak*(k_s  - k_stub )^2)
-              * exp(-as*(sig_s - sig_stub)^2)
-
-        Bandwidths tuned for [0,1] normalised axes:
-          al=5.0  — moderately selective on frequency
-          ak=5.0  — moderately selective on rank
-          as=3.0  — soft on sigma (wider spread between quartiles)
+        We use softer widths (lambda=1.5, gamma=0.8) so that the cosine
+        orientation term k_ori genuinely differentiates stubs by theta, and
+        the Gaussian rho/sigma terms still provide meaningful gradients.
         """
         candidates = self.stubs.get(stub_type, [])
         if not candidates:
             return None
 
-        al = 5.0
-        ak = 5.0
-        as_ = 3.0
+        # Relaxed stub-selection kernel bandwidths
+        lam_stub   = 1.5   # vs kernels.lambda_reg = 8.0
+        gam_stub   = 0.8   # vs kernels.gamma_side = 4.0
 
-        c_lf = torch.tensor([s.rho   for s in candidates], dtype=self.dtype, device=self.device)
-        c_k  = torch.tensor([s.theta for s in candidates], dtype=self.dtype, device=self.device)
-        c_s  = torch.tensor([s.sigma for s in candidates], dtype=self.dtype, device=self.device)
+        c_rho   = torch.tensor([s.rho   for s in candidates], dtype=self.dtype, device=self.device)
+        c_theta = torch.tensor([s.theta for s in candidates], dtype=self.dtype, device=self.device)
+        c_sigma = torch.tensor([s.sigma for s in candidates], dtype=self.dtype, device=self.device)
 
-        scores = (
-            torch.exp(-al  * (c_lf - ctx_rho)   ** 2)
-          * torch.exp(-ak  * (c_k  - ctx_theta)  ** 2)
-          * torch.exp(-as_ * (c_s  - ctx_sigma)  ** 2)
-        )
+        k_r = torch.exp(-lam_stub * (c_rho   - ctx_rho)   ** 2)
+        k_o = 0.5 * (1.0 + torch.cos(c_theta - ctx_theta))   # orientation is most discriminative
+        k_s = torch.exp(-gam_stub * (c_sigma - ctx_sigma) ** 2)
+        scores = k_r * k_o * k_s
 
-        # PDN orbit bonus using k_hat as orbit proxy
+        # PDN orbit bonus: prefer stubs in the expected next orbit family
         if pdn_engine is not None:
-            orb_bonus = pdn_engine.orbit_bonus(pdn_orbit, c_k * math.pi)
-            scores    = scores + 0.25 * orb_bonus
+            orb_bonus = pdn_engine.orbit_bonus(pdn_orbit, c_theta)
+            scores    = scores + 0.3 * orb_bonus
 
         best_idx = int(scores.argmax().item())
         return candidates[best_idx]
@@ -797,43 +746,20 @@ class CoTStubLibrary:
     def stub_kernel(
         self,
         stub    : ContextualStub,
-        c_rho   : torch.Tensor,
-        c_theta : torch.Tensor,
-        c_sigma : torch.Tensor,
+        c_rho   : torch.Tensor,    # (C,)
+        c_theta : torch.Tensor,    # (C,)
+        c_sigma : torch.Tensor,    # (C,)
         kernels : "ThebaultKernels",
-        geo     : Optional["ThebaultTokenGeometry"] = None,
-        cands   : Optional[List[str]] = None,
     ) -> torch.Tensor:
         """
-        Score every candidate token against the active stub.
+        K_stub(c, s) = exp(-λ·(ρ_c−ρ_s)²) · ½(1+cos(θ_c−θ_s)) · exp(-γ·(σ_c−σ_s)²)
 
-        Uses the same (lf_norm, k_hat, sigma) space as best_stub when
-        geo+cands are provided, so the tokens most geometrically similar
-        to the selected stub receive the highest generation bonus.
-
-          score_c = exp(-al*(lf_c - stub.rho  )^2)
-                  * exp(-ak*(k_c  - stub.theta)^2)
-                  * exp(-as*(sig_c- stub.sigma )^2)
+        Returns (C,) tensor of stub-kernel scores for all candidates.
         """
-        C = c_rho.shape[0]
-
-        if geo is not None and cands is not None:
-            al  = 5.0
-            ak  = 5.0
-            as_ = 3.0
-            # Batch compute stub_coords for all candidates
-            coords = [geo.stub_coords(c) for c in cands]
-            lf_vals = torch.tensor([co[0] for co in coords], dtype=self.dtype, device=self.device)
-            k_vals  = torch.tensor([co[1] for co in coords], dtype=self.dtype, device=self.device)
-            s_vals  = torch.tensor([co[2] for co in coords], dtype=self.dtype, device=self.device)
-            return (
-                torch.exp(-al  * (lf_vals - stub.rho)   ** 2)
-              * torch.exp(-ak  * (k_vals  - stub.theta)  ** 2)
-              * torch.exp(-as_ * (s_vals  - stub.sigma)  ** 2)
-            )
-        else:
-            # Fallback: sigma only
-            return torch.exp(-kernels.gamma_side * (c_sigma - stub.sigma) ** 2)
+        k_r = torch.exp(-kernels.lambda_reg * (c_rho   - stub.rho)   ** 2)
+        k_o = 0.5 * (1.0 + torch.cos(c_theta - stub.theta))
+        k_s = torch.exp(-kernels.gamma_side * (c_sigma - stub.sigma) ** 2)
+        return k_r * k_o * k_s
 
 
 class CoTReasoningEngine:
@@ -905,16 +831,21 @@ class CoTReasoningEngine:
           e) Score stored in each CoTStep uses the same relaxed widths so
              the printed scores reflect genuine geometric proximity.
         """
-        # Step a: seed centroid in (lf_norm, k_hat, sigma) space
+        lam = 1.5   # relaxed, matching best_stub
+        gam = 0.8
+
+        # Step a: seed centroid
         clean_seeds = [t for t in seed_tokens
                        if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
         if clean_seeds:
-            coords    = [geo.stub_coords(t) for t in clean_seeds]
-            ctx_rho   = sum(c[0] for c in coords) / len(coords)   # lf_norm mean
-            ctx_theta = sum(c[1] for c in coords) / len(coords)   # k_hat mean
-            ctx_sigma = sum(c[2] for c in coords) / len(coords)   # sigma mean
+            triples   = [geo.triple(t) for t in clean_seeds]
+            ctx_rho   = sum(tr.rho   for tr in triples) / len(triples)
+            ctx_sigma = sum(tr.sigma for tr in triples) / len(triples)
+            sin_m     = sum(math.sin(tr.theta) for tr in triples) / len(triples)
+            cos_m     = sum(math.cos(tr.theta) for tr in triples) / len(triples)
+            ctx_theta = math.atan2(sin_m, cos_m) % math.pi
         else:
-            ctx_rho, ctx_theta, ctx_sigma = 0.5, 0.5, 0.3
+            ctx_rho, ctx_theta, ctx_sigma = 0.5, math.pi / 4, 0.5
 
         self._chain           = []
         self._conclusion_stub = None
@@ -936,12 +867,11 @@ class CoTReasoningEngine:
             if stub is None:
                 continue
 
-            # Score in (lf_norm, k_hat, sigma) space matching best_stub
-            score = (
-                math.exp(-5.0 * (stub.rho   - ctx_rho)   ** 2)
-              * math.exp(-5.0 * (stub.theta - ctx_theta)  ** 2)
-              * math.exp(-3.0 * (stub.sigma - ctx_sigma)  ** 2)
-            )
+            # Score with relaxed widths (same as best_stub uses)
+            k_r   = math.exp(-lam * (stub.rho   - ctx_rho)   ** 2)
+            k_o   = 0.5 * (1.0 + math.cos(stub.theta - ctx_theta))
+            k_s   = math.exp(-gam * (stub.sigma - ctx_sigma) ** 2)
+            score = k_r * k_o * k_s
 
             step = CoTStep(
                 hop_index  = hop_idx,
@@ -952,7 +882,6 @@ class CoTReasoningEngine:
             self._chain.append(step)
 
             # Next hop context = this stub's centroid (chain propagation)
-            # stub.rho = lf_norm, stub.theta = k_hat, stub.sigma = sigma
             ctx_rho, ctx_theta, ctx_sigma = stub.rho, stub.theta, stub.sigma
 
         # Step d: conclusion stub from end of chain geometry
@@ -982,16 +911,17 @@ class CoTReasoningEngine:
         c_rho  : torch.Tensor,
         c_theta: torch.Tensor,
         c_sigma: torch.Tensor,
-        token_position : int,
-        total_tokens   : int,
-        geo            : Optional["ThebaultTokenGeometry"] = None,
-        cands          : Optional[List[str]] = None,
+        token_position: int,
+        total_tokens  : int,
     ) -> torch.Tensor:
         """
         Return the (C,) stub logit bonus for the current generation step.
 
-        Passes geo+cands to stub_kernel so it can score in (f_hat, sigma)
-        space rather than the degenerate Thebault-rho space.
+        Logic:
+          - During first (n_hops-1) * tokens_per_hop tokens, apply the
+            bonus from the current hop's stub.
+          - During the final tokens_per_hop tokens, apply the conclusion stub.
+          - Advance to the next hop every tokens_per_hop tokens.
         """
         C = c_rho.shape[0]
 
@@ -1010,10 +940,7 @@ class CoTReasoningEngine:
         else:
             return torch.zeros(C, dtype=self.dtype, device=self.device)
 
-        raw = self.stubs.stub_kernel(
-            active_stub, c_rho, c_theta, c_sigma, self.kernels,
-            geo=geo, cands=cands,
-        )
+        raw = self.stubs.stub_kernel(active_stub, c_rho, c_theta, c_sigma, self.kernels)
 
         # Normalise
         std = raw.std()
@@ -1534,8 +1461,6 @@ class ThebaultWalker:
             c_rho, c_theta, c_sigma,
             token_position = self._tok_pos,
             total_tokens   = self._total_tokens,
-            geo            = self.geo,
-            cands          = cands,
         )
         # ─────────────────────────────────────────────────────────────────
 
