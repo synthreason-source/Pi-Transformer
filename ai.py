@@ -1358,6 +1358,56 @@ class synthetic_reasonMandateProcessor:
 # SECTION 11 — THÉBAULT WALKER V17-CUDA  (+ PDN + CoT)
 # ════════════════════════════════════════════════════════════════════════════
 
+
+class LocaleTransitRemission:
+    """
+    Semi-Intentful Remission of Manipulation in Locale Transit
+    for Dual Entity Piecewise Linear Inference Errors in Minimalistic Reality Frameworks.
+    """
+    def __init__(self, transit_tolerance: float = 0.15, remission_rate: float = 0.85):
+        self.transit_tolerance = transit_tolerance
+        self.remission_rate = remission_rate
+
+    def apply_remission(self, w1_rho: torch.Tensor, w2_rho: torch.Tensor, c_rho: torch.Tensor) -> torch.Tensor:
+        transit_delta = torch.abs((w1_rho + w2_rho) / 2.0 - c_rho)
+        linear_error = F.relu(transit_delta - self.transit_tolerance)
+        manipulation_mask = (linear_error > 0).float()
+        remission_penalty = torch.exp(-self.remission_rate * linear_error)
+        return torch.where(manipulation_mask == 1.0, remission_penalty, torch.ones_like(c_rho))
+
+
+class ContingentExtringentProbability:
+    """
+    Contingent Probability with Extringent Data:
+    The intermediate probability distribution from step t governs the values at step t+1.
+    We extract the probability landscape (e.g., Shannon entropy and max probability) 
+    as 'extringent data' to dynamically govern the geometric logit manifold of the next step.
+    """
+    def __init__(self, coupling_factor: float = 0.5):
+        self.coupling_factor = coupling_factor
+        # Initial extringent state
+        self.intermediate_entropy = 1.0
+        self.intermediate_max_prob = 1.0
+
+    def govern_next_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        # 1. Use the PREVIOUS intermediate probs (extringent data) to govern CURRENT logits
+        # If previous step was uncertain (high entropy), we cool the temperature to force convergence.
+        # If previous step was certain, we warm the temperature to allow geometric exploration.
+        dynamic_temp = 1.0 + (self.coupling_factor * (1.0 - self.intermediate_max_prob))
+
+        # Apply extringent governance to the logits
+        governed_logits = logits / dynamic_temp
+
+        # 2. Extract CURRENT intermediate probs to act as extringent data for the NEXT step
+        current_probs = F.softmax(governed_logits, dim=-1)
+        entropy = -torch.sum(current_probs * torch.log(current_probs + 1e-9), dim=-1)
+
+        # Store state for step t+1
+        self.intermediate_entropy = entropy.mean().item()
+        self.intermediate_max_prob = current_probs.max().item()
+
+        return governed_logits
+
 class ThebaultWalker:
     def __init__(
         self,
@@ -1511,6 +1561,10 @@ class ThebaultWalker:
             + punct_penalty
         ) / max(temp, 1e-6)
 
+        # --- Contingent Prob Extringent Data ---
+        # Intermediate probs govern the value of the next prob
+        logits = self.contingent_prob.govern_next_probs(logits)
+        # ---------------------------------------
         return cands, F.softmax(logits, dim=-1)
 
     def push_token(self, token: str, sentence_len: int) -> None:
@@ -1832,7 +1886,7 @@ def launch_gui():
             with gr.Row():
                 sentences = gr.Slider(1, 10, value=4, step=1, label="Sentences")
                 tokens    = gr.Slider(20, 180, value=80, step=1, label="Tokens per sentence")
-            seed_input = gr.Textbox(label="Seed Text (Optional)", placeholder="e.g. quantum entanglement")
+            seed_input = gr.Textbox(label="Seed Text (Optional)", value="What is the meaning of life?", placeholder="e.g. quantum entanglement")
             gen_btn    = gr.Button("Generate", variant="primary")
             gen_out    = gr.Textbox(lines=12, label="Generated Text")
             cot_out    = gr.Textbox(lines=16, label="Chain-of-Thought Reasoning Trace", interactive=False)
