@@ -78,9 +78,11 @@ GENERATION TRACE
 OTHER CHANGES VS V17-COT
   - walk_probs() now accepts and_weight parameter (α)
   - generate_passage() accepts instruction_text parameter (separate from seed)
+  - generate_passage() accepts temperature parameter for sampling sharpness
   - InstructionDistribution class replaces the simple seed tokenization
   - TokenStepTrace dataclass records per-step AND metadata
   - GUI has a dedicated "Instruction" textbox separate from "Seed Text"
+  - GUI has a Temperature slider (0.1–3.0, default 1.4)
   - All existing V17 + PDN + CoT mathematics preserved exactly
 
 ===============================================================================
@@ -419,7 +421,7 @@ class PDNEngine:
         return "\n".join(lines)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2c — COT ENGINE + STUBS  (unchanged from V17)
+# SECTION 2c — COT ENGINE + STUBS
 # ════════════════════════════════════════════════════════════════════════════
 
 STUB_PREMISE     = "PREMISE"
@@ -480,7 +482,7 @@ class CoTTrace:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2d — INSTRUCTION DISTRIBUTION  (NEW)
+# SECTION 2d — INSTRUCTION DISTRIBUTION
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -532,10 +534,10 @@ class InstructionDistribution:
         lm           : "ThebaultCompositionLM",
         device       : torch.device = DEVICE,
         dtype        : torch.dtype  = torch.float32,
-        semantic_radius : float = 2.0,   # lambda for geometric expansion kernel
-        recency_decay   : float = 0.7,   # per-position decay from end of instruction
-        context_bonus   : float = 0.15,  # weight for context-coherence component
-        centroid_weight : float = 0.4,   # weight for centroid kernel component
+        semantic_radius : float = 2.0,
+        recency_decay   : float = 0.7,
+        context_bonus   : float = 0.15,
+        centroid_weight : float = 0.4,
     ):
         self.geo              = geo
         self.kernels          = kernels
@@ -547,19 +549,12 @@ class InstructionDistribution:
         self.context_bonus    = context_bonus
         self.centroid_weight  = centroid_weight
 
-        # Per-instruction state (set by set_instruction())
         self._instr_toks    : List[str]          = []
         self._instr_freq    : Dict[str, float]   = {}
         self._instr_centroid: Optional[ThebaultTriple] = None
-        self._base_dist_t   : Optional[torch.Tensor]   = None   # (V,) pre-computed part
+        self._base_dist_t   : Optional[torch.Tensor]   = None
 
     def set_instruction(self, instruction_text: str) -> None:
-        """
-        Parse the instruction text and pre-compute the static components
-        of the instruction distribution over the LM vocabulary.
-
-        Called once per generation run (or when the instruction changes).
-        """
         raw = tokenize(instruction_text)
         self._instr_toks = [t for t in raw
                             if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
@@ -569,7 +564,6 @@ class InstructionDistribution:
             self._instr_centroid = None
             return
 
-        # ── Component 1: unigram with recency decay ──────────────────────
         freq: Dict[str, float] = {}
         N = len(self._instr_toks)
         for pos, tok in enumerate(self._instr_toks):
@@ -577,7 +571,6 @@ class InstructionDistribution:
             freq[tok] = freq.get(tok, 0.0) + decay
         self._instr_freq = freq
 
-        # ── Instruction centroid (circular mean of triples) ───────────────
         triples = [self.geo.triple(t) for t in self._instr_toks]
         rho_m   = sum(t.rho   for t in triples) / len(triples)
         sigma_m = sum(t.sigma for t in triples) / len(triples)
@@ -586,18 +579,14 @@ class InstructionDistribution:
         theta_m = math.atan2(sin_m, cos_m) % math.pi
         self._instr_centroid = ThebaultTriple(rho_m, theta_m, sigma_m)
 
-        # ── Pre-compute static base distribution over full vocab ──────────
         V = len(self.lm.vocab)
         base = torch.zeros(V, dtype=self.dtype, device=self.device)
 
-        # Component 1 contribution: direct unigram matches
         for tok, w in freq.items():
             idx = self.lm._tok2idx.get(tok)
             if idx is not None:
                 base[idx] += w
 
-        # Component 2: semantic expansion — each instruction token donates
-        # weight to geometrically nearby vocab tokens
         if self.geo._rho_t is not None:
             for tok, w in freq.items():
                 tr  = self.geo.triple(tok)
@@ -606,7 +595,6 @@ class InstructionDistribution:
                 k_s = torch.exp(-self.semantic_radius * (self.geo._sigma_t - tr.sigma) ** 2)
                 base += w * k_r * k_o * k_s
 
-        # Component 5: centroid kernel — smooth manifold attractor
         if self._instr_centroid and self.geo._rho_t is not None:
             c = self._instr_centroid
             k_r = torch.exp(-self.kernels.lambda_reg * (self.geo._rho_t   - c.rho)   ** 2)
@@ -614,7 +602,6 @@ class InstructionDistribution:
             k_s = torch.exp(-self.kernels.gamma_side * (self.geo._sigma_t - c.sigma) ** 2)
             base += self.centroid_weight * k_r * k_o * k_s
 
-        # Normalise to a proper probability distribution
         total = base.sum()
         if total.item() > 1e-8:
             base = base / total
@@ -632,41 +619,22 @@ class InstructionDistribution:
         gen_tokens   : List[str],
         lm_tok2idx   : Dict[str, int],
     ) -> torch.Tensor:
-        """
-        Return P_instr over `cands` (the same candidate list used by walk_probs).
-
-        Adds the dynamic context-coherence component on top of the static base.
-
-        Parameters
-        ----------
-        cands      : candidate tokens from LM next_dist()
-        gen_tokens : tokens generated so far in the current sentence
-        lm_tok2idx : mapping token → vocab index
-
-        Returns
-        -------
-        (C,) probability tensor, normalised
-        """
         C = len(cands)
         if C == 0 or self._base_dist_t is None:
             return torch.ones(C, dtype=self.dtype, device=self.device) / max(C, 1)
 
-        # Extract base probs for candidates
         cand_idx   = torch.tensor(
             [lm_tok2idx.get(c, 0) for c in cands],
             dtype=torch.long, device=self.device,
         )
-        base_probs = self._base_dist_t[cand_idx]   # (C,)
+        base_probs = self._base_dist_t[cand_idx]
 
-        # Component 4: context coherence — reward cands that appeared in instruction
         instr_set   = set(self._instr_toks)
         ctx_bonus_v = torch.tensor(
             [self.context_bonus if c in instr_set else 0.0 for c in cands],
             dtype=self.dtype, device=self.device,
         )
 
-        # Component 3: bigram forward — look up (last_instr_tok, last_gen_tok)
-        # as a bigram head and give extra weight to its followers
         bigram_bonus = torch.zeros(C, dtype=self.dtype, device=self.device)
         if self._instr_toks and gen_tokens:
             w1, w2 = self._instr_toks[-1], gen_tokens[-1]
@@ -682,7 +650,7 @@ class InstructionDistribution:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2e — COT STUB LIBRARY  (unchanged)
+# SECTION 2e — COT STUB LIBRARY
 # ════════════════════════════════════════════════════════════════════════════
 
 class CoTStubLibrary:
@@ -1307,7 +1275,7 @@ class ThebaultWalker:
         mrv_filter, chunk_engine, iso_stacker,
         pdn_engine       : PDNEngine,
         cot_engine       : CoTReasoningEngine,
-        instr_dist       : InstructionDistribution,       # ← NEW
+        instr_dist       : InstructionDistribution,
         device           : torch.device = DEVICE,
     ):
         self.geo          = geo
@@ -1321,13 +1289,13 @@ class ThebaultWalker:
         self.iso_stacker  = iso_stacker
         self.pdn          = pdn_engine
         self.cot          = cot_engine
-        self.instr_dist   = instr_dist                    # ← NEW
+        self.instr_dist   = instr_dist
         self.device       = device
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
         self._cur_sent_toks : List[str] = []
         self._cur_orbit     : int       = 0
         self._tok_pos       : int       = 0
-        self._step_traces   : List[TokenStepTrace] = []   # ← NEW
+        self._step_traces   : List[TokenStepTrace] = []
         self.remission      = LocaleTransitRemission()
         self.contingent_prob = ContingentExtringentProbability()
 
@@ -1355,7 +1323,7 @@ class ThebaultWalker:
         xiecho        : float = 0.6,
         pdn_weight    : float = 0.8,
         cot_weight    : float = 1.0,
-        and_weight    : float = 0.5,          # ← NEW: α for AND combination
+        and_weight    : float = 0.5,
     ) -> Tuple[List[str], torch.Tensor]:
         """
         Generate the next-token distribution with AND instruction integration.
@@ -1457,14 +1425,10 @@ class ThebaultWalker:
 
         # ── AND COMBINATION ──────────────────────────────────────────────
         # log P_and(t) = α·log P_instr(t) + (1−α)·log P_walk(t)
-        # where P_walk = softmax(walker_logits)  [already temperature-scaled]
-        #       P_instr = instruction distribution over same candidates
         if and_weight > 0.0 and self.instr_dist._base_dist_t is not None:
             p_instr   = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
             log_instr = torch.log(p_instr.clamp(min=1e-12))
-            # Walker log-probs (normalised)
             log_walk  = F.log_softmax(walker_logits, dim=-1)
-            # Geometric mean in log-space
             log_and   = and_weight * log_instr + (1.0 - and_weight) * log_walk
             final_probs = F.softmax(log_and, dim=-1)
         else:
@@ -1472,7 +1436,6 @@ class ThebaultWalker:
             log_instr   = torch.log(p_instr.clamp(min=1e-12))
             final_probs = F.softmax(walker_logits, dim=-1)
 
-        # ── Record step trace (stored, returned after sampling) ──────────
         self._pending_instr_probs = p_instr
         self._pending_walk_logits = walker_logits
 
@@ -1480,10 +1443,6 @@ class ThebaultWalker:
 
     def record_step_trace(self, step: int, chosen: str, cands: List[str],
                           final_probs: torch.Tensor, and_weight: float) -> TokenStepTrace:
-        """
-        Build a TokenStepTrace for the chosen token after sampling.
-        Must be called immediately after walk_probs() + sampling.
-        """
         try:
             idx   = cands.index(chosen)
             p_and = final_probs[idx].item()
@@ -1526,7 +1485,7 @@ class ThebaultWalker:
         return "\n".join(lines)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — TEXT GENERATION ENGINE  (AND-aware)
+# SECTION 12 — TEXT GENERATION ENGINE  (AND-aware, temperature-aware)
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_passage(
@@ -1535,17 +1494,27 @@ def generate_passage(
     num_sentences   : int   = 4,
     tokens_per_sent : int   = 40,
     seed_text       : str   = "",
-    instruction_text: str   = "",          # ← NEW: separate instruction for AND
-    and_weight      : float = 0.5,         # ← NEW: α for AND combination
+    instruction_text: str   = "",          # separate instruction for AND
+    and_weight      : float = 0.5,         # α for AND combination
+    temperature     : float = 1.4,         # sampling temperature (0.1=sharp, 3.0=flat)
     return_traces   : bool  = False,
 ) -> str | Tuple[str, List[CoTTrace], str]:
     """
     Generate a multi-sentence passage with AND-instruction integration.
 
+    Parameters
+    ----------
+    temperature : float
+        Controls the sharpness of the walker's token distribution before
+        AND-combining with P_instr.
+        - Low  (0.1–0.8) → sharp / deterministic / repetitive
+        - Mid  (1.0–1.6) → default balanced range
+        - High (2.0–3.0) → flat / exploratory / random
+
     Each sentence:
-      1. Plans the CoT chain (as before).
+      1. Plans the CoT chain.
       2. At every token step, AND-combines the instruction distribution
-         with the walker's geometric distribution.
+         with the walker's geometric distribution (at the given temperature).
       3. Records a TokenStepTrace for each token.
 
     Returns
@@ -1553,7 +1522,6 @@ def generate_passage(
     If return_traces=False: generated text string
     If return_traces=True:  (text, cot_traces, step_trace_report)
     """
-    # Set instruction distribution
     if instruction_text.strip():
         walker.instr_dist.set_instruction(instruction_text)
     elif seed_text.strip():
@@ -1567,7 +1535,6 @@ def generate_passage(
     if not head_list:
         return ("", [], "") if return_traces else ""
 
-    # Resolve seed bigram
     seed_w1, seed_w2 = None, None
     seed_toks = []
     if seed_text:
@@ -1602,14 +1569,15 @@ def generate_passage(
 
         for step in range(tokens_per_sent):
             cands, probs = walker.walk_probs(
-                w1, w2, and_weight=and_weight
+                w1, w2,
+                temp       = temperature,
+                and_weight = and_weight,
             )
             if not cands:
                 break
 
             nxt = cands[torch.multinomial(probs, 1).item()]
 
-            # Record AND step trace
             walker.record_step_trace(global_step, nxt, cands, probs, and_weight)
             global_step += 1
 
@@ -1640,7 +1608,7 @@ def generate_passage(
     return result
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — V17 ENGINE  (AND edition)
+# SECTION 13 — V17 ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
 class V17Engine:
@@ -1657,7 +1625,7 @@ class V17Engine:
         self.iso_stacker = IsomorphicSyntaxStacker(device=self.device)
         self.pdn         = PDNEngine(device=self.device)
         self.stub_lib    = CoTStubLibrary(n_theta_bins=8, device=self.device)
-        self.instr_dist  = None    # built after training, needs geo+kernels+lm
+        self.instr_dist  = None
         self.cot         = None
         self.walker      = None
         self.corpus_snippet = ""
@@ -1704,7 +1672,6 @@ class V17Engine:
             device         = self.device,
         )
 
-        # ── Instruction distribution (new) ────────────────────────────────
         print("[*] Building Instruction Distribution module...")
         self.instr_dist = InstructionDistribution(
             geo     = self.geo,
@@ -1794,7 +1761,7 @@ class V17Engine:
         print("[+] Load successful.")
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — GRADIO GUI  (AND Instruction panel)
+# SECTION 14 — GRADIO GUI  (AND Instruction panel + Temperature slider)
 # ════════════════════════════════════════════════════════════════════════════
 
 class V17GUI:
@@ -1822,7 +1789,7 @@ class V17GUI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight):
+    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight, temperature):
         if not self.engine or not self.engine.walker:
             return "Engine not initialised.", "", ""
         text, traces, step_report = generate_passage(
@@ -1833,6 +1800,7 @@ class V17GUI:
             seed_text        = seed_text.strip(),
             instruction_text = instruction_text.strip(),
             and_weight       = float(and_weight),
+            temperature      = float(temperature),
             return_traces    = True,
         )
         trace_text = "\n".join(tr.render() for tr in traces)
@@ -1868,13 +1836,16 @@ def launch_gui():
             gr.Markdown(
                 "### Text Generation with AND Instruction Distribution\n"
                 "The **Instruction** text builds a persistent P_instr distribution that is "
-                "AND-combined with the walker's geometric P_walk at every token step.\n"
-                "**AND weight α=1** → pure instruction; **α=0** → pure walker geometry; **α=0.5** → balanced."
+                "AND-combined with the walker's geometric P_walk at every token step.\n\n"
+                "**AND weight α=1** → pure instruction · **α=0** → pure walker geometry · **α=0.5** → balanced\n\n"
+                "**Temperature** controls distribution sharpness: low (0.1–0.8) = deterministic, "
+                "mid (1.0–1.6) = balanced, high (2.0–3.0) = exploratory/random."
             )
             with gr.Row():
-                sentences  = gr.Slider(1, 10, value=4, step=1,   label="Sentences")
-                tokens     = gr.Slider(20, 180, value=80, step=1, label="Tokens per sentence")
-                and_weight = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
+                sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
+                tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens per sentence")
+                and_weight  = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 3.0, value=1.4, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution source)",
@@ -1891,12 +1862,12 @@ def launch_gui():
             gen_out   = gr.Textbox(lines=10, label="Generated Text")
 
             with gr.Row():
-                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",   interactive=False)
+                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
                 step_out = gr.Textbox(lines=12, label="AND Step Trace (per token)", interactive=False)
 
             gen_btn.click(
                 gui.generate_text,
-                inputs  = [sentences, tokens, seed_input, instruction_input, and_weight],
+                inputs  = [sentences, tokens, seed_input, instruction_input, and_weight, temperature],
                 outputs = [gen_out, cot_out, step_out],
             )
 
@@ -1916,9 +1887,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--gui",         action="store_true")
     parser.add_argument("--corpus",      type=str)
-    parser.add_argument("--instruction", type=str, default="")
+    parser.add_argument("--instruction", type=str,  default="")
     parser.add_argument("--and-weight",  type=float, default=0.5)
-    parser.add_argument("--save",        type=str, default="v17_model.pkl")
+    parser.add_argument("--temperature", type=float, default=1.4,
+                        help="Sampling temperature (0.1=sharp, 3.0=flat, default=1.4)")
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -1933,9 +1905,9 @@ if __name__ == "__main__":
 
     engine = V17Engine()
     engine.train(corpus_text)
-    engine.save_cache(args.save)
+    engine.save_cache(args.save if hasattr(args, 'save') else "v17_model.pkl")
 
-    print("\n--- SAMPLE GENERATION (AND instruction distribution) ---")
+    print("\n--- SAMPLE GENERATION (AND instruction distribution + temperature) ---")
     instruction = args.instruction or "Explain the meaning of life."
     text, traces, step_report = generate_passage(
         engine.walker, engine.lm,
@@ -1943,6 +1915,7 @@ if __name__ == "__main__":
         tokens_per_sent  = 30,
         instruction_text = instruction,
         and_weight       = args.and_weight,
+        temperature      = args.temperature,
         return_traces    = True,
     )
     print(text)
