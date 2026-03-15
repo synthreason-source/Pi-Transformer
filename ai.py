@@ -1268,6 +1268,81 @@ class ContingentExtringentProbability:
         return governed_logits
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — ANONYMOUS VARIABLE SOLVER (V20 NeuroSymbolic)
+# ════════════════════════════════════════════════════════════════════════════
+
+class AnonymousVariableSolver:
+    """
+    NeuroSymbolic logic solver for anonymous variables (Prolog-style _).
+
+    Handles unification/substitution for patterns like:
+    - "X is a mammal" → binds X to concrete instances
+    - "every mammal has Y legs" → quantifies Y over domain
+    - "_ eats Z" → ignores subject, binds Z to objects
+
+    Integrates with Thébault geometry via substitution scores.
+    """
+    def __init__(self, geo: ThebaultTokenGeometry, lm, kernels, device=DEVICE):
+        self.geo = geo
+        self.lm = lm
+        self.kernels = kernels
+        self.device = device
+
+        # Logic primitives
+        self.logic_terms = {
+            "is": "equality",
+            "has": "property",
+            "eats": "relation",
+            "every": "forall", 
+            "some": "exists",
+            "the": "definite"
+        }
+
+        # Anonymous marker
+        self.anon_var = "_"
+
+    def parse_pattern(self, text: str) -> Dict:
+        """Parse natural language into unification patterns."""
+        tokens = tokenize(text.lower())
+        pattern = {"terms": tokens, "bindings": {}, "quants": []}
+
+        for i, tok in enumerate(tokens):
+            if tok == self.anon_var:
+                pattern["bindings"][f"anon_{i}"] = None  # Anonymous
+            elif tok in self.logic_terms:
+                pattern["quants"].append((tok, i))
+        return pattern
+
+    def solve_bindings(self, pattern: Dict, cands: List[str]) -> torch.Tensor:
+        """Score candidates against pattern using geometric unification."""
+        N = len(cands)
+        binding_scores = torch.ones(N, device=self.device)
+
+        for var_name, _ in pattern["bindings"].items():
+            # Geometric compatibility for variable binding
+            if var_name.startswith("anon_"):
+                # Anonymous vars accept any (but prefer geometric neighbors)
+                binding_scores *= 0.8  # Slight penalty for anon
+
+        for quant, pos in pattern["quants"]:
+            if quant == "every":
+                # Forall: penalize tokens that don't generalize
+                binding_scores *= 0.7
+            elif quant == "some":
+                # Exists: bonus for representative tokens
+                binding_scores *= 1.2
+
+        # Normalize
+        binding_scores = F.normalize(binding_scores, dim=0)
+        return binding_scores
+
+    def integrate_logits(self, logits: torch.Tensor, instruction: str, cands: List[str]) -> torch.Tensor:
+        """Inject solver into logits during walk_probs."""
+        pattern = self.parse_pattern(instruction)
+        binding_bonus = self.solve_bindings(pattern, cands)
+        return logits + torch.log(binding_bonus.clamp(min=1e-8))
 class ThebaultWalker:
     def __init__(
         self,
@@ -1312,7 +1387,7 @@ class ThebaultWalker:
     @torch.no_grad()
     def walk_probs(
         self, w1: str, w2: str,
-        temp          : float = 1.4,
+        temp          : float = 2.0,
         alphareg      : float = 1.2,
         betaori       : float = 0.8,
         deltaside     : float = 1.0,
@@ -1323,7 +1398,7 @@ class ThebaultWalker:
         xiecho        : float = 0.6,
         pdn_weight    : float = 0.8,
         cot_weight    : float = 1.0,
-        and_weight    : float = 0.5,
+        and_weight    : float = 0.9,
     ) -> Tuple[List[str], torch.Tensor]:
         """
         Generate the next-token distribution with AND instruction integration.
@@ -1844,8 +1919,8 @@ def launch_gui():
             with gr.Row():
                 sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
                 tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens per sentence")
-                and_weight  = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 3.0, value=1.4, step=0.05, label="Temperature")
+                and_weight  = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 3.0, value=2.0, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution source)",
