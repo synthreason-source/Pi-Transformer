@@ -1387,7 +1387,7 @@ class ThebaultWalker:
     @torch.no_grad()
     def walk_probs(
         self, w1: str, w2: str,
-        temp          : float = 2.0,
+        temp          : float = 1.4,
         alphareg      : float = 1.2,
         betaori       : float = 0.8,
         deltaside     : float = 1.0,
@@ -1398,7 +1398,7 @@ class ThebaultWalker:
         xiecho        : float = 0.6,
         pdn_weight    : float = 0.8,
         cot_weight    : float = 1.0,
-        and_weight    : float = 0.9,
+        and_weight    : float = 0.5,
     ) -> Tuple[List[str], torch.Tensor]:
         """
         Generate the next-token distribution with AND instruction integration.
@@ -1570,8 +1570,8 @@ def generate_passage(
     tokens_per_sent : int   = 40,
     seed_text       : str   = "",
     instruction_text: str   = "",          # separate instruction for AND
-    and_weight      : float = 0.5,         # α for AND combination
-    temperature     : float = 1.4,         # sampling temperature (0.1=sharp, 3.0=flat)
+    and_weight      : float = 0.9,         # α for AND combination
+    temperature     : float = 2.0,         # sampling temperature (0.1=sharp, 3.0=flat)
     return_traces   : bool  = False,
 ) -> str | Tuple[str, List[CoTTrace], str]:
     """
@@ -1920,7 +1920,7 @@ def launch_gui():
                 sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
                 tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens per sentence")
                 and_weight  = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 3.0, value=2.0, step=0.05, label="Temperature")
+                temperature = gr.Slider(0.1, 3.0, value=1.7, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution source)",
