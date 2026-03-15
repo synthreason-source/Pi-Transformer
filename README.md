@@ -1,1 +1,3 @@
-AI systems being "safe", you never know until you try. 
+AI systems being "safe", you never know until you try. btw all datasets i use are open source, or copyrighted works for experimental purposes only.
+
+i do not condone piracy except pillaging that tree habitat containing ancient koala language, for the books themselves, ruthless, much safer from a humble c.o.m.p.u.t.e.r... have fun trying to find that out....
