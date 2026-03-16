@@ -2179,70 +2179,112 @@ class V18GUI:
         return "\n".join(lines)
 
 
+def launch_gui():
+    gui = V18GUI()
 
-gui = V18GUI()
-
-with gr.Blocks(title="NeuroSymbolic V18 CUDA + DNN Arrays (No Sigmoid/Softmax)") as demo:
-    gr.Markdown(
-        "# NeuroSymbolic V18 CUDA — DNN Array Activation Edition\n"
-        "### Thébault Geometry · PDN Theorem · Chain-of-Thought · AND Distribution · "
-        "**No Sigmoid / No Softmax** — 3-Pass DNN Array Pipeline"
-    )
-
-    with gr.Tab("Train"):
-        file_input     = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
-        train_file_btn = gr.Button("Initialise from File", variant="primary")
-        init_out       = gr.Textbox(label="Engine Status / PDN Report", lines=22, interactive=False)
-        train_file_btn.click(gui.init_engine_from_file, inputs=[file_input], outputs=init_out)
-
-    with gr.Tab("Generate"):
+    with gr.Blocks(title="NeuroSymbolic V18 CUDA + DNN Arrays (No Sigmoid/Softmax)") as app:
         gr.Markdown(
-            "### Text Generation with DNN Array Pipeline\n"
-            "Softmax/sigmoid replaced throughout with geometry-conditioned DNN array passes.\n\n"
-            "**AND weight α=1** → pure instruction · **α=0** → pure walker · **α=0.5** → balanced\n\n"
-            "**Temperature** is now geometry-fused: `scaled_i = logits_i · exp(-λ·(rho_i - μ)²/T)`"
-        )
-        with gr.Row():
-            sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
-            tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens/sentence")
-            and_weight  = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="AND weight α")
-            temperature = gr.Slider(0.1, 3.0, value=1.7, step=0.05, label="Temperature")
-
-        instruction_input = gr.Textbox(
-            label       = "Instruction (AND distribution source)",
-            value       = "Explain the meaning of life and human consciousness.",
-            lines       = 2,
-            placeholder = "Enter instruction text…",
-        )
-        seed_input = gr.Textbox(
-            label       = "Seed Text (bigram start, optional)",
-            value       = "",
-            placeholder = "e.g. quantum entanglement",
-        )
-        gen_btn = gr.Button("Generate", variant="primary")
-        gen_out = gr.Textbox(lines=10, label="Generated Text")
-
-        with gr.Row():
-            cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
-            step_out = gr.Textbox(lines=12, label="AND Step Trace (per token)", interactive=False)
-
-        gen_btn.click(
-            gui.generate_text,
-            inputs  = [sentences, tokens, seed_input, instruction_input, and_weight, temperature],
-            outputs = [gen_out, cot_out, step_out],
+            "# NeuroSymbolic V18 CUDA — DNN Array Activation Edition\n"
+            "### Thébault Geometry · PDN Theorem · Chain-of-Thought · AND Distribution · "
+            "**No Sigmoid / No Softmax** — 3-Pass DNN Array Pipeline"
         )
 
-    with gr.Tab("Diagnostics"):
-        dnn_btn  = gr.Button("Show DNN Array Report (V18)")
-        dnn_out  = gr.Textbox(lines=20, label="DNN Activation Report", interactive=False)
-        dnn_btn.click(gui.dnn_report, outputs=dnn_out)
+        with gr.Tab("Train"):
+            file_input     = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
+            train_file_btn = gr.Button("Initialise from File", variant="primary")
+            init_out       = gr.Textbox(label="Engine Status / PDN Report", lines=22, interactive=False)
+            train_file_btn.click(gui.init_engine_from_file, inputs=[file_input], outputs=init_out)
 
-        pdn_btn  = gr.Button("Show PDN Bridge Report")
-        pdn_out  = gr.Textbox(lines=18, label="PDN Report", interactive=False)
-        pdn_btn.click(gui.pdn_report, outputs=pdn_out)
+        with gr.Tab("Generate"):
+            gr.Markdown(
+                "### Text Generation with DNN Array Pipeline\n"
+                "Softmax/sigmoid replaced throughout with geometry-conditioned DNN array passes.\n\n"
+                "**AND weight α=1** → pure instruction · **α=0** → pure walker · **α=0.5** → balanced\n\n"
+                "**Temperature** is now geometry-fused: `scaled_i = logits_i · exp(-λ·(rho_i - μ)²/T)`"
+            )
+            with gr.Row():
+                sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
+                tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens/sentence")
+                and_weight  = gr.Slider(0.0, 1.0, value=0.9, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 3.0, value=1.7, step=0.05, label="Temperature")
 
-        cot_hist_btn = gr.Button("Show Full CoT History")
-        cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History", interactive=False)
-        cot_hist_btn.click(gui.cot_history, outputs=cot_hist_out)
+            instruction_input = gr.Textbox(
+                label       = "Instruction (AND distribution source)",
+                value       = "Explain the meaning of life and human consciousness.",
+                lines       = 2,
+                placeholder = "Enter instruction text…",
+            )
+            seed_input = gr.Textbox(
+                label       = "Seed Text (bigram start, optional)",
+                value       = "",
+                placeholder = "e.g. quantum entanglement",
+            )
+            gen_btn = gr.Button("Generate", variant="primary")
+            gen_out = gr.Textbox(lines=10, label="Generated Text")
 
-demo.launch()
+            with gr.Row():
+                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
+                step_out = gr.Textbox(lines=12, label="AND Step Trace (per token)", interactive=False)
+
+            gen_btn.click(
+                gui.generate_text,
+                inputs  = [sentences, tokens, seed_input, instruction_input, and_weight, temperature],
+                outputs = [gen_out, cot_out, step_out],
+            )
+
+        with gr.Tab("Diagnostics"):
+            dnn_btn  = gr.Button("Show DNN Array Report (V18)")
+            dnn_out  = gr.Textbox(lines=20, label="DNN Activation Report", interactive=False)
+            dnn_btn.click(gui.dnn_report, outputs=dnn_out)
+
+            pdn_btn  = gr.Button("Show PDN Bridge Report")
+            pdn_out  = gr.Textbox(lines=18, label="PDN Report", interactive=False)
+            pdn_btn.click(gui.pdn_report, outputs=pdn_out)
+
+            cot_hist_btn = gr.Button("Show Full CoT History")
+            cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History", interactive=False)
+            cot_hist_btn.click(gui.cot_history, outputs=cot_hist_out)
+
+    app.launch()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gui",         action="store_true")
+    parser.add_argument("--corpus",      type=str)
+    parser.add_argument("--instruction", type=str,  default="")
+    parser.add_argument("--and-weight",  type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=1.4)
+    args = parser.parse_args()
+
+    if args.gui or not args.corpus:
+        launch_gui()
+        exit(0)
+
+    try:
+        corpus_text = Path(args.corpus).read_text(encoding="utf-8")
+    except Exception as e:
+        print(f"[!] Failed to read {args.corpus}: {e}")
+        exit(1)
+
+    engine = V18Engine()
+    engine.train(corpus_text)
+    engine.save_cache("v18_model.pkl")
+
+    print("\n--- SAMPLE GENERATION (V18: DNN Array, no sigmoid/softmax) ---")
+    instruction = args.instruction or "Explain the meaning of life."
+    text, traces, step_report = generate_passage(
+        engine.walker, engine.lm,
+        num_sentences    = 3,
+        tokens_per_sent  = 30,
+        instruction_text = instruction,
+        and_weight       = args.and_weight,
+        temperature      = args.temperature,
+        return_traces    = True,
+    )
+    print(text)
+    print("\n--- COT TRACES ---")
+    for tr in traces:
+        print(tr.render())
+    print("\n--- AND STEP TRACE ---")
+    print(step_report)
