@@ -2283,7 +2283,7 @@ demo = gr.Blocks(title="NeuroSymbolic V18 CUDA + DNN Arrays")(
 )
 
 def launch_gui():
-    demo.launch(share=False, server_name="0.0.0.0")
+    demo.launch(share=False, server_name="127.0.0.1")
 
 # ===== MAIN ENTRYPOINT =====
 if __name__ == "__main__":
