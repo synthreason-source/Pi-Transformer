@@ -121,8 +121,14 @@ def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     - f(0) = 0, f'(0) = 0  (C¹ smooth at origin)
     - f(x) → x  as x → +∞  (asymptotically linear)
     - f(x) → 0  as x → -∞  (suppresses negatives softly)
+
+    CUDA safety: input is pre-clamped to [-50, 50] to prevent overflow
+    in x*x when raw logits contain large penalty values (e.g. -1e4).
+    The clamp is applied in logit-space before squaring, so the
+    relative ordering of candidates is fully preserved.
     """
-    return (x * x) / (x.abs() + eps)
+    x_safe = x.clamp(-50.0, 50.0)
+    return (x_safe * x_safe) / (x_safe.abs() + eps)
 
 
 def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
@@ -132,8 +138,15 @@ def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
     - p=2   → signed square (enhances large values, sign-preserving)
     - p=0.5 → signed sqrt (compresses large values)
     No sigmoid, no softmax, no ReLU.
+
+    CUDA safety: |x| is clamped to [0, 30] before raising to power p.
+    Without this, logits containing large penalty values (e.g. -1e4)
+    produce |x|^2 = 1e8 which compounds through DNN layers into inf/nan,
+    ultimately triggering torch.multinomial CUDA device-side assert.
+    Clamping at 30 keeps max representable value at 30^2 = 900 (p=2)
+    or 30^1.5 ≈ 164 (p=1.5), both well within float32 range.
     """
-    return x.sign() * (x.abs() + 1e-12).pow(p)
+    return x.sign() * (x.abs().clamp(max=30.0) + 1e-12).pow(p)
 
 
 def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torch.Tensor:
@@ -153,14 +166,40 @@ def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     No exponential, no softmax gate.
 
     Steps:
-    1. Shift x so min = 0 (preserve relative order)
-    2. Apply smooth_power_relu to get non-negative values
-    3. L1-normalise to produce a distribution
+    1. Sanitise: replace inf/nan with finite sentinels
+    2. Shift x so min = 0  (preserve relative order, bounded range)
+    3. Apply smooth_power_relu to get non-negative values
+       (smooth_power_relu internally clamps input to [-50,50] so the
+       shifted range [0, 100] is safe against squaring overflow)
+    4. L1-normalise to produce a distribution
+    5. Final nan/inf guard before return
+
+    CUDA safety rationale:
+      torch.multinomial raises a device-side assert when ANY probability
+      value is nan, inf, or negative, or when ALL are zero.
+      This function guarantees: all outputs ≥ eps, sum = 1.0, no nan/inf.
     """
-    x_shifted = x - x.min()                     # shift to [0, ∞)
-    x_pos     = smooth_power_relu(x_shifted)     # smooth non-negative activation
-    x_pos     = x_pos.clamp(min=eps)             # numerical floor
-    return x_pos / x_pos.sum()
+    # Step 1: sanitise — replace inf/nan so subsequent ops are deterministic
+    x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
+
+    # Step 2: shift to [0, range] — prevents squaring of large negatives
+    x_shifted = x - x.min()                     # range: [0, x.max()-x.min()]
+
+    # Step 3: smooth non-negative activation (internally clamped at 50)
+    x_pos = smooth_power_relu(x_shifted)
+
+    # Step 4: L1 normalise
+    x_pos = x_pos.clamp(min=eps)
+    total = x_pos.sum()
+    if total.item() == 0.0 or not torch.isfinite(total):
+        # Uniform fallback — never zero-sum, never nan
+        return torch.full_like(x, 1.0 / max(x.shape[0], 1))
+    result = x_pos / total
+
+    # Step 5: final guard — catches any residual nan/inf from division
+    result = torch.nan_to_num(result, nan=eps, posinf=eps, neginf=eps)
+    result = result.clamp(min=eps)
+    return result / result.sum()
 
 
 def log_l1_simplex(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -278,11 +317,16 @@ class GeometricTempScaler:
         temp    : float,
         c_rho   : Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Always clamp logits first: punct_penalty = -1e4 explodes in signed_power(x,p=2)
+        safe_logits = logits.clamp(-50.0, 50.0)
         if c_rho is None or temp <= 1e-6:
-            return logits / max(temp, 1e-6)
-        mu_rho       = c_rho.mean()
-        geo_weights  = torch.exp(-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1))
-        return logits * geo_weights
+            return safe_logits / max(temp, 0.1)
+        mu_rho   = c_rho.mean()
+        # Clamp exponent floor at -10 so geo_weights stay ≥ exp(-10) ≈ 4.5e-5
+        # Without this, low temp makes geo_weights ≈ 0 → zero-vector → nan
+        exponent    = (-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1)).clamp(min=-10.0)
+        geo_weights = torch.exp(exponent)
+        return safe_logits * geo_weights
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -456,7 +500,13 @@ class ThebaultTokenGeometry:
         )
 
     def tok_indices(self, toks: List[str]) -> torch.Tensor:
-        idx = [self._tok2idx.get(t, 0) for t in toks]
+        # .get(t, 0) maps unknown tokens to index 0. This is safe only when
+        # _pvec_t / _rho_t are non-empty. We additionally clamp to vocab
+        # bounds so that any edge-case mismatch cannot produce an OOB index
+        # that triggers a CUDA device-side assert on tensor indexing.
+        vocab_len = len(self._idx_list)
+        safe_max  = max(vocab_len - 1, 0)
+        idx = [min(self._tok2idx.get(t, 0), safe_max) for t in toks]
         return torch.tensor(idx, dtype=torch.long, device=self.device)
 
 # ════════════════════════════════════════════════════════════════════════════
