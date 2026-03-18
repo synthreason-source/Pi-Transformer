@@ -1,1 +1,0 @@
-A mega trainer is where an LLM code is labeled as per the content style it generates, prompts included, to create a dataset to train on, that spawns new AI code and uses it to generate niche, instruction following AGI content.
