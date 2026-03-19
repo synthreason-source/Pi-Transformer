@@ -2462,7 +2462,7 @@ def launch_gui():
             with gr.Row():
                 syn_w_slider   = gr.Slider(0.0, 2.0, value=0.4,  step=0.05, label="CSNS ω_syn (synaptic weight)")
                 trans_w_slider = gr.Slider(0.0, 2.0, value=1.8,  step=0.05, label="CSNS ω_trans (transitive weight)")
-                syn_k_slider   = gr.Slider(2,   32,  value=8,    step=1,    label="CSNS K (synaptic sparsity)")
+                syn_k_slider   = gr.Slider(2,   32,  value=31,    step=1,    label="CSNS K (synaptic sparsity)")
             train_file_btn = gr.Button("Initialise from File", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / PDN Report", lines=22, interactive=False)
             train_file_btn.click(
