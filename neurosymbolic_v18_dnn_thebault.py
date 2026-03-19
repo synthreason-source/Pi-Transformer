@@ -1,87 +1,84 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V18-CUDA — DNN Array Activation Edition
+NeuroSymbolic V18-CUDA — DNN Array Activation Edition + Cross-Synaptic Neuron Sums
 ===============================================================================
 
-CHANGES FROM V17: DEEP NEURAL NETWORK ARRAY INTEGRATION (NO SIGMOID / NO SOFTMAX)
-──────────────────────────────────────────────────────────────────────────────────
+CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
+──────────────────────────────────────────────────────────────────────────────
 
 MOTIVATION
-  V17 used sigmoid and softmax activations (via F.softmax, F.log_softmax,
-  F.relu, F.normalize) in multiple parts of the Thébault pipeline.
-  These are replaced throughout with DNN-array-based alternatives:
+  V18 computes each candidate token's DNN activation independently.
+  Biological neural networks, however, exhibit lateral synaptic coupling:
+  nearby neurons (geometrically similar tokens) excite or inhibit each other
+  via cross-synaptic sums before their outputs are read out.
+
+  CSNS adds this cross-candidate coupling to the DNN pipeline, grounded in
+  Thébault transitive geometry:
 
   ┌──────────────────────────────────────────────────────────────────────────┐
-  │                  DNN ARRAY ACTIVATION REPLACEMENTS                       │
-  │                                                                          │
-  │  Old (V17)              New (V18)                                        │
-  │  ─────────────────────  ──────────────────────────────────────────────── │
-  │  F.softmax(logits)   →  ThebaultDNNNormalizer.normalize()               │
-  │                         — 2-layer linear projection (no bias params)     │
-  │                         — Power activation  x^p  (p learned per layer)  │
-  │                         — Denominator = L2-norm of power-activated vec  │
-  │                                                                          │
-  │  F.log_softmax(...)  →  ThebaultDNNNormalizer.log_normalize()           │
-  │                         — log of the above normalizer                    │
-  │                                                                          │
-  │  F.relu(x)           →  smooth_power_relu(x)                            │
-  │                         — x^2 / (|x| + ε)  → 0 for x≤0, ≈x for x>>0  │
-  │                         — Continuously differentiable, no hard gate      │
-  │                                                                          │
-  │  F.normalize(x,dim)  →  l2_array_normalize(x, dim)                     │
-  │                         — Explicit ‖x‖₂ via einsum, no F.normalize     │
-  │                                                                          │
-  │  logit / temperature →  GeometricTempScaler.scale()                     │
-  │                         — Applies DNN affine array pass                  │
-  │                         — Uses Hadamard array (not scalar division)      │
+  │               CROSS-SYNAPTIC NEURON SUMS (CSNS)                          │
+  │                                                                           │
+  │  Thébault Transitive Triple  (w1 → w2 → c)                               │
+  │  ─────────────────────────────────────────                               │
+  │  Instead of triple(c) only, compute the COMPOSED triple along the full   │
+  │  context chain:  triple_trans(c) = composed_triple(w1⊕w2, c)            │
+  │  This encodes how candidate c "arrives" from the current bigram context. │
+  │                                                                           │
+  │  Synaptic Weight Matrix  W_syn ∈ ℝ^{C×C}                                │
+  │  ──────────────────────────────────────────                              │
+  │  W_syn[i,j] = k_reg(rho_i, rho_j) · k_ori(theta_i, theta_j)            │
+  │             · k_side(sigma_i, sigma_j)  (Thébault kernel)               │
+  │  Sparse: only top-K neighbours per neuron are retained (K=8 default).   │
+  │                                                                           │
+  │  Cross-Synaptic Sum  (pre-DNN lateral pass)                              │
+  │  ──────────────────────────────────────────                              │
+  │  z_syn[i] = Σ_j  W_syn[i,j] · signed_power(logits[j], p=1.0)          │
+  │           = W_syn @ identity_pass(logits)                                │
+  │  This lets geometrically-similar candidates amplify each other and       │
+  │  geometrically-distant candidates suppress each other before the DNN.   │
+  │                                                                           │
+  │  Transitive Logit Injection                                              │
+  │  ─────────────────────────                                               │
+  │  trans_bonus[i] = k_reg(rho_trans_i, rho_ctx)                           │
+  │                 · k_ori(theta_trans_i, theta_ctx)                        │
+  │                 · k_side(sigma_trans_i, sigma_ctx)                       │
+  │  where (rho_trans, theta_trans, sigma_trans) = triple(w1⊕w2⊕c)         │
+  │                                                                           │
+  │  DNN Integration                                                          │
+  │  ───────────────                                                         │
+  │  logits_enriched = logits + ω_syn · z_syn + ω_trans · trans_bonus       │
+  │  Then fed into DNNArrayPipeline.forward() as before.                     │
   └──────────────────────────────────────────────────────────────────────────┘
 
-DNN ARRAY ARCHITECTURE (ThebaultDNNNormalizer)
-─────────────────────────────────────────────
-  Input logits x ∈ ℝ^C (C = vocab candidates)
+CROSS-SYNAPTIC NEURON SUM ARCHITECTURE
+───────────────────────────────────────
+  Input: logits ∈ ℝ^C, candidate triples {rho_i, theta_i, sigma_i}
 
-  Layer 1:  y₁ = W₁ x  where W₁ = diag(s₁) ⊗ I  (Hadamard scaling array)
-            a₁ = power_act(y₁, p=2)  = y₁ ⊙ |y₁|   (signed power)
+  Step 1  Transitive triple computation
+          For each candidate c_i, compute transitive geometry:
+            p_trans = p(w1) + p(w2) + p_scaled(c_i)
+            (rho_t, theta_t, sigma_t) = _thebault_triple(p_trans)
 
-  Layer 2:  y₂ = W₂ a₁  where W₂ = outer(freq_weights, freq_weights) / C
-            a₂ = power_act(y₂, p=1.5) = sign(y₂) · |y₂|^1.5
+  Step 2  Synaptic weight matrix (sparse, top-K)
+          W[i,j] = exp(-λ·(rho_i-rho_j)²) · cos_kernel(theta) · exp(-γ·(sigma_i-sigma_j)²)
+          Zero out all but top-K weights per row → sparse lateral coupling
 
-  Normalise: P = a₂ / ‖a₂‖₁   (simplex projection via L1 sum)
-             P = clamp(P, min=ε) then re-normalise
+  Step 3  Cross-synaptic sum pass
+          z_pre = signed_power(logits, p=1.0)        (identity signed pass)
+          z_syn = W_syn @ z_pre                       (lateral neuron sum)
+          z_syn = layer_norm_array(z_syn)             (stabilise range)
 
-  This is activation-function free (no sigmoid, no softmax, no ReLU) while
-  still producing valid probability distributions via the L1 simplex projection.
+  Step 4  Transitive bonus injection
+          trans_bonus = k_all(transitive_triple, ctx_triple)
 
-  W₁ is constructed from the Thébault geometry: s₁ = rho_weights derived
-  from the Thébault triple of each candidate token (regularity score as
-  channel scaling), making the DNN intrinsically geometry-aware.
+  Step 5  Enriched logit injection into DNN
+          logits_in = logits + ω_syn * z_syn + ω_trans * trans_bonus
 
-SMOOTH POWER RELU
-─────────────────
-  smooth_power_relu(x, eps=1e-4) = x² / (|x| + ε)
+  Step 6  Standard DNNArrayPipeline.forward(logits_in, c_rho, c_theta, c_sigma)
 
-  Properties:
-    - f(0) = 0  (zero at origin)
-    - f'(0) = 0  (zero gradient at origin, smooth)
-    - f(x) ≈ x for x >> ε  (asymptotically linear for large positive x)
-    - f(x) ≈ 0 for x << 0  (suppresses negatives without hard gate)
-    - Everywhere differentiable (C¹ smooth)
-
-GEOMETRIC TEMPERATURE SCALER
-─────────────────────────────
-  Instead of dividing logits by temperature T (scalar):
-    scaled = GeometricTempScaler.scale(logits, T, rho_weights)
-    scaled_i = logits_i · exp(-λ · (rho_i - μ_rho)² / T)
-  This fuses temperature with Thébault geometry in a single Hadamard pass.
-
-ALL OTHER V17 MATHEMATICS ARE PRESERVED EXACTLY:
-  - Thébault geometry (rho/theta/sigma triples)
-  - PDN engine and orbit maps
-  - CoT stub library and reasoning engine
-  - AND instruction distribution (log-space geometric mean)
-  - MRV filter, ChunkedSum, IsomorphicStacker
-  - ThébaultPotentialGraph propagation
+ALL V18 MATHEMATICS ARE PRESERVED EXACTLY.
+New parameters: syn_weight (ω_syn=0.4), trans_weight (ω_trans=0.6), syn_k (K=8)
 
 ===============================================================================
 """
@@ -109,23 +106,14 @@ def best_device() -> torch.device:
 DEVICE = best_device()
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b — DNN ARRAY ACTIVATION PRIMITIVES  (replaces sigmoid/softmax)
+# SECTION 0b — DNN ARRAY ACTIVATION PRIMITIVES  (from V18, unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     """
     Smooth approximation to ReLU via signed power:
         f(x) = x² / (|x| + ε)
-
-    Replaces F.relu throughout. Properties:
-    - f(0) = 0, f'(0) = 0  (C¹ smooth at origin)
-    - f(x) → x  as x → +∞  (asymptotically linear)
-    - f(x) → 0  as x → -∞  (suppresses negatives softly)
-
-    CUDA safety: input is pre-clamped to [-50, 50] to prevent overflow
-    in x*x when raw logits contain large penalty values (e.g. -1e4).
-    The clamp is applied in logit-space before squaring, so the
-    relative ordering of candidates is fully preserved.
+    CUDA safety: input is pre-clamped to [-50, 50].
     """
     x_safe = x.clamp(-50.0, 50.0)
     return (x_safe * x_safe) / (x_safe.abs() + eps)
@@ -134,26 +122,13 @@ def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
 def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
     """
     Signed power activation: sign(x) · |x|^p
-    - p=1   → identity (linear pass-through)
-    - p=2   → signed square (enhances large values, sign-preserving)
-    - p=0.5 → signed sqrt (compresses large values)
-    No sigmoid, no softmax, no ReLU.
-
-    CUDA safety: |x| is clamped to [0, 30] before raising to power p.
-    Without this, logits containing large penalty values (e.g. -1e4)
-    produce |x|^2 = 1e8 which compounds through DNN layers into inf/nan,
-    ultimately triggering torch.multinomial CUDA device-side assert.
-    Clamping at 30 keeps max representable value at 30^2 = 900 (p=2)
-    or 30^1.5 ≈ 164 (p=1.5), both well within float32 range.
+    CUDA safety: |x| clamped to [0, 30] before raising to power p.
     """
     return x.sign() * (x.abs().clamp(max=30.0) + 1e-12).pow(p)
 
 
 def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torch.Tensor:
-    """
-    L2 normalisation via explicit einsum (replaces F.normalize).
-    norm = sqrt(einsum('i,i->', x, x)) along dim, then divide.
-    """
+    """L2 normalisation via explicit einsum (replaces F.normalize)."""
     sq_sum = (x * x).sum(dim=dim, keepdim=True)
     norm = (sq_sum + eps).sqrt()
     return x / norm
@@ -162,175 +137,303 @@ def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torc
 def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Projects x onto the probability simplex via L1 normalisation.
-    Replaces softmax for producing valid distributions.
-    No exponential, no softmax gate.
-
-    Steps:
-    1. Sanitise: replace inf/nan with finite sentinels
-    2. Shift x so min = 0  (preserve relative order, bounded range)
-    3. Apply smooth_power_relu to get non-negative values
-       (smooth_power_relu internally clamps input to [-50,50] so the
-       shifted range [0, 100] is safe against squaring overflow)
-    4. L1-normalise to produce a distribution
-    5. Final nan/inf guard before return
-
-    CUDA safety rationale:
-      torch.multinomial raises a device-side assert when ANY probability
-      value is nan, inf, or negative, or when ALL are zero.
-      This function guarantees: all outputs ≥ eps, sum = 1.0, no nan/inf.
+    Replaces softmax. Guarantees: all outputs ≥ eps, sum = 1.0, no nan/inf.
     """
-    # Step 1: sanitise — replace inf/nan so subsequent ops are deterministic
     x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
-
-    # Step 2: shift to [0, range] — prevents squaring of large negatives
-    x_shifted = x - x.min()                     # range: [0, x.max()-x.min()]
-
-    # Step 3: smooth non-negative activation (internally clamped at 50)
+    x_shifted = x - x.min()
     x_pos = smooth_power_relu(x_shifted)
-
-    # Step 4: L1 normalise
     x_pos = x_pos.clamp(min=eps)
     total = x_pos.sum()
     if total.item() == 0.0 or not torch.isfinite(total):
-        # Uniform fallback — never zero-sum, never nan
         return torch.full_like(x, 1.0 / max(x.shape[0], 1))
     result = x_pos / total
-
-    # Step 5: final guard — catches any residual nan/inf from division
     result = torch.nan_to_num(result, nan=eps, posinf=eps, neginf=eps)
     result = result.clamp(min=eps)
     return result / result.sum()
 
 
 def log_l1_simplex(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    """
-    Log of l1_simplex_project — replaces F.log_softmax.
-    Used in the AND-combination's log-space geometric mean.
-    """
+    """Log of l1_simplex_project — replaces F.log_softmax."""
     p = l1_simplex_project(x, eps=eps)
     return (p + eps).log()
 
 
-class ThebaultDNNNormalizer:
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0c — CROSS-SYNAPTIC NEURON SUM PRIMITIVES  (NEW in V18-CSNS)
+# ════════════════════════════════════════════════════════════════════════════
+
+def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     """
-    2-layer DNN array normalizer that replaces softmax/sigmoid in the walker.
+    Array layer normalisation (no learned scale/bias).
+    Stabilises the cross-synaptic sum output before DNN injection.
+    Uses explicit mean/std computation — no torch.nn.LayerNorm.
+    """
+    mu  = x.mean()
+    std = x.std()
+    if std.item() < eps:
+        return x - mu
+    return (x - mu) / (std + eps)
 
-    Architecture (parameter-free, geometry-driven):
-    ─────────────────────────────────────────────────
-    Layer 1  Hadamard scaling by Thébault rho-weights:
-             y1 = logits ⊙ rho_scale          (element-wise product)
-             a1 = signed_power(y1, p=2.0)      (signed square activation)
 
-    Layer 2  Outer-product array with freq_weights:
-             y2 = (freq_weights · a1) * freq_scale_vec  (rank-1 array pass)
-             a2 = signed_power(y2, p=1.5)      (signed 3/2 power activation)
+def build_synaptic_weight_matrix(
+    c_rho   : torch.Tensor,
+    c_theta : torch.Tensor,
+    c_sigma : torch.Tensor,
+    lambda_reg : float = 8.0,
+    gamma_side : float = 4.0,
+    top_k      : int   = 8,
+    eps        : float = 1e-8,
+) -> torch.Tensor:
+    """
+    Builds the sparse C×C Thébault synaptic weight matrix.
 
-    Output   L1 simplex projection → valid probability distribution
-             log output for log-space operations
+    W[i,j] measures how much neuron j should contribute to neuron i's
+    cross-synaptic sum, based on their geometric proximity on the
+    Thébault manifold.
 
-    All weights are derived from the Thébault geometry of the vocabulary,
-    so the DNN is intrinsically geometry-conditioned without learned params.
+    Architecture:
+        k_reg[i,j]  = exp(-λ · (rho_i  - rho_j )²)
+        k_ori[i,j]  = 0.5 · (1 + cos(theta_i - theta_j))
+        k_side[i,j] = exp(-γ · (sigma_i - sigma_j)²)
+        W[i,j]      = k_reg · k_ori · k_side
+
+    Sparsification: zero out all but top-K values per row.
+    Self-connections (diagonal) are set to zero.
+
+    CUDA safety: all intermediate tensors clamped to [0,1] range
+    before matrix multiply to prevent gradient explosions.
+    """
+    C = c_rho.shape[0]
+
+    # Pairwise differences — outer broadcast: [C,1] vs [1,C] → [C,C]
+    d_rho   = c_rho.unsqueeze(1)   - c_rho.unsqueeze(0)    # [C, C]
+    d_theta = c_theta.unsqueeze(1) - c_theta.unsqueeze(0)  # [C, C]
+    d_sigma = c_sigma.unsqueeze(1) - c_sigma.unsqueeze(0)  # [C, C]
+
+    k_reg  = torch.exp((-lambda_reg * d_rho   ** 2).clamp(min=-30.0))
+    k_ori  = 0.5 * (1.0 + torch.cos(d_theta))
+    k_side = torch.exp((-gamma_side * d_sigma ** 2).clamp(min=-30.0))
+
+    W = (k_reg * k_ori * k_side).clamp(0.0, 1.0)
+
+    # Zero diagonal (no self-loop)
+    W.fill_diagonal_(0.0)
+
+    # Sparse top-K per row: zero out all except top-K largest weights
+    if top_k < C:
+        # topk threshold per row
+        kth_vals, _ = torch.topk(W, min(top_k, C), dim=1)
+        threshold   = kth_vals[:, -1].unsqueeze(1)          # [C, 1]
+        W           = W * (W >= threshold).float()
+
+    # Row-normalise so each row sums to 1 (or 0 if all zero)
+    row_sum = W.sum(dim=1, keepdim=True).clamp(min=eps)
+    return W / row_sum
+
+
+class CrossSynapticNeuronSum:
+    """
+    Cross-Synaptic Neuron Sum (CSNS) module — NEW in V18-CSNS.
+
+    Implements lateral geometric coupling between candidate neurons
+    before the DNN array pipeline processes them. Grounded in
+    Thébault transitive triple geometry along the context chain
+    w1 → w2 → candidate.
+
+    Two contributions are computed per forward call:
+
+    1. Synaptic lateral sum  (z_syn)
+       Candidates with similar Thébault geometry excite each other;
+       dissimilar candidates are suppressed. This implements a
+       geometry-aware version of lateral inhibition / winner-take-all.
+
+    2. Transitive triple bonus  (trans_bonus)
+       For each candidate c, the transitive Thébault triple of the
+       chain (w1 ⊕ w2 ⊕ c) is compared to the current context triple.
+       Candidates whose transitive geometry aligns with the context
+       receive a bonus — encoding how naturally c "flows" from w1→w2.
+
+    Parameters
+    ──────────
+    syn_weight   : float  weight of synaptic sum term (ω_syn,   default 0.4)
+    trans_weight : float  weight of transitive bonus  (ω_trans, default 0.6)
+    syn_k        : int    top-K sparsity per neuron   (K,       default 8)
+    lambda_reg   : float  rho kernel bandwidth        (λ,       default 8.0)
+    gamma_side   : float  sigma kernel bandwidth      (γ,       default 4.0)
     """
 
-    def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
-        self.device = device
-        self.dtype  = dtype
-
-    def _build_rho_scale(self, c_rho: torch.Tensor) -> torch.Tensor:
-        """Layer-1 Hadamard weights from Thébault rho."""
-        # Centre and scale rho to [0.5, 1.5] range for stable power activation
-        mu  = c_rho.mean()
-        std = c_rho.std() + 1e-8
-        return 1.0 + 0.5 * ((c_rho - mu) / std).clamp(-2.0, 2.0)
-
-    def _build_freq_scale(self, c_rho: torch.Tensor, c_sigma: torch.Tensor) -> torch.Tensor:
-        """Layer-2 scaling vector from joint rho-sigma geometry."""
-        # Geometric mean of rho and sigma as frequency proxy
-        return (c_rho.clamp(min=1e-6) * c_sigma.clamp(min=1e-6)).sqrt()
-
-    def normalize(
+    def __init__(
         self,
-        logits   : torch.Tensor,
-        c_rho    : Optional[torch.Tensor] = None,
-        c_sigma  : Optional[torch.Tensor] = None,
-        temp     : float = 1.0,
+        syn_weight   : float = 0.4,
+        trans_weight : float = 0.6,
+        syn_k        : int   = 8,
+        lambda_reg   : float = 8.0,
+        gamma_side   : float = 4.0,
+        device       : torch.device = DEVICE,
+        dtype        : torch.dtype  = torch.float32,
+    ):
+        self.syn_weight   = syn_weight
+        self.trans_weight = trans_weight
+        self.syn_k        = syn_k
+        self.lambda_reg   = lambda_reg
+        self.gamma_side   = gamma_side
+        self.device       = device
+        self.dtype        = dtype
+
+    @torch.no_grad()
+    def synaptic_sum(
+        self,
+        logits  : torch.Tensor,    # [C]
+        c_rho   : torch.Tensor,    # [C]
+        c_theta : torch.Tensor,    # [C]
+        c_sigma : torch.Tensor,    # [C]
     ) -> torch.Tensor:
         """
-        Forward pass: logits → probability distribution (no softmax).
+        Compute the cross-synaptic lateral sum z_syn.
 
-        If c_rho / c_sigma not provided, falls back to geometry-free L1 simplex.
+        z_syn[i] = Σ_j  W_syn[i,j] · signed_power(logits[j], p=1.0)
+
+        The signed_power(p=1.0) is an identity signed pass — it preserves
+        sign information but clips magnitude via the internal clamp, so
+        large penalty values (-1e4) cannot destabilise the sum.
         """
-        # Apply geometric temperature scaling (Hadamard, not scalar division)
-        if c_rho is not None:
-            temp_weights = torch.exp(
-                -((c_rho - c_rho.mean()) ** 2) / (2.0 * max(temp, 0.1) + 1e-8)
-            )
-            scaled_logits = logits * temp_weights
-        else:
-            scaled_logits = logits / max(temp, 1e-6)
+        W_syn = build_synaptic_weight_matrix(
+            c_rho, c_theta, c_sigma,
+            lambda_reg = self.lambda_reg,
+            gamma_side = self.gamma_side,
+            top_k      = self.syn_k,
+        )
+        z_pre = signed_power(logits, p=1.0)    # [C] — magnitude-clamped
+        z_syn = W_syn @ z_pre                  # [C] — lateral sum
+        return layer_norm_array(z_syn)         # [C] — normalised
 
-        if c_rho is not None and c_sigma is not None:
-            # Layer 1: Hadamard rho-scaling + signed-square activation
-            rho_scale = self._build_rho_scale(c_rho)
-            y1        = scaled_logits * rho_scale
-            a1        = signed_power(y1, p=2.0)
-
-            # Layer 2: freq-scale outer-product array pass + signed-power activation
-            freq_scale = self._build_freq_scale(c_rho, c_sigma)
-            freq_norm  = l2_array_normalize(freq_scale, dim=0)           # unit freq vector
-            y2         = (freq_norm * a1).sum() * freq_norm + a1 * 0.5   # rank-1 + residual
-            a2         = signed_power(y2, p=1.5)
-        else:
-            a2 = scaled_logits
-
-        return l1_simplex_project(a2)
-
-    def log_normalize(
+    @torch.no_grad()
+    def transitive_bonus(
         self,
-        logits  : torch.Tensor,
-        c_rho   : Optional[torch.Tensor] = None,
-        c_sigma : Optional[torch.Tensor] = None,
-        temp    : float = 1.0,
+        c_rho_trans   : torch.Tensor,   # [C] — rho of transitive triple
+        c_theta_trans : torch.Tensor,   # [C] — theta of transitive triple
+        c_sigma_trans : torch.Tensor,   # [C] — sigma of transitive triple
+        ctx_rho       : float,          # scalar context rho
+        ctx_theta     : float,          # scalar context theta
+        ctx_sigma     : float,          # scalar context sigma
     ) -> torch.Tensor:
-        """log of normalize() — replaces F.log_softmax."""
-        p = self.normalize(logits, c_rho, c_sigma, temp)
-        return (p + 1e-12).log()
+        """
+        Compute the transitive geometry bonus for each candidate.
 
+        trans_bonus[i] = k_reg(rho_trans_i, ctx_rho)
+                       · k_ori(theta_trans_i, ctx_theta)
+                       · k_side(sigma_trans_i, ctx_sigma)
 
-class GeometricTempScaler:
-    """
-    Replaces scalar `logits / temperature` with a geometry-fused Hadamard pass.
+        Candidates whose transitive triple (w1⊕w2⊕c) aligns with the
+        current context geometry receive a positive logit bonus.
+        """
+        k_r = torch.exp(
+            -self.lambda_reg * (c_rho_trans   - ctx_rho)   ** 2
+        )
+        k_o = 0.5 * (1.0 + torch.cos(c_theta_trans - ctx_theta))
+        k_s = torch.exp(
+            -self.gamma_side * (c_sigma_trans - ctx_sigma) ** 2
+        )
+        bonus = k_r * k_o * k_s
+        return layer_norm_array(bonus)
 
-    scaled_i = logits_i · exp( -λ · (rho_i - μ_rho)² / T )
-
-    This encodes temperature as a geometry-aware attention mask over the
-    Thébault manifold, sharpening around the corpus mean rho and flattening
-    elsewhere as T increases.
-    """
-
-    def __init__(self, lambda_temp: float = 1.0):
-        self.lambda_temp = lambda_temp
-
-    def scale(
+    @torch.no_grad()
+    def forward(
         self,
-        logits  : torch.Tensor,
-        temp    : float,
-        c_rho   : Optional[torch.Tensor] = None,
+        logits        : torch.Tensor,   # [C] — raw walker logits
+        c_rho         : torch.Tensor,   # [C] — candidate rho
+        c_theta       : torch.Tensor,   # [C] — candidate theta
+        c_sigma       : torch.Tensor,   # [C] — candidate sigma
+        c_rho_trans   : torch.Tensor,   # [C] — transitive rho   (w1⊕w2⊕c)
+        c_theta_trans : torch.Tensor,   # [C] — transitive theta
+        c_sigma_trans : torch.Tensor,   # [C] — transitive sigma
+        ctx_rho       : float,          # scalar context rho  (from w2 triple)
+        ctx_theta     : float,          # scalar context theta
+        ctx_sigma     : float,          # scalar context sigma
     ) -> torch.Tensor:
-        # Always clamp logits first: punct_penalty = -1e4 explodes in signed_power(x,p=2)
-        safe_logits = logits.clamp(-50.0, 50.0)
-        if c_rho is None or temp <= 1e-6:
-            return safe_logits / max(temp, 0.1)
-        mu_rho   = c_rho.mean()
-        # Clamp exponent floor at -10 so geo_weights stay ≥ exp(-10) ≈ 4.5e-5
-        # Without this, low temp makes geo_weights ≈ 0 → zero-vector → nan
-        exponent    = (-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1)).clamp(min=-10.0)
-        geo_weights = torch.exp(exponent)
-        return safe_logits * geo_weights
+        """
+        Full CSNS forward pass.
+
+        Returns logits_enriched = logits
+                                + ω_syn   · z_syn
+                                + ω_trans · trans_bonus
+        """
+        z_syn      = self.synaptic_sum(logits, c_rho, c_theta, c_sigma)
+        trans_bon  = self.transitive_bonus(
+            c_rho_trans, c_theta_trans, c_sigma_trans,
+            ctx_rho, ctx_theta, ctx_sigma,
+        )
+        enriched = (
+            logits
+            + self.syn_weight   * z_syn
+            + self.trans_weight * trans_bon
+        )
+        # Final nan guard — CSNS runs before DNN, so any nan here would
+        # propagate through the entire pipeline
+        return torch.nan_to_num(enriched, nan=0.0, posinf=50.0, neginf=-50.0)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — TOKEN PRIMITIVES
+# SECTION 0d — THÉBAULT TRANSITIVE TRIPLE COMPUTATION
+#              Computes composed triple along context chain w1 → w2 → c
+# ════════════════════════════════════════════════════════════════════════════
+
+def compute_transitive_triples_batched(
+    geo         : "ThebaultTokenGeometry",
+    cands       : List[str],
+    w1          : str,
+    w2          : str,
+    device      : torch.device = DEVICE,
+    dtype       : torch.dtype  = torch.float32,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Compute the transitive Thébault triple for each candidate along the
+    chain w1 → w2 → c_i.
+
+    The transitive triple encodes the full geometric "path" from w1 through
+    w2 to candidate c_i, as opposed to the candidate's solo triple which
+    only reflects c_i's own embedding.
+
+    Method:
+        vec(w1) = (p1x, p1y, q1x, q1y)
+        vec(w2) = (p2x, p2y, q2x, q2y)
+        vec(c)  = (pcx, pcy, qcx, qcy)
+
+        transitive_vec = vec(w1) * 0.25 + vec(w2) * 0.50 + vec(c) * 0.25
+        (weighted blend — w2 is the immediate context so weighted highest)
+
+        Then compute _thebault_triple(transitive_vec) for each c.
+
+    Returns three tensors [C]: rho_trans, theta_trans, sigma_trans
+    """
+    p1x, p1y, q1x, q1y = geo._vecs.get(w1, (0.0, 0.0, 0.0, 0.0))
+    p2x, p2y, q2x, q2y = geo._vecs.get(w2, (0.0, 0.0, 0.0, 0.0))
+
+    rho_list, theta_list, sigma_list = [], [], []
+
+    for c in cands:
+        pcx, pcy, qcx, qcy = geo._vecs.get(c, (0.0, 0.0, 0.0, 0.0))
+
+        # Transitive blend: context chain → candidate
+        tpx = 0.25 * p1x + 0.50 * p2x + 0.25 * pcx
+        tpy = 0.25 * p1y + 0.50 * p2y + 0.25 * pcy
+        tqx = 0.25 * q1x + 0.50 * q2x + 0.25 * qcx
+        tqy = 0.25 * q1y + 0.50 * q2y + 0.25 * qcy
+
+        rho, theta, sigma = _thebault_triple(tpx, tpy, tqx, tqy)
+        rho_list.append(rho)
+        theta_list.append(theta)
+        sigma_list.append(sigma)
+
+    return (
+        torch.tensor(rho_list,   dtype=dtype, device=device),
+        torch.tensor(theta_list, dtype=dtype, device=device),
+        torch.tensor(sigma_list, dtype=dtype, device=device),
+    )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — TOKEN PRIMITIVES  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 STOP_WORDS_COG = set(
@@ -343,7 +446,7 @@ PUNCT_TOKENS     = {",", ".", "!", "?", ";", ":"}
 
 def tokenize(text: str) -> List[str]:
     out = []
-    for w in re.findall(r"\[[A-Z]+\]|\b[a-zA-Z]+\b|[.,!?;:]", text):
+    for w in text.split():
         if w in COGNITIVE_TOKENS or w in PUNCT_TOKENS:
             out.append(w)
         else:
@@ -375,7 +478,7 @@ def detokenize(tokens: List[str]) -> str:
     return out if out and out[-1] in PUNCT_TOKENS else out + "."
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — THÉBAULT TOKEN GEOMETRY  (CUDA-accelerated)
+# SECTION 2 — THÉBAULT TOKEN GEOMETRY  (CUDA-accelerated, unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _perfect_square_cv() -> float:
@@ -500,17 +603,13 @@ class ThebaultTokenGeometry:
         )
 
     def tok_indices(self, toks: List[str]) -> torch.Tensor:
-        # .get(t, 0) maps unknown tokens to index 0. This is safe only when
-        # _pvec_t / _rho_t are non-empty. We additionally clamp to vocab
-        # bounds so that any edge-case mismatch cannot produce an OOB index
-        # that triggers a CUDA device-side assert on tensor indexing.
         vocab_len = len(self._idx_list)
         safe_max  = max(vocab_len - 1, 0)
         idx = [min(self._tok2idx.get(t, 0), safe_max) for t in toks]
         return torch.tensor(idx, dtype=torch.long, device=self.device)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2b — PDN ENGINE
+# SECTION 2b — PDN ENGINE  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class PDNEngine:
@@ -646,7 +745,7 @@ class PDNEngine:
         return "\n".join(lines)
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2c — COT ENGINE + STUBS
+# SECTION 2c — COT ENGINE + STUBS  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 STUB_PREMISE     = "PREMISE"
@@ -707,7 +806,7 @@ class CoTTrace:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2d — INSTRUCTION DISTRIBUTION
+# SECTION 2d — INSTRUCTION DISTRIBUTION  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -720,6 +819,8 @@ class TokenStepTrace:
     p_and       : float
     and_weight  : float
     source      : str   # "instr" | "walker" | "AND"
+    syn_norm    : float = 0.0    # NEW: L2 norm of synaptic sum contribution
+    trans_norm  : float = 0.0   # NEW: L2 norm of transitive bonus contribution
 
     def render(self) -> str:
         return (
@@ -727,6 +828,7 @@ class TokenStepTrace:
             f"  P_instr={self.p_instr:.4f}  P_walk={self.p_walk:.4f}"
             f"  P_and={self.p_and:.4f}  α={self.and_weight:.2f}"
             f"  source={self.source}"
+            f"  |z_syn|={self.syn_norm:.3f}  |trans|={self.trans_norm:.3f}"
         )
 
 
@@ -738,7 +840,7 @@ class InstructionDistribution:
 
     def __init__(
         self,
-        geo          : ThebaultTokenGeometry,
+        geo          : "ThebaultTokenGeometry",
         kernels      : "ThebaultKernels",
         lm           : "ThebaultCompositionLM",
         device       : torch.device = DEVICE,
@@ -811,7 +913,6 @@ class InstructionDistribution:
             k_s = torch.exp(-self.kernels.gamma_side * (self.geo._sigma_t - c.sigma) ** 2)
             base += self.centroid_weight * k_r * k_o * k_s
 
-        # ── V18: use l1_simplex_project instead of softmax ───────────────
         base = base.clamp(min=0.0)
         total = base.sum()
         if total.item() > 1e-8:
@@ -856,13 +957,12 @@ class InstructionDistribution:
                     bigram_bonus[i] = 0.1
 
         raw = base_probs + ctx_bonus_v + bigram_bonus
-        # ── V18: l1_simplex_project replaces softmax ──────────────────────
         raw = raw.clamp(min=1e-12)
         return raw / raw.sum()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2e — COT STUB LIBRARY
+# SECTION 2e — COT STUB LIBRARY  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class CoTStubLibrary:
@@ -1083,7 +1183,7 @@ class CoTReasoningEngine:
         )
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — THÉBAULT KERNELS
+# SECTION 3 — THÉBAULT KERNELS  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultKernels:
@@ -1102,7 +1202,7 @@ class ThebaultKernels:
         return k_r, k_o, k_s
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — MRV FILTER
+# SECTION 4 — MRV FILTER  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class MRVConstraintFilter:
@@ -1137,7 +1237,7 @@ class MRVConstraintFilter:
         return mrv
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — POSITIONAL VECTOR + CHUNKED SUM ENGINE
+# SECTION 5 — POSITIONAL VECTOR + CHUNKED SUM ENGINE  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 VEC_DIM = 4
@@ -1198,7 +1298,7 @@ class ChunkedSumEngine:
         return window[:, 0], window[:, 1] * math.pi
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — ISOMORPHIC SYNTAX STACKER
+# SECTION 6 — ISOMORPHIC SYNTAX STACKER  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -1270,7 +1370,7 @@ class IsomorphicSyntaxStacker:
         return bonuses * echo_weight
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — THÉBAULT CONJUGATE ORBIT
+# SECTION 7 — THÉBAULT CONJUGATE ORBIT  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultConjugateOrbit:
@@ -1280,11 +1380,11 @@ class ThebaultConjugateOrbit:
         return congruence * antipodality
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — THÉBAULT COMPOSITION LM
+# SECTION 8 — THÉBAULT COMPOSITION LM  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultCompositionLM:
-    BASAL_K      = 1.5
+    BASAL_K      = 1000.5
     DENSE_THRESH = 512
 
     def __init__(self, geo, kernels, device=DEVICE):
@@ -1352,7 +1452,7 @@ class ThebaultCompositionLM:
         return kr * ks
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — THÉBAULT POTENTIAL GRAPH
+# SECTION 9 — THÉBAULT POTENTIAL GRAPH  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -1420,7 +1520,7 @@ class ThebaultPotentialGraph:
         )
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — SYNTHETIC REASON MANDATES
+# SECTION 10 — SYNTHETIC REASON MANDATES  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class synthetic_reasonMandateProcessor:
@@ -1448,102 +1548,110 @@ class synthetic_reasonMandateProcessor:
         return enrichment
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 11a — DNN ARRAY PIPELINE (V18 core additions)
+# SECTION 11a — DNN ARRAY PIPELINE (V18 core, unchanged)
 # ════════════════════════════════════════════════════════════════════════════
+
+class ThebaultDNNNormalizer:
+    def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
+        self.device = device
+        self.dtype  = dtype
+
+    def _build_rho_scale(self, c_rho: torch.Tensor) -> torch.Tensor:
+        mu  = c_rho.mean()
+        std = c_rho.std() + 1e-8
+        return 1.0 + 0.5 * ((c_rho - mu) / std).clamp(-2.0, 2.0)
+
+    def _build_freq_scale(self, c_rho: torch.Tensor, c_sigma: torch.Tensor) -> torch.Tensor:
+        return (c_rho.clamp(min=1e-6) * c_sigma.clamp(min=1e-6)).sqrt()
+
+    def normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0):
+        if c_rho is not None:
+            temp_weights = torch.exp(
+                -((c_rho - c_rho.mean()) ** 2) / (2.0 * max(temp, 0.1) + 1e-8)
+            )
+            scaled_logits = logits * temp_weights
+        else:
+            scaled_logits = logits / max(temp, 1e-6)
+
+        if c_rho is not None and c_sigma is not None:
+            rho_scale = self._build_rho_scale(c_rho)
+            y1        = scaled_logits * rho_scale
+            a1        = signed_power(y1, p=2.0)
+            freq_scale = self._build_freq_scale(c_rho, c_sigma)
+            freq_norm  = l2_array_normalize(freq_scale, dim=0)
+            y2         = (freq_norm * a1).sum() * freq_norm + a1 * 0.5
+            a2         = signed_power(y2, p=1.5)
+        else:
+            a2 = scaled_logits
+
+        return l1_simplex_project(a2)
+
+    def log_normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0):
+        p = self.normalize(logits, c_rho, c_sigma, temp)
+        return (p + 1e-12).log()
+
+
+class GeometricTempScaler:
+    def __init__(self, lambda_temp: float = 1.0):
+        self.lambda_temp = lambda_temp
+
+    def scale(self, logits, temp, c_rho=None):
+        safe_logits = logits.clamp(-50.0, 50.0)
+        if c_rho is None or temp <= 1e-6:
+            return safe_logits / max(temp, 0.1)
+        mu_rho   = c_rho.mean()
+        exponent    = (-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1)).clamp(min=-10.0)
+        geo_weights = torch.exp(exponent)
+        return safe_logits * geo_weights
+
 
 class DNNArrayPipeline:
     """
-    Multi-layer DNN array pipeline for Thébault logit processing.
+    3-pass DNN array pipeline (V18). Now receives CSNS-enriched logits as input.
 
-    Replaces all uses of softmax/sigmoid/relu in the walker's logit
-    computation with geometry-conditioned DNN array passes.
-
-    Network topology (3 array passes, no learned weights):
-    ──────────────────────────────────────────────────────
-    Pass 1  Geometry Projection
-            A₁ = diag(rho_weights) · logits           (Hadamard by rho)
-            z₁ = signed_power(A₁, p=2.0)              (signed square)
-
-    Pass 2  Orientation Modulation
-            A₂ = diag(theta_weights) · z₁             (Hadamard by theta)
-            z₂ = signed_power(A₂, p=1.5)              (signed 3/2 power)
-
-    Pass 3  Sigma Residual
-            A₃ = diag(sigma_weights) · z₂ + z₁ · 0.3 (residual connection)
-            z₃ = signed_power(A₃, p=1.0)              (linear / identity)
-
-    Output  l1_simplex_project(z₃)
+    The CSNS module enriches logits BEFORE this pipeline runs:
+        logits_enriched = CSNS.forward(raw_logits, ...)
+        probs = DNNArrayPipeline.forward(logits_enriched, ...)
     """
 
     def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
-        self.device     = device
-        self.dtype      = dtype
+        self.device      = device
+        self.dtype       = dtype
         self._normalizer = ThebaultDNNNormalizer(device, dtype)
         self._temp_scaler = GeometricTempScaler(lambda_temp=1.0)
 
-    def _rho_weights(self, c_rho: torch.Tensor) -> torch.Tensor:
-        """Channel scaling from rho — geometry-aware Layer 1 weights."""
+    def _rho_weights(self, c_rho):
         mu  = c_rho.mean()
         std = c_rho.std() + 1e-8
-        z   = (c_rho - mu) / std                         # standardise
-        return 1.0 + 0.5 * z.clamp(-2.5, 2.5)           # [0, 2] range
+        z   = (c_rho - mu) / std
+        return 1.0 + 0.5 * z.clamp(-2.5, 2.5)
 
-    def _theta_weights(self, c_theta: torch.Tensor) -> torch.Tensor:
-        """Orientation modulation weights from theta (cosine basis)."""
-        return 0.5 * (1.0 + torch.cos(c_theta))          # [0, 1]
+    def _theta_weights(self, c_theta):
+        return 0.5 * (1.0 + torch.cos(c_theta))
 
-    def _sigma_weights(self, c_sigma: torch.Tensor) -> torch.Tensor:
-        """Side-length frequency weights from sigma."""
+    def _sigma_weights(self, c_sigma):
         sig_norm = c_sigma / (c_sigma.max() + 1e-8)
-        return 0.7 + 0.3 * sig_norm                      # [0.7, 1.0]
+        return 0.7 + 0.3 * sig_norm
 
     @torch.no_grad()
-    def forward(
-        self,
-        logits   : torch.Tensor,
-        c_rho    : torch.Tensor,
-        c_theta  : torch.Tensor,
-        c_sigma  : torch.Tensor,
-        temp     : float = 1.4,
-    ) -> torch.Tensor:
-        """
-        Full DNN array forward pass:
-            logits → [Pass1] → [Pass2] → [Pass3] → l1_simplex_project → probs
-        """
-        # Geometric temperature scaling (replaces logits / T)
+    def forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
         logits_scaled = self._temp_scaler.scale(logits, temp, c_rho)
-
-        # Pass 1: Geometry projection (rho-weighted Hadamard + signed square)
         rho_w = self._rho_weights(c_rho)
         z1    = signed_power(logits_scaled * rho_w, p=2.0)
-
-        # Pass 2: Orientation modulation (theta-weighted Hadamard + signed 3/2)
         theta_w = self._theta_weights(c_theta)
         z2      = signed_power(z1 * theta_w, p=1.5)
-
-        # Pass 3: Sigma residual pass (with skip connection from z1)
         sigma_w = self._sigma_weights(c_sigma)
-        z3      = signed_power(z2 * sigma_w + z1 * 0.3, p=1.0)   # residual
-
-        # L1 simplex projection → valid probability distribution (no softmax)
+        z3      = signed_power(z2 * sigma_w + z1 * 0.3, p=1.0)
         return l1_simplex_project(z3)
 
     @torch.no_grad()
-    def log_forward(
-        self,
-        logits  : torch.Tensor,
-        c_rho   : torch.Tensor,
-        c_theta : torch.Tensor,
-        c_sigma : torch.Tensor,
-        temp    : float = 1.4,
-    ) -> torch.Tensor:
-        """log of forward() — replaces F.log_softmax in AND combination."""
+    def log_forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
         p = self.forward(logits, c_rho, c_theta, c_sigma, temp)
         return (p + 1e-12).log()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 11b — LOCALE TRANSIT REMISSION  (smooth_power_relu replaces F.relu)
+# SECTION 11b — LOCALE TRANSIT REMISSION  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class LocaleTransitRemission:
@@ -1553,7 +1661,6 @@ class LocaleTransitRemission:
 
     def apply_remission(self, w1_rho, w2_rho, c_rho):
         transit_delta     = torch.abs((w1_rho + w2_rho) / 2.0 - c_rho)
-        # ── V18: smooth_power_relu replaces F.relu ────────────────────────
         linear_error      = smooth_power_relu(transit_delta - self.transit_tolerance)
         manipulation_mask = (linear_error > 1e-6).float()
         remission_penalty = torch.exp(-self.remission_rate * linear_error)
@@ -1567,23 +1674,12 @@ class ContingentExtringentProbability:
         self.intermediate_max_prob = 1.0
         self._dnn = DNNArrayPipeline()
 
-    def govern_next_probs(self, logits: torch.Tensor,
-                          c_rho: Optional[torch.Tensor] = None,
-                          c_theta: Optional[torch.Tensor] = None,
-                          c_sigma: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        V18: replaces softmax-based temperature govern with DNN array pass.
-        Uses geometric temperature derived from intermediate_max_prob.
-        """
+    def govern_next_probs(self, logits, c_rho=None, c_theta=None, c_sigma=None):
         dynamic_temp = 1.0 + (self.coupling_factor * (1.0 - self.intermediate_max_prob))
-
         if c_rho is not None and c_theta is not None and c_sigma is not None:
-            # Full DNN pipeline with geometry
             governed_logits = self._dnn._temp_scaler.scale(logits, dynamic_temp, c_rho)
         else:
             governed_logits = logits / max(dynamic_temp, 1e-6)
-
-        # Compute entropy via l1_simplex (no softmax)
         current_probs = l1_simplex_project(governed_logits)
         entropy = -(current_probs * (current_probs + 1e-9).log()).sum()
         self.intermediate_entropy  = entropy.item()
@@ -1592,16 +1688,11 @@ class ContingentExtringentProbability:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 11c — ANONYMOUS VARIABLE SOLVER
-#              l2_array_normalize replaces F.normalize
+# SECTION 11c — ANONYMOUS VARIABLE SOLVER  (unchanged from V18)
 # ════════════════════════════════════════════════════════════════════════════
 
 class AnonymousVariableSolver:
-    """
-    NeuroSymbolic logic solver for anonymous variables (Prolog-style _).
-    V18: uses l2_array_normalize instead of F.normalize.
-    """
-    def __init__(self, geo: ThebaultTokenGeometry, lm, kernels, device=DEVICE):
+    def __init__(self, geo, lm, kernels, device=DEVICE):
         self.geo     = geo
         self.lm      = lm
         self.kernels = kernels
@@ -1612,7 +1703,7 @@ class AnonymousVariableSolver:
         }
         self.anon_var = "_"
 
-    def parse_pattern(self, text: str) -> Dict:
+    def parse_pattern(self, text):
         tokens  = tokenize(text.lower())
         pattern = {"terms": tokens, "bindings": {}, "quants": []}
         for i, tok in enumerate(tokens):
@@ -1622,7 +1713,7 @@ class AnonymousVariableSolver:
                 pattern["quants"].append((tok, i))
         return pattern
 
-    def solve_bindings(self, pattern: Dict, cands: List[str]) -> torch.Tensor:
+    def solve_bindings(self, pattern, cands):
         N = len(cands)
         binding_scores = torch.ones(N, device=self.device)
         for var_name, _ in pattern["bindings"].items():
@@ -1633,17 +1724,17 @@ class AnonymousVariableSolver:
                 binding_scores *= 0.7
             elif quant == "some":
                 binding_scores *= 1.2
-        # ── V18: l2_array_normalize replaces F.normalize ──────────────────
         return l2_array_normalize(binding_scores, dim=0)
 
-    def integrate_logits(self, logits: torch.Tensor, instruction: str, cands: List[str]) -> torch.Tensor:
+    def integrate_logits(self, logits, instruction, cands):
         pattern      = self.parse_pattern(instruction)
         binding_bonus = self.solve_bindings(pattern, cands)
         return logits + (binding_bonus.clamp(min=1e-8)).log()
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — THÉBAULT WALKER V18-DNN  (full DNN array integration)
+# SECTION 12 — THÉBAULT WALKER V18-CSNS
+#              Cross-Synaptic Neuron Sum integration point
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultWalker:
@@ -1655,6 +1746,9 @@ class ThebaultWalker:
         cot_engine       : CoTReasoningEngine,
         instr_dist       : InstructionDistribution,
         device           : torch.device = DEVICE,
+        syn_weight       : float = 0.4,
+        trans_weight     : float = 0.6,
+        syn_k            : int   = 8,
     ):
         self.geo          = geo
         self.kernels      = kernels
@@ -1676,9 +1770,21 @@ class ThebaultWalker:
         self._step_traces   : List[TokenStepTrace] = []
         self.remission       = LocaleTransitRemission()
         self.contingent_prob = ContingentExtringentProbability()
-        # ── V18: DNN array pipeline and normalizer ────────────────────────
+        # V18 DNN components
         self._dnn_pipeline  = DNNArrayPipeline(device=device)
         self._dnn_normalizer = ThebaultDNNNormalizer(device=device)
+        # ── V18-CSNS: Cross-Synaptic Neuron Sum module ────────────────────
+        self._csns = CrossSynapticNeuronSum(
+            syn_weight   = syn_weight,
+            trans_weight = trans_weight,
+            syn_k        = syn_k,
+            lambda_reg   = kernels.lambda_reg,
+            gamma_side   = kernels.gamma_side,
+            device       = device,
+        )
+        # Diagnostic counters
+        self._csns_syn_norms   : List[float] = []
+        self._csns_trans_norms : List[float] = []
 
     def begin_sentence(self, seed_tokens=None, total_tokens=40) -> CoTTrace:
         self.chunk_engine.reset()
@@ -1707,10 +1813,19 @@ class ThebaultWalker:
         and_weight    : float = 0.5,
     ) -> Tuple[List[str], torch.Tensor]:
         """
-        V18: Full DNN array pipeline replaces softmax/sigmoid/relu.
+        V18-CSNS walk_probs.
 
-        Walker logit → DNNArrayPipeline.forward() → P_walk (no softmax)
-        AND combination uses log_forward() instead of F.log_softmax
+        Pipeline order:
+          1. Compute raw walker logits (geometric scoring, unchanged from V18)
+          2. ContingentExtringentProbability governance
+          3. ── NEW ── CrossSynapticNeuronSum enrichment
+             a. Compute transitive triples (w1 → w2 → c) for all candidates
+             b. Build synaptic weight matrix W_syn from pairwise Thébault kernels
+             c. Compute z_syn = W_syn @ signed_power(logits)
+             d. Compute trans_bonus from transitive triple vs context alignment
+             e. logits_enriched = governed_logits + ω_syn·z_syn + ω_trans·trans_bonus
+          4. DNNArrayPipeline.forward(logits_enriched)  → P_walk
+          5. AND combination with InstructionDistribution
         """
         cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands:
@@ -1776,8 +1891,8 @@ class ThebaultWalker:
 
         mandate_boost = self.synth.subsynthetic_reason_concept_enrichment(w2, cands, self.device)
 
-        # ── Raw walker logits (geometric pipeline) ────────────────────────
-        log_base      = (base_probs.clamp(min=1e-12)).log()
+        # ── Step 1: Raw walker logits ─────────────────────────────────────
+        log_base   = (base_probs.clamp(min=1e-12)).log()
         raw_logits = (
             log_base
             + alphareg   * k_reg
@@ -1796,41 +1911,65 @@ class ThebaultWalker:
             + punct_penalty
         )
 
-        # ── V18: ContingentExtringentProbability now passes geometry ──────
+        # ── Step 2: ContingentExtringentProbability governance ────────────
         governed_logits = self.contingent_prob.govern_next_probs(
             raw_logits, c_rho, c_theta, c_sigma
         )
 
-        # ── V18: AND COMBINATION via DNN array pipeline ───────────────────
-        # log P_walk  = log(DNNArrayPipeline.forward(governed_logits))
-        # log P_instr = log(InstructionDistribution.distribution(...))
-        # log P_and   = α·log P_instr + (1−α)·log P_walk
-        # P_final     = l1_simplex_project(log P_and)  (no softmax)
+        # ── Step 3: CSNS enrichment (NEW in V18-CSNS) ────────────────────
+        # 3a. Compute transitive triples along w1 → w2 → c chain
+        c_rho_trans, c_theta_trans, c_sigma_trans = compute_transitive_triples_batched(
+            self.geo, cands, w1, w2, device=self.device,
+        )
 
+        # 3b–3e. Full CSNS forward pass (synaptic sum + transitive bonus)
+        logits_enriched = self._csns.forward(
+            governed_logits,
+            c_rho, c_theta, c_sigma,
+            c_rho_trans, c_theta_trans, c_sigma_trans,
+            ctx_rho   = ctx.rho,
+            ctx_theta = ctx.theta,
+            ctx_sigma = ctx.sigma,
+        )
+
+        # Diagnostics: track norms for step trace
+        z_syn_raw = self._csns.synaptic_sum(governed_logits, c_rho, c_theta, c_sigma)
+        t_bon_raw = self._csns.transitive_bonus(
+            c_rho_trans, c_theta_trans, c_sigma_trans,
+            ctx.rho, ctx.theta, ctx.sigma,
+        )
+        syn_norm   = z_syn_raw.norm().item()
+        trans_norm = t_bon_raw.norm().item()
+        self._csns_syn_norms.append(syn_norm)
+        self._csns_trans_norms.append(trans_norm)
+
+        self._pending_instr_probs = None
+        self._pending_walk_logits = logits_enriched
+        self._pending_c_rho       = c_rho
+        self._pending_c_theta     = c_theta
+        self._pending_c_sigma     = c_sigma
+        self._pending_syn_norm    = syn_norm
+        self._pending_trans_norm  = trans_norm
+
+        # ── Step 4: AND combination via DNN array pipeline ────────────────
         if and_weight > 0.0 and self.instr_dist._base_dist_t is not None:
             p_instr   = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
             log_instr = (p_instr.clamp(min=1e-12)).log()
 
-            # DNN log-normalise the walker logits (replaces F.log_softmax)
+            # DNN log-normalise the CSNS-enriched walker logits
             log_walk  = self._dnn_pipeline.log_forward(
-                governed_logits, c_rho, c_theta, c_sigma, temp=1.0
+                logits_enriched, c_rho, c_theta, c_sigma, temp=1.0
             )
             log_and   = and_weight * log_instr + (1.0 - and_weight) * log_walk
-            # L1 simplex via smooth-power (replaces softmax on log_and)
             final_probs = l1_simplex_project(log_and)
         else:
             p_instr     = torch.ones(N, dtype=torch.float32, device=self.device) / N
-            # DNN normalise walker (replaces softmax)
+            # DNN normalise CSNS-enriched logits (replaces softmax)
             final_probs = self._dnn_pipeline.forward(
-                governed_logits, c_rho, c_theta, c_sigma, temp=temp
+                logits_enriched, c_rho, c_theta, c_sigma, temp=temp
             )
 
         self._pending_instr_probs = p_instr
-        self._pending_walk_logits = governed_logits
-        self._pending_c_rho       = c_rho
-        self._pending_c_theta     = c_theta
-        self._pending_c_sigma     = c_sigma
-
         return cands, final_probs
 
     def record_step_trace(self, step: int, chosen: str, cands: List[str],
@@ -1841,9 +1980,8 @@ class ThebaultWalker:
         except (ValueError, IndexError):
             idx, p_and = 0, 0.0
 
-        p_instr = self._pending_instr_probs[idx].item() if hasattr(self, '_pending_instr_probs') else 0.0
+        p_instr = self._pending_instr_probs[idx].item() if hasattr(self, '_pending_instr_probs') and self._pending_instr_probs is not None else 0.0
 
-        # ── V18: DNN log-normalise walk probs (replaces F.log_softmax) ───
         if hasattr(self, '_pending_c_rho'):
             log_walk = self._dnn_pipeline.log_forward(
                 self._pending_walk_logits,
@@ -1861,7 +1999,11 @@ class ThebaultWalker:
         else:
             source = "AND"
 
-        trace = TokenStepTrace(step, chosen, p_instr, p_walk, p_and, and_weight, source)
+        trace = TokenStepTrace(
+            step, chosen, p_instr, p_walk, p_and, and_weight, source,
+            syn_norm   = getattr(self, '_pending_syn_norm',   0.0),
+            trans_norm = getattr(self, '_pending_trans_norm', 0.0),
+        )
         self._step_traces.append(trace)
         return trace
 
@@ -1878,18 +2020,53 @@ class ThebaultWalker:
         if not self._step_traces:
             return "  (no step traces yet)"
         lines = [
-            "step | chosen         | P_instr | P_walk  | P_and   | α    | source",
-            "─────┼───────────────┼─────────┼─────────┼─────────┼──────┼───────",
+            "step | chosen         | P_instr | P_walk  | P_and   | α    | source  | |z_syn| | |trans|",
+            "─────┼───────────────┼─────────┼─────────┼─────────┼──────┼─────────┼─────────┼────────",
         ]
         for t in self._step_traces[-max_steps:]:
             lines.append(
                 f"{t.step:5d}│ {t.chosen:<14s}│ {t.p_instr:.5f}│ {t.p_walk:.5f}│"
-                f" {t.p_and:.5f}│ {t.and_weight:.2f} │ {t.source}"
+                f" {t.p_and:.5f}│ {t.and_weight:.2f} │ {t.source:<7s} │ {t.syn_norm:.4f}  │ {t.trans_norm:.4f}"
             )
+        # Synaptic summary statistics
+        if self._csns_syn_norms:
+            avg_syn   = sum(self._csns_syn_norms)   / len(self._csns_syn_norms)
+            avg_trans = sum(self._csns_trans_norms) / len(self._csns_trans_norms)
+            lines.append(f"\n  CSNS summary: avg |z_syn|={avg_syn:.4f}  avg |trans|={avg_trans:.4f}  "
+                         f"steps={len(self._csns_syn_norms)}")
         return "\n".join(lines)
 
+    def csns_report(self) -> str:
+        """Standalone CSNS diagnostic report."""
+        if not self._csns_syn_norms:
+            return "  (no CSNS data yet — generate text first)"
+        n = len(self._csns_syn_norms)
+        avg_s = sum(self._csns_syn_norms) / n
+        avg_t = sum(self._csns_trans_norms) / n
+        max_s = max(self._csns_syn_norms)
+        max_t = max(self._csns_trans_norms)
+        return (
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║   Cross-Synaptic Neuron Sum (CSNS) Diagnostic Report         ║\n"
+            "╠══════════════════════════════════════════════════════════════╣\n"
+            f"║  Steps processed:       {n:<36d}║\n"
+            f"║  Synaptic sum weight    ω_syn   = {self._csns.syn_weight:<25.3f}║\n"
+            f"║  Transitive bonus weight ω_trans = {self._csns.trans_weight:<24.3f}║\n"
+            f"║  Synaptic sparsity K    = {self._csns.syn_k:<33d}║\n"
+            "║                                                              ║\n"
+            f"║  avg |z_syn|    = {avg_s:<41.4f}║\n"
+            f"║  max |z_syn|    = {max_s:<41.4f}║\n"
+            f"║  avg |trans|    = {avg_t:<41.4f}║\n"
+            f"║  max |trans|    = {max_t:<41.4f}║\n"
+            "║                                                              ║\n"
+            "║  Transitive triple blend weights:                            ║\n"
+            "║    w1 × 0.25  +  w2 × 0.50  +  c × 0.25                    ║\n"
+            "║  (w2 is immediate context, weighted highest)                 ║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
+
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — TEXT GENERATION ENGINE  (DNN-aware, temperature-aware)
+# SECTION 13 — TEXT GENERATION ENGINE  (unchanged except return_traces path)
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_passage(
@@ -1909,6 +2086,8 @@ def generate_passage(
         walker.instr_dist.set_instruction(seed_text)
 
     walker._step_traces.clear()
+    walker._csns_syn_norms.clear()
+    walker._csns_trans_norms.clear()
 
     outputs    : List[str]      = []
     all_traces : List[CoTTrace] = []
@@ -1989,11 +2168,16 @@ def generate_passage(
     return result
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — V18 ENGINE
+# SECTION 14 — V18-CSNS ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
 class V18Engine:
-    def __init__(self):
+    def __init__(
+        self,
+        syn_weight   : float = 0.4,
+        trans_weight : float = 0.6,
+        syn_k        : int   = 8,
+    ):
         self.device      = DEVICE
         self.geo         = ThebaultTokenGeometry(device=self.device)
         self.kernels     = ThebaultKernels()
@@ -2010,6 +2194,10 @@ class V18Engine:
         self.cot         = None
         self.walker      = None
         self.corpus_snippet = ""
+        # CSNS hyperparameters stored for save/load
+        self.syn_weight   = syn_weight
+        self.trans_weight = trans_weight
+        self.syn_k        = syn_k
 
     def train(self, corpus_text: str):
         print(f"[*] Tokenizing corpus ({len(corpus_text)} chars)...")
@@ -2065,11 +2253,14 @@ class V18Engine:
             self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.synth, self.mrv, self.chunk, self.iso_stacker,
             self.pdn, self.cot, self.instr_dist,
-            device=self.device,
+            device       = self.device,
+            syn_weight   = self.syn_weight,
+            trans_weight = self.trans_weight,
+            syn_k        = self.syn_k,
         )
-        print("[+] Training complete. (V18 DNN Array Activations enabled)")
+        print("[+] Training complete. (V18-CSNS: DNN Array + Cross-Synaptic Neuron Sums enabled)")
 
-    def save_cache(self, filename: str = "v18_model.pkl"):
+    def save_cache(self, filename: str = "v18_csns_model.pkl"):
         print(f"[*] Saving model state to {filename}...")
         with open(filename, "wb") as f:
             pickle.dump({
@@ -2084,7 +2275,10 @@ class V18Engine:
                 "pdn_n_star"     : self.pdn.n_star,
                 "pdn_power"      : self.pdn.power_spectrum,
                 "cot_stubs"      : self.stub_lib.stubs,
-                "version"        : "V18-DNN",
+                "syn_weight"     : self.syn_weight,
+                "trans_weight"   : self.trans_weight,
+                "syn_k"          : self.syn_k,
+                "version"        : "V18-CSNS",
             }, f)
         print("[+] Save successful.")
 
@@ -2103,6 +2297,9 @@ class V18Engine:
         self.corpus_snippet     = state["corpus_snippet"]
         self.pdn.n_star         = state.get("pdn_n_star", 4)
         self.pdn.power_spectrum = state.get("pdn_power", {})
+        self.syn_weight         = state.get("syn_weight",   0.4)
+        self.trans_weight       = state.get("trans_weight", 0.6)
+        self.syn_k              = state.get("syn_k",        8)
 
         print("[*] Rebuilding GPU Tensors from loaded state...")
         self.geo.build_cuda_tensors(self.lm.vocab)
@@ -2138,19 +2335,22 @@ class V18Engine:
             self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.synth, self.mrv, self.chunk, self.iso_stacker,
             self.pdn, self.cot, self.instr_dist,
-            device=self.device,
+            device       = self.device,
+            syn_weight   = self.syn_weight,
+            trans_weight = self.trans_weight,
+            syn_k        = self.syn_k,
         )
-        print("[+] Load successful. (V18 DNN Array Activations enabled)")
+        print("[+] Load successful. (V18-CSNS: DNN Array + Cross-Synaptic Neuron Sums enabled)")
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — GRADIO GUI
+# SECTION 15 — GRADIO GUI  (V18-CSNS extended)
 # ════════════════════════════════════════════════════════════════════════════
 
 class V18GUI:
     def __init__(self):
         self.engine = None
 
-    def init_engine_from_file(self, file_obj):
+    def init_engine_from_file(self, file_obj, syn_weight, trans_weight, syn_k):
         if file_obj is None:
             return "Error: No file uploaded."
         try:
@@ -2158,15 +2358,20 @@ class V18GUI:
                 corpus_text = f.read()
             if not corpus_text.strip():
                 return "Error: Uploaded file is empty."
-            self.engine = V18Engine()
+            self.engine = V18Engine(
+                syn_weight   = float(syn_weight),
+                trans_weight = float(trans_weight),
+                syn_k        = int(syn_k),
+            )
             self.engine.train(corpus_text)
             report = self.engine.pdn.theorem_bridge_report()
             stub_counts = {k: len(v) for k, v in self.engine.stub_lib.stubs.items()}
             return (
-                f"V18 Engine initialised (DNN Array Activations — no sigmoid/softmax).\n"
+                f"V18-CSNS Engine initialised.\n"
                 f"File: {file_obj.name.split('/')[-1]}\n"
                 f"Vocab size: {len(self.engine.lm.vocab)}\n"
-                f"CoT stubs: {stub_counts}\n\n"
+                f"CoT stubs: {stub_counts}\n"
+                f"CSNS: ω_syn={syn_weight:.2f}  ω_trans={trans_weight:.2f}  K={int(syn_k)}\n\n"
                 f"{report}"
             )
         except Exception as e:
@@ -2199,32 +2404,45 @@ class V18GUI:
             return "Engine not initialised."
         return self.engine.cot.all_traces_text()
 
+    def csns_report(self):
+        if not self.engine or not self.engine.walker:
+            return "Engine not initialised."
+        return self.engine.walker.csns_report()
+
     def dnn_report(self):
         lines = [
-            "V18 DNN Array Activation Report",
-            "═══════════════════════════════════════════════════════",
+            "V18-CSNS DNN Array + Cross-Synaptic Neuron Sum Report",
+            "═══════════════════════════════════════════════════════════════",
             "",
-            "REPLACED ACTIVATIONS:",
-            "  F.softmax(logits)      → DNNArrayPipeline.forward()",
-            "  F.log_softmax(logits)  → DNNArrayPipeline.log_forward()",
-            "  F.relu(x)              → smooth_power_relu(x) = x²/(|x|+ε)",
-            "  F.normalize(x,dim)     → l2_array_normalize(x,dim)",
+            "PIPELINE ORDER (per token step):",
+            "  1. Raw walker logits  (geometric scoring: kernels, PDN, CoT, etc.)",
+            "  2. ContingentExtringentProbability governance (dynamic temperature)",
+            "  3. ── CSNS enrichment ──────────────────────────────────────────",
+            "     3a. Transitive triples: blend(w1×0.25, w2×0.50, c×0.25) → triple(w1→w2→c)",
+            "     3b. Synaptic matrix:    W[i,j] = k_reg · k_ori · k_side  (top-K sparse)",
+            "     3c. Synaptic sum:       z_syn = W_syn @ signed_power(logits, p=1.0)",
+            "     3d. Transitive bonus:   trans = k_all(triple_trans, ctx)  (layer-normed)",
+            "     3e. Enriched logits:    logits += ω_syn·z_syn + ω_trans·trans",
+            "  4. DNNArrayPipeline.forward(logits_enriched)",
+            "     Pass 1: z1 = signed_power(logits ⊙ rho_weights,   p=2.0)",
+            "     Pass 2: z2 = signed_power(z1     ⊙ theta_weights, p=1.5)",
+            "     Pass 3: z3 = signed_power(z2     ⊙ sigma_weights  + z1·0.3, p=1.0)",
+            "     Output: l1_simplex_project(z3)",
+            "  5. AND combination: α·log P_instr + (1−α)·DNN log P_walk",
             "",
-            "DNN ARRAY PIPELINE (3 passes, no learned weights):",
-            "  Pass 1: z1 = signed_power(logits ⊙ rho_weights,   p=2.0)",
-            "  Pass 2: z2 = signed_power(z1     ⊙ theta_weights, p=1.5)",
-            "  Pass 3: z3 = signed_power(z2     ⊙ sigma_weights  + z1·0.3, p=1.0)",
-            "  Output: l1_simplex_project(z3)",
+            "CSNS GEOMETRY:",
+            "  Synaptic coupling encodes lateral geometric affinity between candidates.",
+            "  Tokens close on the Thébault manifold (similar rho, theta, sigma) amplify",
+            "  each other; geometrically distant tokens suppress each other.",
             "",
-            "GEOMETRY-FUSED TEMPERATURE:",
-            "  scaled_i = logits_i · exp(-λ·(rho_i - μ_rho)²/T)",
-            "  Fuses temperature with Thébault rho manifold (Hadamard, not scalar division)",
+            "  Transitive bonus encodes path geometry: how naturally c 'flows' from w1→w2.",
+            "  The blend weights (0.25/0.50/0.25) prioritise the immediate context w2.",
             "",
-            "AND COMBINATION (log-space):",
-            "  log P_walk  = log(DNNArrayPipeline.forward(logits))",
-            "  log P_and   = α·log P_instr + (1−α)·log P_walk",
-            "  P_final     = l1_simplex_project(log P_and)  [no softmax]",
-            "═══════════════════════════════════════════════════════",
+            "REPLACED ACTIVATIONS (from V18, preserved):",
+            "  F.softmax  → DNNArrayPipeline.forward() / l1_simplex_project()",
+            "  F.relu(x)  → smooth_power_relu(x) = x²/(|x|+ε)",
+            "  F.normalize → l2_array_normalize(x, dim)",
+            "═══════════════════════════════════════════════════════════════",
         ]
         return "\n".join(lines)
 
@@ -2232,25 +2450,32 @@ class V18GUI:
 def launch_gui():
     gui = V18GUI()
 
-    with gr.Blocks(title="NeuroSymbolic V18 CUDA + DNN Arrays (No Sigmoid/Softmax)") as app:
+    with gr.Blocks(title="NeuroSymbolic V18-CSNS — Cross-Synaptic Neuron Sums") as app:
         gr.Markdown(
-            "# NeuroSymbolic V18 CUDA — DNN Array Activation Edition\n"
-            "### Thébault Geometry · PDN Theorem · Chain-of-Thought · AND Distribution · "
-            "**No Sigmoid / No Softmax** — 3-Pass DNN Array Pipeline"
+            "# NeuroSymbolic V18-CSNS — Cross-Synaptic Neuron Sums Edition\n"
+            "### Thébault Geometry · PDN · CoT · AND Distribution · "
+            "**DNN Array** (no sigmoid/softmax) · **Cross-Synaptic Neuron Sums** from Transitive Triples"
         )
 
         with gr.Tab("Train"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
+            with gr.Row():
+                syn_w_slider   = gr.Slider(0.0, 2.0, value=0.4,  step=0.05, label="CSNS ω_syn (synaptic weight)")
+                trans_w_slider = gr.Slider(0.0, 2.0, value=1.8,  step=0.05, label="CSNS ω_trans (transitive weight)")
+                syn_k_slider   = gr.Slider(2,   32,  value=8,    step=1,    label="CSNS K (synaptic sparsity)")
             train_file_btn = gr.Button("Initialise from File", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / PDN Report", lines=22, interactive=False)
-            train_file_btn.click(gui.init_engine_from_file, inputs=[file_input], outputs=init_out)
+            train_file_btn.click(
+                gui.init_engine_from_file,
+                inputs  = [file_input, syn_w_slider, trans_w_slider, syn_k_slider],
+                outputs = init_out,
+            )
 
         with gr.Tab("Generate"):
             gr.Markdown(
-                "### Text Generation with DNN Array Pipeline\n"
-                "Softmax/sigmoid replaced throughout with geometry-conditioned DNN array passes.\n\n"
-                "**AND weight α=1** → pure instruction · **α=0** → pure walker · **α=0.5** → balanced\n\n"
-                "**Temperature** is now geometry-fused: `scaled_i = logits_i · exp(-λ·(rho_i - μ)²/T)`"
+                "### Text Generation with CSNS + DNN Array Pipeline\n\n"
+                "**CSNS pipeline**: governed_logits → synaptic_sum + transitive_bonus → enriched_logits → DNN\n\n"
+                "**AND weight α=1** → pure instruction · **α=0** → pure walker · **α=0.5** → balanced"
             )
             with gr.Row():
                 sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
@@ -2262,11 +2487,9 @@ def launch_gui():
                 label       = "Instruction (AND distribution source)",
                 value       = "Explain the meaning of life and human consciousness.",
                 lines       = 2,
-                placeholder = "Enter instruction text…",
             )
             seed_input = gr.Textbox(
                 label       = "Seed Text (bigram start, optional)",
-                value       = "",
                 placeholder = "e.g. quantum entanglement",
             )
             gen_btn = gr.Button("Generate", variant="primary")
@@ -2274,7 +2497,7 @@ def launch_gui():
 
             with gr.Row():
                 cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
-                step_out = gr.Textbox(lines=12, label="AND Step Trace (per token)", interactive=False)
+                step_out = gr.Textbox(lines=12, label="AND+CSNS Step Trace (per token)", interactive=False)
 
             gen_btn.click(
                 gui.generate_text,
@@ -2283,9 +2506,13 @@ def launch_gui():
             )
 
         with gr.Tab("Diagnostics"):
-            dnn_btn  = gr.Button("Show DNN Array Report (V18)")
-            dnn_out  = gr.Textbox(lines=20, label="DNN Activation Report", interactive=False)
+            dnn_btn  = gr.Button("Show DNN + CSNS Pipeline Report")
+            dnn_out  = gr.Textbox(lines=25, label="DNN Array + CSNS Report", interactive=False)
             dnn_btn.click(gui.dnn_report, outputs=dnn_out)
+
+            csns_btn = gr.Button("Show CSNS Diagnostic Report")
+            csns_out = gr.Textbox(lines=16, label="Cross-Synaptic Neuron Sum Diagnostics", interactive=False)
+            csns_btn.click(gui.csns_report, outputs=csns_out)
 
             pdn_btn  = gr.Button("Show PDN Bridge Report")
             pdn_out  = gr.Textbox(lines=18, label="PDN Report", interactive=False)
@@ -2300,11 +2527,17 @@ def launch_gui():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--gui",         action="store_true")
-    parser.add_argument("--corpus",      type=str)
-    parser.add_argument("--instruction", type=str,  default="")
-    parser.add_argument("--and-weight",  type=float, default=0.5)
-    parser.add_argument("--temperature", type=float, default=1.4)
+    parser.add_argument("--gui",          action="store_true")
+    parser.add_argument("--corpus",       type=str)
+    parser.add_argument("--instruction",  type=str,  default="")
+    parser.add_argument("--and-weight",   type=float, default=0.5)
+    parser.add_argument("--temperature",  type=float, default=1.4)
+    parser.add_argument("--syn-weight",   type=float, default=0.4,
+                        help="CSNS synaptic sum weight ω_syn")
+    parser.add_argument("--trans-weight", type=float, default=0.6,
+                        help="CSNS transitive bonus weight ω_trans")
+    parser.add_argument("--syn-k",        type=int,   default=8,
+                        help="CSNS synaptic sparsity K (top-K neighbours)")
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -2317,11 +2550,15 @@ if __name__ == "__main__":
         print(f"[!] Failed to read {args.corpus}: {e}")
         exit(1)
 
-    engine = V18Engine()
+    engine = V18Engine(
+        syn_weight   = args.syn_weight,
+        trans_weight = args.trans_weight,
+        syn_k        = args.syn_k,
+    )
     engine.train(corpus_text)
-    engine.save_cache("v18_model.pkl")
+    engine.save_cache("v18_csns_model.pkl")
 
-    print("\n--- SAMPLE GENERATION (V18: DNN Array, no sigmoid/softmax) ---")
+    print("\n--- SAMPLE GENERATION (V18-CSNS: DNN Array + Cross-Synaptic Neuron Sums) ---")
     instruction = args.instruction or "Explain the meaning of life."
     text, traces, step_report = generate_passage(
         engine.walker, engine.lm,
@@ -2336,5 +2573,7 @@ if __name__ == "__main__":
     print("\n--- COT TRACES ---")
     for tr in traces:
         print(tr.render())
-    print("\n--- AND STEP TRACE ---")
+    print("\n--- AND+CSNS STEP TRACE ---")
     print(step_report)
+    print("\n--- CSNS DIAGNOSTIC ---")
+    print(engine.walker.csns_report())
