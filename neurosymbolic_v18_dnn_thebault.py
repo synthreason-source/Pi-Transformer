@@ -2452,7 +2452,7 @@ def launch_gui():
         )
 
         with gr.Tab("Train"):
-            file_input     = gr.File(label="Upload .txt Corpus File", file_types=[".txt"])
+            file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
                 syn_w_slider   = gr.Slider(0.0, 2.0, value=0.4,  step=0.05, label="CSNS ω_syn")
                 trans_w_slider = gr.Slider(0.0, 2.0, value=1.8,  step=0.05, label="CSNS ω_trans")
