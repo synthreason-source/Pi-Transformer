@@ -145,7 +145,7 @@ def build_synaptic_weight_matrix(
 class CrossSynapticNeuronSum:
     def __init__(
         self,
-        syn_weight   : float = 0.4,
+        syn_weight   : float = 2.0,
         trans_weight : float = 0.6,
         syn_k        : int   = 8,
         lambda_reg   : float = 8.0,
@@ -2496,7 +2496,7 @@ def generate_passage(
 # ════════════════════════════════════════════════════════════════════════════
 
 class V18Engine:
-    def __init__(self, syn_weight=0.4, trans_weight=0.6, syn_k=8):
+    def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8):
         self.device      = DEVICE
         self.geo         = ThebaultTokenGeometry(device=self.device)
         self.kernels     = ThebaultKernels()
@@ -2634,7 +2634,7 @@ class V18Engine:
         self.pdn.acf_values     = state.get("pdn_acf", {})
         self.pdn.acf_significance_bound = state.get("pdn_sig_bound", 0.0)
         self.pdn.power_spectrum = {k: abs(v) for k, v in self.pdn.acf_values.items()}
-        self.syn_weight         = state.get("syn_weight",   0.4)
+        self.syn_weight         = state.get("syn_weight",   2.0)
         self.trans_weight       = state.get("trans_weight", 0.6)
         self.syn_k              = state.get("syn_k",        8)
 
@@ -2802,9 +2802,9 @@ def launch_gui():
         with gr.Tab("Train"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
-                syn_w_slider   = gr.Slider(0.0, 2.0, value=0.4,  step=0.05, label="CSNS ω_syn")
-                trans_w_slider = gr.Slider(0.0, 2.0, value=1.8,  step=0.05, label="CSNS ω_trans")
-                syn_k_slider   = gr.Slider(2,   32,  value=31,   step=1,    label="CSNS K")
+                syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
+                trans_w_slider = gr.Slider(0.0, 12.0, value=1.8,  step=0.05, label="CSNS ω_trans")
+                syn_k_slider   = gr.Slider(2,   132,  value=31,   step=1,    label="CSNS K")
             train_file_btn = gr.Button("Initialise from File", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
             train_file_btn.click(
@@ -2815,10 +2815,10 @@ def launch_gui():
 
         with gr.Tab("Generate"):
             with gr.Row():
-                sentences   = gr.Slider(1, 10,   value=4,    step=1,    label="Sentences")
-                tokens      = gr.Slider(20, 180, value=80,   step=1,    label="Tokens/sentence")
-                and_weight  = gr.Slider(0.0, 1.0, value=0.25, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 3.0, value=0.2, step=0.05, label="Temperature")
+                sentences   = gr.Slider(1, 110,   value=4,    step=1,    label="Sentences")
+                tokens      = gr.Slider(20, 1180, value=80,   step=1,    label="Tokens/sentence")
+                and_weight  = gr.Slider(0.0, 11.0, value=0.25, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 13.0, value=0.2, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution + kernel mandate source)",
@@ -2870,7 +2870,7 @@ if __name__ == "__main__":
     parser.add_argument("--instruction",  type=str,  default="")
     parser.add_argument("--and-weight",   type=float, default=0.5)
     parser.add_argument("--temperature",  type=float, default=1.4)
-    parser.add_argument("--syn-weight",   type=float, default=0.4)
+    parser.add_argument("--syn-weight",   type=float, default=2.0)
     parser.add_argument("--trans-weight", type=float, default=0.6)
     parser.add_argument("--syn-k",        type=int,   default=8)
     args = parser.parse_args()
