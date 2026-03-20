@@ -9,6 +9,22 @@ CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
 
 [Architecture unchanged — see original V18-CSNS docstring]
 
+REFMODEL + PDN FIX (V18-CSNS-G-FIX2)
+──────────────────────────────────────
+Resolves degenerate D_A^(0)=0 / τ≡1.0 / ACF≡0.0 cascade:
+  1. _thebault_triple:           AND → OR in zero-vector guard (catches k̂=0 tokens)
+  2. AtomismReferenceModel:      rho_atom_threshold 0.60→0.25, kappa_def 0.30→0.15
+  3. AtomismReferenceModel.build: adaptive 80th-pct fallback when fixed thr yields ∅
+  4. V18Engine.train:            geo sanity print after build_cuda_tensors
+  5. PDNEngine.fit_from_trigrams: min-max normalise rho series before ACF;
+                                  fall back to sigma series if rho≡constant
+  6. _thebault_triple:            replace broken cv-based rho (always=0 by
+                                  Thébault's theorem) with parallelogram
+                                  intrinsic metric r_balance × r_ortho
+  7. build_cuda_tensors:          percentile-rank-normalise rho to [0,1]
+                                  uniform — guarantees spread regardless of
+                                  absolute geometry scale
+
 GROUNDING CHANGES IN THIS VERSION (V18-CSNS-G)
 ───────────────────────────────────────────────
 0. FORMAL REFERENCE MODEL (Section 0e — NEW):
@@ -317,9 +333,9 @@ class AtomismReferenceModel:
         self,
         geo                 : "ThebaultTokenGeometry",
         kernels             : "ThebaultKernels",
-        rho_atom_threshold  : float = 0.60,   # D_A = {w : ρ(w) ≥ threshold}
+        rho_atom_threshold  : float = 0.25,   # D_A = {w : ρ(w) ≥ threshold}  [FIX: was 0.60 — too high for Zipfian corpora]
         kappa_ref           : float = 0.50,   # Ref(w) = {w' : K(w,w') > κ_ref}
-        kappa_def           : float = 0.30,   # Def(S) step threshold
+        kappa_def           : float = 0.15,   # Def(S) step threshold  [FIX: was 0.30 — too tight when atoms are sparse]
         max_omega_steps     : int   = 6,      # max iterations to approximate D_A^(ω)
         device              : torch.device = DEVICE,
         dtype               : torch.dtype  = torch.float32,
@@ -361,13 +377,26 @@ class AtomismReferenceModel:
         theta_t = self.geo._theta_t[:V]
         sigma_t = self.geo._sigma_t[:V]
 
-        # ── Step 1: D_A^(0) ─ Russellian simples ─────────────────────────
+        # ── Step 1: D_A^(0) ─ Russellian simples (adaptive fallback) ─────
         # D_A = {w ∈ V : ρ(w) ≥ ρ_atom_threshold}
         # ρ encodes Thébault regularity ∈ [0,1]; high-ρ tokens are geometrically
         # balanced → stable semantic anchors (analogous to logical simples).
+        #
+        # FIX: If the fixed threshold yields an empty D_A (common with Zipfian
+        # corpora where most tokens have ρ ≪ 0.25), fall back to an adaptive
+        # percentile: use the top-20% of tokens by ρ as the atomic base.
         D_A_mask = (rho_t >= self.rho_atom_threshold)
+        if int(D_A_mask.sum()) == 0:
+            sorted_rho, _ = rho_t.sort()
+            adaptive_threshold = sorted_rho[max(0, int(V * 0.80))].item()
+            D_A_mask = (rho_t >= adaptive_threshold)
+            used_thr = adaptive_threshold
+            print(f"[RefModel] Fixed threshold {self.rho_atom_threshold:.2f} yielded 0 atoms; "
+                  f"falling back to adaptive 80th-percentile threshold {adaptive_threshold:.4f}")
+        else:
+            used_thr = self.rho_atom_threshold
         print(f"[RefModel] D_A^(0): {int(D_A_mask.sum())} atoms "
-              f"(ρ ≥ {self.rho_atom_threshold:.2f}) / {V} tokens")
+              f"(ρ ≥ {used_thr:.4f}) / {V} tokens")
 
         # ── Step 2: Iterated Def expansion ───────────────────────────────
         # D_A^(n+1) = D_A^(n) ∪ Def(D_A^(n))
@@ -631,26 +660,42 @@ def _thebault_centres(ax, ay, bx, by, cx, cy, dx, dy):
     return centres
 
 def _thebault_triple(px, py, qx, qy):
-    if abs(px) < 1e-9 and abs(py) < 1e-9 and abs(qx) < 1e-9 and abs(qy) < 1e-9:
+    # FIX: The Thébault theorem guarantees the 4 centres ALWAYS form a perfect
+    # square, so cv ≡ _PERFECT_CV for every non-degenerate token and the original
+    # formula  rho = max(0, 1 - cv/_PERFECT_CV) ≡ 0.0 universally.
+    #
+    # Replacement: rho is now a PARALLELOGRAM-INTRINSIC regularity metric:
+    #
+    #   r_balance  = 1 - |mag_p - mag_q| / (mag_p + mag_q)   [1 if |p|=|q|]
+    #   r_ortho    = 1 - |cos(angle(p,q))|                   [1 if p⊥q]
+    #   rho_raw    = r_balance · r_ortho                      [0→1 product]
+    #
+    # rho_raw is PASSED THROUGH unchanged; build_cuda_tensors then
+    # percentile-rank-normalises it across the full vocabulary so it has
+    # a guaranteed uniform [0,1] distribution (see NOTE there).
+    #
+    # sigma and theta are unchanged from the original formulation.
+    mag_p = math.sqrt(px * px + py * py)
+    mag_q = math.sqrt(qx * qx + qy * qy)
+    if mag_p < 1e-9 or mag_q < 1e-9:
         return 0.0, 0.0, 0.0
     T = _thebault_centres(0.0, 0.0, px, py, px + qx, py + qy, qx, qy)
-    dists = []
+    sides = []
     for i in range(4):
-        for j in range(i + 1, 4):
-            dx = T[i][0] - T[j][0]
-            dy = T[i][1] - T[j][1]
-            dists.append(math.sqrt(dx * dx + dy * dy))
-    mu = sum(dists) / 6
-    if mu < 1e-9:
-        return 0.0, 0.0, 0.0
-    cv  = math.sqrt(sum((d - mu) ** 2 for d in dists) / 6) / mu
-    rho = max(0.0, min(1.0, 1.0 - cv / (_PERFECT_CV + 1e-9)))
-    sides = dists[:4]
+        dx = T[(i+1)%4][0] - T[i][0]
+        dy = T[(i+1)%4][1] - T[i][1]
+        sides.append(math.sqrt(dx * dx + dy * dy))
     sigma = sum(sides) / 4.0
     dx_ori = T[1][0] - T[0][0]
     dy_ori = T[1][1] - T[0][1]
     theta  = math.atan2(dy_ori, dx_ori) % math.pi
-    return rho, theta, sigma
+    # Parallelogram-intrinsic regularity
+    r_balance = 1.0 - abs(mag_p - mag_q) / (mag_p + mag_q)
+    cos_angle = (px * qx + py * qy) / (mag_p * mag_q)
+    cos_angle = max(-1.0, min(1.0, cos_angle))
+    r_ortho   = 1.0 - abs(cos_angle)
+    rho_raw   = r_balance * r_ortho   # ∈ [0,1]; will be percentile-ranked in build_cuda_tensors
+    return rho_raw, theta, sigma
 
 @dataclass
 class ThebaultTriple:
@@ -694,7 +739,23 @@ class ThebaultTokenGeometry:
         rhos   = [r for r, _, _ in triples]
         thetas = [th for _, th, _ in triples]
         sigmas = [s for _, _, s in triples]
-        self._rho_t   = torch.tensor(rhos,   dtype=self.dtype, device=self.device)
+        # FIX: Percentile-rank-normalise rho to [0, 1] uniform distribution.
+        # _thebault_triple now returns rho_raw = r_balance * r_ortho which
+        # has near-zero absolute variance across a Zipfian vocabulary (because
+        # f_hat << k_hat for most tokens). Percentile ranking preserves the
+        # geometric quality ordering while guaranteeing:
+        #   • rho ∈ [0, 1] with uniform distribution
+        #   • D_A^(0) at threshold t captures exactly the top (1-t)*100% of tokens
+        #   • ACF of rho series has non-zero variance
+        rho_raw_t = torch.tensor(rhos, dtype=self.dtype, device=self.device)
+        V_size    = rho_raw_t.shape[0]
+        if V_size > 1:
+            sorted_idx   = torch.argsort(rho_raw_t)
+            rank_t       = torch.zeros(V_size, dtype=self.dtype, device=rho_raw_t.device)
+            rank_t[sorted_idx] = torch.arange(V_size, dtype=self.dtype, device=rho_raw_t.device)
+            self._rho_t  = rank_t / float(V_size - 1)   # uniform [0, 1]
+        else:
+            self._rho_t  = rho_raw_t
         self._theta_t = torch.tensor(thetas, dtype=self.dtype, device=self.device)
         self._sigma_t = torch.tensor(sigmas, dtype=self.dtype, device=self.device)
         self._pvec_t  = torch.stack([
@@ -861,6 +922,57 @@ class PDNEngine:
             self.n_star = 4
             print("[PDN] Insufficient data — defaulting to n*=4")
             return
+
+        # FIX: If the rho series has zero (or near-zero) variance, ACF is
+        # trivially all-zero and n* defaults to 4 uninformatively.
+        # Root cause: _thebault_triple clips rho = max(0, 1 - cv/_PERFECT_CV),
+        # so tokens whose geometry is worse than a perfect square all get rho=0,
+        # which is the case for most Zipfian-distributed tokens.
+        #
+        # Two-stage recovery:
+        #   Stage 1 — Min-max normalise rho to [0, 1] over the observed range.
+        #             This preserves relative temporal variation while removing
+        #             the absolute-scale collapse.  ACF is scale-invariant so
+        #             this doesn't change its interpretation.
+        #   Stage 2 — If rho is still constant after normalisation (e.g. all
+        #             tokens in all trigrams have identical rho=0), fall back to
+        #             sigma (the mean Thébault side-length), which is always
+        #             strictly positive for non-degenerate tokens and has a
+        #             meaningful Zipfian distribution across the vocabulary.
+        rho_min = min(rho_series)
+        rho_max_v = max(rho_series)
+        rho_range = rho_max_v - rho_min
+        if rho_range > 1e-9:
+            rho_series = [(r - rho_min) / rho_range for r in rho_series]
+            print(f"[PDN] Rho range [{rho_min:.4f}, {rho_max_v:.4f}] "
+                  f"→ min-max normalised to [0, 1] for ACF")
+        else:
+            # Stage 2: all rho values are identical — rebuild series using sigma
+            print(f"[PDN] Rho series has zero variance (constant={rho_min:.6f}) "
+                  f"— falling back to sigma (Thébault side-length) series")
+            sigma_series: List[float] = []
+            for (w1, w2, w3), cnt in tri_raw.items():
+                s1 = geo.triple(w1).sigma
+                s2 = geo.triple(w2).sigma
+                s3 = geo.triple(w3).sigma
+                repeats = min(int(cnt), 5)
+                for _ in range(repeats):
+                    sigma_series.extend([s1, s2, s3])
+            sig_min = min(sigma_series) if sigma_series else 0.0
+            sig_max = max(sigma_series) if sigma_series else 1.0
+            sig_range = sig_max - sig_min
+            if sig_range > 1e-9:
+                rho_series = [(s - sig_min) / sig_range for s in sigma_series]
+                print(f"[PDN] Sigma range [{sig_min:.4f}, {sig_max:.4f}] "
+                      f"→ normalised to [0, 1] for ACF")
+            else:
+                # Both rho and sigma are constant — corpus is too homogeneous
+                print("[PDN] Both rho and sigma series have zero variance; "
+                      "corpus may be too small or homogeneous. Defaulting n*=4.")
+                self.n_star = 4
+                self.acf_values = {lag: 0.0 for lag in range(1, self.max_period + 1)}
+                self.power_spectrum = self.acf_values.copy()
+                return
 
         acf = self._compute_acf(rho_series, self.max_period)
         self.acf_values = acf
@@ -2535,6 +2647,14 @@ class V18Engine:
         print("[*] Building GPU Tensor Caches...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
+
+        # FIX: Sanity-check geometry tensors before RefModel build
+        rho_nonzero = int((self.geo._rho_t > 0.01).sum().item())
+        rho_max     = float(self.geo._rho_t.max().item())
+        print(f"[Geo] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
+        if rho_nonzero == 0:
+            print("[Geo] WARNING: all ρ values are near-zero — check that max_freq and ")
+            print("               vocab_size are passed correctly to geo.register()")
 
         print("[*] Building graph potentials...")
         self.graph.build(self.lm)
