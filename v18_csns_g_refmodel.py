@@ -2937,7 +2937,7 @@ def launch_gui():
             with gr.Row():
                 sentences   = gr.Slider(1, 110,   value=4,    step=1,    label="Sentences")
                 tokens      = gr.Slider(20, 1180, value=80,   step=1,    label="Tokens/sentence")
-                and_weight  = gr.Slider(0.0, 11.0, value=0.25, step=0.05, label="AND weight α")
+                and_weight  = gr.Slider(0.0, 11.0, value=11, step=0.05, label="AND weight α")
                 temperature = gr.Slider(0.1, 13.0, value=0.2, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
