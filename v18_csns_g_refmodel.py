@@ -782,7 +782,7 @@ class ThebaultTokenGeometry:
 class PDNEngine:
     def __init__(
         self,
-        n_modes              : int   = 4,
+        n_modes              : int   = 42,
         sigma_pdn            : float = 1.25,
         orbit_weight         : float = 15.4,
         regularity_weight    : float = 0.1,
@@ -1085,8 +1085,8 @@ class InstructionDistribution:
         dtype            : torch.dtype  = torch.float32,
         semantic_radius  : float = 2.0,
         recency_decay    : float = 0.7,
-        context_bonus    : float = 0.15,
-        centroid_weight  : float = 0.4,
+        context_bonus    : float = 0.75,
+        centroid_weight  : float = 0.8,
     ):
         self.geo              = geo
         self.kernels          = kernels
@@ -2073,7 +2073,7 @@ class ThebaultWalker:
         instr_dist       : InstructionDistribution,
         ref_model        : "AtomismReferenceModel" = None,
         device           : torch.device = DEVICE,
-        syn_weight       : float = 0.4,
+        syn_weight       : float = 2.0,
         trans_weight     : float = 0.6,
         syn_k            : int   = 8,
         tau_weight       : float = 0.45,
