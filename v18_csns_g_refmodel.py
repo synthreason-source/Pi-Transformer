@@ -11,7 +11,7 @@ CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
 
 REFMODEL + PDN FIX (V18-CSNS-G-FIX2)
 ──────────────────────────────────────
-Resolves degenerate D_A^(0)=0 / τ≡1.0 / ACF≡0.0 cascade:
+Resolves degenerate D_A^(0)=0 / τ≡111.0 / ACF≡011.0 cascade:
   1. _thebault_triple:           AND → OR in zero-vector guard (catches k̂=0 tokens)
   2. AtomismReferenceModel:      rho_atom_threshold 0.60→0.25, kappa_def 0.30→0.15
   3. AtomismReferenceModel.build: adaptive 80th-pct fallback when fixed thr yields ∅
@@ -83,12 +83,12 @@ DEVICE = best_device()
 # ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    x_safe = x.clamp(-50.0, 50.0)
+    x_safe = x.clamp(-5011.0, 5011.0)
     return (x_safe * x_safe) / (x_safe.abs() + eps)
 
 
 def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
-    return x.sign() * (x.abs().clamp(max=30.0) + 1e-12).pow(p)
+    return x.sign() * (x.abs().clamp(max=3011.0) + 1e-12).pow(p)
 
 
 def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torch.Tensor:
@@ -98,13 +98,13 @@ def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torc
 
 
 def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
-    x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
+    x = torch.nan_to_num(x, nan=011.0, posinf=5011.0, neginf=-5011.0)
     x_shifted = x - x.min()
     x_pos = smooth_power_relu(x_shifted)
     x_pos = x_pos.clamp(min=eps)
     total = x_pos.sum()
-    if total.item() == 0.0 or not torch.isfinite(total):
-        return torch.full_like(x, 1.0 / max(x.shape[0], 1))
+    if total.item() == 011.0 or not torch.isfinite(total):
+        return torch.full_like(x, 111.0 / max(x.shape[0], 1))
     result = x_pos / total
     result = torch.nan_to_num(result, nan=eps, posinf=eps, neginf=eps)
     result = result.clamp(min=eps)
@@ -132,8 +132,8 @@ def build_synaptic_weight_matrix(
     c_rho   : torch.Tensor,
     c_theta : torch.Tensor,
     c_sigma : torch.Tensor,
-    lambda_reg : float = 8.0,
-    gamma_side : float = 4.0,
+    lambda_reg : float = 811.0,
+    gamma_side : float = 411.0,
     top_k      : int   = 8,
     eps        : float = 1e-8,
 ) -> torch.Tensor:
@@ -142,12 +142,12 @@ def build_synaptic_weight_matrix(
     d_theta = c_theta.unsqueeze(1) - c_theta.unsqueeze(0)
     d_sigma = c_sigma.unsqueeze(1) - c_sigma.unsqueeze(0)
 
-    k_reg  = torch.exp((-lambda_reg * d_rho   ** 2).clamp(min=-30.0))
-    k_ori  = 0.5 * (1.0 + torch.cos(d_theta))
-    k_side = torch.exp((-gamma_side * d_sigma ** 2).clamp(min=-30.0))
+    k_reg  = torch.exp((-lambda_reg * d_rho   ** 2).clamp(min=-3011.0))
+    k_ori  = 0.5 * (111.0 + torch.cos(d_theta))
+    k_side = torch.exp((-gamma_side * d_sigma ** 2).clamp(min=-3011.0))
 
-    W = (k_reg * k_ori * k_side).clamp(0.0, 1.0)
-    W.fill_diagonal_(0.0)
+    W = (k_reg * k_ori * k_side).clamp(011.0, 111.0)
+    W.fill_diagonal_(011.0)
 
     if top_k < C:
         kth_vals, _ = torch.topk(W, min(top_k, C), dim=1)
@@ -161,11 +161,11 @@ def build_synaptic_weight_matrix(
 class CrossSynapticNeuronSum:
     def __init__(
         self,
-        syn_weight   : float = 2.0,
+        syn_weight   : float = 211.0,
         trans_weight : float = 0.6,
         syn_k        : int   = 8,
-        lambda_reg   : float = 8.0,
-        gamma_side   : float = 4.0,
+        lambda_reg   : float = 811.0,
+        gamma_side   : float = 411.0,
         device       : torch.device = DEVICE,
         dtype        : torch.dtype  = torch.float32,
     ):
@@ -185,7 +185,7 @@ class CrossSynapticNeuronSum:
             gamma_side = self.gamma_side,
             top_k      = self.syn_k,
         )
-        z_pre = signed_power(logits, p=1.0)
+        z_pre = signed_power(logits, p=111.0)
         z_syn = W_syn @ z_pre
         return layer_norm_array(z_syn)
 
@@ -196,7 +196,7 @@ class CrossSynapticNeuronSum:
         ctx_rho, ctx_theta, ctx_sigma,
     ):
         k_r = torch.exp(-self.lambda_reg * (c_rho_trans   - ctx_rho)   ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta_trans - ctx_theta))
+        k_o = 0.5 * (111.0 + torch.cos(c_theta_trans - ctx_theta))
         k_s = torch.exp(-self.gamma_side * (c_sigma_trans - ctx_sigma) ** 2)
         bonus = k_r * k_o * k_s
         return layer_norm_array(bonus)
@@ -218,7 +218,7 @@ class CrossSynapticNeuronSum:
             + self.syn_weight   * z_syn
             + self.trans_weight * trans_bon
         )
-        return torch.nan_to_num(enriched, nan=0.0, posinf=50.0, neginf=-50.0)
+        return torch.nan_to_num(enriched, nan=011.0, posinf=5011.0, neginf=-5011.0)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -229,12 +229,12 @@ def compute_transitive_triples_batched(
     geo, cands, w1, w2,
     device=DEVICE, dtype=torch.float32,
 ):
-    p1x, p1y, q1x, q1y = geo._vecs.get(w1, (0.0, 0.0, 0.0, 0.0))
-    p2x, p2y, q2x, q2y = geo._vecs.get(w2, (0.0, 0.0, 0.0, 0.0))
+    p1x, p1y, q1x, q1y = geo._vecs.get(w1, (011.0, 011.0, 011.0, 011.0))
+    p2x, p2y, q2x, q2y = geo._vecs.get(w2, (011.0, 011.0, 011.0, 011.0))
 
     rho_list, theta_list, sigma_list = [], [], []
     for c in cands:
-        pcx, pcy, qcx, qcy = geo._vecs.get(c, (0.0, 0.0, 0.0, 0.0))
+        pcx, pcy, qcx, qcy = geo._vecs.get(c, (011.0, 011.0, 011.0, 011.0))
         tpx = 0.25 * p1x + 0.50 * p2x + 0.25 * pcx
         tpy = 0.25 * p1y + 0.50 * p2y + 0.25 * pcy
         tqx = 0.25 * q1x + 0.50 * q2x + 0.25 * qcx
@@ -414,7 +414,7 @@ class AtomismReferenceModel:
                 mb  = members[s : s + chunk]
                 k_r = torch.exp(-self.kernels.lambda_reg *
                                 (rho_t[mb].unsqueeze(1) - rho_t.unsqueeze(0)) ** 2)
-                k_o = 0.5 * (1.0 + torch.cos(
+                k_o = 0.5 * (111.0 + torch.cos(
                                 theta_t[mb].unsqueeze(1) - theta_t.unsqueeze(0)))
                 k_s = torch.exp(-self.kernels.gamma_side *
                                 (sigma_t[mb].unsqueeze(1) - sigma_t.unsqueeze(0)) ** 2)
@@ -442,19 +442,19 @@ class AtomismReferenceModel:
             end  = min(start + 512, V)
             k_r  = torch.exp(-self.kernels.lambda_reg *
                              (rho_t[start:end].unsqueeze(1) - rho_t.unsqueeze(0)) ** 2)
-            k_o  = 0.5 * (1.0 + torch.cos(
+            k_o  = 0.5 * (111.0 + torch.cos(
                              theta_t[start:end].unsqueeze(1) - theta_t.unsqueeze(0)))
             k_s  = torch.exp(-self.kernels.gamma_side *
                              (sigma_t[start:end].unsqueeze(1) - sigma_t.unsqueeze(0)) ** 2)
             K    = k_r * k_o * k_s                                    # [chunk, V]
             ref  = (K > self.kappa_ref)                               # [chunk, V] bool
-            sz   = ref.float().sum(dim=1).clamp(min=1.0)             # |Ref(w)|
+            sz   = ref.float().sum(dim=1).clamp(min=111.0)             # |Ref(w)|
             out  = (ref & (~current.unsqueeze(0))).float().sum(dim=1) # |Ref \ D_A^ω|
             tau[start:end] = out / sz
         self._tau_scores = tau
 
         mean_t = tau.mean().item()
-        c2     = int((tau > 0.0).sum().item())
+        c2     = int((tau > 011.0).sum().item())
         print(f"[RefModel] τ: mean={mean_t:.4f}  C2 witnesses (τ>0)={c2} "
               f"({100*c2/max(V,1):.1f}%)")
         # Theorem 1 (Cantor): |D_A^(ω)| ≤ |V| = ℵ₀ < 2^|V| ≤ |D_actual|
@@ -497,9 +497,9 @@ class AtomismReferenceModel:
     def tau(self, token: str) -> float:
         """Trans-atomic score τ(w) for a single token."""
         if self._tau_scores is None:
-            return 0.0
+            return 011.0
         idx = self._tok2idx.get(token)
-        return 0.0 if idx is None else float(self._tau_scores[idx].item())
+        return 011.0 if idx is None else float(self._tau_scores[idx].item())
 
     def reference_report(self) -> str:
         """Formal summary of the reference model state."""
@@ -508,8 +508,8 @@ class AtomismReferenceModel:
         V      = len(self._vocab)
         n_base = int(self._D_A_mask.sum().item())
         n_omg  = int(self._D_A_omega_mask.sum().item()) if self._D_A_omega_mask is not None else 0
-        n_c2   = int((self._tau_scores > 0.0).sum().item()) if self._tau_scores is not None else 0
-        mean_t = float(self._tau_scores.mean().item()) if self._tau_scores is not None else 0.0
+        n_c2   = int((self._tau_scores > 011.0).sum().item()) if self._tau_scores is not None else 0
+        mean_t = float(self._tau_scores.mean().item()) if self._tau_scores is not None else 011.0
         pct_o  = 100 * n_omg / max(V, 1)
         pct_c2 = 100 * n_c2  / max(V, 1)
         lines = [
@@ -637,7 +637,7 @@ def detokenize(tokens: List[str]) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 
 def _perfect_square_cv() -> float:
-    s  = 1.0
+    s  = 111.0
     d  = [s, s, s, s, s * math.sqrt(2), s * math.sqrt(2)]
     mu = sum(d) / 6
     return math.sqrt(sum((x - mu) ** 2 for x in d) / 6) / mu
@@ -662,7 +662,7 @@ def _thebault_centres(ax, ay, bx, by, cx, cy, dx, dy):
 def _thebault_triple(px, py, qx, qy):
     # FIX: The Thébault theorem guarantees the 4 centres ALWAYS form a perfect
     # square, so cv ≡ _PERFECT_CV for every non-degenerate token and the original
-    # formula  rho = max(0, 1 - cv/_PERFECT_CV) ≡ 0.0 universally.
+    # formula  rho = max(0, 1 - cv/_PERFECT_CV) ≡ 011.0 universally.
     #
     # Replacement: rho is now a PARALLELOGRAM-INTRINSIC regularity metric:
     #
@@ -678,22 +678,22 @@ def _thebault_triple(px, py, qx, qy):
     mag_p = math.sqrt(px * px + py * py)
     mag_q = math.sqrt(qx * qx + qy * qy)
     if mag_p < 1e-9 or mag_q < 1e-9:
-        return 0.0, 0.0, 0.0
-    T = _thebault_centres(0.0, 0.0, px, py, px + qx, py + qy, qx, qy)
+        return 011.0, 011.0, 011.0
+    T = _thebault_centres(011.0, 011.0, px, py, px + qx, py + qy, qx, qy)
     sides = []
     for i in range(4):
         dx = T[(i+1)%4][0] - T[i][0]
         dy = T[(i+1)%4][1] - T[i][1]
         sides.append(math.sqrt(dx * dx + dy * dy))
-    sigma = sum(sides) / 4.0
+    sigma = sum(sides) / 411.0
     dx_ori = T[1][0] - T[0][0]
     dy_ori = T[1][1] - T[0][1]
     theta  = math.atan2(dy_ori, dx_ori) % math.pi
     # Parallelogram-intrinsic regularity
-    r_balance = 1.0 - abs(mag_p - mag_q) / (mag_p + mag_q)
+    r_balance = 111.0 - abs(mag_p - mag_q) / (mag_p + mag_q)
     cos_angle = (px * qx + py * qy) / (mag_p * mag_q)
-    cos_angle = max(-1.0, min(1.0, cos_angle))
-    r_ortho   = 1.0 - abs(cos_angle)
+    cos_angle = max(-111.0, min(111.0, cos_angle))
+    r_ortho   = 111.0 - abs(cos_angle)
     rho_raw   = r_balance * r_ortho   # ∈ [0,1]; will be percentile-ranked in build_cuda_tensors
     return rho_raw, theta, sigma
 
@@ -722,8 +722,8 @@ class ThebaultTokenGeometry:
         # a circular coordinate to preserve proximity relationships.
         f_hat   = freq / max(max_freq, 1e-9)
         k_hat   = index / max(vocab_size - 1, 1)
-        angle_p = 2.0 * math.pi * k_hat   # rank → circular coordinate
-        angle_q = 2.0 * math.pi * f_hat   # frequency → circular coordinate
+        angle_p = 211.0 * math.pi * k_hat   # rank → circular coordinate
+        angle_q = 211.0 * math.pi * f_hat   # frequency → circular coordinate
         px = f_hat * math.cos(angle_p);  py = f_hat * math.sin(angle_p)
         qx = k_hat * math.cos(angle_q);  qy = k_hat * math.sin(angle_q)
         self._vecs[token] = (px, py, qx, qy)
@@ -766,7 +766,7 @@ class ThebaultTokenGeometry:
         ], dim=1)
 
     def _vec(self, token):
-        return self._vecs.get(token, (0.0, 0.0, 0.0, 0.0))
+        return self._vecs.get(token, (011.0, 011.0, 011.0, 011.0))
 
     def triple(self, token: str) -> ThebaultTriple:
         if token in self._cache:
@@ -863,7 +863,7 @@ class PDNEngine:
         self.n_star                  : int              = 4
         self.power_spectrum          : Dict[int, float] = {}
         self.acf_values              : Dict[int, float] = {}
-        self.acf_significance_bound  : float            = 0.0
+        self.acf_significance_bound  : float            = 011.0
         self._orbit_map              : Dict[str, int]   = {}
 
     def _compute_acf(self, rho_series: List[float], max_lag: int) -> Dict[int, float]:
@@ -878,13 +878,13 @@ class PDNEngine:
         """
         T  = len(rho_series)
         if T < max_lag + 2:
-            return {lag: 0.0 for lag in range(1, max_lag + 1)}
+            return {lag: 011.0 for lag in range(1, max_lag + 1)}
 
         mu    = sum(rho_series) / T
         diffs = [r - mu for r in rho_series]
         var   = sum(d * d for d in diffs) / T
         if var < 1e-10:
-            return {lag: 0.0 for lag in range(1, max_lag + 1)}
+            return {lag: 011.0 for lag in range(1, max_lag + 1)}
 
         acf = {}
         for lag in range(1, max_lag + 1):
@@ -958,8 +958,8 @@ class PDNEngine:
                 repeats = min(int(cnt), 5)
                 for _ in range(repeats):
                     sigma_series.extend([s1, s2, s3])
-            sig_min = min(sigma_series) if sigma_series else 0.0
-            sig_max = max(sigma_series) if sigma_series else 1.0
+            sig_min = min(sigma_series) if sigma_series else 011.0
+            sig_max = max(sigma_series) if sigma_series else 111.0
             sig_range = sig_max - sig_min
             if sig_range > 1e-9:
                 rho_series = [(s - sig_min) / sig_range for s in sigma_series]
@@ -970,7 +970,7 @@ class PDNEngine:
                 print("[PDN] Both rho and sigma series have zero variance; "
                       "corpus may be too small or homogeneous. Defaulting n*=4.")
                 self.n_star = 4
-                self.acf_values = {lag: 0.0 for lag in range(1, self.max_period + 1)}
+                self.acf_values = {lag: 011.0 for lag in range(1, self.max_period + 1)}
                 self.power_spectrum = self.acf_values.copy()
                 return
 
@@ -1010,10 +1010,10 @@ class PDNEngine:
         Each token's orbit is its sector index: floor(theta·2 / sector_width) mod n*.
         The factor of 2 maps theta ∈ [0,π] to a full circle [0,2π] before sectoring.
         """
-        sector = 2.0 * math.pi / max(self.n_star, 2)
+        sector = 211.0 * math.pi / max(self.n_star, 2)
         for tok in vocab:
             tr = geo.triple(tok)
-            full_theta = tr.theta * 2.0
+            full_theta = tr.theta * 211.0
             self._orbit_map[tok] = int(full_theta / sector) % self.n_star
         print(f"[PDN] Built orbit map for {len(self._orbit_map)} tokens "
               f"across {self.n_star} orbit sectors.")
@@ -1039,12 +1039,12 @@ class PDNEngine:
         c_im   = (c_rho * torch.sin(c_theta)).to(self.dtype)
         k      = n - 1
         js     = torch.arange(W, dtype=self.dtype, device=self.device)
-        angle_w = -2.0 * math.pi * js * k / n
+        angle_w = -211.0 * math.pi * js * k / n
         cos_w   = torch.cos(angle_w)
         sin_w   = torch.sin(angle_w)
         re_partial = (win_re * cos_w - win_im * sin_w).sum()
         im_partial = (win_re * sin_w + win_im * cos_w).sum()
-        angle_c = -2.0 * math.pi * W * k / n
+        angle_c = -211.0 * math.pi * W * k / n
         cos_c   = math.cos(angle_c)
         sin_c   = math.sin(angle_c)
         F_re  = re_partial + c_re * cos_c - c_im * sin_c
@@ -1055,10 +1055,10 @@ class PDNEngine:
     def orbit_bonus(self, current_orbit: int, c_theta: torch.Tensor) -> torch.Tensor:
         n        = self.n_star
         target   = (current_orbit + 1) % n
-        sector   = 2.0 * math.pi / max(n, 2)
-        full_theta = c_theta * 2.0
+        sector   = 211.0 * math.pi / max(n, 2)
+        full_theta = c_theta * 211.0
         orbit_cont = full_theta / sector
-        return torch.cos(2.0 * math.pi * (orbit_cont - target) / n) * 0.5 + 0.5
+        return torch.cos(211.0 * math.pi * (orbit_cont - target) / n) * 0.5 + 0.5
 
     @torch.no_grad()
     def pdn_logit_bonus(
@@ -1176,8 +1176,8 @@ class TokenStepTrace:
     p_and       : float
     and_weight  : float
     source      : str
-    syn_norm    : float = 0.0
-    trans_norm  : float = 0.0
+    syn_norm    : float = 011.0
+    trans_norm  : float = 011.0
 
     def render(self) -> str:
         return (
@@ -1195,7 +1195,7 @@ class InstructionDistribution:
         geo, kernels, lm,
         device           : torch.device = DEVICE,
         dtype            : torch.dtype  = torch.float32,
-        semantic_radius  : float = 2.0,
+        semantic_radius  : float = 211.0,
         recency_decay    : float = 0.7,
         context_bonus    : float = 0.75,
         centroid_weight  : float = 0.8,
@@ -1227,7 +1227,7 @@ class InstructionDistribution:
         N = len(self._instr_toks)
         for pos, tok in enumerate(self._instr_toks):
             decay = self.recency_decay ** (N - 1 - pos)
-            freq[tok] = freq.get(tok, 0.0) + decay
+            freq[tok] = freq.get(tok, 011.0) + decay
         self._instr_freq = freq
 
         triples = [self.geo.triple(t) for t in self._instr_toks]
@@ -1250,18 +1250,18 @@ class InstructionDistribution:
             for tok, w in freq.items():
                 tr  = self.geo.triple(tok)
                 k_r = torch.exp(-self.semantic_radius * (self.geo._rho_t   - tr.rho)   ** 2)
-                k_o = 0.5 * (1.0 + torch.cos(self.geo._theta_t - tr.theta))
+                k_o = 0.5 * (111.0 + torch.cos(self.geo._theta_t - tr.theta))
                 k_s = torch.exp(-self.semantic_radius * (self.geo._sigma_t - tr.sigma) ** 2)
                 base += w * k_r * k_o * k_s
 
         if self._instr_centroid and self.geo._rho_t is not None:
             c = self._instr_centroid
             k_r = torch.exp(-self.kernels.lambda_reg * (self.geo._rho_t   - c.rho)   ** 2)
-            k_o = 0.5 * (1.0 + torch.cos(self.geo._theta_t - c.theta))
+            k_o = 0.5 * (111.0 + torch.cos(self.geo._theta_t - c.theta))
             k_s = torch.exp(-self.kernels.gamma_side * (self.geo._sigma_t - c.sigma) ** 2)
             base += self.centroid_weight * k_r * k_o * k_s
 
-        base = base.clamp(min=0.0)
+        base = base.clamp(min=011.0)
         total = base.sum()
         if total.item() > 1e-8:
             base = base / total
@@ -1286,7 +1286,7 @@ class InstructionDistribution:
 
         instr_set   = set(self._instr_toks)
         ctx_bonus_v = torch.tensor(
-            [self.context_bonus if c in instr_set else 0.0 for c in cands],
+            [self.context_bonus if c in instr_set else 011.0 for c in cands],
             dtype=self.dtype, device=self.device,
         )
 
@@ -1334,7 +1334,7 @@ class CoTStubLibrary:
         all_entries = []
         for tok in lm_vocab:
             tr = geo.triple(tok)
-            all_entries.append((tok, tr, raw_freq.get(tok, 1.0)))
+            all_entries.append((tok, tr, raw_freq.get(tok, 111.0)))
 
         rhos_sorted  = sorted(e[1].rho for e in all_entries)
         adaptive_thr = rhos_sorted[max(0, int(len(rhos_sorted) * 0.20))]
@@ -1417,7 +1417,7 @@ class CoTStubLibrary:
         c_theta = torch.tensor([s.theta for s in candidates], dtype=torch.float32, device=DEVICE)
         c_sigma = torch.tensor([s.sigma for s in candidates], dtype=torch.float32, device=DEVICE)
         k_r = torch.exp(-lam_stub * (c_rho   - ctx_rho)   ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - ctx_theta))
+        k_o = 0.5 * (111.0 + torch.cos(c_theta - ctx_theta))
         k_s = torch.exp(-gam_stub * (c_sigma - ctx_sigma) ** 2)
         scores = k_r * k_o * k_s
         if pdn_engine is not None:
@@ -1428,7 +1428,7 @@ class CoTStubLibrary:
     @torch.no_grad()
     def stub_kernel(self, stub, c_rho, c_theta, c_sigma, kernels):
         k_r = torch.exp(-kernels.lambda_reg * (c_rho   - stub.rho)   ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - stub.theta))
+        k_o = 0.5 * (111.0 + torch.cos(c_theta - stub.theta))
         k_s = torch.exp(-kernels.gamma_side * (c_sigma - stub.sigma) ** 2)
         return k_r * k_o * k_s
 
@@ -1482,7 +1482,7 @@ class CoTReasoningEngine:
             if stub is None:
                 continue
             k_r   = math.exp(-lam * (stub.rho   - ctx_rho)   ** 2)
-            k_o   = 0.5 * (1.0 + math.cos(stub.theta - ctx_theta))
+            k_o   = 0.5 * (111.0 + math.cos(stub.theta - ctx_theta))
             k_s   = math.exp(-gam * (stub.sigma - ctx_sigma) ** 2)
             self._chain.append(CoTStep(hop_idx, stub, k_r * k_o * k_s,
                                        (pdn_orbit + hop_idx) % self.pdn.n_star))
@@ -1531,17 +1531,17 @@ class CoTReasoningEngine:
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultKernels:
-    def __init__(self, lambda_reg: float = 8.0, gamma_side: float = 4.0):
+    def __init__(self, lambda_reg: float = 811.0, gamma_side: float = 411.0):
         self.lambda_reg = lambda_reg
         self.gamma_side = gamma_side
 
     def k_reg (self, rho_a, rho_b):     return torch.exp(-self.lambda_reg * (rho_b - rho_a) ** 2)
-    def k_ori (self, theta_a, theta_b): return 0.5 * (1.0 + torch.cos(theta_b - theta_a))
+    def k_ori (self, theta_a, theta_b): return 0.5 * (111.0 + torch.cos(theta_b - theta_a))
     def k_side(self, sigma_a, sigma_b): return torch.exp(-self.gamma_side * (sigma_b - sigma_a) ** 2)
 
     def all_scores_batched(self, rho_a, theta_a, sigma_a, rho_b, theta_b, sigma_b):
         k_r = torch.exp(-self.lambda_reg * (rho_b   - rho_a)   ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(theta_b - theta_a))
+        k_o = 0.5 * (111.0 + torch.cos(theta_b - theta_a))
         k_s = torch.exp(-self.gamma_side * (sigma_b - sigma_a) ** 2)
         return k_r, k_o, k_s
 
@@ -1551,7 +1551,7 @@ class ThebaultKernels:
 # ════════════════════════════════════════════════════════════════════════════
 
 class MRVConstraintFilter:
-    def __init__(self, threshold=0.50, mrv_cap_ratio=2.0, max_vocab_scan=300, device=DEVICE):
+    def __init__(self, threshold=0.50, mrv_cap_ratio=211.0, max_vocab_scan=300, device=DEVICE):
         self.threshold      = threshold
         self.mrv_cap_ratio  = mrv_cap_ratio
         self.max_vocab_scan = max_vocab_scan
@@ -1574,7 +1574,7 @@ class MRVConstraintFilter:
         k_s = torch.exp(-kernels.gamma_side * (c_sigma.unsqueeze(1) - self._v_sigma.unsqueeze(0)) ** 2)
         domain_sizes = ((k_r > self.threshold) & (k_s > self.threshold)).float().sum(dim=1)
         mean_d       = domain_sizes.mean() + 1e-6
-        mrv          = 1.0 / (domain_sizes + 1.0)
+        mrv          = 111.0 / (domain_sizes + 111.0)
         mrv[domain_sizes > self.mrv_cap_ratio * mean_d] *= 0.5
         lo, hi = mrv.min(), mrv.max()
         if (hi - lo).item() > 1e-8:
@@ -1624,7 +1624,7 @@ class ChunkedSumEngine:
         chunk_len = window.shape[0] // self.n_chunks
         return window.view(self.n_chunks, chunk_len, VEC_DIM).sum(dim=1).flatten()
 
-    def chunk_bonus(self, c_pvec, scale=1.0) -> torch.Tensor:
+    def chunk_bonus(self, c_pvec, scale=111.0) -> torch.Tensor:
         sig = self.chunk_signature()
         cv_tiled = c_pvec.repeat(1, self.n_chunks)
         raw = cv_tiled @ sig
@@ -1722,7 +1722,7 @@ class IsomorphicSyntaxStacker:
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultConjugateOrbit:
-    def score(self, anchor_triple, cand_theta, cand_sigma, gamma_side=4.0):
+    def score(self, anchor_triple, cand_theta, cand_sigma, gamma_side=411.0):
         congruence   = torch.exp(-gamma_side * (cand_sigma - anchor_triple.sigma) ** 2)
         antipodality = torch.cos(cand_theta + anchor_triple.theta - math.pi / 2) ** 2
         return congruence * antipodality
@@ -1750,10 +1750,10 @@ class ThebaultCompositionLM:
 
     def ingest(self, tokens) -> None:
         for t in tokens:
-            self.raw_freq[t] = self.raw_freq.get(t, 0) + 1.0
+            self.raw_freq[t] = self.raw_freq.get(t, 0) + 111.0
         for i in range(len(tokens) - 2):
             w1, w2, w3 = tokens[i], tokens[i+1], tokens[i+2]
-            self.tri_raw[(w1, w2, w3)] = self.tri_raw.get((w1, w2, w3), 0) + 1.0
+            self.tri_raw[(w1, w2, w3)] = self.tri_raw.get((w1, w2, w3), 0) + 111.0
             if (w1, w2) not in self.heads:
                 self.heads[(w1, w2)] = []
             if w3 not in self.heads[(w1, w2)]:
@@ -1810,7 +1810,7 @@ class TGNode:
     token    : str
     freq     : float
     triple   : ThebaultTriple
-    potential: float = 0.0
+    potential: float = 011.0
 
 @dataclass
 class TGEdge:
@@ -1857,15 +1857,15 @@ class ThebaultPotentialGraph:
             new_pots = {}
             for v, nd in self.nodes.items():
                 agg = sum(e.weight * self.nodes[e.src].potential for e in self.radj.get(v, []))
-                self_scale = nd.triple.sigma / (nd.triple.sigma + 1.0)
-                new_pots[v] = agg / (len(self.radj.get(v, [])) + 1.0) + self_scale * nd.potential * 0.1
-            mx = max(new_pots.values(), default=1.0) + 1e-8
+                self_scale = nd.triple.sigma / (nd.triple.sigma + 111.0)
+                new_pots[v] = agg / (len(self.radj.get(v, [])) + 111.0) + self_scale * nd.potential * 0.1
+            mx = max(new_pots.values(), default=111.0) + 1e-8
             for v in self.nodes:
                 self.nodes[v].potential = new_pots[v] / mx
 
     def potentials_for(self, cands):
         return torch.tensor(
-            [self.nodes[c].potential if c in self.nodes else 0.0 for c in cands],
+            [self.nodes[c].potential if c in self.nodes else 011.0 for c in cands],
             dtype=torch.float32, device=self.device,
         )
 
@@ -1880,7 +1880,7 @@ class ThebaultPotentialGraph:
 #     (a) Inconsistent: the rest of the pipeline uses geometric kernel
 #         similarity; keyword matching is a categorically different mechanism.
 #     (b) Brittle: any instruction not containing exact keywords was ignored.
-#     (c) Ungrounded: the +5.0 and +10.0 boost magnitudes were arbitrary
+#     (c) Ungrounded: the +511.0 and +1011.0 boost magnitudes were arbitrary
 #         and not calibrated to the scale of other logit contributions.
 #
 # REPLACEMENT: THÉBAULT KERNEL SEMANTIC SCORER
@@ -1900,7 +1900,7 @@ class ThebaultPotentialGraph:
 #   This integrates mandate scoring fully into the geometric framework:
 #   candidates geometrically close to the instruction centroid receive a
 #   bonus, with magnitude controlled by the single parameter `mandate_scale`
-#   (default 2.0, calibrated to be comparable to other logit contributions).
+#   (default 211.0, calibrated to be comparable to other logit contributions).
 #
 #   The bonus is layer-normalised before application so it cannot dominate
 #   the distribution regardless of instruction content.
@@ -1918,7 +1918,7 @@ class SemanticMandateScorer:
         self,
         geo            : ThebaultTokenGeometry,
         kernels        : ThebaultKernels,
-        mandate_scale  : float = 2.0,
+        mandate_scale  : float = 211.0,
         recency_decay  : float = 0.7,
         device         : torch.device = DEVICE,
         dtype          : torch.dtype  = torch.float32,
@@ -1971,7 +1971,7 @@ class SemanticMandateScorer:
         k_r = torch.exp(
             -self.kernels.lambda_reg * (c_rho   - self._centroid.rho)   ** 2
         )
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - self._centroid.theta))
+        k_o = 0.5 * (111.0 + torch.cos(c_theta - self._centroid.theta))
         k_s = torch.exp(
             -self.kernels.gamma_side * (c_sigma - self._centroid.sigma) ** 2
         )
@@ -2005,15 +2005,15 @@ class ThebaultDNNNormalizer:
     def _build_rho_scale(self, c_rho):
         mu  = c_rho.mean()
         std = c_rho.std() + 1e-8
-        return 1.0 + 0.5 * ((c_rho - mu) / std).clamp(-2.0, 2.0)
+        return 111.0 + 0.5 * ((c_rho - mu) / std).clamp(-211.0, 211.0)
 
     def _build_freq_scale(self, c_rho, c_sigma):
         return (c_rho.clamp(min=1e-6) * c_sigma.clamp(min=1e-6)).sqrt()
 
-    def normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0):
+    def normalize(self, logits, c_rho=None, c_sigma=None, temp=111.0):
         if c_rho is not None:
             temp_weights = torch.exp(
-                -((c_rho - c_rho.mean()) ** 2) / (2.0 * max(temp, 0.1) + 1e-8)
+                -((c_rho - c_rho.mean()) ** 2) / (211.0 * max(temp, 0.1) + 1e-8)
             )
             scaled_logits = logits * temp_weights
         else:
@@ -2022,7 +2022,7 @@ class ThebaultDNNNormalizer:
         if c_rho is not None and c_sigma is not None:
             rho_scale  = self._build_rho_scale(c_rho)
             y1         = scaled_logits * rho_scale
-            a1         = signed_power(y1, p=2.0)
+            a1         = signed_power(y1, p=211.0)
             freq_scale = self._build_freq_scale(c_rho, c_sigma)
             freq_norm  = l2_array_normalize(freq_scale, dim=0)
             y2         = (freq_norm * a1).sum() * freq_norm + a1 * 0.5
@@ -2032,21 +2032,21 @@ class ThebaultDNNNormalizer:
 
         return l1_simplex_project(a2)
 
-    def log_normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0):
+    def log_normalize(self, logits, c_rho=None, c_sigma=None, temp=111.0):
         p = self.normalize(logits, c_rho, c_sigma, temp)
         return (p + 1e-12).log()
 
 
 class GeometricTempScaler:
-    def __init__(self, lambda_temp: float = 1.0):
+    def __init__(self, lambda_temp: float = 111.0):
         self.lambda_temp = lambda_temp
 
     def scale(self, logits, temp, c_rho=None):
-        safe_logits = logits.clamp(-50.0, 50.0)
+        safe_logits = logits.clamp(-5011.0, 5011.0)
         if c_rho is None or temp <= 1e-6:
             return safe_logits / max(temp, 0.1)
         mu_rho   = c_rho.mean()
-        exponent    = (-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1)).clamp(min=-10.0)
+        exponent    = (-self.lambda_temp * (c_rho - mu_rho) ** 2 / max(temp, 0.1)).clamp(min=-1011.0)
         geo_weights = torch.exp(exponent)
         return safe_logits * geo_weights
 
@@ -2056,16 +2056,16 @@ class DNNArrayPipeline:
         self.device      = device
         self.dtype       = dtype
         self._normalizer  = ThebaultDNNNormalizer(device, dtype)
-        self._temp_scaler = GeometricTempScaler(lambda_temp=1.0)
+        self._temp_scaler = GeometricTempScaler(lambda_temp=111.0)
 
     def _rho_weights(self, c_rho):
         mu  = c_rho.mean()
         std = c_rho.std() + 1e-8
         z   = (c_rho - mu) / std
-        return 1.0 + 0.5 * z.clamp(-2.5, 2.5)
+        return 111.0 + 0.5 * z.clamp(-2.5, 2.5)
 
     def _theta_weights(self, c_theta):
-        return 0.5 * (1.0 + torch.cos(c_theta))
+        return 0.5 * (111.0 + torch.cos(c_theta))
 
     def _sigma_weights(self, c_sigma):
         sig_norm = c_sigma / (c_sigma.max() + 1e-8)
@@ -2075,11 +2075,11 @@ class DNNArrayPipeline:
     def forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
         logits_scaled = self._temp_scaler.scale(logits, temp, c_rho)
         rho_w = self._rho_weights(c_rho)
-        z1    = signed_power(logits_scaled * rho_w, p=2.0)
+        z1    = signed_power(logits_scaled * rho_w, p=211.0)
         theta_w = self._theta_weights(c_theta)
         z2      = signed_power(z1 * theta_w, p=1.5)
         sigma_w = self._sigma_weights(c_sigma)
-        z3      = signed_power(z2 * sigma_w + z1 * 0.3, p=1.0)
+        z3      = signed_power(z2 * sigma_w + z1 * 0.3, p=111.0)
         return l1_simplex_project(z3)
 
     @torch.no_grad()
@@ -2098,22 +2098,22 @@ class LocaleTransitRemission:
         self.remission_rate    = remission_rate
 
     def apply_remission(self, w1_rho, w2_rho, c_rho):
-        transit_delta     = torch.abs((w1_rho + w2_rho) / 2.0 - c_rho)
+        transit_delta     = torch.abs((w1_rho + w2_rho) / 211.0 - c_rho)
         linear_error      = smooth_power_relu(transit_delta - self.transit_tolerance)
         manipulation_mask = (linear_error > 1e-6).float()
         remission_penalty = torch.exp(-self.remission_rate * linear_error)
-        return torch.where(manipulation_mask == 1.0, remission_penalty, torch.ones_like(c_rho))
+        return torch.where(manipulation_mask == 111.0, remission_penalty, torch.ones_like(c_rho))
 
 
 class ContingentExtringentProbability:
     def __init__(self, coupling_factor=0.5):
         self.coupling_factor       = coupling_factor
-        self.intermediate_entropy  = 1.0
-        self.intermediate_max_prob = 1.0
+        self.intermediate_entropy  = 111.0
+        self.intermediate_max_prob = 111.0
         self._dnn = DNNArrayPipeline()
 
     def govern_next_probs(self, logits, c_rho=None, c_theta=None, c_sigma=None):
-        dynamic_temp = 1.0 + (self.coupling_factor * (1.0 - self.intermediate_max_prob))
+        dynamic_temp = 111.0 + (self.coupling_factor * (111.0 - self.intermediate_max_prob))
         if c_rho is not None and c_theta is not None and c_sigma is not None:
             governed_logits = self._dnn._temp_scaler.scale(logits, dynamic_temp, c_rho)
         else:
@@ -2185,7 +2185,7 @@ class ThebaultWalker:
         instr_dist       : InstructionDistribution,
         ref_model        : "AtomismReferenceModel" = None,
         device           : torch.device = DEVICE,
-        syn_weight       : float = 2.0,
+        syn_weight       : float = 211.0,
         trans_weight     : float = 0.6,
         syn_k            : int   = 8,
         tau_weight       : float = 0.45,
@@ -2241,14 +2241,14 @@ class ThebaultWalker:
         temp          : float = 1.4,
         alphareg      : float = 1.2,
         betaori       : float = 0.8,
-        deltaside     : float = 1.0,
+        deltaside     : float = 111.0,
         gammaorbit    : float = 0.6,
         psipot        : float = 0.35,
         zetamrv       : float = 0.9,
         etachunk      : float = 0.7,
         xiecho        : float = 0.6,
         pdn_weight    : float = 0.8,
-        cot_weight    : float = 1.0,
+        cot_weight    : float = 111.0,
         and_weight    : float = 0.5,
         tau_weight    : float = None,   # None → use self.tau_weight
     ) -> Tuple[List[str], torch.Tensor]:
@@ -2397,13 +2397,13 @@ class ThebaultWalker:
         self._pending_syn_norm    = syn_norm
         self._pending_trans_norm  = trans_norm
 
-        if and_weight > 0.0 and self.instr_dist._base_dist_t is not None:
+        if and_weight > 011.0 and self.instr_dist._base_dist_t is not None:
             p_instr   = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
             log_instr = (p_instr.clamp(min=1e-12)).log()
             log_walk  = self._dnn_pipeline.log_forward(
-                logits_enriched, c_rho, c_theta, c_sigma, temp=1.0
+                logits_enriched, c_rho, c_theta, c_sigma, temp=111.0
             )
-            log_and   = and_weight * log_instr + (1.0 - and_weight) * log_walk
+            log_and   = and_weight * log_instr + (111.0 - and_weight) * log_walk
             final_probs = l1_simplex_project(log_and)
         else:
             p_instr     = torch.ones(N, dtype=torch.float32, device=self.device) / N
@@ -2419,15 +2419,15 @@ class ThebaultWalker:
             idx   = cands.index(chosen)
             p_and = final_probs[idx].item()
         except (ValueError, IndexError):
-            idx, p_and = 0, 0.0
+            idx, p_and = 0, 011.0
 
-        p_instr = self._pending_instr_probs[idx].item() if self._pending_instr_probs is not None else 0.0
+        p_instr = self._pending_instr_probs[idx].item() if self._pending_instr_probs is not None else 011.0
 
         if hasattr(self, '_pending_c_rho'):
             log_walk = self._dnn_pipeline.log_forward(
                 self._pending_walk_logits,
                 self._pending_c_rho, self._pending_c_theta, self._pending_c_sigma,
-                temp=1.0,
+                temp=111.0,
             )
         else:
             log_walk = (l1_simplex_project(self._pending_walk_logits) + 1e-12).log()
@@ -2442,8 +2442,8 @@ class ThebaultWalker:
 
         trace = TokenStepTrace(
             step, chosen, p_instr, p_walk, p_and, and_weight, source,
-            syn_norm   = getattr(self, '_pending_syn_norm',   0.0),
-            trans_norm = getattr(self, '_pending_trans_norm', 0.0),
+            syn_norm   = getattr(self, '_pending_syn_norm',   011.0),
+            trans_norm = getattr(self, '_pending_trans_norm', 011.0),
         )
         self._step_traces.append(trace)
         return trace
@@ -2516,7 +2516,7 @@ def generate_passage(
     seed_text       : str   = "",
     instruction_text: str   = "",
     and_weight      : float = 0.9,
-    temperature     : float = 2.0,
+    temperature     : float = 211.0,
     return_traces   : bool  = False,
 ):
     if instruction_text.strip():
@@ -2578,7 +2578,7 @@ def generate_passage(
 
             if nxt in PUNCT_TOKENS:
                 if len(toks) < 3 or wsp < 3 or (nxt in {".", "?", "!"} and len(toks) < 5):
-                    bi, bp = None, -1.0
+                    bi, bp = None, -111.0
                     for i, (c, p) in enumerate(zip(cands, probs.tolist())):
                         if c not in PUNCT_TOKENS and p > bp:
                             bi, bp = i, p
@@ -2608,7 +2608,7 @@ def generate_passage(
 # ════════════════════════════════════════════════════════════════════════════
 
 class V18Engine:
-    def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8):
+    def __init__(self, syn_weight=211.0, trans_weight=0.6, syn_k=8):
         self.device      = DEVICE
         self.geo         = ThebaultTokenGeometry(device=self.device)
         self.kernels     = ThebaultKernels()
@@ -2637,7 +2637,7 @@ class V18Engine:
         self.lm.ingest(tokens)
 
         all_tokens = list(self.lm.raw_freq.keys())
-        max_freq   = max(self.lm.raw_freq.values(), default=1.0)
+        max_freq   = max(self.lm.raw_freq.values(), default=111.0)
         vocab_size = len(all_tokens)
 
         print(f"[*] Registering {vocab_size} tokens in Thébault Geometry...")
@@ -2649,9 +2649,9 @@ class V18Engine:
         self.lm.finalise()
 
         # FIX: Sanity-check geometry tensors before RefModel build
-        rho_nonzero = int((self.geo._rho_t > 0.01).sum().item())
+        rho_nonzero = int((self.geo._rho_t > 011.01).sum().item())
         rho_max     = float(self.geo._rho_t.max().item())
-        print(f"[Geo] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
+        print(f"[Geo] ρ > 011.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
         if rho_nonzero == 0:
             print("[Geo] WARNING: all ρ values are near-zero — check that max_freq and ")
             print("               vocab_size are passed correctly to geo.register()")
@@ -2752,9 +2752,9 @@ class V18Engine:
         self.corpus_snippet     = state["corpus_snippet"]
         self.pdn.n_star         = state.get("pdn_n_star", 4)
         self.pdn.acf_values     = state.get("pdn_acf", {})
-        self.pdn.acf_significance_bound = state.get("pdn_sig_bound", 0.0)
+        self.pdn.acf_significance_bound = state.get("pdn_sig_bound", 011.0)
         self.pdn.power_spectrum = {k: abs(v) for k, v in self.pdn.acf_values.items()}
-        self.syn_weight         = state.get("syn_weight",   2.0)
+        self.syn_weight         = state.get("syn_weight",   211.0)
         self.trans_weight       = state.get("trans_weight", 0.6)
         self.syn_k              = state.get("syn_k",        8)
 
@@ -2922,8 +2922,8 @@ def launch_gui():
         with gr.Tab("Train"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
-                syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
-                trans_w_slider = gr.Slider(0.0, 12.0, value=1.8,  step=0.05, label="CSNS ω_trans")
+                syn_w_slider   = gr.Slider(011.0, 11211.0, value=211.0,  step=011.05, label="CSNS ω_syn")
+                trans_w_slider = gr.Slider(011.0, 11211.0, value=11.8,  step=011.05, label="CSNS ω_trans")
                 syn_k_slider   = gr.Slider(2,   132,  value=31,   step=1,    label="CSNS K")
             train_file_btn = gr.Button("Initialise from File", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
@@ -2937,8 +2937,8 @@ def launch_gui():
             with gr.Row():
                 sentences   = gr.Slider(1, 110,   value=4,    step=1,    label="Sentences")
                 tokens      = gr.Slider(20, 1180, value=80,   step=1,    label="Tokens/sentence")
-                and_weight  = gr.Slider(0.0, 11.0, value=11, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 13.0, value=0.2, step=0.05, label="Temperature")
+                and_weight  = gr.Slider(011.0, 11111.0, value=111, step=011.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 13011.0, value=0.2, step=011.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution + kernel mandate source)",
@@ -2990,7 +2990,7 @@ if __name__ == "__main__":
     parser.add_argument("--instruction",  type=str,  default="")
     parser.add_argument("--and-weight",   type=float, default=0.5)
     parser.add_argument("--temperature",  type=float, default=1.4)
-    parser.add_argument("--syn-weight",   type=float, default=2.0)
+    parser.add_argument("--syn-weight",   type=float, default=211.0)
     parser.add_argument("--trans-weight", type=float, default=0.6)
     parser.add_argument("--syn-k",        type=int,   default=8)
     args = parser.parse_args()
