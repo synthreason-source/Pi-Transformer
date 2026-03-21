@@ -83,7 +83,7 @@ DEVICE = best_device()
 # ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    x_safe = x.clamp(-5011.0, 5011.0)
+    x_safe = x.clamp(-1, 0.5)
     return (x_safe * x_safe) / (x_safe.abs() + eps)
 
 
@@ -2650,7 +2650,7 @@ class V18Engine:
 
     def train(self, corpus_text: str):
         print(f"[*] Tokenizing corpus ({len(corpus_text)} chars)...")
-        self.corpus_snippet = corpus_text[:1000]
+        self.corpus_snippet = corpus_text
         tokens = tokenize(corpus_text)
         self.lm.ingest(tokens)
 
