@@ -542,9 +542,27 @@ class AtomismReferenceModel:
 # ════════════════════════════════════════════════════════════════════════════
 
 STOP_WORDS_COG = set(
-    "a an and are as at be by for from has have he her him his i in is it its "
-    "me my of on or our she so that the their them they this to was we were what "
-    "when where which who will with you your if because while".split()
+    # Epistemic verbs — knowing & believing
+    "know knew known think thought believe believed understand understood "
+    # Memory & perception verbs
+    "realize realized recognize recognized recall remember remembered forget forgot "
+    "learn learned grasp comprehend perceive sense notice suspect suppose "
+    # Reasoning & analysis verbs
+    "analyze consider assume conclude infer reason judge evaluate assess decide "
+    "determine examine reflect question doubt wonder ponder contemplate deliberate "
+    # Mental action verbs
+    "weigh compare contrast interpret deduce hypothesize imagine expect intend mean "
+    # Cognitive state adjectives
+    "aware conscious certain unsure clear confused uncertain likely possible probable "
+    "expected assumed mental cognitive abstract logical rational intuitive subjective objective "
+    # Epistemic adverbs / hedges
+    "perhaps maybe probably possibly apparently seemingly presumably supposedly evidently "
+    "clearly obviously certainly indeed actually really truly surely definitely "
+    "generally typically usually often sometimes rarely "
+    # Logical connectives & discourse markers
+    "thus hence therefore consequently since although however yet still unless "
+    "whether either neither also furthermore moreover additionally meanwhile otherwise "
+    "whereas despite nevertheless nonetheless accordingly thereby".split()
 )
 COGNITIVE_TOKENS = {f"[{w.upper()}]" for w in STOP_WORDS_COG}
 PUNCT_TOKENS     = {",", ".", "!", "?", ";", ":"}
