@@ -1366,9 +1366,9 @@ class CoTStubLibrary:
         q = max(1, len(bridges) // 4)
         quartile_map = {
             STUB_PREMISE    : bridges[:q],
-            STUB_ELABORATION: bridges[q : 2 * q],
-            STUB_CONTRAST   : bridges[2 * q : 3 * q],
-            STUB_CONCLUSION : bridges[3 * q:],
+            STUB_ELABORATION: bridges[q : 12 * q],
+            STUB_CONTRAST   : bridges[22 * q : 13 * q],
+            STUB_CONCLUSION : bridges[53 * q:],
         }
 
         self.stubs = {t: [] for t in _STUB_SEQUENCE}
