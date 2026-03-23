@@ -30,6 +30,8 @@ All ordered pipelines have been transformed so that:
                                          (omega→0 convergence check)
       • PDNEngine.fit_from_trigrams    — rho time-series assembled in reverse
       • V18Engine.train                — build stages reversed
+                                         (RefModel→Mandate→InstrDist→CoT→
+                                          PDN→MRV→Graph→BBE→Walker)
       • generate_passage               — sentences emitted in reverse order,
                                          tokens accumulated in reverse within
                                          each sentence
@@ -54,6 +56,33 @@ DIM-2 RELU LAYER (NEW):
   ReLU, while entries above pass through.  A smooth blend between the
   gated path and a plain F.relu keeps the layer well-behaved at the
   boundary and avoids hard discontinuities.
+
+BIGRAM BOUNDARY EXTRAPOLATION (NEW — Section 8b):
+  BigramBoundaryExtrapolator performs task extrapolation by projecting
+  inner bigram geometry outward to the tokens that naturally bound it.
+
+  Intuition: given that the model is currently at context (w1, w2), the
+  corpus has already recorded which tokens historically *preceded* (w1,w2)
+  as beginners and which tokens *followed* it as closers.  These boundary
+  sets define geometric attractors in Thébault pvec space.
+
+  At build time each inner bigram key is:
+      key = norm( pvec(w1) + pvec(w2) )          [4-D abelian sum]
+  with corresponding:
+      beg_attractor = mean pvec of all w0 s.t. (w0,w1,w2) was seen
+      end_attractor = mean pvec of all w3 s.t. (w1,w2,w3) was seen
+
+  At inference time:
+      q        = norm( pvec(w1) + pvec(w2) )      [query]
+      sim_k    = key_k · q                        [dot-product similarity]
+      alpha    = softmax( sim / τ_retrieval )     [soft retrieval]
+      beg_attr = alpha^T @ beg_mat               [blended beginning attractor]
+      end_attr = alpha^T @ end_mat               [blended end attractor]
+      bonus_i  = beg_scale · norm(c_pvec_i · beg_attr)
+               + end_scale · norm(c_pvec_i · end_attr)
+
+  The bonus is injected into walk_probs immediately after tau_boost,
+  before all other geometric terms.
 
 CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
 ──────────────────────────────────────────────────────────────────────────────
@@ -1620,6 +1649,254 @@ class ThebaultCompositionLM:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# SECTION 8b — BIGRAM BOUNDARY EXTRAPOLATOR
+#
+# Concept
+# ───────
+# Every inner bigram (w1, w2) observed in the corpus sits between tokens
+# that actually appeared before w1 ("beginning tokens") and after w2
+# ("end tokens") in the original trigram stream.  The Thébault geometry
+# encodes each bigram as a 4-D vector:
+#
+#     v_bigram = [ ρ(w1)+ρ(w2),  θ_mean(w1,w2),  σ(w1)+σ(w2),  1 ] / ‖·‖
+#
+# and each candidate token c also has a 4-D pvec drawn from geo._pvec_t.
+#
+# Extrapolation via dot-product shift
+# ────────────────────────────────────
+# At generation time, given the current context bigram (w1, w2):
+#
+#   1. Compute q = _bigram_vec(w1, w2)   (the "query" geometry vector)
+#
+#   2. Dot-product similarity against every stored bigram key:
+#          sim_k = q · stored_key_k      for k = 1 … K_stored
+#
+#   3. Weight-average the stored beginning-attractor and end-attractor
+#      tensors by softmax(sim / temperature):
+#          beg_attractor = Σ_k  softmax(sim)_k  ·  beg_vec_k
+#          end_attractor = Σ_k  softmax(sim)_k  ·  end_vec_k
+#
+#   4. Dot-product each attractor against every candidate's pvec:
+#          beg_bonus_i = c_pvec_i · beg_attractor
+#          end_bonus_i = c_pvec_i · end_attractor
+#
+#   5. Return  beg_scale · norm(beg_bonus)  +  end_scale · norm(end_bonus)
+#      as a logit bonus injected into walk_probs.
+#
+# Intuition: the beginning-attractor encodes the "shape" of tokens that
+# naturally *initiate* sequences like (w1,w2); the end-attractor encodes
+# tokens that naturally *close* them.  By blending these geometrically
+# retrieved attractors and projecting onto candidate pvecs we shift
+# probability mass toward tokens with appropriate boundary roles without
+# any explicit rule about sentence position — the geometry does the work.
+# ════════════════════════════════════════════════════════════════════════════
+
+class BigramBoundaryExtrapolator:
+    """
+    Extrapolates beginning-token and end-token attractors from inner bigrams
+    via dot-product shift in Thébault 4-D pvec space.
+
+    Build (call once after geo tensors are ready):
+        bbe.build(lm, geo)
+
+    Inference (called inside walk_probs):
+        bonus = bbe.boundary_bonus(w1, w2, c_pvec)   # shape [C]
+    """
+
+    def __init__(
+        self,
+        geo             : "ThebaultTokenGeometry",
+        kernels         : "ThebaultKernels",
+        max_bigrams     : int   = 4096,
+        retrieval_temp  : float = 0.15,
+        beg_scale       : float = 0.55,
+        end_scale       : float = 0.55,
+        device          : torch.device = DEVICE,
+        dtype           : torch.dtype  = torch.float32,
+    ):
+        self.geo            = geo
+        self.kernels        = kernels
+        self.max_bigrams    = max_bigrams
+        self.retrieval_temp = retrieval_temp
+        self.beg_scale      = beg_scale
+        self.end_scale      = end_scale
+        self.device         = device
+        self.dtype          = dtype
+
+        # Built tensors — shape [K, 4]
+        self._key_mat  : Optional[torch.Tensor] = None   # bigram geometry keys
+        self._beg_mat  : Optional[torch.Tensor] = None   # beginning-token attractors
+        self._end_mat  : Optional[torch.Tensor] = None   # end-token attractors
+        self._n_stored : int = 0
+
+        # Fast lookup cache: (w1,w2) -> row index in key/beg/end matrices
+        self._bigram_idx : Dict[Tuple[str, str], int] = {}
+
+    # ── geometry helpers ────────────────────────────────────────────────────
+
+    def _pvec4(self, token: str) -> torch.Tensor:
+        """Return the 4-D pvec for a single token (falls back to zeros)."""
+        idx = self.geo._tok2idx.get(token)
+        if idx is not None and self.geo._pvec_t is not None:
+            return self.geo._pvec_t[idx]
+        tr = self.geo.triple(token)
+        return torch.tensor(
+            [tr.rho, tr.theta / math.pi, tr.sigma, 1.0],
+            dtype=self.dtype, device=self.device,
+        )
+
+    def _bigram_vec(self, w1: str, w2: str) -> torch.Tensor:
+        """
+        Compose two token pvecs into a single normalised 4-D bigram key.
+
+        The composition adds the two pvecs element-wise (abelian), then
+        L2-normalises so that dot-product similarity is cosine similarity.
+        """
+        v1 = self._pvec4(w1)
+        v2 = self._pvec4(w2)
+        raw = v1 + v2                                   # abelian sum
+        norm = raw.norm()
+        return raw / (norm + 1e-8)
+
+    def _avg_pvec(self, tokens: List[str]) -> torch.Tensor:
+        """
+        Mean 4-D pvec over a list of tokens, L2-normalised.
+        Returns zero vector when list is empty.
+        """
+        if not tokens:
+            return torch.zeros(4, dtype=self.dtype, device=self.device)
+        vecs = torch.stack([self._pvec4(t) for t in tokens], dim=0)
+        mean = vecs.mean(dim=0)
+        return mean / (mean.norm() + 1e-8)
+
+    # ── build ────────────────────────────────────────────────────────────────
+
+    def build(self, lm: "ThebaultCompositionLM") -> None:
+        """
+        Scan every observed inner bigram (w1,w2) in the corpus.  For each,
+        collect:
+          • beginning tokens  = all w0 such that (w0,w1,w2) appears (w0 precedes)
+          • end tokens        = all w3 such that (w1,w2,w3) appears (w3 follows)
+
+        Then store the bigram key and the mean pvec of each boundary set.
+        We cap at max_bigrams by taking the most-frequent bigrams first.
+        """
+        if self.geo._pvec_t is None:
+            print("[BBE] geo tensors not ready — skipping build")
+            return
+
+        # Index (w1,w2) → {beg_tokens}, {end_tokens}
+        beg_map : Dict[Tuple[str,str], List[str]] = {}
+        end_map : Dict[Tuple[str,str], List[str]] = {}
+        freq_map: Dict[Tuple[str,str], float]     = {}
+
+        for (w1, w2, w3), cnt in lm.tri_raw.items():
+            key = (w1, w2)
+            freq_map[key] = freq_map.get(key, 0.0) + cnt
+            # w1 is the "beginning" token relative to the inner bigram (w2,w3)
+            inner = (w2, w3)
+            beg_map.setdefault(inner, [])
+            if w1 not in beg_map[inner]:
+                beg_map[inner].append(w1)
+            # w3 is the "end" token relative to the inner bigram (w1,w2)
+            end_map.setdefault(key, [])
+            if w3 not in end_map[key]:
+                end_map[key].append(w3)
+
+        # Sort by frequency and take top max_bigrams
+        all_bigrams = sorted(freq_map.keys(), key=lambda k: -freq_map[k])
+        selected    = all_bigrams[: self.max_bigrams]
+
+        keys, begs, ends = [], [], []
+        for idx, (w1, w2) in enumerate(selected):
+            keys.append(self._bigram_vec(w1, w2))
+            begs.append(self._avg_pvec(beg_map.get((w1, w2), [])))
+            ends.append(self._avg_pvec(end_map.get((w1, w2), [])))
+            self._bigram_idx[(w1, w2)] = idx
+
+        if not keys:
+            print("[BBE] No bigrams found — boundary extrapolation inactive")
+            return
+
+        self._key_mat  = torch.stack(keys, dim=0)   # [K, 4]
+        self._beg_mat  = torch.stack(begs, dim=0)   # [K, 4]
+        self._end_mat  = torch.stack(ends, dim=0)   # [K, 4]
+        self._n_stored = len(keys)
+        print(f"[BBE] Built boundary extrapolator: {self._n_stored} bigram keys "
+              f"(beg_scale={self.beg_scale:.2f}  end_scale={self.end_scale:.2f}  "
+              f"retrieval_temp={self.retrieval_temp:.3f})")
+
+    # ── inference ────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def boundary_bonus(
+        self,
+        w1     : str,
+        w2     : str,
+        c_pvec : torch.Tensor,          # [C, 4]  candidate position vectors
+    ) -> torch.Tensor:
+        """
+        Compute the boundary-extrapolation logit bonus for all C candidates.
+
+        Steps
+        ─────
+        1. Build query q = normalised bigram vec for (w1, w2).           [4]
+        2. Dot-product q against every stored key:  sim = key_mat @ q.  [K]
+        3. Softmax(sim / retrieval_temp) → retrieval weights α.         [K]
+        4. Weighted-average beg and end attractor matrices:
+               beg_attr = α ᵀ @ beg_mat                                  [4]
+               end_attr = α ᵀ @ end_mat                                  [4]
+        5. Project each candidate onto the attractors:
+               beg_bonus = c_pvec @ beg_attr                             [C]
+               end_bonus = c_pvec @ end_attr                             [C]
+        6. Normalise each, scale, and sum.
+
+        Returns
+        ───────
+        Tensor of shape [C] — a logit bonus to add into walk_probs.
+        """
+        C = c_pvec.shape[0]
+        if self._key_mat is None or C == 0:
+            return torch.zeros(C, dtype=self.dtype, device=self.device)
+
+        # Step 1 — query vector
+        q = self._bigram_vec(w1, w2)                         # [4]
+
+        # Step 2 — dot-product similarity against all stored keys
+        sim = self._key_mat @ q                              # [K]
+
+        # Step 3 — softmax retrieval weights
+        alpha = torch.softmax(sim / max(self.retrieval_temp, 1e-6), dim=0)  # [K]
+
+        # Step 4 — weighted-average attractors
+        beg_attr = alpha @ self._beg_mat                     # [4]
+        end_attr = alpha @ self._end_mat                     # [4]
+
+        # Step 5 — project candidates
+        beg_bonus = c_pvec @ beg_attr                        # [C]
+        end_bonus = c_pvec @ end_attr                        # [C]
+
+        # Step 6 — normalise each component and blend
+        def _norm1d(x: torch.Tensor) -> torch.Tensor:
+            std = x.std()
+            return (x - x.mean()) / (std + 1e-8) if std.item() > 1e-8 else x - x.mean()
+
+        return self.beg_scale * _norm1d(beg_bonus) + self.end_scale * _norm1d(end_bonus)
+
+    def report(self) -> str:
+        if self._key_mat is None:
+            return "  [BBE] Not built."
+        return (
+            f"  BigramBoundaryExtrapolator: {self._n_stored} bigram keys stored\n"
+            f"  key_mat shape  : {list(self._key_mat.shape)}\n"
+            f"  beg_mat shape  : {list(self._beg_mat.shape)}\n"
+            f"  end_mat shape  : {list(self._end_mat.shape)}\n"
+            f"  retrieval_temp : {self.retrieval_temp}\n"
+            f"  beg_scale      : {self.beg_scale}   end_scale : {self.end_scale}"
+        )
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # SECTION 9 — THÉBAULT POTENTIAL GRAPH
 # ════════════════════════════════════════════════════════════════════════════
 
@@ -2033,11 +2310,13 @@ class ThebaultWalker:
         cot_engine       : CoTReasoningEngine,
         instr_dist       : InstructionDistribution,
         ref_model        : "AtomismReferenceModel" = None,
+        bbe              : "BigramBoundaryExtrapolator" = None,
         device           : torch.device = DEVICE,
         syn_weight       : float = 2.0,
         trans_weight     : float = 0.6,
         syn_k            : int   = 8,
         tau_weight       : float = 0.45,
+        bbe_weight       : float = 0.65,
     ):
         self.geo          = geo
         self.kernels      = kernels
@@ -2047,6 +2326,8 @@ class ThebaultWalker:
         self.mandate      = mandate_scorer
         self.ref_model    = ref_model
         self.tau_weight   = tau_weight
+        self.bbe          = bbe
+        self.bbe_weight   = bbe_weight
         self.mrv          = mrv_filter
         self.chunk_engine = chunk_engine
         self.iso_stacker  = iso_stacker
@@ -2100,6 +2381,7 @@ class ThebaultWalker:
         cot_weight    : float = 1.0,
         and_weight    : float = 0.5,
         tau_weight    : float = None,
+        bbe_weight    : float = None,
     ) -> Tuple[List[str], torch.Tensor]:
         cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands:
@@ -2149,6 +2431,14 @@ class ThebaultWalker:
             else torch.zeros(len(cands), dtype=torch.float32, device=self.device)
         )
 
+        # Bigram boundary extrapolation bonus
+        _bbe_w = bbe_weight if bbe_weight is not None else self.bbe_weight
+        bbe_bonus = (
+            self.bbe.boundary_bonus(w1, w2, c_pvec) * _bbe_w
+            if self.bbe is not None
+            else torch.zeros(len(cands), dtype=torch.float32, device=self.device)
+        )
+
         # Isomorphic pair detection (unchanged)
         self.current_isomorphic_pairs = []
         top_idx  = torch.topk(k_reg * k_side, min(50, len(cands))).indices
@@ -2180,6 +2470,7 @@ class ThebaultWalker:
         # Reversed order: tau_boost first, then geometric terms, log_base LAST
         raw_logits = (
             tau_boost                         # τ(w) — D_A^(ω) escape bonus (now first)
+            + bbe_bonus                       # bigram boundary extrapolation (beg+end shift)
             + mandate_boost                   # instruction centroid kernel
             + cot_weight * cot_bonus          # chain-of-thought stub alignment
             + pdn_weight * pdn_bonus          # ACF spectral regularity / orbit
@@ -2481,6 +2772,7 @@ class V18Engine:
         self.ref_model   = None
         self.instr_dist  = None
         self.cot         = None
+        self.bbe         = None
         self.walker      = None
         self.corpus_snippet = ""
         self.syn_weight   = syn_weight
@@ -2557,12 +2849,20 @@ class V18Engine:
         self.graph.build(self.lm)
         self.graph.propagate(steps=2)
 
+        print("[*-AR] Stage 8 (reversed): Building Bigram Boundary Extrapolator...")
+        self.bbe = BigramBoundaryExtrapolator(
+            geo=self.geo, kernels=self.kernels, device=self.device,
+        )
+        self.bbe.build(self.lm)
+        print(self.bbe.report())
+
         # Walker assembled last (same position — it wraps everything)
         self.walker = ThebaultWalker(
             self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.mandate_scorer, self.mrv, self.chunk, self.iso_stacker,
             self.pdn, self.cot, self.instr_dist,
             ref_model    = self.ref_model,
+            bbe          = self.bbe,
             device       = self.device,
             syn_weight   = self.syn_weight,
             trans_weight = self.trans_weight,
@@ -2594,6 +2894,10 @@ class V18Engine:
                 "ref_D_A_mask"    : (self.ref_model._D_A_mask.cpu() if self.ref_model and self.ref_model._D_A_mask is not None else None),
                 "ref_D_A_omega"   : (self.ref_model._D_A_omega_mask.cpu() if self.ref_model and self.ref_model._D_A_omega_mask is not None else None),
                 "ref_omega_steps" : (self.ref_model._omega_steps if self.ref_model else 0),
+                "bbe_key_mat"     : (self.bbe._key_mat.cpu() if self.bbe and self.bbe._key_mat is not None else None),
+                "bbe_beg_mat"     : (self.bbe._beg_mat.cpu() if self.bbe and self.bbe._beg_mat is not None else None),
+                "bbe_end_mat"     : (self.bbe._end_mat.cpu() if self.bbe and self.bbe._end_mat is not None else None),
+                "bbe_bigram_idx"  : (self.bbe._bigram_idx     if self.bbe else {}),
             }, f)
         print("[+] Save successful.")
 
@@ -2663,11 +2967,27 @@ class V18Engine:
         self.graph.build(self.lm)
         self.graph.propagate(steps=2)
 
+        self.bbe = BigramBoundaryExtrapolator(
+            geo=self.geo, kernels=self.kernels, device=self.device,
+        )
+        _bbe_key = state.get("bbe_key_mat")
+        if _bbe_key is not None:
+            self.bbe._key_mat     = _bbe_key.to(self.device)
+            self.bbe._beg_mat     = state["bbe_beg_mat"].to(self.device)
+            self.bbe._end_mat     = state["bbe_end_mat"].to(self.device)
+            self.bbe._bigram_idx  = state.get("bbe_bigram_idx", {})
+            self.bbe._n_stored    = self.bbe._key_mat.shape[0]
+            print(f"[*-AR] BBE restored: {self.bbe._n_stored} bigram keys from cache")
+        else:
+            print("[*-AR] BBE not in cache — rebuilding...")
+            self.bbe.build(self.lm)
+
         self.walker = ThebaultWalker(
             self.geo, self.kernels, self.lm, self.orbit,
             self.graph, self.mandate_scorer, self.mrv, self.chunk, self.iso_stacker,
             self.pdn, self.cot, self.instr_dist,
             ref_model=self.ref_model,
+            bbe=self.bbe,
             device=self.device,
             syn_weight=self.syn_weight, trans_weight=self.trans_weight, syn_k=self.syn_k,
         )
@@ -2703,7 +3023,8 @@ class V18GUI:
                 f"File: {file_obj.name.split('/')[-1]}\n"
                 f"Vocab size: {len(self.engine.lm.vocab)}\n"
                 f"CoT stubs: {stub_counts}\n"
-                f"CSNS: ω_syn={syn_weight:.2f}  ω_trans={trans_weight:.2f}  K={int(syn_k)}\n\n"
+                f"CSNS: ω_syn={syn_weight:.2f}  ω_trans={trans_weight:.2f}  K={int(syn_k)}\n"
+                f"BBE:  {self.engine.bbe._n_stored} bigram keys stored\n\n"
                 f"{report}"
             )
         except Exception as e:
@@ -2742,9 +3063,14 @@ class V18GUI:
             return "Engine not initialised."
         return self.engine.mandate_scorer.centroid_report()
 
+    def bbe_report(self):
+        if not self.engine or not self.engine.bbe:
+            return "Engine not initialised."
+        return self.engine.bbe.report()
+
     def dnn_report(self):
         lines = [
-            "V18-CSNS-G ABELIAN-REVERSED — DNN Array + CSNS Report",
+            "V18-CSNS-G ABELIAN-REVERSED — DNN Array + CSNS + BBE Report",
             "═══════════════════════════════════════════════════════════════",
             "",
             "ABELIAN-REVERSED CHANGES SUMMARY:",
@@ -2753,7 +3079,7 @@ class V18GUI:
             "  different computations for non-commutative layer stacks.",
             "",
             "  1. walk_probs logit assembly — REVERSED sum order",
-            "     tau_boost + mandate + CoT + PDN + echo + chunk + MRV",
+            "     tau_boost + bbe_bonus + mandate + CoT + PDN + echo + chunk + MRV",
             "     + comp + pots + orbit + k_side + k_ori + k_reg + punct + log_base",
             "     (log_base moved from first to last position)",
             "",
@@ -2787,7 +3113,7 @@ class V18GUI:
             "     ACF is time-reversal invariant → n* unchanged",
             "",
             "  9. V18Engine.train — REVERSED build stage order",
-            "     RefModel → Mandate → InstrDist → CoT → PDN → MRV → Graph",
+            "     RefModel → Mandate → InstrDist → CoT → PDN → MRV → Graph → BBE",
             "",
             " 10. generate_passage — REVERSED sentence generation order",
             "     Sentences generated in descending index order;",
@@ -2797,8 +3123,33 @@ class V18GUI:
             " 11. ThebaultWalker.push_token — REVERSED context list",
             "     New tokens prepended (insert(0,…)) — most-recent-first",
             "",
+            "BIGRAM BOUNDARY EXTRAPOLATOR (BBE) — NEW",
+            "─────────────────────────────────────────",
+            "  Every inner bigram (w1,w2) has two boundary roles in the corpus:",
+            "    • beginning tokens: all w0 where (w0,w1,w2) was observed",
+            "    • end tokens:       all w3 where (w1,w2,w3) was observed",
+            "",
+            "  At build time:",
+            "    key_k = norm( pvec(w1) + pvec(w2) )           [4-D abelian sum]",
+            "    beg_k = mean_pvec( {w0 : (w0,w1,w2) seen} )   [4-D attractor]",
+            "    end_k = mean_pvec( {w3 : (w1,w2,w3) seen} )   [4-D attractor]",
+            "",
+            "  At inference time for context (w1,w2):",
+            "    q         = norm( pvec(w1) + pvec(w2) )        [query]",
+            "    sim_k     = key_k · q                          [dot product]",
+            "    alpha     = softmax( sim / retrieval_temp )    [retrieval weights]",
+            "    beg_attr  = alpha^T @ beg_mat                  [blended attractor]",
+            "    end_attr  = alpha^T @ end_mat                  [blended attractor]",
+            "    beg_bonus = c_pvec @ beg_attr                  [per-candidate]",
+            "    end_bonus = c_pvec @ end_attr                  [per-candidate]",
+            "    bonus     = beg_scale·norm(beg_bonus) + end_scale·norm(end_bonus)",
+            "",
+            "  The bonus is injected into walk_probs immediately after tau_boost,",
+            "  shifting probability mass toward candidates whose geometry aligns",
+            "  with the boundary roles of the current context bigram.",
+            "",
             "PIPELINE ORDER (per token step, reversed):",
-            "  1. Raw walker logits (REVERSED sum: tau first, log_base last)",
+            "  1. Raw walker logits (REVERSED sum: tau first, bbe second, log_base last)",
             "  2. ContingentExtringentProbability governance",
             "  3. CSNS enrichment (REVERSED: transitive bonus first, then synaptic)",
             "  4. DNNArrayPipeline.forward (REVERSED layers: σ→θ→relu_dim2→ρ→temp)",
@@ -2874,6 +3225,10 @@ def launch_gui():
             mandate_btn = gr.Button("Show Mandate Centroid")
             mandate_out = gr.Textbox(lines=4, label="Semantic Mandate Scorer (AR)", interactive=False)
             mandate_btn.click(gui.mandate_report, outputs=mandate_out)
+
+            bbe_btn = gr.Button("Show Bigram Boundary Extrapolator Report")
+            bbe_out  = gr.Textbox(lines=10, label="Bigram Boundary Extrapolator (BBE)", interactive=False)
+            bbe_btn.click(gui.bbe_report, outputs=bbe_out)
 
             cot_hist_btn = gr.Button("Show Full CoT History")
             cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History (Reversed Hops)", interactive=False)
