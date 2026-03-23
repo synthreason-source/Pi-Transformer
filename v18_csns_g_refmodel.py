@@ -19,6 +19,8 @@ All ordered pipelines have been transformed so that:
 
       • walk_probs logit assembly  — summation terms reversed
       • DNNArrayPipeline.forward   — layer stack reversed (z3→z2→z1→scaled)
+                                     + NEW relu_dim2 layer inserted between
+                                       theta layer and rho layer
       • ThebaultDNNNormalizer      — normalisation passes reversed
       • CrossSynapticNeuronSum.forward — enrichment operands reversed
       • build_synaptic_weight_matrix   — kernel product order reversed
@@ -42,6 +44,16 @@ MATHEMATICAL NOTE ON ABELIAN PROPERTY:
   Layer stacks are NOT generally commutative, so reversing them produces
   a genuinely different (non-equivalent) computation — the "reversed"
   qualifier takes precedence and the layers are reordered structurally.
+
+DIM-2 RELU LAYER (NEW):
+  Added as a dedicated method _dim2_relu_layer on DNNArrayPipeline.
+  Placed between the theta layer (z2) and the rho layer (z3) so that
+  orientation-selective sparsification precedes rho amplification.
+  The gate is derived from per-candidate theta weights centred about
+  their batch mean; entries below the mean are pushed toward zero via
+  ReLU, while entries above pass through.  A smooth blend between the
+  gated path and a plain F.relu keeps the layer well-behaved at the
+  boundary and avoids hard discontinuities.
 
 CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
 ──────────────────────────────────────────────────────────────────────────────
@@ -1749,7 +1761,8 @@ class SemanticMandateScorer:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 11a — DNN ARRAY PIPELINE
-# REVERSED: layer stack inverted — z3 gate applied first, then z2, then z1
+# REVERSED: layer stack inverted — sigma applied first, then theta,
+#           then relu_dim2 (NEW), then rho, then temperature scaling.
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultDNNNormalizer:
@@ -1808,6 +1821,42 @@ class GeometricTempScaler:
 
 
 class DNNArrayPipeline:
+    """
+    DNN Array Pipeline — Abelian-Reversed variant.
+
+    Layer stack (reversed from original):
+        z1  : sigma layer   — _sigma_weights  · signed_power(·, p=1.0)
+        z2  : theta layer   — _theta_weights  · signed_power(·, p=1.5)  + residual
+        z2b : relu_dim2     — orientation-selective ReLU on dimension 2 (theta)
+        z3  : rho layer     — _rho_weights    · signed_power(·, p=2.0)
+        out : temp scaling  — GeometricTempScaler → l1_simplex_project
+
+    relu_dim2 design
+    ────────────────
+    Dimension 2 in the Thébault geometry is the theta (orientation) axis.
+    The gate is built by centring the per-candidate theta weights about
+    their batch mean and applying a ReLU:
+
+        gate_raw = relu( theta_w - mean(theta_w) )   ∈ [0, ∞)
+
+    This suppresses candidates whose orientation weight falls below the
+    batch mean (pushing their activation toward zero) while leaving
+    above-mean candidates largely unmodified.  The gate is then rescaled
+    to [0, 1] and used to blend two paths:
+
+        output = x · gate  +  relu(x) · (1 − gate)
+
+    When gate ≈ 1 (strong orientation match): output ≈ x  (identity pass-through).
+    When gate ≈ 0 (weak orientation match):   output ≈ relu(x)  (standard ReLU).
+
+    The blend avoids a hard discontinuity at the gate boundary and keeps
+    the layer well-behaved in both the high-gate and low-gate regimes.
+    Placing this layer between z2 (theta-modulated) and z3 (rho-amplified)
+    ensures that orientation-sparse signals are filtered *before* the
+    signed_power(·, p=2.0) rho amplification step, which would otherwise
+    magnify both relevant and irrelevant activations equally.
+    """
+
     def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
         self.device      = device
         self.dtype       = dtype
@@ -1827,19 +1876,49 @@ class DNNArrayPipeline:
         sig_norm = c_sigma / (c_sigma.max() + 1e-8)
         return 0.7 + 0.3 * sig_norm
 
+    def _dim2_relu_layer(self, x: torch.Tensor, c_theta: torch.Tensor) -> torch.Tensor:
+        """
+        Orientation-selective ReLU layer on dimension 2 (theta axis).
+
+        Candidates whose theta weight exceeds the batch mean are passed
+        through with a near-identity gate; candidates below the mean are
+        pushed toward a plain ReLU.  The smooth blend keeps the layer
+        differentiable at the gate boundary.
+
+        Args:
+            x:       Activation tensor from the preceding theta layer (z2).
+            c_theta: Per-candidate theta coordinates (same length as x).
+
+        Returns:
+            Tensor of same shape as x with orientation-selective activation.
+        """
+        theta_w  = self._theta_weights(c_theta)              # ∈ [0, 1]
+        gate_raw = (theta_w - theta_w.mean()).clamp(min=0.0)  # ReLU on centred weights
+        g_max    = gate_raw.max()
+        gate     = gate_raw / (g_max + 1e-8) if g_max.item() > 1e-8 else gate_raw
+        # Blend: gated pass-through where orientation is strong, plain ReLU elsewhere
+        return x * gate + F.relu(x) * (1.0 - gate)
+
     @torch.no_grad()
     def forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
-        # REVERSED layer order: sigma → theta → rho → temp
+        # REVERSED layer order: sigma → theta → relu_dim2 → rho → temp
         # Original: temp → rho (z1) → theta (z2) → sigma (z3) → project
-        # Reversed: sigma (z1') → theta (z2') → rho (z3') → temp-scale → project
+        # Reversed: sigma (z1') → theta (z2') → relu_dim2 (z2b') → rho (z3') → temp → project
+
+        # Layer 1 — sigma modulation
         sigma_w = self._sigma_weights(c_sigma)
         z1      = signed_power(logits * sigma_w, p=1.0)
 
+        # Layer 2 — theta modulation (with residual from raw logits)
         theta_w = self._theta_weights(c_theta)
         z2      = signed_power(z1 * theta_w + logits * 0.3, p=1.5)
 
+        # Layer 2b — dimension-2 ReLU (orientation-selective activation)
+        z2b     = self._dim2_relu_layer(z2, c_theta)
+
+        # Layer 3 — rho amplification (feeds from z2b, not z2)
         rho_w   = self._rho_weights(c_rho)
-        z3      = signed_power(z2 * rho_w, p=2.0)
+        z3      = signed_power(z2b * rho_w, p=2.0)
 
         # Temperature scaling applied last (reversed from original where it was first)
         logits_scaled = self._temp_scaler.scale(z3, temp, c_rho)
@@ -2678,9 +2757,12 @@ class V18GUI:
             "     + comp + pots + orbit + k_side + k_ori + k_reg + punct + log_base",
             "     (log_base moved from first to last position)",
             "",
-            "  2. DNNArrayPipeline.forward — REVERSED layer stack",
+            "  2. DNNArrayPipeline.forward — REVERSED layer stack + relu_dim2",
             "     Original:  temp_scale → rho(z1) → theta(z2) → sigma(z3) → project",
-            "     Reversed:  sigma(z1') → theta(z2') → rho(z3') → temp_scale → project",
+            "     Reversed:  sigma(z1') → theta(z2') → relu_dim2(z2b') → rho(z3') → temp → project",
+            "     relu_dim2: orientation-selective ReLU on theta axis (dim 2)",
+            "       gate = relu(theta_w - mean(theta_w)), rescaled to [0,1]",
+            "       out  = x·gate + relu(x)·(1-gate)",
             "",
             "  3. CrossSynapticNeuronSum.forward — REVERSED enrichment",
             "     trans_weight·trans first, then syn_weight·z_syn",
@@ -2719,7 +2801,7 @@ class V18GUI:
             "  1. Raw walker logits (REVERSED sum: tau first, log_base last)",
             "  2. ContingentExtringentProbability governance",
             "  3. CSNS enrichment (REVERSED: transitive bonus first, then synaptic)",
-            "  4. DNNArrayPipeline.forward (REVERSED layers: σ→θ→ρ→temp)",
+            "  4. DNNArrayPipeline.forward (REVERSED layers: σ→θ→relu_dim2→ρ→temp)",
             "  5. AND combination (REVERSED: (1-α)·log_walk + α·log_instr)",
             "═══════════════════════════════════════════════════════════════",
         ]
