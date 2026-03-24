@@ -2347,133 +2347,65 @@ class V18RPGUI:
         return "\n".join(lines)
 
 
-def launch_gui():
+def build_demo():
     gui = V18RPGUI()
 
-    with gr.Blocks(title="NeuroSymbolic V18-RP — Randomized Polynomial Complexity") as app:
-        gr.Markdown(
-            "# NeuroSymbolic V18-RP — Randomized Polynomial Complexity\n"
-            "### All core algorithms replaced with RP-time equivalents\n"
-            "RFF · Nyström · Count-Min Sketch · LSH · Random Walk MC · Gumbel-Max · Sketched PDN"
-        )
+    with gr.Blocks(title="NeuroSymbolic V18-RP") as demo:
+        gr.Markdown("# NeuroSymbolic V18-RP — RP Edition")
 
-        with gr.Tab("Train"):
-            file_input = gr.File(label="Upload .txt Corpus", file_types=[".txt"])
-            with gr.Row():
-                syn_w   = gr.Slider(0.0, 2.0, value=0.4,  step=0.05, label="ω_syn (CSNS synaptic)")
-                trans_w = gr.Slider(0.0, 2.0, value=1.8,  step=0.05, label="ω_trans (CSNS transitive)")
-                syn_k   = gr.Slider(2,   32,  value=8,    step=1,    label="K (Nyström sparsity)")
-            with gr.Row():
-                rff_dim    = gr.Slider(32, 512, value=128, step=32, label="D (RFF dimension)")
-                nystrom_m  = gr.Slider(8,  128, value=32,  step=8,  label="m (Nyström landmarks)")
-            train_btn = gr.Button("Train V18-RP Engine", variant="primary")
-            train_out = gr.Textbox(label="Engine Status / PDN Report", lines=20, interactive=False)
-            train_btn.click(gui.init_from_file,
-                            inputs=[file_input, syn_w, trans_w, syn_k, rff_dim, nystrom_m],
-                            outputs=train_out)
+        with gr.Tab("Init / Train"):
+            file_in   = gr.File(label="Training text file (.txt)")
+            syn_w     = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="Synaptic weight")
+            trans_w   = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="Transition weight")
+            syn_k     = gr.Slider(1, 64, value=16, step=1, label="Synaptic k")
+            rff_dim   = gr.Slider(32, 512, value=128, step=32, label="RFF dim D")
+            nystrom_m = gr.Slider(8, 128, value=32, step=4, label="Nyström m")
+            init_btn  = gr.Button("Initialise engine")
+            init_out  = gr.Textbox(lines=15, label="Initialisation / PDN report")
+
+            init_btn.click(
+                gui.init_from_file,
+                inputs=[file_in, syn_w, trans_w, syn_k, rff_dim, nystrom_m],
+                outputs=[init_out],
+            )
 
         with gr.Tab("Generate"):
-            gr.Markdown(
-                "### RP Text Generation Pipeline\n\n"
-                "**RP pipeline**: RFF kernels → Nyström-CSNS → DNN Array → AND(Instr, Walker)\n\n"
-                "All geometric scoring via Random Fourier Features. Synaptic matrix via Nyström. "
-                "Bigram counts via Count-Min Sketch. Candidates via Gumbel-Max reservoir."
+            sentences   = gr.Slider(1, 10, value=3, step=1, label="Number of sentences")
+            tokens      = gr.Slider(8, 128, value=32, step=1, label="Tokens per sentence")
+            seed_text   = gr.Textbox(lines=2, label="Seed text")
+            instr_text  = gr.Textbox(lines=3, label="Instruction / goal")
+            and_weight  = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="AND weight")
+            temperature = gr.Slider(0.1, 2.0, value=0.9, step=0.05, label="Temperature")
+            gen_btn     = gr.Button("Generate")
+            gen_text    = gr.Textbox(lines=8, label="Generated text")
+            gen_trace   = gr.Textbox(lines=12, label="CoT trace")
+            gen_steps   = gr.Textbox(lines=8, label="RP step report")
+
+            gen_btn.click(
+                gui.generate,
+                inputs=[sentences, tokens, seed_text, instr_text, and_weight, temperature],
+                outputs=[gen_text, gen_trace, gen_steps],
             )
-            with gr.Row():
-                sentences   = gr.Slider(1, 10,   value=4,    step=1,   label="Sentences")
-                tokens      = gr.Slider(20, 180, value=80,   step=1,   label="Tokens/sentence")
-                and_weight  = gr.Slider(0.0, 1.0, value=0.25, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 3.0, value=0.2, step=0.05, label="Temperature")
-            instruction_input = gr.Textbox(
-                label="Instruction (AND distribution source)",
-                value="Explain the meaning of life and human consciousness.", lines=2)
-            seed_input = gr.Textbox(label="Seed Text (bigram start, optional)",
-                                     placeholder="e.g. quantum entanglement")
-            gen_btn = gr.Button("Generate", variant="primary")
-            gen_out = gr.Textbox(lines=10, label="Generated Text")
-            with gr.Row():
-                cot_out  = gr.Textbox(lines=12, label="CoT Trace (RP-ANN stubs)", interactive=False)
-                step_out = gr.Textbox(lines=12, label="RP Step Trace (Nyström norms)", interactive=False)
-            gen_btn.click(gui.generate,
-                          inputs=[sentences, tokens, seed_input, instruction_input, and_weight, temperature],
-                          outputs=[gen_out, cot_out, step_out])
 
-        with gr.Tab("RP Diagnostics"):
-            rp_btn   = gr.Button("Show RP Complexity Report")
-            rp_out   = gr.Textbox(lines=20, label="RP Complexity Diagnostics", interactive=False)
-            rp_btn.click(gui.rp_report, outputs=rp_out)
+        with gr.Tab("Reports"):
+            rp_btn   = gr.Button("RP complexity report")
+            pdn_btn  = gr.Button("PDN theorem bridge")
+            cot_btn  = gr.Button("CoT history")
+            algo_btn = gr.Button("Algorithm catalogue")
 
-            algo_btn = gr.Button("Show All RP Algorithms")
-            algo_out = gr.Textbox(lines=30, label="RP Algorithm Details", interactive=False)
-            algo_btn.click(gui.algo_report, outputs=algo_out)
+            rp_out   = gr.Textbox(lines=15, label="RP complexity")
+            pdn_out  = gr.Textbox(lines=15, label="PDN")
+            cot_out  = gr.Textbox(lines=15, label="CoT")
+            algo_out = gr.Textbox(lines=20, label="Algorithms")
 
-            pdn_btn  = gr.Button("Show Sketched PDN Report")
-            pdn_out  = gr.Textbox(lines=18, label="PDN Sketched Spectrum", interactive=False)
-            pdn_btn.click(gui.pdn_report, outputs=pdn_out)
+            rp_btn.click(gui.rp_report, None, rp_out)
+            pdn_btn.click(gui.pdn_report, None, pdn_out)
+            cot_btn.click(gui.cot_history, None, cot_out)
+            algo_btn.click(gui.algo_report, None, algo_out)
 
-            cot_btn  = gr.Button("Show CoT History")
-            cot_out2 = gr.Textbox(lines=20, label="CoT Trace History", interactive=False)
-            cot_btn.click(gui.cot_history, outputs=cot_out2)
+    return demo
 
-    app.launch()
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 20 — CLI ENTRYPOINT
-# ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="NeuroSymbolic V18-RP: Randomized Polynomial Complexity")
-    parser.add_argument("--gui",          action="store_true")
-    parser.add_argument("--corpus",       type=str)
-    parser.add_argument("--instruction",  type=str,  default="")
-    parser.add_argument("--and-weight",   type=float, default=0.5)
-    parser.add_argument("--temperature",  type=float, default=1.4)
-    parser.add_argument("--syn-weight",   type=float, default=0.4)
-    parser.add_argument("--trans-weight", type=float, default=0.6)
-    parser.add_argument("--syn-k",        type=int,   default=8)
-    parser.add_argument("--rff-dim",      type=int,   default=RP_RFF_DIM,
-                        help=f"Random Fourier Feature dimension (default {RP_RFF_DIM})")
-    parser.add_argument("--nystrom-m",    type=int,   default=RP_NYSTROM_M,
-                        help=f"Nyström landmark count (default {RP_NYSTROM_M})")
-    parser.add_argument("--rp-seed",      type=int,   default=RP_SEED,
-                        help="Global RP randomness seed (set for reproducibility)")
-    args = parser.parse_args()
-
-    if args.gui or not args.corpus:
-        launch_gui()
-        exit(0)
-
-    try:
-        corpus_text = Path(args.corpus).read_text(encoding="utf-8")
-    except Exception as e:
-        print(f"[!] Failed to read {args.corpus}: {e}")
-        exit(1)
-
-    engine = V18RPEngine(
-        syn_weight   = args.syn_weight,
-        trans_weight = args.trans_weight,
-        syn_k        = args.syn_k,
-        rff_dim      = args.rff_dim,
-        nystrom_m    = args.nystrom_m,
-    )
-    engine.train(corpus_text)
-    engine.save_cache("v18_rp_model.pkl")
-
-    instruction = args.instruction or "Explain the meaning of life."
-    print("\n--- SAMPLE GENERATION (V18-RP) ---")
-    text, traces, step_report = generate_passage_rp(
-        engine.walker, engine.lm,
-        num_sentences=3, tokens_per_sent=30,
-        instruction_text=instruction,
-        and_weight=args.and_weight,
-        temperature=args.temperature,
-        return_traces=True,
-    )
-    print(text)
-    print("\n--- COT TRACES ---")
-    for tr in traces: print(tr.render())
-    print("\n--- RP STEP TRACE ---")
-    print(step_report)
-    print("\n--- RP COMPLEXITY REPORT ---")
-    print(engine.walker.rp_complexity_report())
+    demo = build_demo()
+    demo.launch()
