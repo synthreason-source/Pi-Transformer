@@ -616,7 +616,7 @@ class RPCompositionLM:
         cands_all=list(agg.keys())
         sampled=[cands_all[i] for i in _reservoir_sample_indices(len(cands_all),
                                                                    min(RP_RESERVOIR_K*4,len(cands_all)))]
-        cands=sampled[:400]; total=sum(agg.get(c,1e-4) for c in cands); V=len(self.vocab)+1
+        cands=sampled; total=sum(agg.get(c,1e-4) for c in cands); V=len(self.vocab)+1
         return cands,torch.tensor(
             [(agg.get(c,1e-4)+self.BASAL_K)/(total+self.BASAL_K*V) for c in cands],
             dtype=torch.float32,device=self.device)
@@ -641,7 +641,7 @@ class RPMRVFilter:
         self._vocab_feats: Optional[torch.Tensor]=None; self._v_toks: List[str]=[]
 
     def prime(self, vocab, geo):
-        scan=vocab[:500]; self._v_toks=scan
+        scan=vocab; self._v_toks=scan
         if geo._feat_t is not None:
             self._vocab_feats=geo._feat_t[geo.tok_indices(scan)]
         else:
@@ -1074,7 +1074,7 @@ class FittedLineRegression(nn.Module):
         "rho_mean","sigma_mean","composition"
     ]
 
-    def __init__(self, feature_dim=16, rank=1):
+    def __init__(self, feature_dim=17, rank=1):
         super().__init__()
         self.feature_dim = feature_dim
         self.W            = nn.Parameter(torch.randn(feature_dim, rank) * 0.05)
@@ -1266,9 +1266,15 @@ class RPWalker:
             C, k_reg, k_ori, k_side, orbit_scores, pot_bonus, mrv_scores,
             chunk_bonus, echo_bonus, pdn_bonus, cot_bonus,
             p_instr, syn_norm_vec, trans_norm_vec, c_rho, c_sigma, comp_bonus)
-
         if self.fitted_model is not None:
-            delta = self.fitted_model(features)          # (C,) — learned correction
+            _fd = self.fitted_model.W.shape[0]   # self = RPWalker, .fitted_model.W is FLR ✓
+            if features.shape[1] != _fd:
+                if features.shape[1] < _fd:
+                    _pad = torch.zeros(...)
+                    features = torch.cat([features, _pad], dim=1)
+                else:
+                    features = features[:, :_fd]
+            delta = self.fitted_model(features)
             raw_logits = logits_enriched + delta
         else:
             # Fallback: hand-tuned weights (identical to original V18-RP)
@@ -1597,7 +1603,7 @@ class V18RPEngine:
         self.walker    = None   # built during train()
 
     def train(self, corpus_text: str):
-        self._corpus_snippet = corpus_text[:1000]
+        self._corpus_snippet = corpus_text
         print(f"[V18-RP] Tokenising {len(corpus_text)} chars…")
         tokens = tokenize(corpus_text)
 
@@ -1801,7 +1807,7 @@ def build_gradio_app() -> gr.Blocks:
                 instr_txt = gr.Textbox(label="Instruction text")
             with gr.Row():
                 n_sents   = gr.Slider(1,16,value=4,step=1,label="Sentences")
-                toks_sent = gr.Slider(10,120,value=40,step=5,label="Tokens/sentence")
+                toks_sent = gr.Slider(10,120,value=80,step=5,label="Tokens/sentence")
                 and_w     = gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
                 temp      = gr.Slider(0.5,5.0,value=2.0,step=0.1,label="Temperature")
                 show_tr   = gr.Checkbox(value=True,label="Show traces")
