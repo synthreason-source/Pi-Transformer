@@ -1833,8 +1833,7 @@ if __name__ == "__main__":
     parser.add_argument("--save",         default="", help="Save engine to path")
     parser.add_argument("--load",         default="", help="Load engine from path")
     parser.add_argument("--gui",          action="store_true", help="Launch Gradio GUI")
-    parser.add_argument("--port",         type=int,   default=7860)
     args = parser.parse_args()
 
-    build_gradio_app().launch(server_port=args.port, share=False)
+    build_gradio_app().launch(share=False)
   
