@@ -2232,17 +2232,102 @@ class V18RPEngine:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 19 — GRADIO GUI
 # ════════════════════════════════════════════════════════════════════════════
+from datasets import load_dataset
+
+def load_hf_text_dataset(
+    dataset_name: str,
+    config_name: str = None,
+    split: str = "train",
+    text_field: str = None,
+    portion: float = 1.0,
+    max_examples: int = None,
+) -> str:
+    """
+    Load text from a Hugging Face dataset and return a single concatenated corpus string.
+    """
+    ds = load_dataset(dataset_name, config_name or None, split=split)
+
+    # Subsample by portion
+    if portion < 1.0:
+        n = int(len(ds) * portion)
+        n = max(n, 1)
+        ds = ds.select(range(n))
+
+    # Optional hard cap
+    if max_examples is not None:
+        n = min(len(ds), int(max_examples))
+        ds = ds.select(range(n))
+
+    # Choose text field
+    if text_field is None or text_field.strip() == "":
+        ex0 = ds[0]
+        text_field = None
+        for k, v in ex0.items():
+            if isinstance(v, str):
+                text_field = k
+                break
+        if text_field is None:
+            raise ValueError("No string field found in dataset; please specify text_field explicitly.")
+
+    texts = [ex[text_field] for ex in ds if ex.get(text_field)]
+    return "\n\n".join(texts)
+
 
 class V18RPGUI:
     def __init__(self):
         self.engine = None
 
-    def init_from_file(self, file_obj, syn_w, trans_w, syn_k, rff_dim, nystrom_m):
-        if file_obj is None: return "Error: No file uploaded."
+    def init_from_source(
+        self,
+        mode,                 # "file" or "hf"
+        file_obj,
+        hf_name,
+        hf_config,
+        hf_split,
+        hf_text_field,
+        hf_portion,
+        hf_max_examples,
+        syn_w, trans_w, syn_k, rff_dim, nystrom_m,
+    ):
         try:
-            with open(file_obj.name, 'r', encoding='utf-8') as f:
-                corpus = f.read()
-            if not corpus.strip(): return "Error: Empty file."
+            if mode == "file":
+                if file_obj is None:
+                    return "Error: No file uploaded."
+                with open(file_obj.name, 'r', encoding='utf-8') as f:
+                    corpus = f.read()
+                if not corpus.strip():
+                    return "Error: Empty file."
+                source_desc = f"File: {file_obj.name.split('/')[-1]}"
+            else:
+                if not hf_name:
+                    return "Error: No Hugging Face dataset name provided."
+                max_ex = None
+                if hf_max_examples is not None:
+                    try:
+                        max_ex_int = int(hf_max_examples)
+                        if max_ex_int > 0:
+                            max_ex = max_ex_int
+                    except Exception:
+                        max_ex = None
+
+                corpus = load_hf_text_dataset(
+                    dataset_name=hf_name.strip(),
+                    config_name=(hf_config or "").strip() or None,
+                    split=(hf_split or "train").strip(),
+                    text_field=(hf_text_field or None),
+                    portion=float(hf_portion),
+                    max_examples=max_ex,
+                )
+                if not corpus.strip():
+                    return "Error: Loaded dataset has no text."
+
+                source_desc = (
+                    f"HF dataset: {hf_name.strip()} "
+                    f"(config={hf_config or 'None'}, split={hf_split or 'train'}, "
+                    f"portion={float(hf_portion):.2f}, "
+                    f"max_examples={max_ex if max_ex is not None else 'None'})"
+                )
+
             self.engine = V18RPEngine(
                 syn_weight=float(syn_w), trans_weight=float(trans_w),
                 syn_k=int(syn_k), rff_dim=int(rff_dim), nystrom_m=int(nystrom_m),
@@ -2251,8 +2336,8 @@ class V18RPGUI:
             pdn_report = self.engine.pdn.theorem_bridge_report()
             stub_counts = {k: len(v) for k, v in self.engine.stub_lib.stubs.items()}
             return (
-                f"V18-RP Engine initialised.\n"
-                f"File: {file_obj.name.split('/')[-1]}\n"
+                "V18-RP Engine initialised.\n"
+                f"{source_desc}\n"
                 f"Vocab: {len(self.engine.lm.vocab)} tokens\n"
                 f"CoT stubs: {stub_counts}\n"
                 f"RFF dim D={int(rff_dim)}  Nyström m={int(nystrom_m)}\n"
@@ -2282,11 +2367,13 @@ class V18RPGUI:
         return self.engine.walker.rp_complexity_report()
 
     def pdn_report(self):
-        if not self.engine: return "Engine not initialised."
+        if not self.engine:
+            return "Engine not initialised."
         return self.engine.pdn.theorem_bridge_report()
 
     def cot_history(self):
-        if not self.engine or not self.engine.cot: return "Engine not initialised."
+        if not self.engine or not self.engine.cot:
+            return "Engine not initialised."
         return self.engine.cot.all_traces_text()
 
     def algo_report(self):
@@ -2351,24 +2438,82 @@ def build_demo():
     gui = V18RPGUI()
 
     with gr.Blocks(title="NeuroSymbolic V18-RP") as demo:
-        gr.Markdown("# NeuroSymbolic V18-RP — RP Edition")
+        gr.Markdown("# NeuroSymbolic V18-RP — Randomized Polynomial Edition")
 
+        # Init / Train tab
         with gr.Tab("Init / Train"):
-            file_in   = gr.File(label="Training text file (.txt)")
+            mode = gr.Radio(
+                ["file", "hf"],
+                value="file",
+                label="Training source",
+            )
+
+            with gr.Group(visible=True) as file_group:
+                file_in = gr.File(label="Training text file (.txt)")
+
+            with gr.Group(visible=False) as hf_group:
+                hf_name = gr.Textbox(
+                    label="HF dataset name",
+                    placeholder="e.g. wikitext, imdb, ag_news",
+                )
+                hf_config = gr.Textbox(
+                    label="HF config name (optional)",
+                    placeholder="e.g. wikitext-103-raw-v1",
+                )
+                hf_split = gr.Textbox(
+                    label="Split",
+                    value="train",
+                    placeholder="train / validation / test or custom split",
+                )
+                hf_text_field = gr.Textbox(
+                    label="Text field (blank = auto-detect)",
+                    placeholder="e.g. text, content, review",
+                )
+                hf_portion = gr.Slider(
+                    minimum=0.01,
+                    maximum=1.0,
+                    value=0.1,
+                    step=0.01,
+                    label="Dataset portion used (fraction of split)",
+                )
+                hf_max_examples = gr.Number(
+                    label="Max examples (optional cap)",
+                    value=None,
+                    precision=0,
+                )
+
+            def _toggle_mode(m):
+                return (
+                    gr.update(visible=(m == "file")),
+                    gr.update(visible=(m == "hf")),
+                )
+
+            mode.change(
+                _toggle_mode,
+                inputs=mode,
+                outputs=[file_group, hf_group],
+            )
+
             syn_w     = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="Synaptic weight")
             trans_w   = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="Transition weight")
             syn_k     = gr.Slider(1, 64, value=16, step=1, label="Synaptic k")
             rff_dim   = gr.Slider(32, 512, value=128, step=32, label="RFF dim D")
             nystrom_m = gr.Slider(8, 128, value=32, step=4, label="Nyström m")
+
             init_btn  = gr.Button("Initialise engine")
-            init_out  = gr.Textbox(lines=15, label="Initialisation / PDN report")
+            init_out  = gr.Textbox(lines=18, label="Initialisation / PDN report")
 
             init_btn.click(
-                gui.init_from_file,
-                inputs=[file_in, syn_w, trans_w, syn_k, rff_dim, nystrom_m],
+                gui.init_from_source,
+                inputs=[
+                    mode, file_in,
+                    hf_name, hf_config, hf_split, hf_text_field, hf_portion, hf_max_examples,
+                    syn_w, trans_w, syn_k, rff_dim, nystrom_m,
+                ],
                 outputs=[init_out],
             )
 
+        # Generate tab
         with gr.Tab("Generate"):
             sentences   = gr.Slider(1, 10, value=3, step=1, label="Number of sentences")
             tokens      = gr.Slider(8, 128, value=32, step=1, label="Tokens per sentence")
@@ -2376,6 +2521,7 @@ def build_demo():
             instr_text  = gr.Textbox(lines=3, label="Instruction / goal")
             and_weight  = gr.Slider(0.0, 5.0, value=1.0, step=0.1, label="AND weight")
             temperature = gr.Slider(0.1, 2.0, value=0.9, step=0.05, label="Temperature")
+
             gen_btn     = gr.Button("Generate")
             gen_text    = gr.Textbox(lines=8, label="Generated text")
             gen_trace   = gr.Textbox(lines=12, label="CoT trace")
@@ -2387,6 +2533,7 @@ def build_demo():
                 outputs=[gen_text, gen_trace, gen_steps],
             )
 
+        # Reports tab
         with gr.Tab("Reports"):
             rp_btn   = gr.Button("RP complexity report")
             pdn_btn  = gr.Button("PDN theorem bridge")
