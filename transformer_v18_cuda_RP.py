@@ -709,11 +709,6 @@ class CoTTrace:
     seed_tokens:List[str]; steps:List[CoTStep]; conclusion:Optional[ContextualStub]
     def render(self):
         lines=["  ── CoT Trace (RP-ANN) ──",f"  Seed: {' '.join(self.seed_tokens[:6])}"]
-        for s in self.steps:
-            lines.append(f"  Hop {s.hop_index:02d} [{s.stub.stub_type:<11s}] "
-                         f"score={s.stub_score:.3f} orbit={s.pdn_orbit} ρ={s.stub.rho:.3f}\n"
-                         f"          → {s.stub.label}")
-        if self.conclusion: lines.append(f"  Conclusion ρ={self.conclusion.rho:.3f} → {self.conclusion.label}")
         return "\n".join(lines)
 
 class RPCoTStubLibrary:
@@ -757,6 +752,9 @@ class RPCoTStubLibrary:
             label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-ρ] {' '.join(toks[:3])}…"))
 
     def _rebuild_lsh(self):
+        # Sort stubs within each type by rho ascending → ordered geometric impulse sequence
+        for _stype in _STUB_SEQUENCE:
+            self.stubs[_stype].sort(key=lambda s: s.rho)
         self._stub_list=[s for st in _STUB_SEQUENCE for s in self.stubs[st]]
         if not self._stub_list: return
         rt=torch.tensor([s.rho for s in self._stub_list],dtype=torch.float32,device=self.device)
@@ -804,7 +802,14 @@ class RPCoTReasoningEngine:
             ctx_theta=math.atan2(sin_m,cos_m)%math.pi
         else: ctx_rho,ctx_theta,ctx_sigma=0.5,math.pi/4,0.5
         self._chain=[]; self._conclusion_stub=None
-        hops=[STUB_PREMISE]+[STUB_ELABORATION]*max(1,self.n_hops-2)+[STUB_CONTRAST]
+        # Map n_hops positions onto _STUB_SEQUENCE in strict sorted order
+        _seq = _STUB_SEQUENCE
+        if self.n_hops >= len(_seq):
+            hops = list(_seq) + [_seq[-2]] * (self.n_hops - len(_seq))
+        else:
+            _step = (len(_seq) - 1) / max(self.n_hops - 1, 1)
+            hops = [_seq[min(int(round(i * _step)), len(_seq)-1)]
+                    for i in range(self.n_hops)]
         for i,stype in enumerate(hops[:self.n_hops]):
             stub=self.stubs.best_stub(stype,ctx_rho,ctx_theta,ctx_sigma,self.kernels,
                                        pdn_orbit=(pdn_orbit+i)%self.pdn.n_star,pdn_engine=self.pdn)
@@ -1071,7 +1076,7 @@ class FittedLineRegression(nn.Module):
     FEATURE_NAMES = [
         "k_reg","k_ori","k_side","orbit","potential","mrv",
         "chunk","echo","pdn","cot","instr","syn_norm","trans_norm",
-        "rho_mean","sigma_mean","composition"
+        "rho_mean","sigma_mean","composition","sorted_impulse"
     ]
 
     def __init__(self, feature_dim=17, rank=1):
@@ -1156,6 +1161,7 @@ class RPWalker:
         pdn_bonus: torch.Tensor, cot_bonus: torch.Tensor,
         instr_probs: torch.Tensor, syn_norm_vec: torch.Tensor, trans_norm_vec: torch.Tensor,
         c_rho: torch.Tensor, c_sigma: torch.Tensor, comp_bonus: torch.Tensor,
+        sorted_impulse: torch.Tensor,          # 17th: rho-rank directional impulse
     ) -> torch.Tensor:
         def _safe(t):
             if t.shape[0] != C:
@@ -1168,7 +1174,8 @@ class RPWalker:
             _safe(pdn_bonus), _safe(cot_bonus),
             _safe(instr_probs), _safe(syn_norm_vec), _safe(trans_norm_vec),
             _safe(c_rho), _safe(c_sigma), _safe(comp_bonus),
-        ], dim=-1)  # (C, 16)
+            _safe(sorted_impulse),               # 17th feature
+        ], dim=-1)  # (C, 17)
 
     @torch.no_grad()
     def walk_probs(self, w1, w2, temp=1.4,
@@ -1253,6 +1260,17 @@ class RPWalker:
         # Composition bonus
         comp_bonus = self.lm.composition_logit_bonus(w1, w2, c_rho, c_sigma)
 
+        # ── SORTED IMPULSE: rho-rank directional signal for ordered NLP generation ──
+        # Candidates are implicitly sorted by ascending rho-rank; direction is
+        # governed by a cosine schedule over the generation horizon:
+        #   hop_frac=0 (start) → impulse_dir=+1 → bias toward high-ρ (confident tokens)
+        #   hop_frac=1 (end)   → impulse_dir=−1 → bias toward low-ρ  (concluding tokens)
+        _rho_rank      = torch.argsort(torch.argsort(c_rho)).float()          # 0..C-1
+        _rank_norm     = _rho_rank / max(float(C - 1), 1.0)                  # 0→1
+        _hop_frac      = self._tok_pos / max(self._total_tokens - 1, 1)
+        _impulse_dir   = math.cos(math.pi * _hop_frac)                       # +1→−1
+        sorted_impulse = layer_norm_array(_rank_norm * _impulse_dir)
+
         # Instruction distribution
         if and_weight > 0.0 and self.instr_dist.base_dist_t is not None:
             p_instr = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
@@ -1265,12 +1283,13 @@ class RPWalker:
         features = self._extract_features(
             C, k_reg, k_ori, k_side, orbit_scores, pot_bonus, mrv_scores,
             chunk_bonus, echo_bonus, pdn_bonus, cot_bonus,
-            p_instr, syn_norm_vec, trans_norm_vec, c_rho, c_sigma, comp_bonus)
+            p_instr, syn_norm_vec, trans_norm_vec, c_rho, c_sigma, comp_bonus,
+            sorted_impulse)
         if self.fitted_model is not None:
             _fd = self.fitted_model.W.shape[0]   # self = RPWalker, .fitted_model.W is FLR ✓
             if features.shape[1] != _fd:
                 if features.shape[1] < _fd:
-                    _pad = torch.zeros(...)
+                    _pad = torch.zeros(C, _fd - features.shape[1], device=self.device)
                     features = torch.cat([features, _pad], dim=1)
                 else:
                     features = features[:, :_fd]
@@ -1292,7 +1311,8 @@ class RPWalker:
                           + mandate_boost
                           + punct_bias
                           + punct_penalty
-                          + 0.4 * comp_bonus)
+                          + 0.4  * comp_bonus
+                          + 10.25 * sorted_impulse)   # sorted rho-rank impulse
 
         # Remission gating
         w1_rho = self.geo.triple_fast(w1).rho
@@ -1390,7 +1410,7 @@ class RPWalker:
             "5. LSH ANN SEARCH            O(C·b·r) b=8 r=4",
             "6. RANDOM WALK MC            O(V·t)  t=20",
             "7. SKETCHED FFT (PDN)        O(T·k)  k=200",
-            "8. FITTED LINE REGRESSION    O(C·16) learnable delta",
+            "8. FITTED LINE REGRESSION    O(C·17) learnable delta (incl. sorted_impulse)",
             "",
             f"Fitted line active: {self.fitted_model is not None}",
             self.fitted_model.feature_report() if self.fitted_model else "  (train via engine.train_fitted_line())",
@@ -1412,7 +1432,7 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
 
     # Temporarily attach untrained model so walk_probs captures features
     if walker.fitted_model is None:
-        walker.fitted_model = FittedLineRegression(16).to(device)
+        walker.fitted_model = FittedLineRegression(17).to(device)
 
     walker._fl_replay_buf.clear()
     features_list: List[torch.Tensor] = []
@@ -1462,7 +1482,7 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
     for feats, gold_idx in zip(features_list, gold_list):
         C = feats.shape[0]
         if C < max_C:
-            pad = torch.zeros(max_C - C, 16)
+            pad = torch.zeros(max_C - C, 17)
             feats = torch.cat([feats, pad], dim=0)
         padded_feats.append(feats)
         padded_golds.append(min(gold_idx, max_C - 1))
@@ -1472,7 +1492,7 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
 
     print(f"[FittedLine] Training on {len(features_t):,} steps, C={max_C}, D=16, epochs={epochs}")
 
-    model = FittedLineRegression(feature_dim=16, rank=1).to(device)
+    model = FittedLineRegression(feature_dim=17, rank=1).to(device)
     opt   = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     from torch.utils.data import TensorDataset, DataLoader
@@ -1670,7 +1690,7 @@ class V18RPEngine:
 
     def load_fitted_line(self, path="fitted_line_v18rp.pt"):
         assert self._initialised, "Call .train() first."
-        model = FittedLineRegression(16).to(self.device)
+        model = FittedLineRegression(17).to(self.device)
         model.load_state_dict(torch.load(path, map_location=self.device))
         model.eval()
         self.walker.fitted_model = model
