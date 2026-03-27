@@ -31,7 +31,7 @@ def train_and_save():
     # ---------------------------------
 
     # 1. Provide some training text.
-    with open("xab", "r", encoding="utf-8") as f:
+    with open("singlekb.txt", "r", encoding="utf-8") as f:
         corpus = f.read()
 
     # 2. Initialize the empty engine
