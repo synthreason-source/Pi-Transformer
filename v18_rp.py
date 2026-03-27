@@ -1852,7 +1852,7 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
 # SECTION 19 — V18-RP-ANISO ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
-class V18RPAnisoEngine:
+class V18RPEngine:
     def __init__(self, syn_weight=0.4, trans_weight=0.6, syn_k=8,
                  rff_dim=RP_RFF_DIM, nystrom_m=RP_NYSTROM_M,
                  aniso_ooi_weight=ANISO_OOI_W,
@@ -1968,7 +1968,7 @@ class V18RPAnisoEngine:
         print(f"[V18-RP-ANISO] Engine saved to {path}")
 
     @staticmethod
-    def load(path="v18rp_aniso_engine.pkl") -> "V18RPAnisoEngine":
+    def load(path="v18rp_aniso_engine.pkl") -> "V18RPEngine":
         with open(path, "rb") as f: eng = pickle.load(f)
         print(f"[V18-RP-ANISO] Engine loaded from {path}")
         return eng
@@ -1978,14 +1978,14 @@ class V18RPAnisoEngine:
 # SECTION 20 — GRADIO GUI
 # ════════════════════════════════════════════════════════════════════════════
 
-_engine: Optional[V18RPAnisoEngine] = None
+_engine: Optional[V18RPEngine] = None
 
 def _gui_init(mode, file_in, hf_name, hf_config, hf_split, hf_field,
               hf_portion, hf_max, syn_w, trans_w, syn_k, rff_dim, nystrom_m,
               ooi_w, rep_w):
     global _engine
     try:
-        _engine = V18RPAnisoEngine(
+        _engine = V18RPEngine(
             syn_weight=float(syn_w), trans_weight=float(trans_w),
             syn_k=int(syn_k), rff_dim=int(rff_dim), nystrom_m=int(nystrom_m),
             aniso_ooi_weight=float(ooi_w),
