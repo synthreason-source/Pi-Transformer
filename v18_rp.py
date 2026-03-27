@@ -1,81 +1,65 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V18-RP — Randomized Polynomial Complexity Edition
+NeuroSymbolic V18-RP-ANISO — Non-Isotropic Inter-Candidate Edition
 ===============================================================================
 
-COMPLETE ALGORITHMIC REWRITE: ALL CORE ALGORITHMS → RP COMPLEXITY
-═══════════════════════════════════════════════════════════════════
+WHAT CHANGED FROM V18-RP → V18-RP-ANISO
+─────────────────────────────────────────
 
-WHAT CHANGED FROM V18-CSNS → V18-RP
-────────────────────────────────────
+The core addition is NON-ISOTROPIC PREDICTION WEIGHTS.
 
-Every O(n²) or O(n³) deterministic algorithm has been replaced with an
-RP (Randomized Polynomial-time) counterpart. The system retains the same
-semantic architecture — Thébault geometry, CSNS lateral coupling, PDN
-symmetry detection, CoT reasoning — but all heavy computation now runs
-in randomized sublinear or near-linear time with bounded error probability.
+In V18-RP every candidate token was scored only against the generation context
+(w1, w2 bigram centroid). That made the kernel isotropic: two candidates that
+are geometrically close to each other in Thébault space received the same
+bonus even though they are substitutable synonyms.
 
-┌─────────────────────────────────────────────────────────────────────────────┐
-│  COMPONENT                  │ ORIGINAL            │ RP REPLACEMENT          │
-│─────────────────────────────┼─────────────────────┼─────────────────────────│
-│ Thébault triple             │ Exact 4-centre calc  │ Random Fourier Features │
-│ (geometry encoding)         │ O(1) per token       │ (RFF sketch, d=128)     │
-│                             │ but O(V) total       │ via Bochner's theorem   │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ Synaptic weight matrix      │ Exact C×C Gaussian   │ Nyström approximation   │
-│ (CSNS lateral coupling)     │ kernel: O(C²)        │ O(C·m), m=32 landmarks  │
-│                             │                      │ ε-approximation w.h.p.  │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ Top-K candidate selection   │ Exact torch.topk     │ Reservoir sampling      │
-│                             │ O(C log K)           │ O(C) one-pass           │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ Bigram/trigram counts       │ Exact dict lookup    │ Count-Min Sketch        │
-│                             │ O(1) amortised       │ O(w) hash probes        │
-│                             │ but O(V²) storage    │ O(w·d) space, ε-approx  │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ Graph potential propagation │ Dense adjacency mul  │ Random Walk Monte Carlo │
-│                             │ O(|V|·|E|) per step  │ O(|V|·t) t=walk length  │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ Kernel similarity search    │ Exact inner product  │ LSH (Locality-Sensitive │
-│ (MRV candidate scoring)     │ O(C·V)              │ Hashing) O(C·b) b=bands │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ PDN spectral analysis       │ Exact DFT            │ Randomized sketched FFT │
-│                             │ O(n log n) exact     │ O(n·k) k=sparse modes   │
-├─────────────────────────────┼─────────────────────┼─────────────────────────┤
-│ CoT stub matching           │ Exact kernel vs all  │ ANN via Random          │
-│                             │ O(S)                 │ Projection Trees O(logS)│
-└─────────────────────────────┴─────────────────────┴─────────────────────────┘
+V18-RP-ANISO adds two interacting mechanisms:
 
-RP GUARANTEES
-─────────────
-All randomized algorithms satisfy:
-  P[output correct] ≥ 1 - δ   (δ = failure probability, typically 0.01-0.05)
-  Runtime polynomial in input size: O(n^k) for fixed k
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 1. SENTENCE OBJECT-OF-INTEREST (OOI) TRACKER                            │
+│    Each sentence maintains a live set of "objects of interest" — the      │
+│    geometrically salient tokens already generated (high rho, mid theta). │
+│    Every new candidate is scored against EACH OOI via the anisotropic    │
+│    directional kernel (see below), not just against the context bigram.  │
+│                                                                           │
+│ 2. ANISOTROPIC DIRECTIONAL KERNEL  (AnisoDirKernel)                      │
+│    k_aniso(a, b) = exp(-λ_rho·Δρ² - λ_theta·Δθ_aniso² - λ_sigma·Δσ²)   │
+│    where Δθ_aniso is the SIGNED angular difference modulated by ρ:       │
+│      Δθ_aniso = (θ_b - θ_a) · (1 + α·ρ_a)                               │
+│    High-rho tokens stretch the angular axis → tokens that are similar    │
+│    in rho but differ slightly in theta are pushed further apart in        │
+│    kernel space.  This breaks the isotropy of the standard cosine kernel. │
+│                                                                           │
+│ 3. INTER-CANDIDATE REPULSION (DPP-LITE)                                  │
+│    After scoring each candidate against the OOI set, we compute a        │
+│    lightweight diversity penalty:                                          │
+│      repulsion_i = Σ_j≠i  k_aniso(c_i, c_j) · final_prob_j              │
+│    This is subtracted (scaled) from the logits so that a cluster of      │
+│    near-synonym candidates is forced to differentiate — only the best    │
+│    representative of each geometric cluster survives with high weight.   │
+│                                                                           │
+│ 4. FEATURE DIMENSION EXTENDED 17 → 19                                    │
+│    Feature 18: ooi_affinity   — mean aniso kernel score vs OOI set       │
+│    Feature 19: inter_repulsion — DPP-lite diversity penalty               │
+└──────────────────────────────────────────────────────────────────────────┘
 
-Derandomization: setting a fixed random seed reproduces results exactly.
+All other algorithms (RFF, Nyström, CMS, reservoir, LSH, random walk, PDN,
+CoT, fitted line) are unchanged from V18-RP.
 
-THEORETICAL GROUNDING
-──────────────────────
-• Random Fourier Features: Rahimi & Recht (2007) — shift-invariant kernels
-  k(x,y) = E_ω[φ(x)·φ(y)]  where φ(x) = √(2/D)·cos(ωᵀx + b)
+THEORETICAL NOTE
+────────────────
+The anisotropic kernel belongs to the family of Matern-style directional
+kernels studied in:
+  Paciorek & Schervish (2006) "Spatial modelling using a new class of
+  nonstationary covariance functions."
+The ρ-dependent axis stretching is equivalent to a locally-adaptive
+length-scale in the θ direction, giving a non-stationary (non-isotropic)
+Gaussian process prior over token geometry.
 
-• Nyström Approximation: Williams & Seeger (2001) — kernel matrix approx
-  K ≈ K_{nm} K_{mm}⁻¹ K_{mn}   rank-m approximation, ε=O(1/√m)
-
-• Count-Min Sketch: Cormode & Muthukrishnan (2005) — frequency estimation
-  P[|CMS(x) - freq(x)| > ε·N] ≤ δ   with w=⌈e/ε⌉, d=⌈ln(1/δ)⌉
-
-• Reservoir Sampling: Vitter (1985) — uniform random sample in O(n)
-  Each element equally likely to appear in output of size k
-
-• LSH for cosine similarity: Charikar (2002)
-  P[h(x)=h(y)] = 1 - arccos(sim(x,y))/π
-
-• Random Walk Monte Carlo: Lovász (1999)
-  π(v) converged after O(|V|log|V|/gap) steps
-
-===============================================================================
+The DPP-lite repulsion is a first-order approximation of Determinantal
+Point Process diversity (Kulesza & Taskar 2012) that runs in O(C²) but
+with C typically ≤ 200 so it remains practical.
 """
 
 from __future__ import annotations
@@ -115,13 +99,23 @@ RP_LSH_ROWS      = 4
 RP_WALK_STEPS    = 20
 RP_RESERVOIR_K   = 64
 
+# ── ANISO CONFIG ─────────────────────────────────────────────────────────
+ANISO_LAMBDA_RHO   = 8.0   # Mahalanobis stretch along ρ axis
+ANISO_LAMBDA_THETA = 4.0   # Mahalanobis stretch along θ axis
+ANISO_LAMBDA_SIGMA = 2.0   # Mahalanobis stretch along σ axis
+ANISO_ALPHA        = 1.5   # ρ-dependent θ-axis anisotropy factor
+ANISO_OOI_MAX      = 12    # max objects-of-interest tracked per sentence
+ANISO_OOI_RHO_THR  = 0.25  # minimum ρ for a token to be OOI-eligible
+ANISO_REPULSION_W  = 0.55  # weight of inter-candidate repulsion in final logits
+ANISO_OOI_W        = 0.70  # weight of OOI affinity bonus in final logits
+
 _rng    = random.Random(RP_SEED)
 _np_rng = np.random.default_rng(RP_SEED)
 torch.manual_seed(RP_SEED)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b — SHARED ACTIVATION PRIMITIVES
+# SECTION 0b — SHARED ACTIVATION PRIMITIVES  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
@@ -151,7 +145,223 @@ def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — RANDOM FOURIER FEATURES
+# SECTION 0c — ANISOTROPIC DIRECTIONAL KERNEL  ← NEW
+# ════════════════════════════════════════════════════════════════════════════
+
+class AnisoDirKernel:
+    """
+    Non-isotropic kernel over Thébault space (ρ, θ, σ).
+
+    k_aniso(a, b) = exp(
+        -λ_rho   · (ρ_b - ρ_a)²
+        -λ_theta · Δθ_aniso(a,b)²
+        -λ_sigma · (σ_b - σ_a)²
+    )
+
+    where   Δθ_aniso = (θ_b - θ_a) · (1 + α · ρ_a)
+
+    Effect: high-ρ "anchor" tokens stretch the angular dimension, so two
+    candidates that differ only slightly in θ are treated as more distinct
+    when the anchor is geometrically confident (high ρ).  This breaks the
+    isotropy of the plain cosine kernel used in V18-RP.
+    """
+
+    def __init__(self,
+                 lambda_rho:   float = ANISO_LAMBDA_RHO,
+                 lambda_theta: float = ANISO_LAMBDA_THETA,
+                 lambda_sigma: float = ANISO_LAMBDA_SIGMA,
+                 alpha:        float = ANISO_ALPHA,
+                 device: torch.device = DEVICE,
+                 dtype:  torch.dtype  = torch.float32):
+        self.lr  = lambda_rho
+        self.lt  = lambda_theta
+        self.ls  = lambda_sigma
+        self.a   = alpha
+        self.device = device
+        self.dtype  = dtype
+
+    # ── scalar anchor × batch candidates ────────────────────────────────
+    def score_anchor_vs_batch(
+        self,
+        anc_rho:   float, anc_theta: float, anc_sigma: float,
+        c_rho:   torch.Tensor, c_theta: torch.Tensor, c_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """Returns (C,) scores; anchor is a single triple."""
+        d_rho   = c_rho   - anc_rho
+        d_theta = (c_theta - anc_theta) * (1.0 + self.a * anc_rho)
+        d_sigma = c_sigma  - anc_sigma
+        return torch.exp(
+            -self.lr * d_rho**2
+            -self.lt * d_theta**2
+            -self.ls * d_sigma**2
+        )
+
+    # ── batch × batch  (C × C)  for inter-candidate repulsion ───────────
+    def gram_matrix(
+        self,
+        c_rho:   torch.Tensor,   # (C,)
+        c_theta: torch.Tensor,   # (C,)
+        c_sigma: torch.Tensor,   # (C,)
+    ) -> torch.Tensor:
+        """
+        Returns (C, C) Gram matrix K where K[i,j] = k_aniso(c_i, c_j).
+        The diagonal is 1 by definition (self-similarity).
+        Because anisotropy is anchor-dependent, K is NOT necessarily symmetric;
+        K[i,j] uses c_i as anchor: Δθ_aniso = (θ_j-θ_i)·(1+α·ρ_i).
+        """
+        C = c_rho.shape[0]
+        # broadcast: rows = anchors (i), cols = candidates (j)
+        rho_i   = c_rho.unsqueeze(1)    # (C,1)
+        theta_i = c_theta.unsqueeze(1)  # (C,1)
+        sigma_i = c_sigma.unsqueeze(1)  # (C,1)
+
+        rho_j   = c_rho.unsqueeze(0)    # (1,C)
+        theta_j = c_theta.unsqueeze(0)  # (1,C)
+        sigma_j = c_sigma.unsqueeze(0)  # (1,C)
+
+        d_rho   = rho_j   - rho_i
+        d_theta = (theta_j - theta_i) * (1.0 + self.a * rho_i)
+        d_sigma = sigma_j  - sigma_i
+
+        K = torch.exp(
+            -self.lr * d_rho**2
+            -self.lt * d_theta**2
+            -self.ls * d_sigma**2
+        )
+        return K  # (C, C)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0d — SENTENCE OOI TRACKER  ← NEW
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class OOIEntry:
+    token: str
+    rho:   float
+    theta: float
+    sigma: float
+
+
+class SentenceOOITracker:
+    """
+    Tracks "objects of interest" within the current sentence.
+
+    A token is OOI-eligible if:
+      • ρ ≥ ANISO_OOI_RHO_THR  (geometrically confident)
+      • not a stop-word / punctuation
+      • not already in the OOI set (deduplication by token)
+
+    The OOI set is maintained as a fixed-size ring (newest evicts oldest once
+    full), so it always reflects the most recent salient context.
+
+    At each generation step, every candidate is scored against the full OOI
+    set via AnisoDirKernel, giving a richer, sentence-aware affinity signal
+    than the plain bigram context used elsewhere.
+    """
+
+    def __init__(self,
+                 aniso_kernel: AnisoDirKernel,
+                 max_ooi:   int   = ANISO_OOI_MAX,
+                 rho_thr:   float = ANISO_OOI_RHO_THR,
+                 device: torch.device = DEVICE):
+        self.kernel  = aniso_kernel
+        self.max_ooi = max_ooi
+        self.rho_thr = rho_thr
+        self.device  = device
+        self._ooi: List[OOIEntry] = []
+
+    def reset(self):
+        self._ooi.clear()
+
+    def push(self, token: str, triple) -> bool:
+        """
+        Offer a token to the OOI set.
+        Returns True if the token was accepted.
+        """
+        if triple.rho < self.rho_thr:
+            return False
+        # Deduplicate
+        if any(e.token == token for e in self._ooi):
+            return False
+        entry = OOIEntry(token, triple.rho, triple.theta, triple.sigma)
+        if len(self._ooi) >= self.max_ooi:
+            self._ooi.pop(0)          # evict oldest
+        self._ooi.append(entry)
+        return True
+
+    @property
+    def size(self) -> int:
+        return len(self._ooi)
+
+    # ── main scoring: (C,) ooi_affinity for each candidate ──────────────
+    @torch.no_grad()
+    def ooi_affinity(
+        self,
+        c_rho:   torch.Tensor,
+        c_theta: torch.Tensor,
+        c_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        For each candidate c_i, compute the mean anisotropic kernel score
+        against all OOI entries.  Returns (C,) tensor in [0, 1].
+
+        If the OOI set is empty, returns zeros.
+        """
+        C = c_rho.shape[0]
+        if not self._ooi:
+            return torch.zeros(C, device=self.device)
+
+        # Accumulate scores from each OOI anchor
+        agg = torch.zeros(C, device=self.device)
+        for entry in self._ooi:
+            agg += self.kernel.score_anchor_vs_batch(
+                entry.rho, entry.theta, entry.sigma,
+                c_rho, c_theta, c_sigma)
+
+        return agg / len(self._ooi)   # mean in [0,1]
+
+    # ── inter-candidate repulsion: (C,) DPP-lite penalty ────────────────
+    @torch.no_grad()
+    def inter_candidate_repulsion(
+        self,
+        c_rho:    torch.Tensor,
+        c_theta:  torch.Tensor,
+        c_sigma:  torch.Tensor,
+        prob_vec: torch.Tensor,        # current soft probability (C,)
+    ) -> torch.Tensor:
+        """
+        DPP-lite repulsion:
+            repulsion_i = Σ_{j≠i} K[i,j] · prob_j
+
+        This penalises a candidate proportionally to how similar it is
+        (in anisotropic kernel space) to other high-probability candidates,
+        breaking isotropy across the candidate set.
+
+        Returns (C,) repulsion scores (higher = more redundant = more penalised).
+        The caller should SUBTRACT this from logits.
+        """
+        C = c_rho.shape[0]
+        if C < 2:
+            return torch.zeros(C, device=self.device)
+
+        K = self.kernel.gram_matrix(c_rho, c_theta, c_sigma)  # (C, C)
+
+        # Zero diagonal so a token doesn't repel itself
+        K = K * (1.0 - torch.eye(C, device=self.device))
+
+        p = prob_vec.to(self.device).clamp(min=0.0)
+        if p.sum().item() < 1e-12:
+            p = torch.ones(C, device=self.device) / C
+        else:
+            p = p / p.sum()
+
+        repulsion = K @ p   # (C,) weighted sum of similarity to other cands
+        return repulsion
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 1 — RANDOM FOURIER FEATURES  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RandomFourierFeatures:
@@ -187,7 +397,7 @@ class RandomFourierFeatures:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — NYSTRÖM APPROXIMATION
+# SECTION 2 — NYSTRÖM APPROXIMATION  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class NystromSynapticMatrix:
@@ -218,7 +428,7 @@ class NystromSynapticMatrix:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — RESERVOIR SAMPLING
+# SECTION 3 — RESERVOIR SAMPLING  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def _reservoir_sample_indices(n: int, k: int) -> List[int]:
@@ -235,7 +445,7 @@ def reservoir_topk(scores: torch.Tensor, k: int, bias: float = 2.0) -> torch.Ten
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — COUNT-MIN SKETCH
+# SECTION 4 — COUNT-MIN SKETCH  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class CountMinSketch:
@@ -261,7 +471,7 @@ class CountMinSketch:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — LSH INDEX
+# SECTION 5 — LSH INDEX  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class LSHIndex:
@@ -298,7 +508,7 @@ class LSHIndex:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — RANDOM WALK POTENTIAL ENGINE
+# SECTION 6 — RANDOM WALK POTENTIAL ENGINE  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RandomWalkPotentialEngine:
@@ -346,7 +556,7 @@ class RandomWalkPotentialEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — SKETCHED PDN ENGINE
+# SECTION 7 — SKETCHED PDN ENGINE  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class SketchedPDNEngine:
@@ -427,7 +637,7 @@ class SketchedPDNEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — THÉBAULT TOKEN GEOMETRY (RP)
+# SECTION 8 — THÉBAULT TOKEN GEOMETRY  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
@@ -501,7 +711,7 @@ class ThebaultTokenGeometryRP:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — RP CSNS
+# SECTION 9 — RP CSNS  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_transitive_triples_rp(geo, cands, w1, w2, device=DEVICE, dtype=torch.float32):
@@ -543,7 +753,7 @@ class RPCrossSynapticNeuronSum:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — RP COMPOSITION LM
+# SECTION 10 — RP COMPOSITION LM  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 STOP_WORDS_COG = set(
@@ -631,7 +841,7 @@ class RPCompositionLM:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — RP MRV FILTER
+# SECTION 11 — RP MRV FILTER  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RPMRVFilter:
@@ -667,7 +877,7 @@ class RPMRVFilter:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — RP KERNELS
+# SECTION 12 — RP KERNELS  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RPKernels:
@@ -686,7 +896,7 @@ class RPKernels:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — CoT STUBS + REASONING ENGINE
+# SECTION 13 — CoT STUBS + REASONING ENGINE  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 STUB_PREMISE="PREMISE"; STUB_ELABORATION="ELABORATION"
@@ -752,7 +962,6 @@ class RPCoTStubLibrary:
             label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-ρ] {' '.join(toks[:3])}…"))
 
     def _rebuild_lsh(self):
-        # Sort stubs within each type by rho ascending → ordered geometric impulse sequence
         for _stype in _STUB_SEQUENCE:
             self.stubs[_stype].sort(key=lambda s: s.rho)
         self._stub_list=[s for st in _STUB_SEQUENCE for s in self.stubs[st]]
@@ -802,7 +1011,6 @@ class RPCoTReasoningEngine:
             ctx_theta=math.atan2(sin_m,cos_m)%math.pi
         else: ctx_rho,ctx_theta,ctx_sigma=0.5,math.pi/4,0.5
         self._chain=[]; self._conclusion_stub=None
-        # Map n_hops positions onto _STUB_SEQUENCE in strict sorted order
         _seq = _STUB_SEQUENCE
         if self.n_hops >= len(_seq):
             hops = list(_seq) + [_seq[-2]] * (self.n_hops - len(_seq))
@@ -848,7 +1056,7 @@ class RPCoTReasoningEngine:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — ANCILLARY SUBSYSTEMS
+# SECTION 14 — ANCILLARY SUBSYSTEMS  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultConjugateOrbit:
@@ -944,7 +1152,7 @@ class IsomorphicSyntaxStacker:
                 bonuses+=sim_score*kr*ks
         if bonuses.shape[0] > 1:
             std = bonuses.std(unbiased=False)
-            if std.item() > 1e-8: 
+            if std.item() > 1e-8:
                 bonuses = (bonuses - bonuses.mean()) / std
         return bonuses * echo_weight
 
@@ -1003,14 +1211,15 @@ class ContingentExtringentProbability:
 class TokenStepTrace:
     step:int; chosen:str; p_instr:float; p_walk:float; p_and:float; and_weight:float
     source:str; syn_norm:float=0.0; trans_norm:float=0.0; rp_nystrom_rank:int=0
+    ooi_size:int=0; repulsion_mean:float=0.0
     def render(self):
         return (f"  {self.step:03d} {self.chosen:<14s} Pand={self.p_and:.4f} ({self.and_weight:.2f}) "
                 f"[{self.source:>7s}] zsyn={self.syn_norm:.3f} trans={self.trans_norm:.3f} "
-                f"nystrom={self.rp_nystrom_rank}")
+                f"nystrom={self.rp_nystrom_rank} ooi={self.ooi_size} rep={self.repulsion_mean:.3f}")
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — RP INSTRUCTION DISTRIBUTION
+# SECTION 15 — RP INSTRUCTION DISTRIBUTION  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RPInstructionDistribution:
@@ -1062,42 +1271,38 @@ class RPInstructionDistribution:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 15.5 — FITTED LINE REGRESSION (NEW)
-# Learns optimal combination of ALL RP bonuses from corpus replay.
-# Replaces all hand-tuned scalar weights (alpha, beta, delta, gamma...).
+# SECTION 15.5 — FITTED LINE REGRESSION  (extended to 19 features)
 # ════════════════════════════════════════════════════════════════════════════
 
 class FittedLineRegression(nn.Module):
     """
-    Single 'fitted line' (rank-1) over ALL 16 RP bonus signals.
-    Learns W ∈ R^{16×1}, b ∈ R^{1}, feature_scale ∈ R^{16}
-    such that delta_logit = tanh(feature_scale * features @ W + b) * 2.0
-    is added to base_logits before final softmax.
-    Total trainable params: 16 + 1 + 16 = 33.
+    Single 'fitted line' (rank-1) over ALL 19 RP+ANISO bonus signals.
+
+    Features 1-17: identical to V18-RP
+    Feature 18: ooi_affinity      — mean aniso kernel score vs OOI set
+    Feature 19: inter_repulsion   — DPP-lite diversity penalty (negated for fitting)
     """
     FEATURE_NAMES = [
         "k_reg","k_ori","k_side","orbit","potential","mrv",
         "chunk","echo","pdn","cot","instr","syn_norm","trans_norm",
-        "rho_mean","sigma_mean","composition","sorted_impulse"
+        "rho_mean","sigma_mean","composition","sorted_impulse",
+        "ooi_affinity",        # NEW
+        "inter_repulsion_neg", # NEW (stored negated so + weight = more repulsion)
     ]
+    FEATURE_DIM = 19
 
-    def __init__(self, feature_dim=17, rank=1):
+    def __init__(self, feature_dim: int = FEATURE_DIM, rank: int = 1):
         super().__init__()
-        self.feature_dim = feature_dim
+        self.feature_dim  = feature_dim
         self.W            = nn.Parameter(torch.randn(feature_dim, rank) * 0.05)
         self.b            = nn.Parameter(torch.randn(rank) * 0.05)
         self.feature_scale= nn.Parameter(torch.ones(feature_dim))
 
     def forward(self, features: torch.Tensor) -> torch.Tensor:
-        """features: (C, 16)  →  delta: (C,)"""
         x = features * self.feature_scale.unsqueeze(0)
         return torch.tanh(torch.matmul(x, self.W).sum(-1) + self.b.sum()) * 2.0
 
     def loss(self, features: torch.Tensor, gold_indices: torch.Tensor) -> torch.Tensor:
-        """
-        features:     (B, C, 16)
-        gold_indices: (B,)
-        """
         B, C, D = features.shape
         deltas  = self(features.view(B*C, D)).view(B, C)
         probs   = F.softmax(deltas, dim=-1)
@@ -1105,65 +1310,100 @@ class FittedLineRegression(nn.Module):
         return F.binary_cross_entropy(probs, targets)
 
     def feature_report(self) -> str:
-        lines = ["  Fitted Line Feature Weights:"]
+        lines = ["  Fitted Line Feature Weights (V18-RP-ANISO):"]
         w = (self.W.squeeze(-1) * self.feature_scale).detach().cpu()
         for name, wi in zip(self.FEATURE_NAMES, w):
             bar = "█" * int(abs(wi.item())*10)
             sign = "+" if wi.item() >= 0 else "-"
-            lines.append(f"    {name:<14s} {sign}{abs(wi.item()):.4f}  {bar}")
+            lines.append(f"    {name:<18s} {sign}{abs(wi.item()):.4f}  {bar}")
         return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — RP WALKER (FULL, WITH FITTED LINE INTEGRATION)
+# SECTION 16 — RP WALKER  (extended with ANISO signals)
 # ════════════════════════════════════════════════════════════════════════════
 
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
                  chunk_engine, iso_stacker, pdn_engine, cot_engine, instr_dist, rff,
-                 device=DEVICE, syn_weight=0.4, trans_weight=0.6, syn_k=8):
+                 device=DEVICE, syn_weight=0.4, trans_weight=0.6, syn_k=8,
+                 aniso_ooi_weight: float = ANISO_OOI_W,
+                 aniso_repulsion_weight: float = ANISO_REPULSION_W):
         self.geo=geo; self.kernels=kernels; self.lm=lm; self.orbit=orbit
         self.rw_graph=rw_graph; self.synth=synth; self.mrv=mrv_filter
         self.chunk_engine=chunk_engine; self.iso_stacker=iso_stacker
         self.pdn=pdn_engine; self.cot=cot_engine; self.instr_dist=instr_dist
         self.rff=rff; self.device=device
+        self.aniso_ooi_weight      = aniso_ooi_weight
+        self.aniso_repulsion_weight= aniso_repulsion_weight
+
         self._current_isomorphic_pairs=[]; self._cur_sent_toks: List[str]=[]
         self._cur_orbit=0; self._tok_pos=0; self._step_traces: List[TokenStepTrace]=[]
+        self._total_tokens=40
         self._remission=LocaleTransitRemission()
         self._contingent=ContingentExtringentProbability()
         self._dnn=DNNArrayPipeline(device=device)
         self._csns=RPCrossSynapticNeuronSum(rff=rff,syn_weight=syn_weight,
                                              trans_weight=trans_weight,syn_k=syn_k,device=device)
         self._csns_syn_norms: List[float]=[]; self._csns_trans_norms: List[float]=[]
-        self._rp_report_lines: List[str]=[]
+
+        # ── ANISO subsystems ─────────────────────────────────────────────
+        self._aniso_kernel = AnisoDirKernel(device=device)
+        self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
+
         # Pending state for step-trace recording
         self._pending_instr_probs=None; self._pending_walk_logits=None
         self._pending_crho=self._pending_ctheta=self._pending_csigma=None
         self._pending_syn_norm=self._pending_trans_norm=0.0
         self._pending_nystrom_rank=RP_NYSTROM_M
-        self._total_tokens=40
-        # ── FITTED LINE (None until train_fitted_line() is called) ──────────
+        self._pending_ooi_size=0; self._pending_repulsion_mean=0.0
+
+        # Fitted line (None until train_fitted_line() is called)
         self.fitted_model: Optional[FittedLineRegression] = None
-        self._fl_replay_buf: List[Tuple[torch.Tensor, int]] = []  # (features, gold_idx)
+        self._fl_replay_buf: List[Tuple[torch.Tensor, int]] = []
 
     def begin_sentence(self, seed_tokens=None, total_tokens=40) -> CoTTrace:
-        self.chunk_engine.reset(); self._cur_sent_toks.clear()
+        self.chunk_engine.reset()
+        self._cur_sent_toks.clear()
         self._cur_orbit=0; self._tok_pos=0; self._total_tokens=total_tokens
+        # Reset OOI tracker for the new sentence
+        self._ooi_tracker.reset()
         seeds = seed_tokens or []
         self.cot.begin_sentence()
         return self.cot.plan_chain(seeds, self.geo, pdn_orbit=self._cur_orbit)
 
-    # ── NEW: extract all 16 bonus signals into a (C,16) feature tensor ─────
-    def _extract_features(
+    # ── ANISO feature extraction helper ─────────────────────────────────
+    def _aniso_features(
         self,
-        C: int,
-        k_reg: torch.Tensor, k_ori: torch.Tensor, k_side: torch.Tensor,
-        orbit_scores: torch.Tensor, pot_bonus: torch.Tensor, mrv_scores: torch.Tensor,
-        chunk_bonus: torch.Tensor, echo_bonus: torch.Tensor,
-        pdn_bonus: torch.Tensor, cot_bonus: torch.Tensor,
-        instr_probs: torch.Tensor, syn_norm_vec: torch.Tensor, trans_norm_vec: torch.Tensor,
-        c_rho: torch.Tensor, c_sigma: torch.Tensor, comp_bonus: torch.Tensor,
-        sorted_impulse: torch.Tensor,          # 17th: rho-rank directional impulse
+        c_rho: torch.Tensor, c_theta: torch.Tensor, c_sigma: torch.Tensor,
+        pre_softmax_probs: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute the two ANISO-specific features for the candidate set:
+          ooi_affinity   (C,) in [0,1]
+          inter_repulsion(C,) in [0,1]  (before negation)
+
+        pre_softmax_probs: current soft probability estimate used for
+        DPP-lite repulsion weighting.  Any distribution will do; we use the
+        LM base probs so the repulsion is well-defined even on the first call.
+        """
+        ooi_aff = self._ooi_tracker.ooi_affinity(c_rho, c_theta, c_sigma)
+        repulsion = self._ooi_tracker.inter_candidate_repulsion(
+            c_rho, c_theta, c_sigma, pre_softmax_probs)
+        return ooi_aff, repulsion
+
+    # ── full feature vector: 17 (V18-RP) + 2 (ANISO) = 19 ───────────────
+    def _extract_features(
+        self, C,
+        k_reg, k_ori, k_side,
+        orbit_scores, pot_bonus, mrv_scores,
+        chunk_bonus, echo_bonus,
+        pdn_bonus, cot_bonus,
+        instr_probs, syn_norm_vec, trans_norm_vec,
+        c_rho, c_sigma, comp_bonus,
+        sorted_impulse,
+        ooi_affinity,          # NEW feature 18
+        inter_repulsion,       # NEW feature 19 (stored negated)
     ) -> torch.Tensor:
         def _safe(t):
             if t.shape[0] != C:
@@ -1176,8 +1416,10 @@ class RPWalker:
             _safe(pdn_bonus), _safe(cot_bonus),
             _safe(instr_probs), _safe(syn_norm_vec), _safe(trans_norm_vec),
             _safe(c_rho), _safe(c_sigma), _safe(comp_bonus),
-            _safe(sorted_impulse),               # 17th feature
-        ], dim=-1)  # (C, 17)
+            _safe(sorted_impulse),
+            _safe(ooi_affinity),
+            _safe(-inter_repulsion),   # negated: high repulsion → negative feature
+        ], dim=-1)   # (C, 19)
 
     @torch.no_grad()
     def walk_probs(self, w1, w2, temp=1.4,
@@ -1205,43 +1447,31 @@ class RPWalker:
         ctx = self.geo.triple_fast(w2)
         k_reg, k_ori, k_side = self.kernels.all_scores_batched(
             ctx.rho, ctx.theta, ctx.sigma, c_rho, c_theta, c_sigma)
-
-        orbit_scores = self.orbit.score(ctx, c_theta, c_sigma, self.kernels.gamma_side)
-
-        pot_bonus = self.rw_graph.potentials_for(cands) * psi_pot
-
-        mrv_scores = self.mrv.mrv_scores_batched(c_rho, c_sigma, self.kernels) * zeta_mrv
-
+        orbit_scores  = self.orbit.score(ctx, c_theta, c_sigma, self.kernels.gamma_side)
+        pot_bonus     = self.rw_graph.potentials_for(cands) * psi_pot
+        mrv_scores    = self.mrv.mrv_scores_batched(c_rho, c_sigma, self.kernels) * zeta_mrv
         window_rho, window_theta = self.chunk_engine.window_rho_theta()
-        
-        chunk_bonus = self.chunk_engine.chunk_bonus(c_pvec, scale=eta_chunk)
-
-        echo_bonus = self.iso_stacker.syntax_echo_bonus(
+        chunk_bonus   = self.chunk_engine.chunk_bonus(c_pvec, scale=eta_chunk)
+        echo_bonus    = self.iso_stacker.syntax_echo_bonus(
             c_rho, c_sigma, self._cur_sent_toks, self.geo, self.kernels, echo_weight=xi_echo)
-
-        pdn_bonus = self.pdn.pdn_logit_bonus(
+        pdn_bonus     = self.pdn.pdn_logit_bonus(
             window_rho, window_theta, c_rho, c_theta, self._cur_orbit) * pdn_weight
-
-        cot_bonus = self.cot.active_bonus(
+        cot_bonus     = self.cot.active_bonus(
             c_rho, c_theta, c_sigma, self._tok_pos, self._total_tokens) * cot_weight
-
         mandate_boost = self.synth.subsynthetic_reason_concept_enrichment(
             w2, cands, self.device)
-
-        punct_bias   = torch.tensor(
+        punct_bias    = torch.tensor(
             [2.0 if c in PUNCT_TOKENS else 0.0 for c in cands],
             dtype=torch.float32, device=self.device)
         punct_penalty = torch.tensor(
             [-3.0 if (c in PUNCT_TOKENS and len(self._cur_sent_toks) < 6) else 0.0
              for c in cands], dtype=torch.float32, device=self.device)
+        base_logits   = torch.log(base_probs.clamp(min=1e-12))
 
-        base_logits = torch.log(base_probs.clamp(min=1e-12))
-
-        # ── CSNS forward ────────────────────────────────────────────────────
+        # CSNS forward
         c_rho_t, c_theta_t, c_sigma_t = compute_transitive_triples_rp(
             self.geo, cands, w1, w2, device=self.device)
-        governed = self._contingent.govern_next_probs(
-            base_logits, c_rho, c_theta, c_sigma)
+        governed = self._contingent.govern_next_probs(base_logits, c_rho, c_theta, c_sigma)
         logits_enriched = self._csns.forward(
             governed, c_rho, c_theta, c_sigma,
             c_rho_t, c_theta_t, c_sigma_t,
@@ -1254,23 +1484,15 @@ class RPWalker:
         trans_norm = t_bon_raw.norm().item()
         self._csns_syn_norms.append(syn_norm)
         self._csns_trans_norms.append(trans_norm)
+        syn_norm_vec   = z_syn_raw.clamp(-5, 5)
+        trans_norm_vec = t_bon_raw.clamp(-5, 5)
+        comp_bonus     = self.lm.composition_logit_bonus(w1, w2, c_rho, c_sigma)
 
-        # Per-candidate norm vectors for feature stacking
-        syn_norm_vec   = z_syn_raw.clamp(-5,5)
-        trans_norm_vec = t_bon_raw.clamp(-5,5)
-
-        # Composition bonus
-        comp_bonus = self.lm.composition_logit_bonus(w1, w2, c_rho, c_sigma)
-
-        # ── SORTED IMPULSE: rho-rank directional signal for ordered NLP generation ──
-        # Candidates are implicitly sorted by ascending rho-rank; direction is
-        # governed by a cosine schedule over the generation horizon:
-        #   hop_frac=0 (start) → impulse_dir=+1 → bias toward high-ρ (confident tokens)
-        #   hop_frac=1 (end)   → impulse_dir=−1 → bias toward low-ρ  (concluding tokens)
-        _rho_rank      = torch.argsort(torch.argsort(c_rho)).float()          # 0..C-1
-        _rank_norm     = _rho_rank / max(float(C - 1), 1.0)                  # 0→1
-        _hop_frac      = self._tok_pos / max(self._total_tokens - 1, 1)
-        _impulse_dir   = math.cos(math.pi * _hop_frac)                       # +1→−1
+        # Sorted impulse (rho-rank directional, unchanged from V18-RP)
+        _rho_rank    = torch.argsort(torch.argsort(c_rho)).float()
+        _rank_norm   = _rho_rank / max(float(C - 1), 1.0)
+        _hop_frac    = self._tok_pos / max(self._total_tokens - 1, 1)
+        _impulse_dir = math.cos(math.pi * _hop_frac)
         sorted_impulse = layer_norm_array(_rank_norm * _impulse_dir)
 
         # Instruction distribution
@@ -1279,42 +1501,68 @@ class RPWalker:
         else:
             p_instr = torch.ones(C, dtype=torch.float32, device=self.device) / C
 
-        # ════════════════════════════════════════════════════════════════════
-        # FITTED LINE: replaces α*k_reg + β*k_ori + δ*k_side + γ*orbit + ...
-        # ════════════════════════════════════════════════════════════════════
+        # ════════════════════════════════════════════════════════════════
+        # ANISO SIGNALS  ← NEW
+        # Use LM base probs as the probability weight for DPP-lite repulsion.
+        # This is evaluated BEFORE the fitted-line / hand-tuned correction so
+        # that similar candidates are repelled based on the prior, not the
+        # post-hoc adjusted distribution (avoids circular dependency).
+        # ════════════════════════════════════════════════════════════════
+        ooi_affinity, inter_repulsion = self._aniso_features(
+            c_rho, c_theta, c_sigma, base_probs)
+
+        # Normalise for stable logit addition
+        def _znorm(t: torch.Tensor) -> torch.Tensor:
+            s = t.std()
+            return (t - t.mean()) / (s + 1e-8) if s.item() > 1e-8 else t - t.mean()
+
+        ooi_aff_norm = _znorm(ooi_affinity)
+        rep_norm     = _znorm(inter_repulsion)
+
+        self._pending_ooi_size       = self._ooi_tracker.size
+        self._pending_repulsion_mean = inter_repulsion.mean().item()
+
+        # Build full 19-d feature tensor
         features = self._extract_features(
             C, k_reg, k_ori, k_side, orbit_scores, pot_bonus, mrv_scores,
             chunk_bonus, echo_bonus, pdn_bonus, cot_bonus,
             p_instr, syn_norm_vec, trans_norm_vec, c_rho, c_sigma, comp_bonus,
-            sorted_impulse)
+            sorted_impulse,
+            ooi_affinity,
+            inter_repulsion)
+
+        # ── FITTED LINE or hand-tuned fallback ──────────────────────────
         if self.fitted_model is not None:
-            _fd = self.fitted_model.W.shape[0]   # self = RPWalker, .fitted_model.W is FLR ✓
+            _fd = self.fitted_model.W.shape[0]
             if features.shape[1] != _fd:
                 if features.shape[1] < _fd:
                     _pad = torch.zeros(C, _fd - features.shape[1], device=self.device)
                     features = torch.cat([features, _pad], dim=1)
                 else:
                     features = features[:, :_fd]
-            delta = self.fitted_model(features)
+            delta      = self.fitted_model(features)
             raw_logits = logits_enriched + delta
         else:
-            # Fallback: hand-tuned weights (identical to original V18-RP)
+            # Hand-tuned fallback — ANISO terms appended after V18-RP sum
             raw_logits = (logits_enriched
-                          + alpha_reg  * k_reg
-                          + beta_ori   * k_ori
-                          + delta_side * k_side
-                          + gamma_orbit* orbit_scores
-                          + psi_pot    * pot_bonus
-                          + zeta_mrv   * mrv_scores
-                          + eta_chunk  * chunk_bonus
-                          + xi_echo    * echo_bonus
-                          + pdn_weight * pdn_bonus
-                          + cot_weight * cot_bonus
+                          + alpha_reg   * k_reg
+                          + beta_ori    * k_ori
+                          + delta_side  * k_side
+                          + gamma_orbit * orbit_scores
+                          + psi_pot     * pot_bonus
+                          + zeta_mrv    * mrv_scores
+                          + eta_chunk   * chunk_bonus
+                          + xi_echo     * echo_bonus
+                          + pdn_weight  * pdn_bonus
+                          + cot_weight  * cot_bonus
                           + mandate_boost
                           + punct_bias
                           + punct_penalty
-                          + 0.4  * comp_bonus
-                          + 10.25 * sorted_impulse)   # sorted rho-rank impulse
+                          + 0.4   * comp_bonus
+                          + 10.25 * sorted_impulse
+                          # ── ANISO additions ──────────────────────────
+                          + self.aniso_ooi_weight       * ooi_aff_norm
+                          - self.aniso_repulsion_weight * rep_norm)
 
         # Remission gating
         w1_rho = self.geo.triple_fast(w1).rho
@@ -1326,7 +1574,7 @@ class RPWalker:
         raw_logits = raw_logits * remission
 
         # Save for replay / training
-        self._fl_replay_buf.append((features.cpu().clone(), -1))  # gold filled in later
+        self._fl_replay_buf.append((features.cpu().clone(), -1))
         self._pending_instr_probs   = p_instr
         self._pending_walk_logits   = raw_logits
         self._pending_crho          = c_rho
@@ -1368,7 +1616,6 @@ class RPWalker:
         source = ("instr" if p_instr > p_walk * 1.5 else
                   "walker" if p_walk > p_instr * 1.5 else "AND")
 
-        # Fill in gold index for the most recent replay buffer entry
         if self._fl_replay_buf:
             feats, _ = self._fl_replay_buf[-1]
             self._fl_replay_buf[-1] = (feats, idx)
@@ -1377,21 +1624,32 @@ class RPWalker:
             step=step, chosen=chosen, p_instr=p_instr, p_walk=p_walk,
             p_and=p_and, and_weight=and_weight, source=source,
             syn_norm=self._pending_syn_norm, trans_norm=self._pending_trans_norm,
-            rp_nystrom_rank=self._pending_nystrom_rank)
+            rp_nystrom_rank=self._pending_nystrom_rank,
+            ooi_size=self._pending_ooi_size,
+            repulsion_mean=self._pending_repulsion_mean)
         self._step_traces.append(trace)
         return trace
 
-    def push_token(self, token, sentence_len):
-        if token in PUNCT_TOKENS or token in COGNITIVE_TOKENS: return
+    def push_token(self, token: str, sentence_len: int):
+        """
+        Push a newly generated token into the sentence state.
+        Also offers the token to the OOI tracker for the sentence-level
+        non-isotropic comparison set.
+        """
+        if token in PUNCT_TOKENS or token in COGNITIVE_TOKENS:
+            return
         self._cur_sent_toks.append(token)
         self._tok_pos += 1
         pos_norm = len(self._cur_sent_toks) / max(sentence_len, 1)
-        self.chunk_engine.push(self.geo.triple_fast(token), pos_norm)
+        triple   = self.geo.triple_fast(token)
+        self.chunk_engine.push(triple, pos_norm)
         self._cur_orbit = self.pdn.orbit_of(token)
+        # ── ANISO: register as object-of-interest if eligible ───────────
+        self._ooi_tracker.push(token, triple)
 
     def step_trace_report(self, max_steps=30) -> str:
         if not self._step_traces: return "  (no step traces)"
-        lines = ["  step  chosen          Pand   wt   source  zsyn   trans  nystrom"]
+        lines = ["  step  chosen          Pand   wt   source  zsyn   trans  nystrom  ooi  rep"]
         for t in self._step_traces[-max_steps:]:
             lines.append(t.render())
         if self._csns_syn_norms:
@@ -1403,38 +1661,40 @@ class RPWalker:
 
     def algo_report(self) -> str:
         return "\n".join([
-            "V18-RP All Core Algorithms — Randomized Polynomial Time",
+            "V18-RP-ANISO — Non-Isotropic Inter-Candidate Vectorisation",
             "",
-            "1. RANDOM FOURIER FEATURES   O(C·D)  D=128",
-            "2. NYSTRÖM APPROXIMATION     O(C·m)  m=32",
-            "3. COUNT-MIN SKETCH          O(w·d)  w=1024 d=5",
-            "4. RESERVOIR SAMPLING        O(C)    one-pass",
-            "5. LSH ANN SEARCH            O(C·b·r) b=8 r=4",
-            "6. RANDOM WALK MC            O(V·t)  t=20",
-            "7. SKETCHED FFT (PDN)        O(T·k)  k=200",
-            "8. FITTED LINE REGRESSION    O(C·17) learnable delta (incl. sorted_impulse)",
+            "1. RANDOM FOURIER FEATURES    O(C·D)   D=128",
+            "2. NYSTRÖM APPROXIMATION      O(C·m)   m=32",
+            "3. COUNT-MIN SKETCH           O(w·d)   w=1024 d=5",
+            "4. RESERVOIR SAMPLING         O(C)     one-pass",
+            "5. LSH ANN SEARCH             O(C·b·r) b=8 r=4",
+            "6. RANDOM WALK MC             O(V·t)   t=20",
+            "7. SKETCHED FFT (PDN)         O(T·k)   k=200",
+            "8. FITTED LINE REGRESSION     O(C·19)  learnable delta",
+            "9. ANISO DIR KERNEL           O(C²)    ρ-dependent θ stretch",
+            "   – OOI affinity             O(C·|OOI|) sentence-aware",
+            "   – DPP-lite repulsion       O(C²)    inter-candidate diversity",
             "",
             f"Fitted line active: {self.fitted_model is not None}",
-            self.fitted_model.feature_report() if self.fitted_model else "  (train via engine.train_fitted_line())",
+            f"OOI tracker size:   {self._ooi_tracker.size}/{ANISO_OOI_MAX}",
+            f"λ_rho={ANISO_LAMBDA_RHO}  λ_theta={ANISO_LAMBDA_THETA}  "
+            f"λ_sigma={ANISO_LAMBDA_SIGMA}  α={ANISO_ALPHA}",
+            self.fitted_model.feature_report() if self.fitted_model
+            else "  (train via engine.train_fitted_line())",
         ])
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — FITTED LINE TRAINING PIPELINE
+# SECTION 17 — FITTED LINE TRAINING PIPELINE  (updated for 19 features)
 # ════════════════════════════════════════════════════════════════════════════
 
 def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
                       batch_size=64, epochs=200, lr=3e-4,
                       max_replay_steps=50000, device=DEVICE) -> FittedLineRegression:
-    """
-    Teacher-forced corpus replay → collect (features, gold_idx) pairs
-    → fit FittedLineRegression via softmax cross-entropy.
-    """
     print(f"[FittedLine] Replaying {len(corpus_tokens)} tokens, up to {max_replay_steps} steps…")
 
-    # Temporarily attach untrained model so walk_probs captures features
     if walker.fitted_model is None:
-        walker.fitted_model = FittedLineRegression(17).to(device)
+        walker.fitted_model = FittedLineRegression(FittedLineRegression.FEATURE_DIM).to(device)
 
     walker._fl_replay_buf.clear()
     features_list: List[torch.Tensor] = []
@@ -1448,23 +1708,18 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
             break
         gold_tok = corpus_tokens[t_pos]
 
-        cands, probs = walker.walk_probs(w1, w2, temp=1e-9)  # near-deterministic
+        cands, probs = walker.walk_probs(w1, w2, temp=1e-9)
         if not cands:
-            w1, w2 = w2, gold_tok
-            continue
+            w1, w2 = w2, gold_tok; continue
 
         if gold_tok in cands:
             gold_idx = cands.index(gold_tok)
         else:
-            w1, w2 = w2, gold_tok
-            continue
+            w1, w2 = w2, gold_tok; continue
 
-        # Retrieve the features captured during walk_probs
         if walker._fl_replay_buf:
             feats, _ = walker._fl_replay_buf.pop(0)
-            # Pad or trim to 16 candidates (needed for batching)
-            # We store per-step: (C,16) → keep as-is, batch later
-            features_list.append(feats)          # (C, 16) cpu
+            features_list.append(feats)
             gold_list.append(gold_idx)
             steps_done += 1
 
@@ -1474,27 +1729,30 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
             print(f"[FittedLine]   …replayed {steps_done} steps")
 
     if not features_list:
-        print("[FittedLine] No training data collected. Check corpus & LM.")
+        print("[FittedLine] No training data collected.")
         return walker.fitted_model
 
-    # Pad all feature tensors to same C dimension
     max_C = max(f.shape[0] for f in features_list)
-    padded_feats = []
-    padded_golds = []
+    FD    = FittedLineRegression.FEATURE_DIM
+    padded_feats, padded_golds = [], []
     for feats, gold_idx in zip(features_list, gold_list):
         C = feats.shape[0]
+        # Pad or trim feature dim
+        if feats.shape[1] < FD:
+            feats = torch.cat([feats, torch.zeros(C, FD - feats.shape[1])], dim=1)
+        elif feats.shape[1] > FD:
+            feats = feats[:, :FD]
         if C < max_C:
-            pad = torch.zeros(max_C - C, 17)
-            feats = torch.cat([feats, pad], dim=0)
+            feats = torch.cat([feats, torch.zeros(max_C - C, FD)], dim=0)
         padded_feats.append(feats)
         padded_golds.append(min(gold_idx, max_C - 1))
 
-    features_t = torch.stack(padded_feats).to(device)   # (N, max_C, 16)
-    golds_t    = torch.tensor(padded_golds, dtype=torch.long, device=device)  # (N,)
+    features_t = torch.stack(padded_feats).to(device)
+    golds_t    = torch.tensor(padded_golds, dtype=torch.long, device=device)
 
-    print(f"[FittedLine] Training on {len(features_t):,} steps, C={max_C}, D=16, epochs={epochs}")
+    print(f"[FittedLine] Training on {len(features_t):,} steps, C={max_C}, D={FD}, epochs={epochs}")
 
-    model = FittedLineRegression(feature_dim=17, rank=1).to(device)
+    model = FittedLineRegression(feature_dim=FD, rank=1).to(device)
     opt   = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     from torch.utils.data import TensorDataset, DataLoader
@@ -1506,12 +1764,10 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
         epoch_loss = 0.0
         for feat_b, gold_b in loader:
             loss = model.loss(feat_b, gold_b)
-            opt.zero_grad()
-            loss.backward()
+            opt.zero_grad(); loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             epoch_loss += loss.item()
-
         if epoch % 20 == 0 or epoch == epochs - 1:
             print(f"[FittedLine]   Epoch {epoch:3d}/{epochs}  "
                   f"CE={epoch_loss/max(len(loader),1):.5f}")
@@ -1523,7 +1779,7 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — GENERATION
+# SECTION 18 — GENERATION  (unchanged interface)
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
@@ -1593,68 +1849,65 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — V18 RP ENGINE (FULL)
+# SECTION 19 — V18-RP-ANISO ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
-class V18RPEngine:
+class V18RPAnisoEngine:
     def __init__(self, syn_weight=0.4, trans_weight=0.6, syn_k=8,
-                 rff_dim=RP_RFF_DIM, nystrom_m=RP_NYSTROM_M):
-        self.device      = DEVICE
-        self.syn_weight  = syn_weight
-        self.trans_weight= trans_weight
-        self.syn_k       = syn_k
-        self.rff_dim     = rff_dim
-        self.nystrom_m   = nystrom_m
-        self._corpus_snippet = ""
-        self._initialised    = False
+                 rff_dim=RP_RFF_DIM, nystrom_m=RP_NYSTROM_M,
+                 aniso_ooi_weight=ANISO_OOI_W,
+                 aniso_repulsion_weight=ANISO_REPULSION_W):
+        self.device              = DEVICE
+        self.syn_weight          = syn_weight
+        self.trans_weight        = trans_weight
+        self.syn_k               = syn_k
+        self.rff_dim             = rff_dim
+        self.nystrom_m           = nystrom_m
+        self.aniso_ooi_weight    = aniso_ooi_weight
+        self.aniso_repulsion_weight = aniso_repulsion_weight
+        self._corpus_snippet     = ""
+        self._initialised        = False
 
-        self.rff       = RandomFourierFeatures(rff_dim=rff_dim, device=self.device)
-        self.geo       = ThebaultTokenGeometryRP(device=self.device)
-        self.lm        = RPCompositionLM(self.geo, self.rff, device=self.device)
-        self.kernels   = RPKernels(self.rff)
-        self.orbit     = ThebaultConjugateOrbit()
-        self.rw_graph  = RandomWalkPotentialEngine(device=self.device)
-        self.synth     = synthetic_reasonMandateProcessor()
-        self.mrv       = RPMRVFilter(self.rff, device=self.device)
-        self.chunk     = ChunkedSumEngine(device=self.device)
-        self.isostacker= IsomorphicSyntaxStacker(self.rff, device=self.device)
-        self.pdn       = SketchedPDNEngine(device=self.device)
-        self.stublib   = RPCoTStubLibrary(self.rff, device=self.device)
-        self.cot       = None   # built during train()
-        self.instrdist = None   # built during train()
-        self.walker    = None   # built during train()
+        self.rff        = RandomFourierFeatures(rff_dim=rff_dim, device=self.device)
+        self.geo        = ThebaultTokenGeometryRP(device=self.device)
+        self.lm         = RPCompositionLM(self.geo, self.rff, device=self.device)
+        self.kernels    = RPKernels(self.rff)
+        self.orbit      = ThebaultConjugateOrbit()
+        self.rw_graph   = RandomWalkPotentialEngine(device=self.device)
+        self.synth      = synthetic_reasonMandateProcessor()
+        self.mrv        = RPMRVFilter(self.rff, device=self.device)
+        self.chunk      = ChunkedSumEngine(device=self.device)
+        self.isostacker = IsomorphicSyntaxStacker(self.rff, device=self.device)
+        self.pdn        = SketchedPDNEngine(device=self.device)
+        self.stublib    = RPCoTStubLibrary(self.rff, device=self.device)
+        self.cot        = None
+        self.instrdist  = None
+        self.walker     = None
 
     def train(self, corpus_text: str):
         self._corpus_snippet = corpus_text
-        print(f"[V18-RP] Tokenising {len(corpus_text)} chars…")
+        print(f"[V18-RP-ANISO] Tokenising {len(corpus_text)} chars…")
         tokens = tokenize(corpus_text)
-
         self.lm.ingest(tokens)
         all_tokens = list(self.lm.raw_freq.keys())
         max_freq   = max(self.lm.raw_freq.values(), default=1.0)
         vocab_size = len(all_tokens)
-
-        print(f"[V18-RP] Registering {vocab_size} tokens…")
+        print(f"[V18-RP-ANISO] Registering {vocab_size} tokens…")
         for idx, tok in enumerate(all_tokens):
             self.geo.register(tok, self.lm.raw_freq[tok], idx, max_freq, vocab_size)
-
-        print("[V18-RP] Building GPU tensors + RFF feature cache…")
+        print("[V18-RP-ANISO] Building GPU tensors + RFF feature cache…")
         self.geo.build_cuda_tensors(self.lm.vocab, self.rff)
         self.lm.finalise()
-
-        print("[V18-RP] Random Walk MC potential propagation…")
+        print("[V18-RP-ANISO] Random Walk MC potential propagation…")
         self.rw_graph.build_from_trigrams(self.lm.tri_raw, self.lm.raw_freq, self.rff, self.geo)
         self.rw_graph.propagate()
-
-        print("[V18-RP] Priming LSH-based MRV filter…")
+        print("[V18-RP-ANISO] Priming LSH-based MRV filter…")
         self.mrv.prime(self.lm.vocab, self.geo)
-
-        print("[V18-RP] Sketched PDN spectral fitting…")
+        print("[V18-RP-ANISO] Sketched PDN spectral fitting…")
         self.pdn.fit_from_trigrams(self.geo, self.lm.tri_raw)
         self.pdn.build_orbit_map(self.lm.vocab, self.geo)
         print(self.pdn.theorem_bridge_report())
-
-        print("[V18-RP] Building RP CoT stub library + LSH ANN index…")
+        print("[V18-RP-ANISO] Building RP CoT stub library + LSH ANN index…")
         self.stublib.build(self.geo, self.lm.vocab, self.lm.raw_freq)
         self.cot = RPCoTReasoningEngine(
             self.stublib, self.kernels, self.pdn,
@@ -1668,13 +1921,14 @@ class V18RPEngine:
             self.rff, device=self.device,
             syn_weight=self.syn_weight,
             trans_weight=self.trans_weight,
-            syn_k=self.syn_k)
+            syn_k=self.syn_k,
+            aniso_ooi_weight=self.aniso_ooi_weight,
+            aniso_repulsion_weight=self.aniso_repulsion_weight)
         self._initialised = True
-        print("[V18-RP] Engine ready.")
+        print("[V18-RP-ANISO] Engine ready.")
 
     def train_fitted_line(self, corpus_text: str = "",
                           epochs=200, lr=3e-4, max_steps=50000) -> FittedLineRegression:
-        """One-call fitted line training. Uses training corpus if provided, else re-uses stored snippet."""
         assert self._initialised, "Call .train() first."
         text   = corpus_text if corpus_text.strip() else self._corpus_snippet
         tokens = tokenize(text)
@@ -1686,13 +1940,13 @@ class V18RPEngine:
             epochs=epochs, lr=lr,
             max_replay_steps=max_steps,
             device=self.device)
-        torch.save(model.state_dict(), "fitted_line_v18rp.pt")
-        print("[FittedLine] Weights saved to fitted_line_v18rp.pt")
+        torch.save(model.state_dict(), "fitted_line_v18rp_aniso.pt")
+        print("[FittedLine] Weights saved to fitted_line_v18rp_aniso.pt")
         return model
 
-    def load_fitted_line(self, path="fitted_line_v18rp.pt"):
+    def load_fitted_line(self, path="fitted_line_v18rp_aniso.pt"):
         assert self._initialised, "Call .train() first."
-        model = FittedLineRegression(17).to(self.device)
+        model = FittedLineRegression(FittedLineRegression.FEATURE_DIM).to(self.device)
         model.load_state_dict(torch.load(path, map_location=self.device))
         model.eval()
         self.walker.fitted_model = model
@@ -1709,16 +1963,14 @@ class V18RPEngine:
             and_weight=and_weight, temperature=temperature,
             return_traces=return_traces)
 
-    def save(self, path="v18rp_engine.pkl"):
-        with open(path, "wb") as f:
-            pickle.dump(self, f)
-        print(f"[V18-RP] Engine saved to {path}")
+    def save(self, path="v18rp_aniso_engine.pkl"):
+        with open(path, "wb") as f: pickle.dump(self, f)
+        print(f"[V18-RP-ANISO] Engine saved to {path}")
 
     @staticmethod
-    def load(path="v18rp_engine.pkl") -> "V18RPEngine":
-        with open(path, "rb") as f:
-            eng = pickle.load(f)
-        print(f"[V18-RP] Engine loaded from {path}")
+    def load(path="v18rp_aniso_engine.pkl") -> "V18RPAnisoEngine":
+        with open(path, "rb") as f: eng = pickle.load(f)
+        print(f"[V18-RP-ANISO] Engine loaded from {path}")
         return eng
 
 
@@ -1726,15 +1978,18 @@ class V18RPEngine:
 # SECTION 20 — GRADIO GUI
 # ════════════════════════════════════════════════════════════════════════════
 
-_engine: Optional[V18RPEngine] = None
+_engine: Optional[V18RPAnisoEngine] = None
 
 def _gui_init(mode, file_in, hf_name, hf_config, hf_split, hf_field,
-              hf_portion, hf_max, syn_w, trans_w, syn_k, rff_dim, nystrom_m):
+              hf_portion, hf_max, syn_w, trans_w, syn_k, rff_dim, nystrom_m,
+              ooi_w, rep_w):
     global _engine
     try:
-        _engine = V18RPEngine(
+        _engine = V18RPAnisoEngine(
             syn_weight=float(syn_w), trans_weight=float(trans_w),
-            syn_k=int(syn_k), rff_dim=int(rff_dim), nystrom_m=int(nystrom_m))
+            syn_k=int(syn_k), rff_dim=int(rff_dim), nystrom_m=int(nystrom_m),
+            aniso_ooi_weight=float(ooi_w),
+            aniso_repulsion_weight=float(rep_w))
 
         if mode == "Text file":
             if file_in is None: return "❌ No file uploaded."
@@ -1750,10 +2005,12 @@ def _gui_init(mode, file_in, hf_name, hf_config, hf_split, hf_field,
             return "❌ Unknown mode."
 
         _engine.train(text)
-        return (f"✅ Engine initialised.\n"
+        return (f"✅ Engine initialised (V18-RP-ANISO).\n"
                 f"Vocab: {len(_engine.lm.vocab):,}  "
                 f"Trigrams: {len(_engine.lm.tri_raw):,}  "
-                f"Device: {_engine.device}\n\n"
+                f"Device: {_engine.device}\n"
+                f"ANISO: OOI_w={ooi_w}  repulsion_w={rep_w}  "
+                f"λρ={ANISO_LAMBDA_RHO}  λθ={ANISO_LAMBDA_THETA}  α={ANISO_ALPHA}\n\n"
                 + _engine.pdn.theorem_bridge_report())
     except Exception as e:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
@@ -1787,8 +2044,14 @@ def _gui_generate(seed, instruction, n_sents, toks_per_sent,
         import traceback; return f"❌ Error:\n{traceback.format_exc()}", "", ""
 
 def build_gradio_app() -> gr.Blocks:
-    with gr.Blocks(title="NeuroSymbolic V18-RP + FittedLine") as demo:
-        gr.Markdown("# NeuroSymbolic V18-RP — FittedLine Edition")
+    with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO") as demo:
+        gr.Markdown("# NeuroSymbolic V18-RP-ANISO — Non-Isotropic Inter-Candidate Edition")
+        gr.Markdown(
+            "**New in ANISO**: Each sentence maintains a live *Object-of-Interest* (OOI) set of "
+            "geometrically salient tokens. Candidates are scored against this set via the "
+            "**anisotropic directional kernel** (ρ-stretched θ axis) and a **DPP-lite repulsion** "
+            "term that penalises near-synonym clusters — making prediction weights non-isotropic "
+            "to similar words.")
 
         with gr.Tab("Init / Train"):
             mode    = gr.Radio(["Text file","HuggingFace dataset"], value="Text file", label="Source")
@@ -1806,21 +2069,28 @@ def build_gradio_app() -> gr.Blocks:
                 syn_k    = gr.Slider(1,64,value=16,step=1,label="Synaptic k")
                 rff_dim  = gr.Slider(32,512,value=128,step=32,label="RFF dim D")
                 nystrom_m= gr.Slider(8,128,value=32,step=4,label="Nyström m")
+            gr.Markdown("### ANISO Hyperparameters")
+            with gr.Row():
+                ooi_w = gr.Slider(0.0,3.0,value=ANISO_OOI_W,step=0.05,
+                                   label="OOI affinity weight")
+                rep_w = gr.Slider(0.0,3.0,value=ANISO_REPULSION_W,step=0.05,
+                                   label="Inter-candidate repulsion weight")
             init_btn = gr.Button("Initialise + Train")
-            init_out = gr.Textbox(lines=18, label="Init output")
+            init_out = gr.Textbox(lines=20, label="Init output")
             init_btn.click(_gui_init,
                 inputs=[mode,file_in,hf_name,hf_config,hf_split,hf_field,
-                        hf_portion,hf_max,syn_w,trans_w,syn_k,rff_dim,nystrom_m],
+                        hf_portion,hf_max,syn_w,trans_w,syn_k,rff_dim,nystrom_m,
+                        ooi_w,rep_w],
                 outputs=init_out)
 
         with gr.Tab("Fit Line"):
-            gr.Markdown("Train the FittedLineRegression over ALL RP bonus signals from corpus replay.")
+            gr.Markdown("Train the FittedLineRegression (19 features incl. OOI affinity + repulsion).")
             with gr.Row():
                 fl_epochs   = gr.Slider(10,500,value=200,step=10,label="Epochs")
                 fl_lr       = gr.Slider(1e-5,1e-2,value=3e-4,step=1e-5,label="Learning rate")
                 fl_maxsteps = gr.Slider(1000,200000,value=50000,step=1000,label="Max replay steps")
             fl_btn = gr.Button("Train Fitted Line")
-            fl_out = gr.Textbox(lines=20, label="Fitted line report")
+            fl_out = gr.Textbox(lines=22, label="Fitted line report")
             fl_btn.click(_gui_fit_line, inputs=[fl_epochs,fl_lr,fl_maxsteps], outputs=fl_out)
 
         with gr.Tab("Generate"):
@@ -1836,7 +2106,7 @@ def build_gradio_app() -> gr.Blocks:
             gen_btn  = gr.Button("Generate")
             gen_out  = gr.Textbox(lines=8,  label="Generated text")
             cot_out  = gr.Textbox(lines=12, label="CoT traces")
-            step_out = gr.Textbox(lines=12, label="Step traces")
+            step_out = gr.Textbox(lines=14, label="Step traces (incl. OOI/repulsion)")
             gen_btn.click(_gui_generate,
                 inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr],
                 outputs=[gen_out,cot_out,step_out])
@@ -1849,19 +2119,20 @@ def build_gradio_app() -> gr.Blocks:
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="V18-RP FittedLine Edition")
-    parser.add_argument("--corpus",       default="", help="Path to corpus .txt")
-    parser.add_argument("--fit_line",     action="store_true", help="Train fitted line after corpus load")
-    parser.add_argument("--fit_epochs",   type=int,   default=200)
-    parser.add_argument("--fit_lr",       type=float, default=3e-4)
-    parser.add_argument("--fit_steps",    type=int,   default=50000)
-    parser.add_argument("--seed",         default="", help="Seed text for generation")
-    parser.add_argument("--instruction",  default="", help="Instruction text")
-    parser.add_argument("--sentences",    type=int,   default=4)
-    parser.add_argument("--save",         default="", help="Save engine to path")
-    parser.add_argument("--load",         default="", help="Load engine from path")
-    parser.add_argument("--gui",          action="store_true", help="Launch Gradio GUI")
+    parser = argparse.ArgumentParser(description="V18-RP-ANISO FittedLine Edition")
+    parser.add_argument("--corpus",      default="",    help="Path to corpus .txt")
+    parser.add_argument("--fit_line",    action="store_true")
+    parser.add_argument("--fit_epochs",  type=int,   default=200)
+    parser.add_argument("--fit_lr",      type=float, default=3e-4)
+    parser.add_argument("--fit_steps",   type=int,   default=50000)
+    parser.add_argument("--seed",        default="")
+    parser.add_argument("--instruction", default="")
+    parser.add_argument("--sentences",   type=int,   default=4)
+    parser.add_argument("--save",        default="")
+    parser.add_argument("--load",        default="")
+    parser.add_argument("--gui",         action="store_true")
+    parser.add_argument("--ooi_weight",  type=float, default=ANISO_OOI_W)
+    parser.add_argument("--rep_weight",  type=float, default=ANISO_REPULSION_W)
     args = parser.parse_args()
 
     build_gradio_app().launch(share=False)
-  
