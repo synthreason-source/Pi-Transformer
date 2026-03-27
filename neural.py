@@ -163,7 +163,6 @@ def stream_autonomic_passage(engine: V18RPEngine, bio_reader: AutonomicSignalRea
         sent_text = detokenize(toks)
         walker.iso_stacker.add(toks, walker.geo, sent_text)
         
-        print(f"\n   [System | Arousal: {arousal:.2f} | Temp: {dynamic_temp:.2f} | Context Nodes: {len(toks)}]")
         
     print("\n\n--- [ BIO-SYNC STREAMING ENDED ] ---")
 
