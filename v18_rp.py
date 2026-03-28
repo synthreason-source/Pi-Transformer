@@ -640,88 +640,105 @@ class SketchedPDNEngine:
 # SECTION 8 — THÉBAULT TOKEN GEOMETRY  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
+
 @dataclass
-class ThebaultTripleRP:
+class BolyaiTripleRP:
     rho: float; theta: float; sigma: float
 
-def _perfect_square_cv():
-    s=1.0; d=[s,s,s,s,s*math.sqrt(2),s*math.sqrt(2)]; mu=sum(d)/6
-    return math.sqrt(sum((x-mu)**2 for x in d)/6)/mu
-_PERFECT_CV = _perfect_square_cv()
+def _hyp_dist(x1, y1, x2, y2, eps=1e-8):
+    n1 = min(x1*x1 + y1*y1, 1.0 - eps)
+    n2 = min(x2*x2 + y2*y2, 1.0 - eps)
+    dx = (x1 - x2)**2 + (y1 - y2)**2
+    z = 1.0 + 2.0 * dx / max((1.0 - n1) * (1.0 - n2), eps)
+    z = max(z, 1.0 + eps)
+    return math.acosh(z)
 
-def _thebault_triple_exact(px,py,qx,qy):
-    if abs(px)<1e-9 and abs(py)<1e-9 and abs(qx)<1e-9 and abs(qy)<1e-9: return 0.0,0.0,0.0
-    corners=[(0,0),(px,py),(px+qx,py+qy),(qx,qy)]; centres=[]
-    for i in range(4):
-        ax,ay=corners[i]; bx,by=corners[(i+1)%4]
-        mx,my=(ax+bx)/2,(ay+by)/2; hx,hy=(bx-ax)/2,(by-ay)/2
-        centres.append((mx-hy,my+hx))
-    dists=[math.sqrt((centres[i][0]-centres[j][0])**2+(centres[i][1]-centres[j][1])**2)
-           for i in range(4) for j in range(i+1,4)]
-    mu=sum(dists)/6
-    if mu<1e-9: return 0.0,0.0,0.0
-    cv=math.sqrt(sum((d-mu)**2 for d in dists)/6)/mu
-    rho=max(0.0,min(1.0,1.0-cv/(_PERFECT_CV+1e-9)))
-    sigma=sum(dists[:4])/4.0
-    theta=math.atan2(centres[1][1]-centres[0][1],centres[1][0]-centres[0][0])%math.pi
-    return rho,theta,sigma
-
-class ThebaultTokenGeometryRP:
+class BolyaiTokenGeometryRP:
     def __init__(self, device=DEVICE, dtype=torch.float32):
         self.device=device; self.dtype=dtype
-        self._vecs: Dict[str,Tuple]={}; self._cache: Dict[str,ThebaultTripleRP]={}
+        self._vecs: Dict[str,Tuple]={}; self._cache: Dict[str,BolyaiTripleRP]={}
         self._tok2idx: Dict[str,int]={}; self._idx_list: List[str]=[]
         self._rho_t=self._theta_t=self._sigma_t=self._pvec_t=self._feat_t=None
-        self.rff: Optional[RandomFourierFeatures]=None
+        self.rff: Optional['RandomFourierFeatures']=None
 
     def register(self, token, freq, index, max_freq, vocab_size):
-        f=freq/max(max_freq,1e-9); k=index/max(vocab_size-1,1)
-        ap=2*math.pi*k; aq=2*math.pi*f
-        self._vecs[token]=(f*math.cos(ap),f*math.sin(ap),k*math.cos(aq),k*math.sin(aq))
-        self._cache.pop(token,None)
+        f = freq / max(max_freq, 1e-9)
+        k = index / max(vocab_size - 1, 1)
+        r = 0.92 * math.sqrt(max(f, 1e-9))
+        ang = 2.0 * math.pi * k
+        x = r * math.cos(ang)
+        y = r * math.sin(ang)
+        self._vecs[token] = (x, y)
+        self._cache.pop(token, None)
 
-    def triple_fast(self, token) -> ThebaultTripleRP:
+    def triple_fast(self, token) -> BolyaiTripleRP:
         if token in self._cache: return self._cache[token]
-        rho,theta,sigma=_thebault_triple_exact(*self._vecs.get(token,(0,0,0,0)))
-        t=ThebaultTripleRP(rho,theta,sigma); self._cache[token]=t; return t
+        x, y = self._vecs.get(token, (0.0, 0.0))
+        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        hyp_r = 2.0 * math.atanh(eu)
+        rho = math.tanh(0.5 * hyp_r)
+        theta = math.atan2(y, x) % math.pi
+        sigma = 2.0 / max(1.0 - eu*eu, 1e-8)
+        t = BolyaiTripleRP(rho, theta, sigma)
+        self._cache[token] = t
+        return t
 
     def build_cuda_tensors(self, vocab, rff):
         self.rff=rff; triples=[self.triple_fast(t) for t in vocab]
         self._idx_list=vocab; self._tok2idx={t:i for i,t in enumerate(vocab)}
-        self._rho_t  =torch.tensor([t.rho   for t in triples],dtype=self.dtype,device=self.device)
-        self._theta_t=torch.tensor([t.theta for t in triples],dtype=self.dtype,device=self.device)
-        self._sigma_t=torch.tensor([t.sigma for t in triples],dtype=self.dtype,device=self.device)
-        self._pvec_t =torch.stack([self._rho_t,self._theta_t/math.pi,self._sigma_t,
-                                    torch.ones_like(self._rho_t)],dim=1)
-        with torch.no_grad():
-            self._feat_t=rff.features(self._rho_t,self._theta_t,self._sigma_t)
-        print(f"[RP-Geo] RFF features: {self._feat_t.shape}")
+        self._rho_t   = torch.tensor([t.rho   for t in triples],dtype=self.dtype,device=self.device)
+        self._theta_t = torch.tensor([t.theta for t in triples],dtype=self.dtype,device=self.device)
+        self._sigma_t = torch.tensor([t.sigma for t in triples],dtype=self.dtype,device=self.device)
+        self._pvec_t  = torch.stack([self._rho_t,self._theta_t/math.pi,self._sigma_t, torch.ones_like(self._rho_t)],dim=1)
+        with torch.no_grad(): self._feat_t=rff.features(self._rho_t,self._theta_t,self._sigma_t)
+        print(f"[RP-Geo-Bolyai] RFF features: {self._feat_t.shape}")
 
-    def _vec(self,token): return self._vecs.get(token,(0,0,0,0))
-    def composed_triple(self,t1,t2):
-        p1x,p1y,q1x,q1y=self._vec(t1); p2x,p2y,q2x,q2y=self._vec(t2)
-        rho,theta,sigma=_thebault_triple_exact(p1x+p2x,p1y+p2y,q1x+q2x,q1y+q2y)
-        return ThebaultTripleRP(rho,theta,sigma)
-    def batch_triples(self,idx): return self._rho_t[idx],self._theta_t[idx],self._sigma_t[idx]
-    def tok_indices(self,toks):
-        safe=max(len(self._idx_list)-1,0)
-        return torch.tensor([min(self._tok2idx.get(t,0),safe) for t in toks],
-                             dtype=torch.long,device=self.device)
-    def rff_features_for(self,toks): return self._feat_t[self.tok_indices(toks)]
+    def _vec(self, token):
+        return self._vecs.get(token, (0.0, 0.0))
 
+    def composed_triple(self, t1, t2):
+        x1, y1 = self._vec(t1)
+        x2, y2 = self._vec(t2)
+        x = (x1 + x2) * 0.5
+        y = (y1 + y2) * 0.5
+        n = math.sqrt(x*x + y*y)
+        if n >= 0.98:
+            s = 0.98 / max(n, 1e-8)
+            x *= s; y *= s
+        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        hyp_r = 2.0 * math.atanh(eu)
+        rho = math.tanh(0.5 * hyp_r)
+        theta = math.atan2(y, x) % math.pi
+        sigma = 2.0 / max(1.0 - eu*eu, 1e-8)
+        return BolyaiTripleRP(rho, theta, sigma)
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — RP CSNS  (unchanged)
-# ════════════════════════════════════════════════════════════════════════════
+    def batch_triples(self, idx):
+        return self._rho_t[idx], self._theta_t[idx], self._sigma_t[idx]
+
+    def tok_indices(self, toks):
+        safe = max(len(self._idx_list) - 1, 0)
+        return torch.tensor([min(self._tok2idx.get(t, 0), safe) for t in toks], dtype=torch.long, device=self.device)
+
+    def rff_features_for(self, toks):
+        return self._feat_t[self.tok_indices(toks)]
 
 def compute_transitive_triples_rp(geo, cands, w1, w2, device=DEVICE, dtype=torch.float32):
-    p1x,p1y,q1x,q1y=geo._vec(w1); p2x,p2y,q2x,q2y=geo._vec(w2)
-    rl,tl,sl=[],[],[]
+    p1x, p1y = geo._vec(w1)
+    p2x, p2y = geo._vec(w2)
+    rl, tl, sl = [], [], []
     for c in cands:
-        pcx,pcy,qcx,qcy=geo._vec(c)
-        rho,theta,sigma=_thebault_triple_exact(
-            .25*p1x+.5*p2x+.25*pcx,.25*p1y+.5*p2y+.25*pcy,
-            .25*q1x+.5*q2x+.25*qcx,.25*q1y+.5*q2y+.25*qcy)
+        pcx, pcy = geo._vec(c)
+        x = .25 * p1x + .5 * p2x + .25 * pcx
+        y = .25 * p1y + .5 * p2y + .25 * pcy
+        n = math.sqrt(x*x + y*y)
+        if n >= 0.98:
+            s = 0.98 / max(n, 1e-8)
+            x *= s; y *= s
+        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        hyp_r = 2.0 * math.atanh(eu)
+        rho = math.tanh(0.5 * hyp_r)
+        theta = math.atan2(y, x) % math.pi
+        sigma = 2.0 / max(1.0 - eu*eu, 1e-8)
         rl.append(rho); tl.append(theta); sl.append(sigma)
     return (torch.tensor(rl,dtype=dtype,device=device),
             torch.tensor(tl,dtype=dtype,device=device),
@@ -908,7 +925,7 @@ class ContextualStub:
     stub_type:str; tokens:List[str]; rho:float; theta:float; sigma:float; weight:float; label:str=""
     def __post_init__(self):
         if not self.label: self.label=f"[{self.stub_type}] {' '.join(self.tokens[:4])}…"
-    def as_triple(self): return ThebaultTripleRP(self.rho,self.theta,self.sigma)
+    def as_triple(self): return BolyaiTripleRP(self.rho,self.theta,self.sigma)
 
 @dataclass
 class CoTStep:
@@ -1059,7 +1076,7 @@ class RPCoTReasoningEngine:
 # SECTION 14 — ANCILLARY SUBSYSTEMS  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
-class ThebaultConjugateOrbit:
+class BolyaiConjugateOrbit:
     def score(self,anchor,cand_theta,cand_sigma,gamma_side=4.0):
         return torch.exp(-gamma_side*(cand_sigma-anchor.sigma)**2) * \
                torch.cos(cand_theta+anchor.theta-math.pi/2)**2
@@ -1243,7 +1260,7 @@ class RPInstructionDistribution:
         ctx_sigma=sum(t.sigma for t in triples)/len(triples)
         sin_m=sum(math.sin(t.theta) for t in triples)/len(triples)
         cos_m=sum(math.cos(t.theta) for t in triples)/len(triples)
-        self.instr_centroid=ThebaultTripleRP(ctx_rho,math.atan2(sin_m,cos_m)%math.pi,ctx_sigma)
+        self.instr_centroid=BolyaiTripleRP(ctx_rho,math.atan2(sin_m,cos_m)%math.pi,ctx_sigma)
         V=len(self.lm.vocab); base=torch.zeros(V,dtype=self.dtype,device=self.device)
         for tok,w in freq.items():
             idx=self.lm._tok2idx.get(tok)
@@ -1869,10 +1886,10 @@ class V18RPEngine:
         self._initialised        = False
 
         self.rff        = RandomFourierFeatures(rff_dim=rff_dim, device=self.device)
-        self.geo        = ThebaultTokenGeometryRP(device=self.device)
+        self.geo        = BolyaiTokenGeometryRP(device=self.device)
         self.lm         = RPCompositionLM(self.geo, self.rff, device=self.device)
         self.kernels    = RPKernels(self.rff)
-        self.orbit      = ThebaultConjugateOrbit()
+        self.orbit      = BolyaiConjugateOrbit()
         self.rw_graph   = RandomWalkPotentialEngine(device=self.device)
         self.synth      = synthetic_reasonMandateProcessor()
         self.mrv        = RPMRVFilter(self.rff, device=self.device)
