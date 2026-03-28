@@ -1235,6 +1235,64 @@ class TokenStepTrace:
                 f"nystrom={self.rp_nystrom_rank} ooi={self.ooi_size} rep={self.repulsion_mean:.3f}")
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 14.5 — PROPOSITIONAL SURJECTION ENGINE (NEW)
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PropositionalStatement:
+    subj: str
+    pred: str
+    obj: str
+    confidence: float
+
+    def render(self):
+        return f"  ⟨ {self.subj} → {self.pred} → {self.obj} ⟩  (conf: {self.confidence:.3f})"
+
+class PropositionalSurjectionEngine:
+    """
+    Performs surjective mapping of the dense generative manifold (token sequences)
+    into a small, discrete set of propositional statements using geometric properties.
+    """
+    def __init__(self, geo, rho_threshold=0.20):
+        self.geo = geo
+        self.rho_threshold = rho_threshold
+
+    def surject_sentence(self, tokens: List[str]) -> List[PropositionalStatement]:
+        clean_toks = [t for t in tokens if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
+        if len(clean_toks) < 3:
+            return []
+
+        triples = [self.geo.triple_fast(t) for t in clean_toks]
+        statements = []
+
+        for i in range(len(clean_toks) - 2):
+            w1, w2, w3 = clean_toks[i], clean_toks[i+1], clean_toks[i+2]
+            t1, t2, t3 = triples[i], triples[i+1], triples[i+2]
+
+            # Map high-density entities via intermediate relation
+            if t1.rho > self.rho_threshold and t3.rho > self.rho_threshold:
+                conf = (t1.rho * t2.sigma * t3.rho) ** (1/3)
+                stmt = PropositionalStatement(
+                    subj=w1.upper(), pred=w2.lower(), obj=w3.upper(), confidence=conf
+                )
+                statements.append(stmt)
+
+        statements.sort(key=lambda x: x.confidence, reverse=True)
+
+        # Deduplicate to minimal cover
+        seen_entities = set()
+        minimal_cover = []
+        for stmt in statements:
+            if stmt.subj not in seen_entities or stmt.obj not in seen_entities:
+                minimal_cover.append(stmt)
+                seen_entities.add(stmt.subj)
+                seen_entities.add(stmt.obj)
+
+        return minimal_cover[:3]
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — RP INSTRUCTION DISTRIBUTION  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
@@ -1285,6 +1343,64 @@ class RPInstructionDistribution:
                                 dtype=self.dtype,device=self.device)
         raw=(base_probs+ctx_bonus).clamp(min=1e-12)
         return raw/raw.sum()
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 14.5 — PROPOSITIONAL SURJECTION ENGINE (NEW)
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PropositionalStatement:
+    subj: str
+    pred: str
+    obj: str
+    confidence: float
+
+    def render(self):
+        return f"  ⟨ {self.subj} → {self.pred} → {self.obj} ⟩  (conf: {self.confidence:.3f})"
+
+class PropositionalSurjectionEngine:
+    """
+    Performs surjective mapping of the dense generative manifold (token sequences)
+    into a small, discrete set of propositional statements using geometric properties.
+    """
+    def __init__(self, geo, rho_threshold=0.20):
+        self.geo = geo
+        self.rho_threshold = rho_threshold
+
+    def surject_sentence(self, tokens: List[str]) -> List[PropositionalStatement]:
+        clean_toks = [t for t in tokens if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
+        if len(clean_toks) < 3:
+            return []
+
+        triples = [self.geo.triple_fast(t) for t in clean_toks]
+        statements = []
+
+        for i in range(len(clean_toks) - 2):
+            w1, w2, w3 = clean_toks[i], clean_toks[i+1], clean_toks[i+2]
+            t1, t2, t3 = triples[i], triples[i+1], triples[i+2]
+
+            # Map high-density entities via intermediate relation
+            if t1.rho > self.rho_threshold and t3.rho > self.rho_threshold:
+                conf = (t1.rho * t2.sigma * t3.rho) ** (1/3)
+                stmt = PropositionalStatement(
+                    subj=w1.upper(), pred=w2.lower(), obj=w3.upper(), confidence=conf
+                )
+                statements.append(stmt)
+
+        statements.sort(key=lambda x: x.confidence, reverse=True)
+
+        # Deduplicate to minimal cover
+        seen_entities = set()
+        minimal_cover = []
+        for stmt in statements:
+            if stmt.subj not in seen_entities or stmt.obj not in seen_entities:
+                minimal_cover.append(stmt)
+                seen_entities.add(stmt.subj)
+                seen_entities.add(stmt.obj)
+
+        return minimal_cover[:3]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1364,6 +1480,8 @@ class RPWalker:
                                              trans_weight=trans_weight,syn_k=syn_k,device=device)
         self._csns_syn_norms: List[float]=[]; self._csns_trans_norms: List[float]=[]
 
+        # ── ANISO & Surjection subsystems ────────────────────────────────
+        self.surjector = PropositionalSurjectionEngine(geo)
         # ── ANISO subsystems ─────────────────────────────────────────────
         self._aniso_kernel = AnisoDirKernel(device=device)
         self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
@@ -1857,11 +1975,35 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
         outputs.append(sent_text)
         walker.iso_stacker.add(toks, walker.geo, sent_text)
 
+        # Surject into propositions
+        props = walker.surjector.surject_sentence(toks)
+        if props:
+            walker._step_traces.append(TokenStepTrace(
+                step=global_step, chosen="[SURJECTION]", p_instr=0, p_walk=0, p_and=0,
+                and_weight=0, source="PROP", syn_norm=0, trans_norm=0,
+                rp_nystrom_rank=0, ooi_size=0, repulsion_mean=0
+            ))
+            # Hack: We inject the proposition trace directly into the CoT traces string later
+            if not hasattr(walker, '_prop_traces'): walker._prop_traces = []
+            walker._prop_traces.append((sent_idx, props))
+
     full_text = " ".join(outputs)
+
+    # Format propositions
+    prop_text = "Small Propositional Statements:\n"
+    if hasattr(walker, '_prop_traces') and walker._prop_traces:
+        for s_idx, props in walker._prop_traces:
+            prop_text += f"\nSentence {s_idx+1}:\n"
+            for p in props:
+                prop_text += p.render() + "\n"
+        walker._prop_traces.clear()
+    else:
+        prop_text += "  (no confident propositions found)\n"
+
     if return_traces:
         cot_text  = walker.cot.all_traces_text()
         step_text = walker.step_trace_report()
-        return full_text, cot_text, step_text
+        return full_text, cot_text, step_text, prop_text
     return full_text
 
 
@@ -1972,7 +2114,7 @@ class V18RPEngine:
     def generate(self, seed_text="", instruction_text="", num_sentences=4,
                  tokens_per_sent=40, and_weight=0.9, temperature=2.0,
                  return_traces=False):
-        assert self._initialised, "Call .train() first."
+        assert getattr(self, "_initialised", False), "Call .train() first."
         return generate_passage_rp(
             self.walker, self.lm,
             num_sentences=num_sentences, tokens_per_sent=tokens_per_sent,
@@ -2047,18 +2189,19 @@ def _gui_generate(seed, instruction, n_sents, toks_per_sent,
                   and_weight, temperature, show_traces):
     global _engine
     if _engine is None or not _engine._initialised:
-        return "❌ Initialise engine first.", "", ""
+        return "❌ Initialise engine first.", "", "", ""
     try:
-        text, cot, steps = _engine.generate(
+        text, cot, steps, props = _engine.generate(
             seed_text=seed, instruction_text=instruction,
             num_sentences=int(n_sents), tokens_per_sent=int(toks_per_sent),
             and_weight=float(and_weight), temperature=float(temperature),
             return_traces=True)
         cot_out   = cot   if show_traces else "(traces disabled)"
         steps_out = steps if show_traces else "(traces disabled)"
-        return text, cot_out, steps_out
+        prop_out  = props if show_traces else "(traces disabled)"
+        return text, cot_out, steps_out, prop_out
     except Exception as e:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}", "", ""
+        import traceback; return f"❌ Error:\n{traceback.format_exc()}", "", "", ""
 
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO") as demo:
@@ -2122,11 +2265,12 @@ def build_gradio_app() -> gr.Blocks:
                 show_tr   = gr.Checkbox(value=True,label="Show traces")
             gen_btn  = gr.Button("Generate")
             gen_out  = gr.Textbox(lines=8,  label="Generated text")
+            prop_out = gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out  = gr.Textbox(lines=12, label="CoT traces")
             step_out = gr.Textbox(lines=14, label="Step traces (incl. OOI/repulsion)")
             gen_btn.click(_gui_generate,
                 inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr],
-                outputs=[gen_out,cot_out,step_out])
+                outputs=[gen_out,cot_out,step_out,prop_out])
 
     return demo
 
