@@ -1424,8 +1424,8 @@ class RPWalker:
     @torch.no_grad()
     def walk_probs(self, w1, w2, temp=1.4,
                    alpha_reg=1.2, beta_ori=0.8, delta_side=1.0, gamma_orbit=0.6,
-                   psi_pot=0.35, zeta_mrv=0.9, eta_chunk=0.7, xi_echo=0.6,
-                   pdn_weight=0.8, cot_weight=1.0, and_weight=0.5,
+                   psi_pot=4.35, zeta_mrv=10.9, eta_chunk=40.7, xi_echo=80.6,
+                   pdn_weight=10.8, cot_weight=51.0, and_weight=210.5,
                    cands=None, base_probs=None):
 
         if cands is None or base_probs is None:
@@ -1559,7 +1559,7 @@ class RPWalker:
                           + punct_bias
                           + punct_penalty
                           + 0.4   * comp_bonus
-                          + 10.25 * sorted_impulse
+                          + 0.25 * sorted_impulse
                           # ── ANISO additions ──────────────────────────
                           + self.aniso_ooi_weight       * ooi_aff_norm
                           - self.aniso_repulsion_weight * rep_norm)
