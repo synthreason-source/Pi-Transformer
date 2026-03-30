@@ -108,7 +108,6 @@ ANISO_OOI_MAX      = 12    # max objects-of-interest tracked per sentence
 ANISO_OOI_RHO_THR  = 0.25  # minimum ρ for a token to be OOI-eligible
 ANISO_REPULSION_W  = 0.55  # weight of inter-candidate repulsion in final logits
 ANISO_OOI_W        = 0.70  # weight of OOI affinity bonus in final logits
-SELF_ENCUMBRANCE_W = 0.35  # post-ANISO self-encumbrance weight
 
 _rng    = random.Random(RP_SEED)
 _np_rng = np.random.default_rng(RP_SEED)
@@ -143,34 +142,6 @@ def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     mu = x.mean(); std = x.std()
     return (x - mu) / (std + eps) if std.item() >= eps else x - mu
-
-
-def self_encumbrance_from_probs(prob_vec: torch.Tensor, strength: float = SELF_ENCUMBRANCE_W) -> torch.Tensor:
-    """
-    Post-ANISO self-encumbrance over a candidate distribution.
-
-    Sort probabilities descending, build forward and backward cumulative mass,
-    then map the signed encumbrance back to original candidate order.
-    High-probability candidates receive a negative correction, while lower-mass
-    candidates receive a relative lift. The output is z-normalised so it can be
-    added directly to logits as a stable post-feature adjustment.
-    """
-    C = prob_vec.shape[0]
-    if C <= 1:
-        return torch.zeros_like(prob_vec)
-    p = prob_vec.clamp(min=1e-12)
-    p = p / p.sum().clamp(min=1e-12)
-    sort_idx = torch.argsort(p, descending=True)
-    inv_idx = torch.empty_like(sort_idx)
-    inv_idx[sort_idx] = torch.arange(C, device=p.device)
-    ps = p[sort_idx]
-    c_fwd = torch.cumsum(ps, dim=0)
-    c_rev = torch.cumsum(ps.flip(0), dim=0).flip(0)
-    rank = torch.linspace(1.0, 0.0, C, device=p.device, dtype=p.dtype)
-    raw = -(c_fwd - c_rev) * (0.5 + 0.5 * rank)
-    std = raw.std(unbiased=False)
-    raw = (raw - raw.mean()) / (std + 1e-8) if std.item() > 1e-8 else raw - raw.mean()
-    return raw[inv_idx] * strength
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1485,12 +1456,39 @@ class FittedLineRegression(nn.Module):
 # SECTION 16 — RP WALKER  (extended with ANISO signals)
 # ════════════════════════════════════════════════════════════════════════════
 
+
+# =============================================================================
+# SELF-ENCUMBRANCE CONFIG & HELPER
+# =============================================================================
+SELF_ENCUMBRANCE_W = 0.22
+
+def self_encumbrance_from_probs(probs: torch.Tensor, strength: float = SELF_ENCUMBRANCE_W) -> torch.Tensor:
+    if probs.ndim != 1:
+        probs = probs.reshape(-1)
+
+    p = probs.clamp_min(1e-12)
+    p = p / p.sum()
+
+    ps, order = torch.sort(p, descending=True)
+    csum = torch.cumsum(ps, dim=0)
+    rev_csum = torch.cumsum(torch.flip(ps, dims=[0]), dim=0)
+    tailmass = torch.flip(rev_csum, dims=[0])
+
+    score_sorted = tailmass - csum
+    score_sorted = score_sorted - score_sorted.mean()
+    score_sorted = score_sorted / (score_sorted.abs().max().clamp_min(1e-12))
+
+    out = torch.empty_like(score_sorted)
+    out[order] = score_sorted
+    return strength * out
+
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
                  chunk_engine, iso_stacker, pdn_engine, cot_engine, instr_dist, rff,
                  device=DEVICE, syn_weight=0.4, trans_weight=0.6, syn_k=8,
                  aniso_ooi_weight: float = ANISO_OOI_W,
-                 aniso_repulsion_weight: float = ANISO_REPULSION_W):
+                 aniso_repulsion_weight: float = ANISO_REPULSION_W,
+                 self_encumbrance_weight: float = SELF_ENCUMBRANCE_W):
         self.geo=geo; self.kernels=kernels; self.lm=lm; self.orbit=orbit
         self.rw_graph=rw_graph; self.synth=synth; self.mrv=mrv_filter
         self.chunk_engine=chunk_engine; self.iso_stacker=iso_stacker
@@ -1498,6 +1496,7 @@ class RPWalker:
         self.rff=rff; self.device=device
         self.aniso_ooi_weight      = aniso_ooi_weight
         self.aniso_repulsion_weight= aniso_repulsion_weight
+        self.self_encumbrance_weight = self_encumbrance_weight
 
         self._current_isomorphic_pairs=[]; self._cur_sent_toks: List[str]=[]
         self._cur_orbit=0; self._tok_pos=0; self._step_traces: List[TokenStepTrace]=[]
@@ -1737,6 +1736,14 @@ class RPWalker:
             c_rho)
         raw_logits = raw_logits * remission
 
+        # ── Self-Encumbrance ─────────────────────────────────────────────
+        prelim_probs = F.softmax(raw_logits / max(float(temp), 1e-9), dim=0)
+        encumb_bonus = self_encumbrance_from_probs(
+            prelim_probs,
+            strength=getattr(self, "self_encumbrance_weight", SELF_ENCUMBRANCE_W)
+        )
+        raw_logits = raw_logits + encumb_bonus
+
         # Save for replay / training
         self._fl_replay_buf.append((features.cpu().clone(), -1))
         self._pending_instr_probs   = p_instr
@@ -1747,15 +1754,6 @@ class RPWalker:
         self._pending_syn_norm      = syn_norm
         self._pending_trans_norm    = trans_norm
         self._pending_nystrom_rank  = RP_NYSTROM_M
-
-        # Post-ANISO self-encumbrance
-        prelim_probs = self._dnn.forward(raw_logits, c_rho, c_theta, c_sigma, temp=temp)
-        encumb_bonus = self_encumbrance_from_probs(
-            prelim_probs,
-            strength=getattr(self, "self_encumbrance_weight", SELF_ENCUMBRANCE_W)
-        )
-        raw_logits = raw_logits + encumb_bonus
-        self._pending_self_encumbrance = encumb_bonus
 
         # Final distribution
         if and_weight > 0.0 and self.instr_dist.base_dist_t is not None:
