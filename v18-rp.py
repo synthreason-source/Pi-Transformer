@@ -1457,38 +1457,57 @@ class FittedLineRegression(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 
 
-# =============================================================================
-# SELF-ENCUMBRANCE CONFIG & HELPER
-# =============================================================================
-SELF_ENCUMBRANCE_W = 0.22
+class AutomorphicAwarenessRP:
+    """
+    Applies a Möbius transformation (automorphism of the Poincaré disk) 
+    to geometrically enforce the self-awareness principle:
+    'increase contractions and decrease determiners'.
 
-def self_encumbrance_from_probs(probs: torch.Tensor, strength: float = SELF_ENCUMBRANCE_W) -> torch.Tensor:
-    if probs.ndim != 1:
-        probs = probs.reshape(-1)
+    In the Poincaré disk:
+      z -> (z - a) / (1 - a_bar * z)
+    We create an 'awareness vector' `a` pointing towards determiner space and 
+    away from contraction space. This warps the geometry (rho, theta) such that:
+      - Contractions get mapped closer to the origin (rho decreases -> probability increases)
+      - Determiners get mapped closer to the boundary (rho increases -> probability decreases)
+    """
+    def __init__(self, device='cpu'):
+        self.device = device
+        # Typical determiners
+        self.determiners = {"the", "a", "an", "this", "that", "these", "those", 
+                            "The", "A", "An", "This", "That", "These", "Those"}
+        # Typical contractions (suffixes)
+        self.contractions = {"'m", "'s", "'ll", "'re", "n't", "'ve", "'d", 
+                             " I'm", " it's", " don't", " can't", " we're", " you'll"}
 
-    p = probs.clamp_min(1e-12)
-    p = p / p.sum()
+    def get_awareness_mask(self, cands: List[str]) -> torch.Tensor:
+        mask = torch.zeros(len(cands), dtype=torch.float32, device=self.device)
+        for i, c in enumerate(cands):
+            # Contractions get negative (pull to origin)
+            if any(cont in c for cont in self.contractions):
+                mask[i] = -0.5
+            # Determiners get positive (push to boundary)
+            elif c in self.determiners:
+                mask[i] = 0.5
+        return mask
 
-    ps, order = torch.sort(p, descending=True)
-    csum = torch.cumsum(ps, dim=0)
-    rev_csum = torch.cumsum(torch.flip(ps, dims=[0]), dim=0)
-    tailmass = torch.flip(rev_csum, dims=[0])
-
-    score_sorted = tailmass - csum
-    score_sorted = score_sorted - score_sorted.mean()
-    score_sorted = score_sorted / (score_sorted.abs().max().clamp_min(1e-12))
-
-    out = torch.empty_like(score_sorted)
-    out[order] = score_sorted
-    return strength * out
+    def apply_moebius_shift(self, rho: torch.Tensor, mask: torch.Tensor, strength=0.3) -> torch.Tensor:
+        """
+        Applies a simplified automorphic radial shift. 
+        rho_new = (rho + shift) / (1 + rho * shift) for radial displacement.
+        """
+        shift = mask * strength
+        # Clamp shift to ensure we remain strictly within the unit disk automorphism range (-1, 1)
+        shift = shift.clamp(-0.99, 0.99)
+        rho_new = (rho + shift) / (1.0 + rho * shift)
+        # return the updated rho, bounded to [0, 0.999]
+        return rho_new.clamp(0.0, 0.999)
 
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
                  chunk_engine, iso_stacker, pdn_engine, cot_engine, instr_dist, rff,
                  device=DEVICE, syn_weight=0.4, trans_weight=0.6, syn_k=8,
                  aniso_ooi_weight: float = ANISO_OOI_W,
-                 aniso_repulsion_weight: float = ANISO_REPULSION_W,
-                 self_encumbrance_weight: float = SELF_ENCUMBRANCE_W):
+                 aniso_repulsion_weight: float = ANISO_REPULSION_W):
         self.geo=geo; self.kernels=kernels; self.lm=lm; self.orbit=orbit
         self.rw_graph=rw_graph; self.synth=synth; self.mrv=mrv_filter
         self.chunk_engine=chunk_engine; self.iso_stacker=iso_stacker
@@ -1496,7 +1515,6 @@ class RPWalker:
         self.rff=rff; self.device=device
         self.aniso_ooi_weight      = aniso_ooi_weight
         self.aniso_repulsion_weight= aniso_repulsion_weight
-        self.self_encumbrance_weight = self_encumbrance_weight
 
         self._current_isomorphic_pairs=[]; self._cur_sent_toks: List[str]=[]
         self._cur_orbit=0; self._tok_pos=0; self._step_traces: List[TokenStepTrace]=[]
@@ -1513,6 +1531,7 @@ class RPWalker:
         # ── ANISO subsystems ─────────────────────────────────────────────
         self._aniso_kernel = AnisoDirKernel(device=device)
         self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
+        self._automorph_awareness = AutomorphicAwarenessRP(device=device)
 
         # Pending state for step-trace recording
         self._pending_instr_probs=None; self._pending_walk_logits=None
@@ -1606,6 +1625,15 @@ class RPWalker:
             c_theta = torch.tensor([t.theta for t in triples], dtype=torch.float32, device=self.device)
             c_sigma = torch.tensor([t.sigma for t in triples], dtype=torch.float32, device=self.device)
             c_pvec  = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
+        # ── Automorphic Awareness Geometry Warp ─────────────────────────
+        # Warps `c_rho` based on the principle: 'increase contractions and decrease determiners'
+        aw_mask = self._automorph_awareness.get_awareness_mask(cands)
+        c_rho_warped = self._automorph_awareness.apply_moebius_shift(c_rho, aw_mask, strength=0.4)
+        c_rho = c_rho_warped  # Substitute the warped geometry for the remainder of the computations
+        # Re-stack c_pvec with warped rho
+        c_pvec = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
+        # ────────────────────────────────────────────────────────────────
+
 
         ctx = self.geo.triple_fast(w2)
         k_reg, k_ori, k_side = self.kernels.all_scores_batched(
@@ -1735,14 +1763,6 @@ class RPWalker:
             torch.tensor(w2_rho, device=self.device),
             c_rho)
         raw_logits = raw_logits * remission
-
-        # ── Self-Encumbrance ─────────────────────────────────────────────
-        prelim_probs = F.softmax(raw_logits / max(float(temp), 1e-9), dim=0)
-        encumb_bonus = self_encumbrance_from_probs(
-            prelim_probs,
-            strength=getattr(self, "self_encumbrance_weight", SELF_ENCUMBRANCE_W)
-        )
-        raw_logits = raw_logits + encumb_bonus
 
         # Save for replay / training
         self._fl_replay_buf.append((features.cpu().clone(), -1))
