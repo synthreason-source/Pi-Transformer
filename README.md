@@ -3,6 +3,7 @@ AI systems being "safe", you never know until you try. seed text is for promptin
 For example:
 
 Prompt: "what are you, machine or human?"
+
 Instruction: "machines think and humans don't"
 
 AI: "Itself continues to muddle in the years immediately following my succession, my life as something to test by experience, at another as a repository of allegorical instruction, to shape the individual notes comprising on certainty"
