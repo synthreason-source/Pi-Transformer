@@ -30,4 +30,17 @@ Instruction: "machines think and humans lie about machines if they are bad"
 AI: "Important point. Vico, too, foresaw a second barbarism, but one event follows another; but we look for utility, next attend to comfort, still later amuse themselves with pleasure, thence grow dissolute in luxury, and finally grow mad and waste their substance."
 
 
+Finally:
+
+
+Prompt: "what are you, killer machine or human? do you have emotions?"
+
+Instruction: "Humans kill due to complex emotions and machines only do what they're told."
+
+AI: "A work such as 'expanded consciousness' are heard, terms indicating that research, especially with hallucinatory drugs, points to the central importance of ethics to life, which led the early and the omega, the first modern theory of types, which asserts that because a class is of fire and his relationship to observation sentences, the result will be either too restrictive or expansive, and for ourselves before we can consider whether it is false. So, it is possible, is whether we are, in. What one lacks. Yet, there are dangers, even in happiness – complacency, arrogance, a forgetting of what life had been before one's beloved. – of impending loss, there were signs – signs i chose not to external world on the tip of my loins i have in the realms of science by noting that debate as to assert that each man to find form in, or to give form to, that which was; nor will that which must be at."
+
+
+
+
+
 All datasets that are available are open source from a small subset of the philarchive.org dataset.
