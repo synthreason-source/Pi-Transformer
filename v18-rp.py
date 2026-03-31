@@ -1228,6 +1228,7 @@ class ContingentExtringentProbability:
 class TokenStepTrace:
     step:int; chosen:str; p_instr:float; p_walk:float; p_and:float; and_weight:float
     source:str; syn_norm:float=0.0; trans_norm:float=0.0; rp_nystrom_rank:int=0
+    para_dup:float=0.0; para_expanse:float=0.0
     ooi_size:int=0; repulsion_mean:float=0.0
     def render(self):
         return (f"  {self.step:03d} {self.chosen:<14s} Pand={self.p_and:.4f} ({self.and_weight:.2f}) "
@@ -1551,6 +1552,12 @@ class RPWalker:
         self.rff=rff; self.device=device
         self.aniso_ooi_weight      = aniso_ooi_weight
         self.aniso_repulsion_weight= aniso_repulsion_weight
+        self.para_dup_weight = 10
+        self.para_expanse_weight = 0.6
+        self._recent_paragraphs = []
+        self._current_paragraph = []
+        self._pending_para_dup = None
+        self._pending_para_expanse = None
 
         self._current_isomorphic_pairs=[]; self._cur_sent_toks: List[str]=[]
         self._cur_orbit=0; self._tok_pos=0; self._step_traces: List[TokenStepTrace]=[]
@@ -1641,10 +1648,54 @@ class RPWalker:
         ], dim=-1)   # (C, 19)
 
     @torch.no_grad()
+    def _norm_tok(self, t: str) -> str:
+        import re
+        return re.sub(r"\s+", " ", t.strip().lower())
+
+    def _close_paragraph(self):
+        para = [self._norm_tok(t) for t in self._current_paragraph if self._norm_tok(t)]
+        if para:
+            self._recent_paragraphs.append(para)
+            self._recent_paragraphs = self._recent_paragraphs[-PARA_DUP_WINDOW:]
+        self._current_paragraph = []
+
+    def _observe_generated_token(self, tok: str):
+        self._current_paragraph.append(tok)
+        if "\n" in tok:
+            self._close_paragraph()
+
+    def _paragraph_duplication(self, cands):
+        if not self._recent_paragraphs:
+            import torch
+            return torch.zeros(len(cands), device=self.device)
+
+        prefix = [self._norm_tok(t) for t in self._current_paragraph if self._norm_tok(t)]
+        prefix = prefix[-PARA_DUP_MATCH_CAP:]
+
+        vals = []
+        import torch
+        for cand in cands:
+            trial = prefix + [self._norm_tok(cand)]
+            best = 0.0
+
+            for para in self._recent_paragraphs:
+                max_k = min(len(trial), len(para), PARA_DUP_MATCH_CAP)
+                hit = 0
+                for k in range(1, max_k + 1):
+                    if trial[-k:] == para[:k]:
+                        hit = k
+                if hit > 0:
+                    best = max(best, hit / max_k)
+
+            vals.append(best)
+
+        return torch.tensor(vals, dtype=torch.float32, device=self.device)
+
     def walk_probs(self, w1, w2, temp=1.4,
                    alpha_reg=1.2, beta_ori=0.8, delta_side=1.0, gamma_orbit=0.6,
                    psi_pot=4.35, zeta_mrv=10.9, eta_chunk=40.7, xi_echo=80.6,
                    pdn_weight=10.8, cot_weight=51.0, and_weight=210.5,
+                   para_dup_weight=10, para_expanse_weight=0.6,
                    cands=None, base_probs=None):
 
         if cands is None or base_probs is None:
@@ -1700,6 +1751,25 @@ class RPWalker:
         punct_penalty = torch.tensor(
             [-3.0 if (c in PUNCT_TOKENS and len(self._cur_sent_toks) < 6) else 0.0
              for c in cands], dtype=torch.float32, device=self.device)
+                # Inverse number paragraph expanse barrier
+        para_duration = len(self._current_paragraph)
+        remaining = max(1.0, 0.7 - para_duration)
+        inv_expanse = 1.0 / remaining
+
+        para_expanse = torch.tensor([
+            (inv_expanse * 10.0) if c in ["\n\n", "\n"] else (-inv_expanse)
+            for c in cands
+        ], dtype=torch.float32, device=self.device)
+        self._pending_para_expanse = para_expanse
+
+        para_dup = self._paragraph_duplication(cands)
+        # Using z-norm for the duplication array
+        # mean/std 
+        m = para_dup.mean()
+        s = para_dup.std(unbiased=False)
+        para_dup_norm = (para_dup - m) / (s + 1e-8) if s > 1e-8 else para_dup - m
+        self._pending_para_dup = para_dup
+
         base_logits   = torch.log(base_probs.clamp(min=1e-12))
 
         # CSNS forward
@@ -1792,6 +1862,8 @@ class RPWalker:
                           + mandate_boost
                           + punct_bias
                           + punct_penalty
+                          + para_expanse_weight * para_expanse
+                          - para_dup_weight * para_dup_norm
                           + 0.4   * comp_bonus
                           + 0.25 * sorted_impulse
                           # ── ANISO additions ──────────────────────────
@@ -2063,6 +2135,7 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
             cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
             if not cands: break
             nxt = cands[torch.multinomial(probs, 1).item()]
+            walker._observe_generated_token(nxt)
             walker.record_step_trace(global_step, nxt, cands, probs, and_weight)
             walker.push_token(nxt, tokens_per_sent)
             global_step += 1
