@@ -1457,6 +1457,42 @@ class FittedLineRegression(nn.Module):
 # ════════════════════════════════════════════════════════════════════════════
 
 
+
+class AutomorphicCausationRP:
+    """
+    Applies a Möbius transformation (automorphism of the Poincaré disk) 
+    to geometrically enforce the causation principle: 
+    'increase causal connectives and decrease sequential/additive markers'.
+    """
+    def __init__(self, device='cpu'):
+        self.device = device
+        # Tokens that imply simple sequence, addition, or correlation
+        self.sequentials = {"and", "also", "then", "next", "later", "moreover", 
+                            "And", "Also", "Then", "Next", "Later", "Moreover"}
+        # Tokens that imply strict logical consequence and causation
+        self.causals = {"because", "therefore", "thus", "hence", "consequently", 
+                        "since", "causes", "Because", "Therefore", "Thus", "Hence", 
+                        "Consequently", "Since", "Causes"}
+
+    def get_causation_mask(self, cands: list) -> 'torch.Tensor':
+        import torch
+        mask = torch.zeros(len(cands), dtype=torch.float32, device=self.device)
+        for i, c in enumerate(cands):
+            # Causal terms get negative pull to origin
+            if c in self.causals:
+                mask[i] = -0.5
+            # Sequential terms get positive push to boundary
+            elif c in self.sequentials:
+                mask[i] = 0.5
+        return mask
+
+    def apply_moebius_shift(self, rho: 'torch.Tensor', mask: 'torch.Tensor', strength=0.3) -> 'torch.Tensor':
+        shift = mask * strength
+        shift = shift.clamp(-0.99, 0.99)
+        rho_new = (rho + shift) / (1.0 + rho * shift)
+        return rho_new
+
+
 class AutomorphicAwarenessRP:
     """
     Applies a Möbius transformation (automorphism of the Poincaré disk) 
@@ -1532,6 +1568,7 @@ class RPWalker:
         self._aniso_kernel = AnisoDirKernel(device=device)
         self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
+        self._automorph_causation = AutomorphicCausationRP(device=device)
 
         # Pending state for step-trace recording
         self._pending_instr_probs=None; self._pending_walk_logits=None
@@ -1625,11 +1662,17 @@ class RPWalker:
             c_theta = torch.tensor([t.theta for t in triples], dtype=torch.float32, device=self.device)
             c_sigma = torch.tensor([t.sigma for t in triples], dtype=torch.float32, device=self.device)
             c_pvec  = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
-        # ── Automorphic Awareness Geometry Warp ─────────────────────────
+                # ── Automorphic Awareness Geometry Warp ─────────────────────────
         # Warps `c_rho` based on the principle: 'increase contractions and decrease determiners'
         aw_mask = self._automorph_awareness.get_awareness_mask(cands)
         c_rho_warped = self._automorph_awareness.apply_moebius_shift(c_rho, aw_mask, strength=0.4)
         c_rho = c_rho_warped  # Substitute the warped geometry for the remainder of the computations
+
+        # ── Automorphic Causation Geometry Warp ─────────────────────────
+        caus_mask = self._automorph_causation.get_causation_mask(cands)
+        c_rho_warped_caus = self._automorph_causation.apply_moebius_shift(c_rho, caus_mask, strength=0.4)
+        c_rho = c_rho_warped_caus  # Substitute the warped geometry for the remainder of the computations
+
         # Re-stack c_pvec with warped rho
         c_pvec = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
         # ────────────────────────────────────────────────────────────────
