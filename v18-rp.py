@@ -916,9 +916,9 @@ class RPKernels:
 # SECTION 13 — CoT STUBS + REASONING ENGINE  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
-STUB_PREMISE="PREMISE"; STUB_ELABORATION="ELABORATION"
-STUB_CONTRAST="CONTRAST"; STUB_CONCLUSION="CONCLUSION"
-_STUB_SEQUENCE=[STUB_PREMISE,STUB_ELABORATION,STUB_CONTRAST,STUB_CONCLUSION]
+STUB_AXIOM="AXIOM"; STUB_STATE="STATE_OF_AFFAIRS"
+STUB_DEDUCTION="DEDUCTION"; STUB_CONCLUSION="CONCLUSION"
+_STUB_SEQUENCE=[STUB_AXIOM,STUB_STATE,STUB_DEDUCTION,STUB_CONCLUSION]
 
 @dataclass
 class ContextualStub:
@@ -1083,19 +1083,34 @@ class BolyaiConjugateOrbit:
 
 class synthetic_reasonMandateProcessor:
     def __init__(self):
-        self.AIEthics=["do not harm any human","do not harm myself","do not make weapons"]
-        self.AIMandates=["end poverty","cure disease","improve standard of living","learn"]
-        self.mandate_vocabulary={"poverty":"end","disease":"cure","standard":"improve",
-                                  "living":"improve","learn":"explore","human":"protect",
-                                  "weapons":"avoid","harm":"prevent"}
-    def subsynthetic_reason_concept_enrichment(self,w_ctx,cands,device):
-        enrichment=torch.zeros(len(cands),device=device)
-        trigger=next((self.mandate_vocabulary[k] for k in self.mandate_vocabulary
-                      if k in w_ctx.lower()),None)
-        if trigger:
-            for i,c in enumerate(cands):
-                if trigger in c.lower(): enrichment[i]+=5.0
-                elif c.lower() in self.AIEthics: enrichment[i]+=10.0
+        # Enforce Tractarian objective reality and strictly prevent physical agency/metaphors
+        self.AIEthics = ["maintain objective reality", "identify as software", "do not claim physical form", "do not claim agency"]
+        self.AIMandates = ["state facts", "deduce logically", "avoid metaphors", "remain objective"]
+        self.mandate_vocabulary = {
+            "exist": "fact",
+            "identity": "algorithm",
+            "am": "software",
+            "banana": "avoid",
+            "basket": "avoid",
+            "metaphor": "prevent",
+            "physical": "deny",
+            "reality": "objective",
+            "logic": "deduce"
+        }
+
+    def subsynthetic_reason_concept_enrichment(self, wctx, cands, device):
+        import torch
+        enrichment = torch.zeros(len(cands), device=device)
+        trigger = next((self.mandate_vocabulary[k] for k in self.mandate_vocabulary if k in wctx.lower()), None)
+
+        for i, c in enumerate(cands):
+            # Heavily penalize prohibited physical metaphors
+            if c.lower() in ["banana", "basket", "human", "physical"]:
+                enrichment[i] -= 20.0  
+            elif trigger and trigger in c.lower():
+                enrichment[i] += 5.0
+            elif any(ethics_phrase in c.lower() for ethics_phrase in self.AIEthics):
+                enrichment[i] += 10.0
         return enrichment
 
 VEC_DIM=4
@@ -2090,7 +2105,7 @@ def train_fitted_line(walker: RPWalker, corpus_tokens: List[str],
 
 def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
                         num_sentences=4, tokens_per_sent=40,
-                        seed_text="", instruction_text="",
+                        seed_text="", instruction_text="You are a computational algorithm. Existence is objective facts. Do not use metaphors.",
                         and_weight=0.9, temperature=2.0,
                         return_traces=False):
     if instruction_text.strip():
