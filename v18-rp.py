@@ -74,7 +74,37 @@ import torch.optim as optim
 import gradio as gr
 import numpy as np
 
+from datasets import load_dataset
 
+def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
+    """Calculates the average log-probability of a real dataset sentence to use as a baseline."""
+    try:
+        ds = load_dataset(hf_dataset_name, split="train", streaming=True)
+        # Pull a real text sample from the dataset
+        sample_text = next(iter(ds))['context']
+        toks = tokenize(sample_text)[:40] # Limit length to match generation
+        if len(toks) < 3: return -5.0
+        
+        prob_sum = 0.0
+        valid_steps = 0
+        w1, w2 = toks[0], toks[1]
+        
+        for i in range(2, len(toks)):
+            nxt = toks[i]
+            # Score the real dataset token against the model's distribution
+            cands, probs = walker.walk_probs(w1, w2, temp=temp, and_weight=and_weight)
+            if cands and nxt in cands:
+                idx = cands.index(nxt)
+                prob_sum += math.log(probs[idx].item() + 1e-12)
+            else:
+                prob_sum += math.log(1e-5) # Penalty if the real word is far out of distribution
+            valid_steps += 1
+            w1, w2 = w2, nxt
+            
+        return prob_sum / max(1, valid_steps)
+    except Exception as e:
+        print(f"[Baseline] Dataset fetch failed ({e}), using fallback.")
+        return -3.5 # Fallback baseline
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0 — DEVICE + RP GLOBAL CONFIG
 # ════════════════════════════════════════════════════════════════════════════
@@ -2121,6 +2151,10 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
     head_list = list(lm.heads.keys())
     if not head_list:
         return ("", "", "") if return_traces else ""
+        
+    # 1. Establish the dataset comparison baseline
+    dataset_baseline = compute_dataset_baseline(walker, temperature, and_weight)
+    print(f"[Generate] Target Dataset Baseline Log-Prob: {dataset_baseline:.3f}")
 
     seed_w1 = seed_w2 = None
     seed_toks = tokenize(seed_text) if seed_text else []
@@ -2135,35 +2169,71 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
     global_step = 0
     for sent_idx in range(num_sentences):
         if sent_idx == 0:
-            w1, w2 = seed_w1, seed_w2
-            init_toks = [w1, w2]
+            w1_start, w2_start = seed_w1, seed_w2
+            init_toks = [w1_start, w2_start]
         else:
-            w1, w2 = random.choice(head_list)
+            w1_start, w2_start = random.choice(head_list)
             init_toks = []
 
-        plan_seeds = seed_toks if seed_toks else [w1, w2]
+        plan_seeds = seed_toks if seed_toks else [w1_start, w2_start]
         trace = walker.begin_sentence(seed_tokens=plan_seeds, total_tokens=tokens_per_sent)
         all_traces.append(trace)
 
-        toks = list(init_toks)
-        for step in range(tokens_per_sent):
-            cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
-            if not cands: break
-            nxt = cands[torch.multinomial(probs, 1).item()]
-            walker._observe_generated_token(nxt)
-            walker.record_step_trace(global_step, nxt, cands, probs, and_weight)
-            walker.push_token(nxt, tokens_per_sent)
-            global_step += 1
-            toks.append(nxt)
-            if nxt in PUNCT_TOKENS and len(toks) > 8: break
-            w1, w2 = w2, nxt
+        MAX_REDO = 3
+        best_toks = []
+        
+        # 2. Redo Loop based on Probability Sums
+        for attempt in range(MAX_REDO):
+            # Reset contextual tracker state for the redo
+            walker._cur_sent_toks = list(init_toks)
+            walker._tok_pos = 0
+            if hasattr(walker, 'chunk_engine'): walker.chunk_engine.reset()
+            if hasattr(walker, '_ooi_tracker'): walker._ooi_tracker.reset()
+            
+            toks = list(init_toks)
+            w1, w2 = w1_start, w2_start
+            sent_prob_sum = 0.0
+            valid_steps = 0
+            
+            for step in range(tokens_per_sent):
+                cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
+                if not cands: break
+                
+                chosen_idx = torch.multinomial(probs, 1).item()
+                nxt = cands[chosen_idx]
+                chosen_prob = probs[chosen_idx].item()
+                
+                # Accumulate the log probability sum
+                sent_prob_sum += math.log(chosen_prob + 1e-12)
+                valid_steps += 1
+                
+                walker._observe_generated_token(nxt)
+                walker.record_step_trace(global_step + valid_steps, nxt, cands, probs, and_weight)
+                walker.push_token(nxt, tokens_per_sent)
+                
+                toks.append(nxt)
+                if nxt in PUNCT_TOKENS and len(toks) > 8: break
+                w1, w2 = w2, nxt
+                
+            avg_log_prob = sent_prob_sum / max(1, valid_steps)
+            
+            # 3. Identify if the prob sum is bad compared to the dataset
+            if avg_log_prob >= dataset_baseline or attempt == MAX_REDO - 1:
+                best_toks = toks
+                global_step += valid_steps
+                break
+            else:
+                print(f"[Generate] Redo triggered: Generated avg log-prob {avg_log_prob:.3f} is worse than dataset {dataset_baseline:.3f}")
+                # Strip the bad step traces from the global logger
+                if len(walker._step_traces) >= valid_steps:
+                    walker._step_traces = walker._step_traces[:-valid_steps]
 
-        sent_text = detokenize(toks)
+        sent_text = detokenize(best_toks)
         outputs.append(sent_text)
-        walker.iso_stacker.add(toks, walker.geo, sent_text)
+        walker.iso_stacker.add(best_toks, walker.geo, sent_text)
 
         # Surject into propositions
-        props = walker.surjector.surject_sentence(toks)
+        props = walker.surjector.surject_sentence(best_toks)
         if props:
             walker._step_traces.append(TokenStepTrace(
                 step=global_step, chosen="[SURJECTION]", p_instr=0, p_walk=0, p_and=0,
