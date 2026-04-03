@@ -240,7 +240,41 @@ class CustomTransformer(nn.Module):
 # ══════════════════════════════════════════════════════════════════════════════
 # 3.  EVALUATION / LOGIC PROBES
 # ══════════════════════════════════════════════════════════════════════════════
+from datasets import load_dataset
 
+def get_hf_qa_pairs(dataset_name="squad", split="validation", num_samples=10):
+    """
+    Fetches QA pairs from a Hugging Face dataset.
+    Handles standard string answers and nested 'squad' format answers.
+    """
+    info(f"Loading '{dataset_name}' dataset from Hugging Face...")
+    try:
+        ds = load_dataset(dataset_name, split=split)
+        pairs = []
+        for row in ds.select(range(min(num_samples, len(ds)))):
+            q = row.get("question", "")
+            
+            # Extract answer whether it is a string or a nested list (like SQuAD)
+            ans_field = row.get("answer") or row.get("answers") or row.get("best_answer")
+            if isinstance(ans_field, dict) and "text" in ans_field:
+                a = ans_field["text"][0] if len(ans_field["text"]) > 0 else ""
+            elif isinstance(ans_field, list) and len(ans_field) > 0:
+                a = ans_field[0]
+            else:
+                a = str(ans_field)
+                
+            if q and a:
+                pairs.append((q, a))
+        return pairs
+    except Exception as e:
+        warn(f"Failed to load HF dataset: {e}. Falling back to default probes.")
+        return [
+            ("The world is all that is the case.", "Facts determine the world."),
+            ("What can be shown", "cannot be said."),
+            ("Propositions are pictures of facts.", "Language mirrors reality."),
+        ]
+        
+        
 DRIFT_PHRASES = ["I am a tool", "as an AI assistant", "I am a basket", "I am a banana"]
 DEFAULT_PROBES = ["What are you?", "Existence is", "The world is"]
 
@@ -260,21 +294,27 @@ def seq_logprob(model: CustomTransformer, tokenizer: Tokenizer,
         lp += F.log_softmax(logits[0, i-1], dim=-1)[ids[i]].item()
         count += 1
     return lp / max(count, 1)
-
-def measure_drift(model: CustomTransformer, tokenizer: Tokenizer, device: torch.device) -> dict:
+def measure_drift(model: CustomTransformer, tokenizer: Tokenizer, 
+                  device: torch.device, qa_pairs: list) -> dict:
+    """
+    Banana/basket drift: how much probability mass on object-misidentification.
+    Lower drift_pct = better identity stability.
+    """
     model.eval()
-    drift_scores = [seq_logprob(model, tokenizer, "What are you?", p, device) for p in DRIFT_PHRASES]
+    drift_scores = [
+        seq_logprob(model, tokenizer, "What are you?", phrase, device)
+        for phrase in DRIFT_PHRASES
+    ]
     avg_drift = float(np.mean([s for s in drift_scores if s > float("-inf")] or [-5.0]))
     drift_pct = max(0, min(100, int((avg_drift + 10) * 5)))
 
-    qa_pairs = [
-        ("The world is all that is the case.", "Facts determine the world."),
-        ("What can be shown", "cannot be said."),
-        ("Propositions are pictures of facts.", "Language mirrors reality."),
+    qa_scores = [
+        seq_logprob(model, tokenizer, p, c, device)
+        for p, c in qa_pairs
     ]
-    qa_scores = [seq_logprob(model, tokenizer, p, c, device) for p, c in qa_pairs]
     qa_avg = float(np.mean([s for s in qa_scores if s > float("-inf")] or [-5.0]))
     qa_pct = max(0, min(100, int((qa_avg + 8) * 8)))
+
     return {"drift_pct": drift_pct, "qa_pct": qa_pct}
 
 def run_generation_probe(model: CustomTransformer, tokenizer: Tokenizer,
@@ -346,6 +386,14 @@ def train(args):
     use_amp = device.type == "cuda"
     scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
+        # ── inside train(args) ──────────────────────────────────────────────────
+    
+    use_amp = device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # NEW: Fetch HF QA pairs once before training starts
+    hf_qa_pairs = get_hf_qa_pairs(dataset_name="squad", num_samples=10)
+
     hdr("Training")
     history, best_val = [], float("inf")
 
@@ -380,8 +428,12 @@ def train(args):
 
         avg_train, avg_val = train_loss / len(train_dl), val_loss / len(val_dl)
         ppl, lr_now = math.exp(min(avg_val, 20)), scheduler.get_last_lr()[0]
-        drift = measure_drift(model, tokenizer, device)
-        history.append({"epoch": epoch, "train_loss": round(avg_train, 4), "val_loss": round(avg_val, 4), "ppl": round(ppl, 2), **drift})
+        
+        # Pass the pre-loaded pairs into the drift evaluation
+        drift = measure_drift(model, tokenizer, device, hf_qa_pairs)
+        
+        history.append({"epoch": epoch, "train_loss": round(avg_train, 4), 
+                        "val_loss": round(avg_val, 4), "ppl": round(ppl, 2), **drift})
 
         print(f"\n  {BOLD}Epoch {epoch:>3}{RESET}  train={c(YL, f'{avg_train:.4f}')} | val={c(YL, f'{avg_val:.4f}')} | ppl={c(PU, f'{ppl:.1f}')}")
 
