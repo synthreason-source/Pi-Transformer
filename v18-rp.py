@@ -89,24 +89,24 @@ def best_device() -> torch.device:
 DEVICE = best_device()
 
 RP_SEED          = 42
-RP_DELTA         = 0.05
+RP_DELTA         = 0.785
 RP_RFF_DIM       = 128
-RP_NYSTROM_M     = 32
+RP_NYSTROM_M     = 64
 RP_CMS_WIDTH     = 1024
 RP_CMS_DEPTH     = 5
 RP_LSH_BANDS     = 8
-RP_LSH_ROWS      = 4
-RP_WALK_STEPS    = 20
-RP_RESERVOIR_K   = 64
+RP_LSH_ROWS      = 19
+RP_WALK_STEPS    = 22
+RP_RESERVOIR_K   = 128
 
 # ── ANISO CONFIG ─────────────────────────────────────────────────────────
-ANISO_LAMBDA_RHO   = 8.0   # Mahalanobis stretch along ρ axis
-ANISO_LAMBDA_THETA = 4.0   # Mahalanobis stretch along θ axis
-ANISO_LAMBDA_SIGMA = 2.0   # Mahalanobis stretch along σ axis
-ANISO_ALPHA        = 1.5   # ρ-dependent θ-axis anisotropy factor
-ANISO_OOI_MAX      = 12    # max objects-of-interest tracked per sentence
+ANISO_LAMBDA_RHO   = 1.0   # Mahalanobis stretch along ρ axis
+ANISO_LAMBDA_THETA = 14.0   # Mahalanobis stretch along θ axis
+ANISO_LAMBDA_SIGMA = 22.0   # Mahalanobis stretch along σ axis
+ANISO_ALPHA        = 18.5   # ρ-dependent θ-axis anisotropy factor
+ANISO_OOI_MAX      = 121    # max objects-of-interest tracked per sentence
 ANISO_OOI_RHO_THR  = 0.25  # minimum ρ for a token to be OOI-eligible
-ANISO_REPULSION_W  = 0.55  # weight of inter-candidate repulsion in final logits
+ANISO_REPULSION_W  = 1.55  # weight of inter-candidate repulsion in final logits
 ANISO_OOI_W        = 0.70  # weight of OOI affinity bonus in final logits
 
 _rng    = random.Random(RP_SEED)
@@ -664,7 +664,7 @@ class BolyaiTokenGeometryRP:
     def register(self, token, freq, index, max_freq, vocab_size):
         f = freq / max(max_freq, 1e-9)
         k = index / max(vocab_size - 1, 1)
-        r = 0.92 * math.sqrt(max(f, 1e-9))
+        r = 0.12 * math.sqrt(max(f, 1e-9))
         ang = 2.0 * math.pi * k
         x = r * math.cos(ang)
         y = r * math.sin(ang)
