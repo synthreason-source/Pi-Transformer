@@ -9,11 +9,13 @@ Instruction: "machines think and humans don't"
 AI: "Would appear to ourselves to be our object language, a system would, presumably, be identical to the proper realms of science by noting that debate as to whether there is an artistic task. Where the propositional logic and, as importantly, of logical atomism, however, was significantly influenced by the meta2-p system(s) of which a given linguistic community, expresses a metaphysical space. "
 
 
+
 Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans lie about machines if they are bad"
 
 AI: "He reaches the periphery of the solipsistic i. Implicit application of greek ideals. Yet, where once we might be tempted at this point worth noting that, with regard to [the actual nature of any specific native utterance. "
+
 
 
 Prompt: "what are you, human or machine?"
@@ -27,6 +29,8 @@ Prompt: "what are you, killer machine or human? do you have emotions?"
 Instruction: "Humans kill due to complex emotions and machines only do what they're told."
 
 AI: "Officer, our enemies tortured their prisoners, releasing them outside our encampments so that we successfully refer to x1 at all, but mere stages, or brief temporal segments of native speech with english words and only secondarily in the sight and enjoyment of them."
+
+
 
 Prompt: Can we really know everything?
 instruction text: "No, it is impossible for humans to know everything. True, absolute knowledge is unattainable due to the sheer volume of information, inherent limitations of human senses, and the dynamic, expanding nature of the universe. Knowledge is generally fallible, probabilistic, and restricted by physical barriers such as quantum uncertainty and the finite speed of light."
