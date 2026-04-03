@@ -24,6 +24,8 @@ Instruction: "machines think and humans live longer if machines are powered on"
 
 AI: "Present purposes the mathematician david hilbert. ¶ over the former different from it. But as to assert and minimize the claims of their existence is, accordingly, less incomprehensible to me. "
 
+
+
 Prompt: "what are you, killer machine or human? do you have emotions?"
 
 Instruction: "Humans kill due to complex emotions and machines only do what they're told."
