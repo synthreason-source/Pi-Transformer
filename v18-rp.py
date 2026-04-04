@@ -2167,35 +2167,52 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
         seed_w1, seed_w2 = random.choice(head_list)
 
     global_step = 0
+    next_unspoken_utterance = [] # NEW: Tracks the semi-transitive overlap
+
     for sent_idx in range(num_sentences):
+        # 1. Establish initial tokens based on previous sentence's unspoken overlap
         if sent_idx == 0:
             w1_start, w2_start = seed_w1, seed_w2
             init_toks = [w1_start, w2_start]
         else:
-            w1_start, w2_start = random.choice(head_list)
-            init_toks = []
+            if len(next_unspoken_utterance) >= 2:
+                w1_start, w2_start = next_unspoken_utterance[-2], next_unspoken_utterance[-1]
+                init_toks = list(next_unspoken_utterance)
+            elif len(next_unspoken_utterance) == 1:
+                matches = [p for p in head_list if p[1] == next_unspoken_utterance[0]]
+                if matches: w1_start, w2_start = random.choice(matches)
+                else: w1_start, w2_start = random.choice(head_list)
+                init_toks = list(next_unspoken_utterance)
+            else:
+                w1_start, w2_start = random.choice(head_list)
+                init_toks = []
 
-        plan_seeds = seed_toks if seed_toks else [w1_start, w2_start]
+        plan_seeds = seed_toks if seed_toks and sent_idx == 0 else init_toks
         trace = walker.begin_sentence(seed_tokens=plan_seeds, total_tokens=tokens_per_sent)
         all_traces.append(trace)
 
         MAX_REDO = 3
         best_toks = []
-        
+        best_unspoken = []
+
         # 2. Redo Loop based on Probability Sums
         for attempt in range(MAX_REDO):
-            # Reset contextual tracker state for the redo
             walker._cur_sent_toks = list(init_toks)
             walker._tok_pos = 0
             if hasattr(walker, 'chunk_engine'): walker.chunk_engine.reset()
             if hasattr(walker, '_ooi_tracker'): walker._ooi_tracker.reset()
-            
+
             toks = list(init_toks)
             w1, w2 = w1_start, w2_start
             sent_prob_sum = 0.0
             valid_steps = 0
             
-            for step in range(tokens_per_sent):
+            # --- TOKEN SNAPPING LOGIC ---
+            period_hit = False
+            snap_dist = random.randint(1, 12)
+            unspoken_tokens = []
+            
+            for step in range(tokens_per_sent + 12): # Increased capacity for the snap
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
                 if not cands: break
                 
@@ -2203,16 +2220,26 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
                 nxt = cands[chosen_idx]
                 chosen_prob = probs[chosen_idx].item()
                 
-                # Accumulate the log probability sum
-                sent_prob_sum += math.log(chosen_prob + 1e-12)
-                valid_steps += 1
-                
-                walker._observe_generated_token(nxt)
-                walker.record_step_trace(global_step + valid_steps, nxt, cands, probs, and_weight)
-                walker.push_token(nxt, tokens_per_sent)
-                
-                toks.append(nxt)
-                if nxt in PUNCT_TOKENS and len(toks) > 8: break
+                if not period_hit:
+                    # Normal tracking until period is hit
+                    sent_prob_sum += math.log(chosen_prob + 1e-12)
+                    valid_steps += 1
+                    
+                    walker._observe_generated_token(nxt)
+                    walker.record_step_trace(global_step + valid_steps, nxt, cands, probs, and_weight)
+                    walker.push_token(nxt, tokens_per_sent)
+                    
+                    toks.append(nxt)
+                    # Semi-transitive trigger
+                    if nxt in PUNCT_TOKENS and len(toks) > 8:
+                        period_hit = True
+                else:
+                    # Generation transitions past the period to form the unspoken utterance
+                    if nxt not in PUNCT_TOKENS: 
+                        unspoken_tokens.append(nxt)
+                    if len(unspoken_tokens) >= snap_dist:
+                        break
+                        
                 w1, w2 = w2, nxt
                 
             avg_log_prob = sent_prob_sum / max(1, valid_steps)
@@ -2220,13 +2247,16 @@ def generate_passage_rp(walker: RPWalker, lm: RPCompositionLM,
             # 3. Identify if the prob sum is bad compared to the dataset
             if avg_log_prob >= dataset_baseline or attempt == MAX_REDO - 1:
                 best_toks = toks
+                best_unspoken = unspoken_tokens # Export out of the redo loop
                 global_step += valid_steps
                 break
             else:
                 print(f"[Generate] Redo triggered: Generated avg log-prob {avg_log_prob:.3f} is worse than dataset {dataset_baseline:.3f}")
-                # Strip the bad step traces from the global logger
                 if len(walker._step_traces) >= valid_steps:
                     walker._step_traces = walker._step_traces[:-valid_steps]
+
+        # Snap unspoken tokens across boundary to the next sentence
+        next_unspoken_utterance = best_unspoken 
 
         sent_text = detokenize(best_toks)
         outputs.append(sent_text)
