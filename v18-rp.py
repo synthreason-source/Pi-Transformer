@@ -1584,6 +1584,38 @@ class AutomorphicAwarenessRP:
         # return the updated rho, bounded to [0, 0.999]
         return rho_new.clamp(0.0, 0.999)
 
+
+class ContralateralTemporalResizingRP:
+    def __init__(self, device='cpu'):
+        self.device = device
+        self.temporal_past = {'was', 'were', 'had', 'before', 'yesterday', 'previously', 'past', 'then', 'ago'}
+        self.temporal_future = {'will', 'shall', 'after', 'tomorrow', 'next', 'soon', 'future', 'now'}
+
+    def get_temporal_mask(self, cands):
+        import torch
+        mask = torch.zeros(len(cands), dtype=torch.float32, device=self.device)
+        for i, c in enumerate(cands):
+            c_lower = c.lower()
+            if c_lower in self.temporal_past:
+                mask[i] = -0.5
+            elif c_lower in self.temporal_future:
+                mask[i] = 0.5
+        return mask
+
+    def apply_resizing(self, rho, theta, mask, strength=0.3):
+        import math
+        import torch
+        shift = mask * strength
+        shift = shift.clamp(-0.99, 0.99)
+        rho_new = (rho + shift) / (1.0 + rho * shift)
+        rho_new = rho_new.clamp(0.0, 0.999)
+
+        active = (mask != 0.0).float()
+        theta_new = theta + (active * math.pi)
+        theta_new = (theta_new + math.pi) % (2 * math.pi) - math.pi
+        return rho_new, theta_new
+
+
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
                  chunk_engine, iso_stacker, pdn_engine, cot_engine, instr_dist, rff,
@@ -1621,6 +1653,7 @@ class RPWalker:
         self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
+        self._temporal_resizing = ContralateralTemporalResizingRP(device=device)
 
         # Pending state for step-trace recording
         self._pending_instr_probs=None; self._pending_walk_logits=None
@@ -1768,6 +1801,27 @@ class RPWalker:
         caus_mask = self._automorph_causation.get_causation_mask(cands)
         c_rho_warped_caus = self._automorph_causation.apply_moebius_shift(c_rho, caus_mask, strength=0.4)
         c_rho = c_rho_warped_caus  # Substitute the warped geometry for the remainder of the computations
+
+        # ── Contralateral Temporal Resizing Warp ────────────────────────
+        temp_mask = self._temporal_resizing.get_temporal_mask(cands)
+        c_rho, c_theta = self._temporal_resizing.apply_resizing(c_rho, c_theta, temp_mask, strength=0.4)
+
+        # ── Heavy Center Repulsion Recalculation ────────────────────────
+        # 1. Heavily subtract the sentence centers (c_rho - center_rho) via OOI affinity
+        ooi_aff, repulsion = self._aniso_features(c_rho, c_theta, c_sigma, base_probs)
+        ooi_aff_heavy = ooi_aff * 5.0 # heavily penalize centers
+
+        # 2. Recalculate probs
+        temp_logits = torch.log(base_probs.clamp(min=1e-12))
+        temp_probs = torch.softmax(temp_logits - ooi_aff_heavy, dim=-1)
+
+        # 3. Clip in the mean
+        mean_prob = temp_probs.mean()
+        temp_probs = temp_probs.clamp(max=mean_prob)
+
+        # 4. Minus again
+        final_penalty = temp_probs * ooi_aff_heavy
+        # ────────────────────────────────────────────────────────────────
 
         # Re-stack c_pvec with warped rho
         c_pvec = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
