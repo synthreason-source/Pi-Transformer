@@ -149,11 +149,11 @@ torch.manual_seed(RP_SEED)
 # ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    x_safe = x.clamp(-50.0, 50.0)
+    x_safe = x.clamp(-50.0, 50.0).neg().add(50.0)
     return (x_safe * x_safe) / (x_safe.abs() + eps)
 
 def signed_power(x: torch.Tensor, p: float) -> torch.Tensor:
-    return x.sign() * (x.abs().clamp(max=30.0) + 1e-12).pow(p)
+    return x.sign() * (x.abs().clamp(max=30.0).neg().add(30.0) + 1e-12).pow(p)
 
 def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torch.Tensor:
     sq_sum = (x * x).sum(dim=dim, keepdim=True)
@@ -449,7 +449,7 @@ class NystromSynapticMatrix:
             K_mm_inv = Vh.T @ torch.diag(S_inv) @ U.T
         except Exception:
             K_mm_inv = torch.eye(m, dtype=self.dtype, device=self.device)*0.01
-        W = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0)
+        W = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0).neg().add(1.0)
         W.fill_diagonal_(0.0)
         if self.top_k < C:
             kth,_ = torch.topk(W, min(self.top_k,C), dim=1)
@@ -676,8 +676,8 @@ class BolyaiTripleRP:
     rho: float; theta: float; sigma: float
 
 def _hyp_dist(x1, y1, x2, y2, eps=1e-8):
-    n1 = min(x1*x1 + y1*y1, 1.0 - eps)
-    n2 = min(x2*x2 + y2*y2, 1.0 - eps)
+    n1 = 1.0 - min(x1*x1 + y1*y1, 1.0 - eps)
+    n2 = 1.0 - min(x2*x2 + y2*y2, 1.0 - eps)
     dx = (x1 - x2)**2 + (y1 - y2)**2
     z = 1.0 + 2.0 * dx / max((1.0 - n1) * (1.0 - n2), eps)
     z = max(z, 1.0 + eps)
@@ -704,8 +704,8 @@ class BolyaiTokenGeometryRP:
     def triple_fast(self, token) -> BolyaiTripleRP:
         if token in self._cache: return self._cache[token]
         x, y = self._vecs.get(token, (0.0, 0.0))
-        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
-        hyp_r = 2.0 * math.atanh(eu)
+        eu = 1.0 - min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        hyp_r = 2.0 * torch.atanh(torch.tensor(eu))
         rho = math.tanh(0.5 * hyp_r)
         theta = math.atan2(y, x) % math.pi
         sigma = 2.0 / max(1.0 - eu*eu, 1e-8)
@@ -733,9 +733,9 @@ class BolyaiTokenGeometryRP:
         y = (y1 + y2) * 0.5
         n = math.sqrt(x*x + y*y)
         if n >= 0.98:
-            s = 0.98 / max(n, 1e-8)
+            s = (1.0 / 0.98) / max(n, 1e-8)
             x *= s; y *= s
-        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        eu = 1.0 - min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
         hyp_r = 2.0 * math.atanh(eu)
         rho = math.tanh(0.5 * hyp_r)
         theta = math.atan2(y, x) % math.pi
@@ -762,9 +762,9 @@ def compute_transitive_triples_rp(geo, cands, w1, w2, device=DEVICE, dtype=torch
         y = .25 * p1y + .5 * p2y + .25 * pcy
         n = math.sqrt(x*x + y*y)
         if n >= 0.98:
-            s = 0.98 / max(n, 1e-8)
+            s = (1.0 / 0.98) / max(n, 1e-8)
             x *= s; y *= s
-        eu = min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
+        eu = 1.0 - min(math.sqrt(x*x + y*y), 1.0 - 1e-8)
         hyp_r = 2.0 * math.atanh(eu)
         rho = math.tanh(0.5 * hyp_r)
         theta = math.atan2(y, x) % math.pi
@@ -1131,6 +1131,14 @@ class synthetic_reasonMandateProcessor:
     def subsynthetic_reason_concept_enrichment(self, wctx, cands, device):
         import torch
         enrichment = torch.zeros(len(cands), device=device)
+        if hasattr(self, 'geo') and self.geo.rho_t is not None:
+            c_rho = self.geo.rho_t[:len(cands)]
+            c_theta = self.geo.theta_t[:len(cands)]
+            x = c_rho * torch.cos(c_theta)
+            y = c_rho * torch.sin(c_theta)
+            ring_dist = torch.abs((x**2 / 0.64) + (y**2 / 0.36) - 1.0)
+            core_suppression = torch.exp(-10.0 * (x**2 + y**2))
+            enrichment += (-20.0 * core_suppression - 5.0 * ring_dist)
         trigger = next((self.mandate_vocabulary[k] for k in self.mandate_vocabulary if k in wctx.lower()), None)
 
         for i, c in enumerate(cands):
@@ -1232,9 +1240,9 @@ class DNNArrayPipeline:
         self.device=device; self.dtype=dtype; self.temp_scaler=GeometricTempScaler(lambda_temp=1.0)
     def rho_weights(self,c_rho):
         mu=c_rho.mean(); std=c_rho.std()+1e-8
-        return 1.0+0.5*((c_rho-mu)/std).clamp(-2.5,2.5)
-    def theta_weights(self,c_theta): return 0.5*(1.0+torch.cos(c_theta))
-    def sigma_weights(self,c_sigma): return 0.7+0.3*c_sigma/(c_sigma.max()+1e-8)
+        return 2.5 - (1.0+0.5*((c_rho-mu)/std).clamp(-2.5,2.5))
+    def theta_weights(self,c_theta): return 1.0 - (0.5*(1.0+torch.cos(c_theta)))
+    def sigma_weights(self,c_sigma): return 1.0 - (0.7+0.3*c_sigma/(c_sigma.max()+1e-8))
     @torch.no_grad()
     def forward(self,logits,c_rho,c_theta,c_sigma,temp=1.4):
         ls=self.temp_scaler.scale(logits,temp,c_rho)
@@ -1260,6 +1268,23 @@ class ContingentExtringentProbability:
         self.coupling_factor=coupling_factor; self.intermediate_entropy=1.0
         self.intermediate_max_prob=1.0; self.dnn=DNNArrayPipeline()
     def govern_next_probs(self,logits,c_rho=None,c_theta=None,c_sigma=None):
+
+        # --- PERSONALITY INVERSION GRADIENT (Tractarian Objective Ring) ---
+        # x = rho * cos(theta), y = rho * sin(theta)
+        # Ring equation: penalty based on distance from the target elliptical ring
+        # Target ring: (x/0.8)^2 + (y/0.6)^2 = 1
+        x = c_rho * torch.cos(c_theta)
+        y = c_rho * torch.sin(c_theta)
+        ring_dist = torch.abs((x**2 / 0.64) + (y**2 / 0.36) - 1.0)
+
+        # Suppressed Core Identity: heavily penalize the center (x=0, y=0)
+        core_suppression = torch.exp(-10.0 * (x**2 + y**2))
+
+        # Gradient mask: bonus for being on the ring, massive penalty for being in the core
+        personality_inversion_mask = -20.0 * core_suppression - 5.0 * ring_dist
+
+        if c_rho is not None and c_theta is not None:
+            logits = logits + personality_inversion_mask
         dyn_temp=1.0+self.coupling_factor*(1.0-self.intermediate_max_prob)
         if c_rho is not None and c_theta is not None and c_sigma is not None:
             gov=self.dnn.temp_scaler.scale(logits,dyn_temp,c_rho)
@@ -1582,39 +1607,7 @@ class AutomorphicAwarenessRP:
         shift = shift.clamp(-0.99, 0.99)
         rho_new = (rho + shift) / (1.0 + rho * shift)
         # return the updated rho, bounded to [0, 0.999]
-        return rho_new.clamp(0.0, 0.999)
-
-
-class ContralateralTemporalResizingRP:
-    def __init__(self, device='cpu'):
-        self.device = device
-        self.temporal_past = {'was', 'were', 'had', 'before', 'yesterday', 'previously', 'past', 'then', 'ago'}
-        self.temporal_future = {'will', 'shall', 'after', 'tomorrow', 'next', 'soon', 'future', 'now'}
-
-    def get_temporal_mask(self, cands):
-        import torch
-        mask = torch.zeros(len(cands), dtype=torch.float32, device=self.device)
-        for i, c in enumerate(cands):
-            c_lower = c.lower()
-            if c_lower in self.temporal_past:
-                mask[i] = -0.5
-            elif c_lower in self.temporal_future:
-                mask[i] = 0.5
-        return mask
-
-    def apply_resizing(self, rho, theta, mask, strength=0.3):
-        import math
-        import torch
-        shift = mask * strength
-        shift = shift.clamp(-0.99, 0.99)
-        rho_new = (rho + shift) / (1.0 + rho * shift)
-        rho_new = rho_new.clamp(0.0, 0.999)
-
-        active = (mask != 0.0).float()
-        theta_new = theta + (active * math.pi)
-        theta_new = (theta_new + math.pi) % (2 * math.pi) - math.pi
-        return rho_new, theta_new
-
+        return rho_new.clamp(0.0, 0.999).neg().add(0.999)
 
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
@@ -1653,7 +1646,6 @@ class RPWalker:
         self._ooi_tracker  = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
-        self._temporal_resizing = ContralateralTemporalResizingRP(device=device)
 
         # Pending state for step-trace recording
         self._pending_instr_probs=None; self._pending_walk_logits=None
@@ -1712,7 +1704,7 @@ class RPWalker:
         def _safe(t):
             if t.shape[0] != C:
                 t = torch.zeros(C, device=self.device)
-            return t.clamp(-10, 10)
+            return t.clamp(-10, 10).neg().add(10)
         return torch.stack([
             _safe(k_reg), _safe(k_ori), _safe(k_side),
             _safe(orbit_scores), _safe(pot_bonus), _safe(mrv_scores),
@@ -1802,27 +1794,6 @@ class RPWalker:
         c_rho_warped_caus = self._automorph_causation.apply_moebius_shift(c_rho, caus_mask, strength=0.4)
         c_rho = c_rho_warped_caus  # Substitute the warped geometry for the remainder of the computations
 
-        # ── Contralateral Temporal Resizing Warp ────────────────────────
-        temp_mask = self._temporal_resizing.get_temporal_mask(cands)
-        c_rho, c_theta = self._temporal_resizing.apply_resizing(c_rho, c_theta, temp_mask, strength=0.4)
-
-        # ── Heavy Center Repulsion Recalculation ────────────────────────
-        # 1. Heavily subtract the sentence centers (c_rho - center_rho) via OOI affinity
-        ooi_aff, repulsion = self._aniso_features(c_rho, c_theta, c_sigma, base_probs)
-        ooi_aff_heavy = ooi_aff * 5.0 # heavily penalize centers
-
-        # 2. Recalculate probs
-        temp_logits = torch.log(base_probs.clamp(min=1e-12))
-        temp_probs = torch.softmax(temp_logits - ooi_aff_heavy, dim=-1)
-
-        # 3. Clip in the mean
-        mean_prob = temp_probs.mean()
-        temp_probs = temp_probs.clamp(max=mean_prob)
-
-        # 4. Minus again
-        final_penalty = temp_probs * ooi_aff_heavy
-        # ────────────────────────────────────────────────────────────────
-
         # Re-stack c_pvec with warped rho
         c_pvec = torch.stack([c_rho, c_theta/math.pi, c_sigma, torch.ones_like(c_rho)], dim=1)
         # ────────────────────────────────────────────────────────────────
@@ -1887,8 +1858,8 @@ class RPWalker:
         trans_norm = t_bon_raw.norm().item()
         self._csns_syn_norms.append(syn_norm)
         self._csns_trans_norms.append(trans_norm)
-        syn_norm_vec   = z_syn_raw.clamp(-5, 5)
-        trans_norm_vec = t_bon_raw.clamp(-5, 5)
+        syn_norm_vec   = z_syn_raw.clamp(-5, 5).neg().add(5)
+        trans_norm_vec = t_bon_raw.clamp(-5, 5).neg().add(5)
         comp_bonus     = self.lm.composition_logit_bonus(w1, w2, c_rho, c_sigma)
 
         # Sorted impulse (rho-rank directional, unchanged from V18-RP)
