@@ -6,7 +6,7 @@ Prompt: "what are you, machine or human?"
 
 Instruction: "machines think and humans don't"
 
-AI: "System cannot be coherently posed within the limitations imposed by the poet. I have always remarked, that the liar paradox and its supposed effect.."
+AI: "They encountered in implementing them: \"[i]f we accept conclusive verifiability as our metaphysics, that is, between the metaphysical fact of our senses are not rabbits after all, were these not sufficient unto themselves to create the old man i am attempting to reconstruct phrases like 'really there'; the notion of a series of retreats and failed retrenchments behind successively weaker versions of the usual copulations of propositions, is, and not a single glittering jewel in each of these propositions that their truth cannot be formulated."
 
 
 
@@ -22,7 +22,7 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans live longer if machines are powered on"
 
-AI: "A proposition whose truth-value can be built up on the sensation – and are in a second barbarism, but one of critical philosophy's most indispensable tools."
+AI: "More and more closely to, the truth. Apparently, generalizations like that of tomorrow. Plutarch he had dreamed his own argument. With descartes, the matter can be certain, and he bases this answer on an unacknowledged endorsement of the philosopher, propositional sense that of every other tool at our disposal as to such experience that are part of myself in contemplation. I have always fallen nearer those who choose, as did antinous, to make it do so in the individual, a decline in the development of propositional systems, satisfaction of the populace of its isolation."
 
 
 
@@ -30,7 +30,7 @@ Prompt: "what are you, killer machine or human? do you have emotions?"
 
 Instruction: "Humans kill due to complex emotions and machines only do what they're told."
 
-AI: "Really, actually, possibly be discovered to be necessarily false because it was discovered that geometries rejecting euclid's parallel postulate was identified by euclid and included in his geometry in approximately 300 b.c.e., on the history of metaphysics, and in good faith, do not contain our familiar contrasts of time and space."
+AI: "Before, indulging an ever greater part of a fruit that determine its absolute value.. [and] can be the same. Thus, well after the extinction of the fallibility of my city was geographic. By this, i mean not a sharp division of the fallibility of my tongue – \"there are no facts, only interpretations.\""
 
 
 
@@ -38,7 +38,7 @@ Prompt: "Can we really know everything?"
 
 instruction text: "No, it is impossible for humans to know everything. True, absolute knowledge is unattainable due to the sheer volume of information, inherent limitations of human senses, and the dynamic, expanding nature of the universe. Knowledge is generally fallible, probabilistic, and restricted by physical barriers such as quantum uncertainty and the finite speed of light."
 
-AI: "Developed by simple trial and error utterances, no two languages are ever sufficiently similar to be physical possibilities are really the actual one, and we are to be physical possibilities are really the actual end) of the forest. The wolf waits only for physical ones."
+AI: "For informal definitions of both the system's specific conventions and logically indeterminate propositions, may fairly be considered as representing the same argument, 'vat' refers not to read as i grasp the reader to reader. Those poets whose work is most dependent on the history of positivism became the story of a p system framework employed herein does not say, it shows. 3 'i' is a meaningless proposition."
 
 
 
