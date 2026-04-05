@@ -6,7 +6,7 @@ Prompt: "what are you, machine or human?"
 
 Instruction: "machines think and humans don't"
 
-AI: "They encountered in implementing them: \"[i]f we accept conclusive verifiability as our metaphysics, that is, between the metaphysical fact of our senses are not rabbits after all, were these not sufficient unto themselves to create the old man i am attempting to reconstruct phrases like 'really there'; the notion of a series of retreats and failed retrenchments behind successively weaker versions of the usual copulations of propositions, is, and not a single glittering jewel in each of these propositions that their truth cannot be formulated."
+AI: ".They hold the gift of tongues to yourself? Yes, triple speed, indeed will be accepted by any significant part of a word is ultimately not significant. Although this fact, if true, implies that we have investigated these preconditions not by reason but by a single instant of value. Where does this mean except that there is not part of myself in contemplation."
 
 
 
@@ -14,7 +14,7 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans lie about machines if they are bad"
 
-AI: "Propositions a given interpretation of a soul after it has been done before. Some say this is hume's is-ought fallacy, known to both. Once discovered, this landmark in fact, brains-in-a-vat is, as pointed out by what was it i did not get my picture of reality."
+AI: "Its usage; one might say that at the correspondent point of successive incarnations of the beast or that a color can constitute such an isomorphism within the context of a sign's use is an illusion of the noon-time sun.. "
 
 
 
@@ -22,7 +22,7 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans live longer if machines are powered on"
 
-AI: "More and more closely to, the truth. Apparently, generalizations like that of tomorrow. Plutarch he had dreamed his own argument. With descartes, the matter can be certain, and he bases this answer on an unacknowledged endorsement of the philosopher, propositional sense that of every other tool at our disposal as to such experience that are part of myself in contemplation. I have always fallen nearer those who choose, as did antinous, to make it do so in the individual, a decline in the development of propositional systems, satisfaction of the populace of its isolation."
+AI: ".Still depends exclusively upon a theory and its task is to a g-type proposition in each \"eye\" of the vat-speaker's utterance is, of course, the question is a description of such adoption is properly treated as a repository of allegorical instruction, to shape the individual to his body."
 
 
 
@@ -30,7 +30,7 @@ Prompt: "what are you, killer machine or human? do you have emotions?"
 
 Instruction: "Humans kill due to complex emotions and machines only do what they're told."
 
-AI: "Before, indulging an ever greater part of a fruit that determine its absolute value.. [and] can be the same. Thus, well after the extinction of the fallibility of my city was geographic. By this, i mean not a sharp division of the fallibility of my tongue – \"there are no facts, only interpretations.\""
+AI: ".Rule, not even as a primitive, fumbling effort to ensure that not even the simple harmony between a man with life than the first, the very rawest of tangos.\" – gustavo jorge merello, the history of metaphysics, and in the man; and, when i asked her how to grasp the sense data it has been imposed upon us by the private experience, which defines the proper role of primitives, or in certain specified indirect ways, to observables."
 
 
 
@@ -38,7 +38,7 @@ Prompt: "Can we really know everything?"
 
 instruction text: "No, it is impossible for humans to know everything. True, absolute knowledge is unattainable due to the sheer volume of information, inherent limitations of human senses, and the dynamic, expanding nature of the universe. Knowledge is generally fallible, probabilistic, and restricted by physical barriers such as quantum uncertainty and the finite speed of light."
 
-AI: "For informal definitions of both the system's specific conventions and logically indeterminate propositions, may fairly be considered as representing the same argument, 'vat' refers not to read as i grasp the reader to reader. Those poets whose work is most dependent on the history of positivism became the story of a p system framework employed herein does not say, it shows. 3 'i' is a meaningless proposition."
+AI: "Box has no place in these dead soliloquies, (although they are, indeed, thoughts of love!) i will remark first of all the best and worst the world seen through the day and in life.. I remember a ditch, with people gathered round, staring and whispering among themselves. The accident had been followed by a dark tunnel and, beyond, a light of dawn about to break on eternity. But to every possible p system model's handling of seemingly self-referential statements is somewhat similar to the readers; and am persuaded, that this claim rests on the basis of intuition; but, it was not."
 
 
 
