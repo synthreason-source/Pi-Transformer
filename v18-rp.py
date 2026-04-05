@@ -2573,7 +2573,7 @@ def build_gradio_app() -> gr.Blocks:
                 n_sents   = gr.Slider(1,16,value=4,step=1,label="Sentences")
                 toks_sent = gr.Slider(10,120,value=80,step=5,label="Tokens/sentence")
                 and_w     = gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
-                temp      = gr.Slider(0.5,5.0,value=5.0,step=0.1,label="Temperature")
+                temp      = gr.Slider(0.5,15.0,value=5.0,step=0.1,label="Temperature")
                 show_tr   = gr.Checkbox(value=True,label="Show traces")
             gen_btn  = gr.Button("Generate")
             gen_out  = gr.Textbox(lines=8,  label="Generated text")
