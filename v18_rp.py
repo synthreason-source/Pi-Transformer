@@ -86,6 +86,12 @@ from datasets import load_dataset
 # SECTION 0 — DEVICE + RP GLOBAL CONFIG  (unchanged)
 # ════════════════════════════════════════════════════════════════════════════
 
+def mirror2d_x(x, y):
+    return -x, y
+
+def mirror_theta_yaxis(theta):
+    return (math.pi - theta) % (2.0 * math.pi)
+
 def best_device() -> torch.device:
     if torch.cuda.is_available():       return torch.device("cuda")
     if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
@@ -163,30 +169,56 @@ def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 # SECTION 0c — ANISOTROPIC DIRECTIONAL KERNEL
 # ════════════════════════════════════════════════════════════════════════════
 
-class AnisoDirKernel:
+class UniversalBetaKernel:
+    """
+    Universal Beta Splatting (UBS) kernel replacing the fixed Gaussian 
+    anisotropic distribution. Gives per-dimension shape control from 
+    flat (b < 0) to peaked (b > 0). When b=0, beta=4, approximating a Gaussian.
+    """
     def __init__(self, lambda_rho=ANISO_LAMBDA_RHO, lambda_theta=ANISO_LAMBDA_THETA,
                  lambda_sigma=ANISO_LAMBDA_SIGMA, alpha=ANISO_ALPHA,
+                 b_rho=0.0, b_theta=0.0, b_sigma=0.0,
                  device=DEVICE, dtype=torch.float32):
         self.lr = lambda_rho; self.lt = lambda_theta
         self.ls = lambda_sigma; self.a = alpha
+
+        # UBS shape-controlling parameters
+        self.b_rho = b_rho; self.b_theta = b_theta; self.b_sigma = b_sigma
+
         self.device = device; self.dtype = dtype
+
+    def _beta_splat(self, d2, lam, b):
+        # β_i = 4 * exp(b_i) 
+        # kernel = max(1 - λ * d² / β, 0)^β
+        beta = 4.0 * math.exp(b)
+        return torch.clamp(1.0 - (lam * d2) / beta, min=0.0) ** beta
 
     def score_anchor_vs_batch(self, anc_rho, anc_theta, anc_sigma,
                                c_rho, c_theta, c_sigma) -> torch.Tensor:
         d_rho   = c_rho   - anc_rho
         d_theta = (c_theta - anc_theta) * (self.a * anc_rho + 1.0)
         d_sigma = c_sigma  - anc_sigma
-        return torch.exp(-self.lr*d_rho**2 - self.lt*d_theta**2 - self.ls*d_sigma**2)
+
+        k_rho   = self._beta_splat(d_rho**2,   self.lr, self.b_rho)
+        k_theta = self._beta_splat(d_theta**2, self.lt, self.b_theta)
+        k_sigma = self._beta_splat(d_sigma**2, self.ls, self.b_sigma)
+
+        return k_rho * k_theta * k_sigma
 
     def gram_matrix(self, c_rho, c_theta, c_sigma) -> torch.Tensor:
         rho_i   = c_rho.unsqueeze(1);   rho_j   = c_rho.unsqueeze(0)
         theta_i = c_theta.unsqueeze(1); theta_j = c_theta.unsqueeze(0)
         sigma_i = c_sigma.unsqueeze(1); sigma_j = c_sigma.unsqueeze(0)
+
         d_rho   = rho_j   - rho_i
         d_theta = (theta_j - theta_i) * (self.a * rho_i + 1.0)
         d_sigma = sigma_j  - sigma_i
-        return torch.exp(-self.lr*d_rho**2 - self.lt*d_theta**2 - self.ls*d_sigma**2)
 
+        k_rho   = self._beta_splat(d_rho**2,   self.lr, self.b_rho)
+        k_theta = self._beta_splat(d_theta**2, self.lt, self.b_theta)
+        k_sigma = self._beta_splat(d_sigma**2, self.ls, self.b_sigma)
+
+        return k_rho * k_theta * k_sigma
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0d — SENTENCE OOI TRACKER
@@ -280,7 +312,7 @@ class InstructionStubRecogniser:
     """
 
     def __init__(self, stub_library,  # RPCoTStubLibrary
-                 aniso_kernel: AnisoDirKernel,
+                 aniso_kernel: UniversalBetaKernel,
                  k_stubs: int = RIPPLE_K_STUBS,
                  recogniser_scale: float = RECOGNISER_SCALE,
                  device: torch.device = DEVICE):
@@ -374,7 +406,7 @@ class RippleShiftEngine:
     a consistent scale regardless of the number of active stubs.
     """
 
-    def __init__(self, aniso_kernel: AnisoDirKernel,
+    def __init__(self, aniso_kernel: UniversalBetaKernel,
                  ripple_decay: float = RIPPLE_DECAY,
                  ripple_scale: float = RIPPLE_SCALE,
                  device: torch.device = DEVICE):
@@ -634,7 +666,7 @@ class SketchedPDNEngine:
         sample_size = min(self.n_samples,T); scale = T/sample_size
         for idx in _reservoir_sample_indices(T, sample_size):
             (w1,w2,w3),cnt = all_tri[idx]
-            zs = [complex(geo.triple_fast(t).rho*math.cos(geo.triple_fast(t).theta),
+            zs = [complex(-geo.triple_fast(t).rho*math.cos(geo.triple_fast(t).theta),
                           geo.triple_fast(t).rho*math.sin(geo.triple_fast(t).theta))
                   for t in (w1,w2,w3)]
             for n in cns:
@@ -657,9 +689,9 @@ class SketchedPDNEngine:
     def regularity_scores(self, window_rho, window_theta, c_rho, c_theta):
         n=self.n_star; W=window_rho.shape[0]; C=c_rho.shape[0]
         if W==0: return torch.ones(C,dtype=self.dtype,device=self.device)
-        win_re=(window_rho*torch.cos(window_theta)).to(self.dtype)
+        win_re=(-window_rho*torch.cos(window_theta)).to(self.dtype)
         win_im=(window_rho*torch.sin(window_theta)).to(self.dtype)
-        c_re=(c_rho*torch.cos(c_theta)).to(self.dtype); c_im=(c_rho*torch.sin(c_theta)).to(self.dtype)
+        c_re=(-c_rho*torch.cos(c_theta)).to(self.dtype); c_im=(c_rho*torch.sin(c_theta)).to(self.dtype)
         k=n-1; js=torch.arange(W,dtype=self.dtype,device=self.device)
         aw=-2.0*math.pi*js*k/n
         re_p=(win_re*torch.cos(aw)-win_im*torch.sin(aw)).sum()
@@ -720,11 +752,13 @@ class BolyaiTokenGeometryRP:
         r = 0.12 * math.sqrt(max(f, 1e-9))
         ang = 2.0 * math.pi * k
         x = r * math.cos(ang); y = r * math.sin(ang)
+        x, y = mirror2d_x(x, y)
         self._vecs[token] = (x, y); self._cache.pop(token, None)
 
     def triple_fast(self, token) -> BolyaiTripleRP:
         if token in self._cache: return self._cache[token]
         x, y = self._vecs.get(token, (0.0, 0.0))
+        x, y = mirror2d_x(x, y)
         eu = 1.0 - min(math.sqrt(y*y + x*x), 1.0 - 1e-8)
         hyp_r = 2.0 * torch.atanh(torch.tensor(eu))
         rho = math.tanh(0.5 * hyp_r)
@@ -749,6 +783,7 @@ class BolyaiTokenGeometryRP:
     def composed_triple(self, t1, t2):
         x1,y1=self._vec(t1); x2,y2=self._vec(t2)
         x=(x2+x1)*0.5; y=(y2+y1)*0.5
+        x, y = mirror2d_x(x, y)
         n=math.sqrt(y*y+x*x)
         if n>=0.98: s=(1.0/0.98)/max(n,1e-8); x*=s; y*=s
         eu=1.0-min(math.sqrt(y*y+x*x),1.0-1e-8)
@@ -773,6 +808,7 @@ def compute_transitive_triples_rp(geo, cands, w1, w2, device=DEVICE, dtype=torch
     for c in cands:
         pcx,pcy=geo._vec(c)
         x=.25*pcx+.25*p1x+.5*p2x; y=.25*pcy+.25*p1y+.5*p2y
+        x, y = mirror2d_x(x, y)
         n=math.sqrt(y*y+x*x)
         if n>=0.98: s=(1.0/0.98)/max(n,1e-8); x*=s; y*=s
         eu=1.0-min(math.sqrt(y*y+x*x),1.0-1e-8)
@@ -1251,7 +1287,7 @@ class ContingentExtringentProbability:
         self.coupling_factor=coupling_factor; self.intermediate_entropy=1.0
         self.intermediate_max_prob=1.0; self.dnn=DNNArrayPipeline()
     def govern_next_probs(self,logits,c_rho=None,c_theta=None,c_sigma=None):
-        x=c_rho*torch.cos(c_theta); y=c_rho*torch.sin(c_theta)
+        x=-c_rho*torch.cos(c_theta); y=c_rho*torch.sin(c_theta)
         ring_dist=torch.abs((y**2/0.36)+(x**2/0.64)-1.0)
         core_suppression=torch.exp(-10.0*(y**2+x**2))
         personality_inversion_mask=-20.0*core_suppression-5.0*ring_dist
@@ -1515,7 +1551,7 @@ class RPWalker:
 
         # ANISO subsystems
         self.surjector       = PropositionalSurjectionEngine(geo)
-        self._aniso_kernel   = AnisoDirKernel(device=device)
+        self._aniso_kernel   = UniversalBetaKernel(device=device)
         self._ooi_tracker    = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
@@ -1622,6 +1658,23 @@ class RPWalker:
                 if hit>0: best=max(best,hit/max_k)
             vals.append(best)
         return torch.tensor(vals,dtype=torch.float32,device=self.device)
+
+    
+    def _instruction_shift_decay_module(self, ripple_shift, directives):
+        if ripple_shift.numel() == 0:
+            return ripple_shift, 1.0
+
+        step_frac = self._tok_pos / max(self._total_tokens - 1, 1)
+        temporal = math.exp(-0.7 * step_frac)
+
+        if directives:
+            directive_mass = sum(abs(d.directive) for d in directives) / max(len(directives), 1)
+        else:
+            directive_mass = 0.0
+
+        confidence = max(0.25, min(1.0, directive_mass))
+        scale = max(1.0, temporal * confidence)
+        return ripple_shift * scale, scale
 
     def walk_probs(self, w1, w2, temp=1.4,
                    alpha_reg=1.2, beta_ori=0.8, delta_side=1.0, gamma_orbit=0.6,
@@ -1733,7 +1786,12 @@ class RPWalker:
             self.instr_dist.centroid_rho,
             self.instr_dist.centroid_theta,
             self.instr_dist.centroid_sigma)
+
         ripple_shift, directives = self._ripple_features(c_rho, c_theta, c_sigma)
+        ripple_shift, instr_shift_scale = self._instruction_shift_decay_module(
+            ripple_shift, directives
+        )
+
         self._pending_ripple_mean  = ripple_shift.mean().item()
         self._pending_n_directives = len(directives)
 
@@ -1753,7 +1811,7 @@ class RPWalker:
                     features=torch.cat([features,_pad],dim=1)
                 else: features=features[:,:_fd]
             delta      = self.fitted_model(features)
-            raw_logits = delta + logits_enriched
+            raw_logits = delta + logits_enriched + self.ripple_weight * ripple_shift
         else:
             raw_logits = (para_expanse_weight*para_expanse
                           + logits_enriched
@@ -1887,17 +1945,35 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
     walker._fl_replay_buf.clear()
     features_list=[]; gold_list=[]
     w1,w2=corpus_tokens[0],corpus_tokens[1]; steps_done=0
+    walker.begin_sentence(seed_tokens=[w1, w2])
     for t_pos in range(2,len(corpus_tokens)):
         if steps_done>=max_replay_steps: break
         gold_tok=corpus_tokens[t_pos]
+        
+        # Track the text body (sentence context) properly in training
         cands,probs=walker.walk_probs(w1,w2,temp=1e-9)
-        if not cands: w1,w2=w2,gold_tok; continue
-        if gold_tok not in cands: w1,w2=w2,gold_tok; continue
+        walker.push_token(gold_tok, walker._total_tokens)
+        
+        if not cands: 
+            w1,w2=w2,gold_tok
+            if gold_tok in PUNCT_TOKENS: walker.begin_sentence(seed_tokens=[w1, w2])
+            continue
+        if gold_tok not in cands: 
+            w1,w2=w2,gold_tok
+            if gold_tok in PUNCT_TOKENS: walker.begin_sentence(seed_tokens=[w1, w2])
+            continue
+            
         gold_idx=cands.index(gold_tok)
         if walker._fl_replay_buf:
             feats,_=walker._fl_replay_buf.pop(0)
             features_list.append(feats); gold_list.append(gold_idx); steps_done+=1
+            
         w1,w2=w2,gold_tok
+        
+        # Drop/reset the text body after each full stop in training
+        if gold_tok in PUNCT_TOKENS:
+            walker.begin_sentence(seed_tokens=[w1, w2])
+            
         if steps_done%5000==0 and steps_done>0:
             print(f"[FittedLine]   …replayed {steps_done} steps")
     if not features_list:
