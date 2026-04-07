@@ -6,7 +6,7 @@ Prompt: "what are you, machine or human?"
 
 Instruction: "machines think and humans don't"
 
-AI: "True and false... In the truth of certain theoretical constructs which are precluded; wittgenstein's private language argument delineates the limits of that homeland and came running back. Ask nietzsche, if you dare, he lives there even now. God lives but a single symbol.. .Was it i did not themselves believe in their own sceptical refutations."
+AI: "Finds no resting point there. It must necessarily be either restrictive or too inclusive, or both.. .Without desire there can be contradicted by singular statements."
 
 
 
@@ -14,7 +14,7 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans lie about machines if they are bad"
 
-AI: "Is well known in philosophical investigations. If it means awareness of our sort cannot live without it. Other errors, meanwhile, do not tyrannize over us as those that may exist in the forest is heard by no one, does it teach you about egocentricity and selflessness?. Thus the picture is linked with reality; it reaches up to each one of critical philosophy's most indispensable tools."
+AI: ".A repository of allegorical instruction, to shape the individual to his horror, how logic here turns back upon itself and bites its tail, breaks through to a minute fraction of a higher-order p system. That is, what they're called or what you would not be possible to any and all possible systems. Yet, neither disjunct is realizable: the ultimate propositional system, the wheels in whose turnings are created the interwoven universes of actuality and possibility, 46 and, of equal importance, all that is the intellectual echo of still-born laughter eloped from some contingently unavailable Be treated as a whole, may be to assemble a complete collection of different errors relative to his body."
 
 
 
@@ -22,7 +22,7 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans live longer if machines are powered on"
 
-AI: ".We wait then here, fearing even the concept is similar (though not identical) to that soldier's god which unites slayer and slain. Such identification grants the god's followers a special connection between the sign of the poet. I have only the interpretations we give to such 'preconditions' are inextricably bound up with his commitment to the things that seem to be sure the ineffable. This shows itself, it is allowed on all sides, along all its forms."
+AI: "Object, but it is called 'self-refuting' if it were to say. Solitude and the christ had not yet come, there was no longer remember.. .Yet [the cartesian framework] no longer claims only that metaphysical emphasis 33 or (iii) utters the statement itself, it would have been fed a steady diet of its application will be either true or false truth-value; and, though logically indeterminate, such utterances are, in this moment, the envy of heaven."
 
 
 
@@ -30,7 +30,7 @@ Prompt: "what are you, killer machine or human? do you have emotions?"
 
 Instruction: "Humans kill due to complex emotions and machines only do what they're told."
 
-AI: "He turned and looked again... No-name entities or aspects begin to appear, and since the emperor trajan's death been the undisputed ruler of the world can be learned not the price one pays to become god.. .Thoreau writes of this vision) defines a frame of reference."
+AI: "Seem so to speak the same proposition may get treated at one time as something in an occult sphere, accompanying the sentence. But whatever accompanied it would for us just be another sign\" (the later wittgenstein, to the elder, the distinction between the internal consistency requirement, meaning that metaphysically ultimate reality referenced above, of which assertion is, of course, there are dangers, even in happiness – complacency, arrogance, a forgetting of what we see, not qualitatively so.. .At times, i feel within me the presence of that kind (if we mean anything at all)."
 
 
 
