@@ -2431,6 +2431,8 @@ def build_gradio_app() -> gr.Blocks:
             "3-mixer graph before logit injection. Each signal fans into multiple mixers "
             "simultaneously; 2 CrossTangle nodes apply Möbius bilinear interactions between "
             "mixer pairs before they converge. No signal flows cleanly — all are entangled.")
+    # Incrementally increase temporal hyperparameters across 4 stages
+
 
         with gr.Tab("Init / Train"):
             mode   =gr.Radio(["Text file","HuggingFace dataset"],value="Text file",label="Source")
@@ -2440,22 +2442,24 @@ def build_gradio_app() -> gr.Blocks:
                 hf_split=gr.Textbox(value="train",label="Split"); hf_field=gr.Textbox(value="text",label="Field")
                 hf_portion=gr.Slider(0.01,1.0,value=1.0,label="Portion"); hf_max=gr.Textbox(value="",label="Max examples")
             with gr.Row():
-                syn_w=gr.Slider(0.0,5.0,value=1.0,step=0.1,label="Synaptic weight")
-                trans_w=gr.Slider(0.0,5.0,value=1.0,step=0.1,label="Transition weight")
+                gr.Markdown("### Temporal Hyperparameters")
+
+                syn_w=gr.Slider(0.0,5.0,value=22.0,step=0.1,label="Synaptic weight")
+                trans_w=gr.Slider(0.0,5.0,value=22.0,step=0.1,label="Transition weight")
                 syn_k=gr.Slider(1,64,value=16,step=1,label="Synaptic k")
                 rff_dim=gr.Slider(32,512,value=128,step=32,label="RFF dim D")
                 nystrom_m=gr.Slider(8,128,value=32,step=4,label="Nyström m")
-            gr.Markdown("### ANISO Hyperparameters")
+            gr.Markdown("### Temporal ANISO Hyperparameters")
             with gr.Row():
-                ooi_w=gr.Slider(0.0,3.0,value=ANISO_OOI_W,step=0.05,label="OOI affinity weight")
-                rep_w=gr.Slider(0.0,3.0,value=ANISO_REPULSION_W,step=0.05,label="Repulsion weight")
-            gr.Markdown("### RIPPLE Hyperparameters")
+                ooi_w=gr.Slider(0.0,3.0,value=22.10,step=0.05,label="OOI affinity weight")
+                rep_w=gr.Slider(0.0,3.0,value=rpl_w,step=0.05,label="Repulsion weight")
+            gr.Markdown("### Temporal RIPPLE Hyperparameters")
             with gr.Row():
                 rpl_w=gr.Slider(0.0,8.0,value=RIPPLE_WEIGHT,step=0.1,label="Ripple logit weight")
                 rpl_k=gr.Slider(1,20,value=RIPPLE_K_STUBS,step=1,label="Ripple k_stubs")
-            gr.Markdown("### SPAGHETTI Hyperparameters")
+            gr.Markdown("### Temporal SPAGHETTI Hyperparameters")
             with gr.Row():
-                spag_c=gr.Slider(0.0,1.0,value=SPAGHETTI_COUPLING,step=0.05,
+                spag_c=gr.Slider(0.0,1.0,value=0.60,step=0.05,
                                   label="Möbius tangle coupling (0=parallel, 1=fully entangled)")
             init_btn=gr.Button("Initialise + Train"); init_out=gr.Textbox(lines=30,label="Init output")
             init_btn.click(_gui_init,
