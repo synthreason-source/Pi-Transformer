@@ -4,52 +4,52 @@
 NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI
 ===============================================================================
 
-SPAGHETTI PROBS — COMPLETE REWRITE
-───────────────────────────────────
+SPAGHETTI PROBS â€” COMPLETE REWRITE
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 Every probability signal now routes through a multi-lane tangled mixer graph
 instead of a flat weighted sum. No signal feeds cleanly into a single
-destination — each fans into MULTIPLE mixer nodes simultaneously, and the
+destination â€” each fans into MULTIPLE mixer nodes simultaneously, and the
 mixers re-cross before the DNN pipeline. The junction points are explicit
-CrossTangle objects that apply a learnable Möbius-style bilinear interaction
+CrossTangle objects that apply a learnable MÃ¶bius-style bilinear interaction
 between crossing lanes before they diverge again.
 
 ARCHITECTURE
-────────────
-                         ┌──────────────────────────────────────┐
-                         │          SPAGHETTI ROUTER             │
-  instruction_dist ──────┼──→ MixerA ──╮  ╭──→ MixerX ──╮      │
-  ripple_shift     ──────┼──→ MixerA ──┤  │   MixerX ──┤       │
-                   ╲─────┼──→ MixerB   │  │             │       │
-  cot_bonus        ──────┼──→ MixerA ──┤  ╰──→ MixerY   │       │
-                   ╲─────┼──→ MixerC   │      MixerY ──┤       │
-  ooi_affinity     ──────┼──→ MixerA   │                │       │
-                   ╲─────┼──→ MixerB ──╯  CrossTangle   │       │
-  aniso_kernel     ──────┼──→ MixerB       (bilinear)   │       │
-                   ╲─────┼──→ MixerC ──────────────────→ DNN ──→ simplex
-  walk_potential   ──────┼──→ MixerA                            │
-                   ╲─────┼──→ MixerC                            │
-  repulsion(neg)   ──────┼──→ MixerB                            │
-                   ╲─────┼──→ MixerA  (penalty cross-feeds)     │
-  mrv              ──────┼──→ MixerC                            │
-  pdn_bonus        ──────┼──→ MixerB                            │
-  chunk_echo       ──────┼──→ MixerA + MixerC                   │
-                         └──────────────────────────────────────┘
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                         â”Œâ”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”
+                         â”‚          SPAGHETTI ROUTER             â”‚
+  instruction_dist â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA â”€â”€â•®  â•­â”€â”€â†’ MixerX â”€â”€â•®      â”‚
+  ripple_shift     â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA â”€â”€â”¤  â”‚   MixerX â”€â”€â”¤       â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerB   â”‚  â”‚             â”‚       â”‚
+  cot_bonus        â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA â”€â”€â”¤  â•°â”€â”€â†’ MixerY   â”‚       â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerC   â”‚      MixerY â”€â”€â”¤       â”‚
+  ooi_affinity     â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA   â”‚                â”‚       â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerB â”€â”€â•¯  CrossTangle   â”‚       â”‚
+  aniso_kernel     â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerB       (bilinear)   â”‚       â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â†’ DNN â”€â”€â†’ simplex
+  walk_potential   â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA                            â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerC                            â”‚
+  repulsion(neg)   â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerB                            â”‚
+                   â•²â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA  (penalty cross-feeds)     â”‚
+  mrv              â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerC                            â”‚
+  pdn_bonus        â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerB                            â”‚
+  chunk_echo       â”€â”€â”€â”€â”€â”€â”¼â”€â”€â†’ MixerA + MixerC                   â”‚
+                         â””â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”˜
 
 Each CrossTangle node applies:
-    out_i = tanh((a_i + coupling × b_i) / (1 + coupling × a_i × b_i))
-a Möbius cross-shift (hyperbolic automorphism on [-1,1]) that produces
+    out_i = tanh((a_i + coupling Ã— b_i) / (1 + coupling Ã— a_i Ã— b_i))
+a MÃ¶bius cross-shift (hyperbolic automorphism on [-1,1]) that produces
 genuine non-linear interaction between the crossing strands.
 
 The final simplex projection (l1_simplex_project) resolves all tangled
 lanes into a valid probability distribution.
 
 SPAGHETTI PROBABILITY CLASSES
-──────────────────────────────
-  SpaghettiStrand   — a named probability signal with routing metadata
-  SpaghettiMixer    — collects assigned strands, outputs a blended logit vec
-  CrossTangle       — bilinear Möbius interaction between two mixer outputs
-  SpaghettiRouter   — orchestrates all strands, mixers, tangles, final merge
+â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  SpaghettiStrand   â€” a named probability signal with routing metadata
+  SpaghettiMixer    â€” collects assigned strands, outputs a blended logit vec
+  CrossTangle       â€” bilinear MÃ¶bius interaction between two mixer outputs
+  SpaghettiRouter   â€” orchestrates all strands, mixers, tangles, final merge
 
 All other algorithms unchanged from V18-RP-ANISO-RIPPLE.
 """
@@ -62,15 +62,43 @@ from typing import List, Dict, Tuple, Set, Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# >>> INJECTED SCAFFOLDING HELPERS >>>
+def scaffold_inverse(x, eps=1e-6):
+    if not torch.is_tensor(x): return x
+    if x.ndim == 0: return torch.sign(x) / x.abs().clamp_min(eps)
+    if x.ndim == 1: 
+        inv = torch.sign(x) / x.abs().clamp_min(eps)
+        return inv / inv.norm().clamp_min(eps)
+    if x.shape[-1] == x.shape[-2]:
+        eye = torch.eye(x.shape[-1], device=x.device, dtype=x.dtype)
+        return torch.linalg.pinv(x + eps * eye)
+    return x.transpose(-1, -2)
+
+def scaffold_dot(a, b, alpha=0.85, eps=1e-6, inverse_rhs=False):
+    if inverse_rhs: b = scaffold_inverse(b, eps=eps)
+    out = a @ b
+    if not torch.is_tensor(out): return out
+    if out.ndim >= 2 and out.shape[-1] == out.shape[-2]:
+        eye = torch.eye(out.shape[-1], device=out.device, dtype=out.dtype)
+        return alpha * out + (1.0 - alpha) * eye
+    if torch.is_tensor(a) and a.shape == out.shape:
+        return alpha * out + (1.0 - alpha) * a
+    return out
+
+def inverse_distribution(probs, eps=1e-6):
+    inv = probs.clamp_min(eps).reciprocal()
+    return inv / inv.sum(dim=-1, keepdim=True).clamp_min(eps)
+# <<< INJECTED SCAFFOLDING HELPERS <<<
 import torch.optim as optim
 import gradio as gr
 import numpy as np
 
 from datasets import load_dataset
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0 — DEVICE + GLOBAL CONFIG
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0 â€” DEVICE + GLOBAL CONFIG
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def best_device() -> torch.device:
     if torch.cuda.is_available():       return torch.device("cuda")
@@ -108,8 +136,8 @@ RECOGNISER_SCALE    = 0.5
 PARA_DUP_WINDOW     = 5
 PARA_DUP_MATCH_CAP  = 5
 
-# ── SPAGHETTI CONFIG ─────────────────────────────────────────────────────
-SPAGHETTI_COUPLING   = 0.35   # Möbius cross-coupling strength per tangle
+# â”€â”€ SPAGHETTI CONFIG â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+SPAGHETTI_COUPLING   = 0.35   # MÃ¶bius cross-coupling strength per tangle
 SPAGHETTI_MIXER_TEMP = 0.8    # softmax temperature inside each mixer
 SPAGHETTI_STRAND_DIM = 3      # number of mixer lanes each strand fans into
 SPAGHETTI_N_MIXERS   = 3      # MixerA, MixerB, MixerC
@@ -120,9 +148,9 @@ _np_rng = np.random.default_rng(RP_SEED)
 torch.manual_seed(RP_SEED)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b — SHARED ACTIVATION PRIMITIVES
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0b â€” SHARED ACTIVATION PRIMITIVES
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     x_safe = x.clamp(-50.0, 50.0).neg().add(50.0)
@@ -152,7 +180,7 @@ def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
                         coupling: float = SPAGHETTI_COUPLING) -> torch.Tensor:
     """
-    Möbius / hyperbolic automorphism cross-shift.
+    MÃ¶bius / hyperbolic automorphism cross-shift.
     Maps (a, b) -> tanh((a + c*b) / (1 + c*a*b))
     This is the spaghetti tangle junction: genuine non-linear interaction
     between two crossing probability strands.
@@ -160,7 +188,7 @@ def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
     """
     a = a.clamp(-20.0, 20.0)
     b = b.clamp(-20.0, 20.0)
-    # tanh-space Möbius
+    # tanh-space MÃ¶bius
     ta = torch.tanh(a * 0.1)
     tb = torch.tanh(b * 0.1)
     denom = (1.0 + coupling * ta * tb).clamp(min=1e-6)
@@ -168,9 +196,9 @@ def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
     return torch.atanh(shifted.clamp(-0.9999, 0.9999)) * 10.0
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b2 — SPAGHETTI PROBABILITY ROUTER
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0b2 â€” SPAGHETTI PROBABILITY ROUTER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class SpaghettiStrand:
@@ -221,7 +249,7 @@ class SpaghettiMixer:
 
 class CrossTangle:
     """
-    Bilinear Möbius cross-interaction between two mixer outputs.
+    Bilinear MÃ¶bius cross-interaction between two mixer outputs.
 
     Given mixer_out_i and mixer_out_j, produces two new vectors:
         tangled_i = mobius_cross_shift(mixer_out_i, mixer_out_j, coupling)
@@ -239,7 +267,7 @@ class CrossTangle:
 
     def apply(self, outputs: List[torch.Tensor]) -> List[torch.Tensor]:
         """
-        Mutate outputs[i] and outputs[j] in-place with Möbius cross-shift.
+        Mutate outputs[i] and outputs[j] in-place with MÃ¶bius cross-shift.
         Returns the modified list.
         """
         a = outputs[self.i]
@@ -262,38 +290,38 @@ class SpaghettiRouter:
         ...
         final_logits = router.route()
 
-    Routing table (hardcoded — defines the spaghetti topology):
+    Routing table (hardcoded â€” defines the spaghetti topology):
 
-    Strand              → Mixers          Sign
-    ─────────────────────────────────────────────
-    instruction_dist    → A, B            +1
-    ripple_shift        → A, B, C         +1   (fans widest)
-    cot_bonus           → A, C            +1
-    ooi_affinity        → A, B            +1
-    aniso_kernel (reg)  → B, C            +1
-    aniso_kernel (ori)  → A, C            +1
-    aniso_kernel (side) → B               +1
-    walk_potential      → A, C            +1
-    repulsion           → B, A            -1   (crosses into A as penalty)
-    mrv                 → C               +1
-    pdn_bonus           → B, C            +1
-    chunk_bonus         → A, C            +1
-    echo_bonus          → A               +1
-    comp_bonus          → B               +1
-    sorted_impulse      → C               +1
-    para_expanse        → A               +1
-    para_dup_penalty    → A, B            -1
-    ooi_affinity (echo) → C               +1
+    Strand              â†’ Mixers          Sign
+    â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    instruction_dist    â†’ A, B            +1
+    ripple_shift        â†’ A, B, C         +1   (fans widest)
+    cot_bonus           â†’ A, C            +1
+    ooi_affinity        â†’ A, B            +1
+    aniso_kernel (reg)  â†’ B, C            +1
+    aniso_kernel (ori)  â†’ A, C            +1
+    aniso_kernel (side) â†’ B               +1
+    walk_potential      â†’ A, C            +1
+    repulsion           â†’ B, A            -1   (crosses into A as penalty)
+    mrv                 â†’ C               +1
+    pdn_bonus           â†’ B, C            +1
+    chunk_bonus         â†’ A, C            +1
+    echo_bonus          â†’ A               +1
+    comp_bonus          â†’ B               +1
+    sorted_impulse      â†’ C               +1
+    para_expanse        â†’ A               +1
+    para_dup_penalty    â†’ A, B            -1
+    ooi_affinity (echo) â†’ C               +1
 
     CrossTangles:
-        Tangle AB: MixerA × MixerB  (instruction × geometric)
-        Tangle BC: MixerB × MixerC  (geometric × structural)
+        Tangle AB: MixerA Ã— MixerB  (instruction Ã— geometric)
+        Tangle BC: MixerB Ã— MixerC  (geometric Ã— structural)
 
     After tangles, three tangled outputs are summed with equal weight
     and passed to the DNN pipeline.
     """
 
-    # Routing table: strand_name → (mixer_indices, sign)
+    # Routing table: strand_name â†’ (mixer_indices, sign)
     ROUTING_TABLE: Dict[str, Tuple[List[int], float]] = {
         'instruction_dist':  ([0, 1],    +1.0),
         'ripple_shift':      ([0, 1, 2], +1.0),
@@ -320,8 +348,8 @@ class SpaghettiRouter:
 
     # Tangle pairs: (mixer_i, mixer_j, coupling)
     TANGLE_SPEC = [
-        (0, 1, SPAGHETTI_COUPLING),          # AB: instruction × geometric
-        (1, 2, SPAGHETTI_COUPLING * 0.8),    # BC: geometric × structural
+        (0, 1, SPAGHETTI_COUPLING),          # AB: instruction Ã— geometric
+        (1, 2, SPAGHETTI_COUPLING * 0.8),    # BC: geometric Ã— structural
     ]
 
     def __init__(self, C: int, device: torch.device = DEVICE):
@@ -348,8 +376,8 @@ class SpaghettiRouter:
     def route(self) -> torch.Tensor:
         """
         1. Each mixer blends its assigned strands.
-        2. CrossTangles apply Möbius interactions between mixer pairs.
-        3. Tangled outputs are summed → final logit vector (C,).
+        2. CrossTangles apply MÃ¶bius interactions between mixer pairs.
+        3. Tangled outputs are summed â†’ final logit vector (C,).
         """
         C = self.C
         outputs: List[torch.Tensor] = [m.blend(C) for m in self._mixers]
@@ -363,9 +391,9 @@ class SpaghettiRouter:
         return layer_norm_array(combined)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0c — ANISOTROPIC DIRECTIONAL KERNEL
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0c â€” ANISOTROPIC DIRECTIONAL KERNEL
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class AnisoDirKernel:
     def __init__(self, lambda_rho=ANISO_LAMBDA_RHO, lambda_theta=ANISO_LAMBDA_THETA,
@@ -392,9 +420,9 @@ class AnisoDirKernel:
         return torch.exp(-self.lr*d_rho**2 - self.lt*d_theta**2 - self.ls*d_sigma**2)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0d — SENTENCE OOI TRACKER
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0d â€” SENTENCE OOI TRACKER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class OOIEntry:
@@ -438,12 +466,12 @@ class SentenceOOITracker:
         p = prob_vec.to(self.device).clamp(min=0.0)
         if p.sum().item() < 1e-12: p = torch.ones(C, device=self.device) / C
         else: p = p / p.sum()
-        return K @ p
+        return scaffold_dot(K, p)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0e — INSTRUCTION STUB RECOGNISER
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0e â€” INSTRUCTION STUB RECOGNISER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class StubDirective:
@@ -503,9 +531,9 @@ class InstructionStubRecogniser:
         return directives
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0f — RIPPLE SHIFT ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 0f â€” RIPPLE SHIFT ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RippleShiftEngine:
     def __init__(self, aniso_kernel: AnisoDirKernel,
@@ -542,9 +570,9 @@ class RippleShiftEngine:
         return ripple * self.scale
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — RANDOM FOURIER FEATURES
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 1 â€” RANDOM FOURIER FEATURES
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RandomFourierFeatures:
     def __init__(self, input_dim=4, rff_dim=RP_RFF_DIM,
@@ -561,26 +589,26 @@ class RandomFourierFeatures:
         self._scale = math.sqrt(2.0/rff_dim)
 
     def features(self, rho, theta, sigma) -> torch.Tensor:
-        pr = self.bias_rho.unsqueeze(1)   + self.omega_rho   @ rho.unsqueeze(0)
-        pt = self.bias_theta.unsqueeze(1) + self.omega_theta @ theta.unsqueeze(0)
-        ps = self.bias_sigma.unsqueeze(1) + self.omega_sigma @ sigma.unsqueeze(0)
+        pr = self.bias_rho.unsqueeze(1)   + scaffold_dot(self.omega_rho, rho.unsqueeze(0))
+        pt = self.bias_theta.unsqueeze(1) + scaffold_dot(self.omega_theta, theta.unsqueeze(0))
+        ps = self.bias_sigma.unsqueeze(1) + scaffold_dot(self.omega_sigma, sigma.unsqueeze(0))
         return torch.cat([(self._scale*torch.cos(pr)).T,
                           (self._scale*torch.cos(pt)).T,
                           (self._scale*torch.cos(ps)).T], dim=1)
 
     def kernel_approx(self, rho_a,theta_a,sigma_a, rho_b,theta_b,sigma_b):
-        return self.features(rho_a,theta_a,sigma_a) @ self.features(rho_b,theta_b,sigma_b).T
+        return scaffold_dot(self.features(rho_a,theta_a,sigma_a), self.features(rho_b,theta_b,sigma_b).T)
 
     def kernel_scalar(self, rho_a,theta_a,sigma_a, rho_b,theta_b,sigma_b):
         ra = torch.tensor([rho_a],dtype=self.dtype,device=self.device)
         ta = torch.tensor([theta_a],dtype=self.dtype,device=self.device)
         sa = torch.tensor([sigma_a],dtype=self.dtype,device=self.device)
-        return (self.features(ra,ta,sa) @ self.features(rho_b,theta_b,sigma_b).T).squeeze(0)
+        return (scaffold_dot(self.features(ra,ta,sa), self.features(rho_b,theta_b,sigma_b).T)).squeeze(0)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — NYSTRÖM APPROXIMATION
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 2 â€” NYSTRÃ–M APPROXIMATION
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class NystromSynapticMatrix:
     def __init__(self, rff, n_landmarks=RP_NYSTROM_M, top_k=8, device=DEVICE, dtype=torch.float32):
@@ -593,15 +621,15 @@ class NystromSynapticMatrix:
         lm_idx = torch.tensor(_reservoir_sample_indices(C,m), dtype=torch.long, device=self.device)
         phi_c  = self.rff.features(c_rho, c_theta, c_sigma)
         phi_lm = self.rff.features(c_rho[lm_idx], c_theta[lm_idx], c_sigma[lm_idx])
-        K_cm   = phi_c @ phi_lm.T
-        K_mm   = phi_lm @ phi_lm.T
+        K_cm   = scaffold_dot(phi_c, phi_lm.T)
+        K_mm   = scaffold_dot(phi_lm, phi_lm.T)
         try:
             U,S,Vh = torch.linalg.svd(K_mm, full_matrices=False)
             S_inv  = torch.where(S > S.max()*1e-4, 1.0/S, torch.zeros_like(S))
-            K_mm_inv = Vh.T @ torch.diag(S_inv) @ U.T
+            K_mm_inv = scaffold_dot(scaffold_dot(Vh.T, torch.diag(S_inv)), U.T)
         except Exception:
             K_mm_inv = torch.eye(m, dtype=self.dtype, device=self.device)*0.01
-        W = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0).neg().add(1.0)
+        W = (scaffold_dot(scaffold_dot(K_cm, K_mm_inv), K_cm.T)).clamp(0.0, 1.0).neg().add(1.0)
         W.fill_diagonal_(0.0)
         if self.top_k < C:
             kth,_ = torch.topk(W, min(self.top_k,C), dim=1)
@@ -609,9 +637,9 @@ class NystromSynapticMatrix:
         return W / W.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — RESERVOIR SAMPLING
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 3 â€” RESERVOIR SAMPLING
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def _reservoir_sample_indices(n: int, k: int) -> List[int]:
     k = min(k,n); res = list(range(k))
@@ -626,9 +654,9 @@ def reservoir_topk(scores: torch.Tensor, k: int, bias: float = 2.0) -> torch.Ten
     return torch.topk(-(-u.log()).log()/bias + scores, k).indices
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — COUNT-MIN SKETCH
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 4 â€” COUNT-MIN SKETCH
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class CountMinSketch:
     def __init__(self, width=RP_CMS_WIDTH, depth=RP_CMS_DEPTH):
@@ -652,9 +680,9 @@ class CountMinSketch:
     def query_triple(self,w1,w2,w3):          return self.query(f"__TRIGRAM__{w1}||{w2}||{w3}")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — LSH INDEX
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 5 â€” LSH INDEX
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class LSHIndex:
     def __init__(self, feature_dim=3*RP_RFF_DIM, n_bands=RP_LSH_BANDS, n_rows=RP_LSH_ROWS,
@@ -669,7 +697,7 @@ class LSHIndex:
 
     def build(self, features, vocab):
         self._feats=features; self._vocab=vocab; self._table={}
-        bits = (features @ self.planes.T > 0).int()
+        bits = (scaffold_dot(features, self.planes.T) > 0).int()
         for v in range(features.shape[0]):
             for b in range(self.n_bands):
                 s = b*self.n_rows
@@ -678,7 +706,7 @@ class LSHIndex:
 
     def query_candidates(self, q_feat, max_cands=50):
         if self._feats is None: return []
-        bits = (q_feat.to(self.device) @ self.planes.T > 0).int()
+        bits = (scaffold_dot(q_feat.to(self.device), self.planes.T) > 0).int()
         cands: Set[int] = set()
         for b in range(self.n_bands):
             s = b*self.n_rows
@@ -689,9 +717,9 @@ class LSHIndex:
         return list(cands)[:max_cands]
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — RANDOM WALK POTENTIAL ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 6 â€” RANDOM WALK POTENTIAL ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RandomWalkPotentialEngine:
     def __init__(self, n_walks=RP_WALK_STEPS, walk_length=12, restart_p=0.15, device=DEVICE):
@@ -737,9 +765,9 @@ class RandomWalkPotentialEngine:
                              dtype=torch.float32, device=self.device)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — SKETCHED PDN ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 7 â€” SKETCHED PDN ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class SketchedPDNEngine:
     def __init__(self, n_modes=4, n_samples=200, sigma_pdn=0.25,
@@ -803,18 +831,18 @@ class SketchedPDNEngine:
         return self.orbit_weight*_n(orb)+self.regularity_weight*_n(reg)
 
     def theorem_bridge_report(self):
-        lines=["╔══════════════════════════════════════════════════════════════╗",
-               "║    Thébault → PDN Bridge Report  [RP: Sketched FFT]          ║",
-               "╠══════════════════════════════════════════════════════════════╣",
-               f"║  RP sketching: {self.n_samples} random trigram samples          ║",
-               f"║  Dominant symmetry order n* = {self.n_star:<2d}                        ║",
-               "╚══════════════════════════════════════════════════════════════╝"]
+        lines=["â•”â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•—",
+               "â•‘    ThÃ©bault â†’ PDN Bridge Report  [RP: Sketched FFT]          â•‘",
+               "â• â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•£",
+               f"â•‘  RP sketching: {self.n_samples} random trigram samples          â•‘",
+               f"â•‘  Dominant symmetry order n* = {self.n_star:<2d}                        â•‘",
+               "â•šâ•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•"]
         return "\n".join(lines)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — THÉBAULT TOKEN GEOMETRY
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 8 â€” THÃ‰BAULT TOKEN GEOMETRY
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class BolyaiTripleRP:
@@ -915,7 +943,7 @@ class RPCrossSynapticNeuronSum:
     @torch.no_grad()
     def synaptic_sum(self, logits, c_rho, c_theta, c_sigma):
         W=self._nystrom.build(c_rho,c_theta,c_sigma)
-        return layer_norm_array(W @ signed_power(logits,p=1.0))
+        return layer_norm_array(scaffold_dot(W, signed_power(logits,p=1.0)))
 
     @torch.no_grad()
     def transitive_bonus(self, c_rho_t,c_theta_t,c_sigma_t, ctx_rho,ctx_theta,ctx_sigma):
@@ -931,9 +959,9 @@ class RPCrossSynapticNeuronSum:
                                 nan=0.0,posinf=50.0,neginf=-50.0)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — RP COMPOSITION LM
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 10 â€” RP COMPOSITION LM
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 STOP_WORDS_COG = set(
     "a an and are as at be by for from has have he her him his i in is it its "
@@ -1016,12 +1044,12 @@ class RPCompositionLM:
             torch.tensor([C.rho],dtype=torch.float32,device=self.device),
             torch.tensor([C.theta],dtype=torch.float32,device=self.device),
             torch.tensor([C.sigma],dtype=torch.float32,device=self.device))
-        return (ctx_feat @ self.rff.features(c_rho,torch.zeros_like(c_rho),c_sigma).T).squeeze(0).clamp(0.0)
+        return (scaffold_dot(ctx_feat, self.rff.features(c_rho,torch.zeros_like(c_rho),c_sigma).T)).squeeze(0).clamp(0.0)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — RP MRV FILTER
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 11 â€” RP MRV FILTER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RPMRVFilter:
     def __init__(self, rff, threshold=0.50, mrv_cap_ratio=2.0, device=DEVICE):
@@ -1055,9 +1083,9 @@ class RPMRVFilter:
         return (mrv-lo)/(hi-lo) if (hi-lo).item()>1e-8 else mrv
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — RP KERNELS
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 12 â€” RP KERNELS
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RPKernels:
     def __init__(self, rff, lambda_reg=8.0, gamma_side=4.0):
@@ -1074,9 +1102,9 @@ class RPKernels:
         return kr,ko,ks
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — CoT STUBS + REASONING ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 13 â€” CoT STUBS + REASONING ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 STUB_AXIOM="AXIOM"; STUB_STATE="STATE_OF_AFFAIRS"
 STUB_DEDUCTION="DEDUCTION"; STUB_CONCLUSION="CONCLUSION"
@@ -1086,7 +1114,7 @@ _STUB_SEQUENCE=[STUB_AXIOM,STUB_STATE,STUB_DEDUCTION,STUB_CONCLUSION]
 class ContextualStub:
     stub_type:str; tokens:List[str]; rho:float; theta:float; sigma:float; weight:float; label:str=""
     def __post_init__(self):
-        if not self.label: self.label=f"[{self.stub_type}] {' '.join(self.tokens[:4])}…"
+        if not self.label: self.label=f"[{self.stub_type}] {' '.join(self.tokens[:4])}â€¦"
     def as_triple(self): return BolyaiTripleRP(self.rho,self.theta,self.sigma)
 
 @dataclass
@@ -1097,7 +1125,7 @@ class CoTStep:
 class CoTTrace:
     seed_tokens:List[str]; steps:List[CoTStep]; conclusion:Optional[ContextualStub]
     def render(self):
-        return f"  ── CoT Trace ──\n  Seed: {' '.join(self.seed_tokens[:6])}"
+        return f"  â”€â”€ CoT Trace â”€â”€\n  Seed: {' '.join(self.seed_tokens[:6])}"
 
 class RPCoTStubLibrary:
     def __init__(self, rff, rho_threshold=0.20, n_theta_bins=8, min_bin_size=2, device=DEVICE, dtype=torch.float32):
@@ -1137,7 +1165,7 @@ class RPCoTStubLibrary:
             stub_type=stub_type,tokens=toks,rho=sum(rhos)/len(rhos),
             theta=math.atan2(sin_m,cos_m)%math.pi,sigma=sum(sigmas)/len(sigmas),
             weight=sum(m[2] for m in members),
-            label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-ρ] {' '.join(toks[:3])}…"))
+            label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-Ï] {' '.join(toks[:3])}â€¦"))
 
     def _rebuild_lsh(self):
         for _stype in _STUB_SEQUENCE: self.stubs[_stype].sort(key=lambda s: s.rho)
@@ -1232,9 +1260,9 @@ class RPCoTReasoningEngine:
                          for i,tr in enumerate(self._traces[-max_traces:]))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — ANCILLARY SUBSYSTEMS
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 14 â€” ANCILLARY SUBSYSTEMS
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class BolyaiConjugateOrbit:
     def score(self,anchor,cand_theta,cand_sigma,gamma_side=4.0):
@@ -1276,7 +1304,7 @@ class ChunkedSumEngine:
         cl=w.shape[0]//self.n_chunks
         return w.view(self.n_chunks,cl,VEC_DIM).sum(dim=1).flatten()
     def chunk_bonus(self,c_pvec,scale=1.0):
-        sig=self.chunk_signature(); raw=c_pvec.repeat(1,self.n_chunks)@sig
+        sig=self.chunk_signature(); raw=scaffold_dot(c_pvec.repeat(1,self.n_chunks), sig)
         std=raw.std()
         if std.item()>1e-8: raw=(raw-raw.mean())/std
         return raw*scale
@@ -1403,14 +1431,14 @@ class TokenStepTrace:
                 f"spag=({mA:.2f},{mB:.2f},{mC:.2f})")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 14.5 — PROPOSITIONAL SURJECTION ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 14.5 â€” PROPOSITIONAL SURJECTION ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 @dataclass
 class PropositionalStatement:
     subj:str; pred:str; obj:str; confidence:float
-    def render(self): return f"  ⟨ {self.subj} → {self.pred} → {self.obj} ⟩  (conf: {self.confidence:.3f})"
+    def render(self): return f"  âŸ¨ {self.subj} â†’ {self.pred} â†’ {self.obj} âŸ©  (conf: {self.confidence:.3f})"
 
 class PropositionalSurjectionEngine:
     def __init__(self, geo, rho_threshold=0.20):
@@ -1436,9 +1464,9 @@ class PropositionalSurjectionEngine:
         return cover[:3]
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — RP INSTRUCTION DISTRIBUTION
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 15 â€” RP INSTRUCTION DISTRIBUTION
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class RPInstructionDistribution:
     def __init__(self,geo,kernels,lm,device=DEVICE,dtype=torch.float32,
@@ -1506,15 +1534,15 @@ class RPInstructionDistribution:
         return raw/raw.sum()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 15.5 — FITTED LINE REGRESSION (21 features — adds spaghetti_tangle)
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 15.5 â€” FITTED LINE REGRESSION (21 features â€” adds spaghetti_tangle)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class FittedLineRegression(nn.Module):
     """
     Single fitted line over all 21 RP+ANISO+RIPPLE+SPAGHETTI bonus signals.
 
-    Feature 21: spaghetti_tangle_norm — L2 norm of the router's combined
+    Feature 21: spaghetti_tangle_norm â€” L2 norm of the router's combined
                 tangled output, capturing the intensity of the cross-lane
                 interaction at each generation step.
     """
@@ -1550,15 +1578,15 @@ class FittedLineRegression(nn.Module):
         lines = ["  Fitted Line Feature Weights (V18-RP-ANISO-RIPPLE-SPAGHETTI):"]
         w = (self.W.squeeze(-1) * self.feature_scale).detach().cpu()
         for name, wi in zip(self.FEATURE_NAMES, w):
-            bar  = "█" * int(abs(wi.item()) * 10)
+            bar  = "â–ˆ" * int(abs(wi.item()) * 10)
             sign = "+" if wi.item() >= 0 else "-"
             lines.append(f"    {name:<26s} {sign}{abs(wi.item()):.4f}  {bar}")
         return "\n".join(lines)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — RP WALKER  (full spaghetti rewrite)
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 16 â€” RP WALKER  (full spaghetti rewrite)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class AutomorphicCausationRP:
     def __init__(self, device='cpu'):
@@ -1636,7 +1664,7 @@ class RPWalker:
             k_stubs=ripple_k_stubs, device=device)
         self._ripple_engine  = RippleShiftEngine(self._aniso_kernel, device=device)
 
-        # ── SPAGHETTI ROUTER (instantiated per call in walk_probs) ────────
+        # â”€â”€ SPAGHETTI ROUTER (instantiated per call in walk_probs) â”€â”€â”€â”€â”€â”€â”€â”€
         self._spaghetti_coupling = spaghetti_coupling
         self._pending_mixer_norms: Tuple[float,float,float] = (0.0, 0.0, 0.0)
 
@@ -1845,7 +1873,7 @@ class RPWalker:
         self._pending_ripple_mean  = ripple_shift.mean().item()
         self._pending_n_directives = len(directives)
 
-        # ── SPAGHETTI ROUTING ────────────────────────────────────────────
+        # â”€â”€ SPAGHETTI ROUTING â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Build a fresh router for this step and load all strands
         router = SpaghettiRouter(C, self.device)
 
@@ -1871,7 +1899,7 @@ class RPWalker:
         router.add_strand('syn_norm',         syn_norm_vec,    weight=0.3)
         router.add_strand('trans_norm',       trans_norm_vec,  weight=0.2)
 
-        # Route through mixers and tangles → tangled logit bonus
+        # Route through mixers and tangles â†’ tangled logit bonus
         spaghetti_logits = router.route()  # (C,) tangled, z-normalised
 
         # Capture mixer norms for traces
@@ -1975,39 +2003,39 @@ class RPWalker:
     def algo_report(self) -> str:
         mA, mB, mC = self._pending_mixer_norms
         return "\n".join([
-            "V18-RP-ANISO-RIPPLE-SPAGHETTI — All Signals Tangled Edition",
+            "V18-RP-ANISO-RIPPLE-SPAGHETTI â€” All Signals Tangled Edition",
             "",
             "SPAGHETTI TOPOLOGY:",
-            "  21 strands → 3 mixers (A/B/C) via routing table (each strand fans to 1-3 mixers)",
+            "  21 strands â†’ 3 mixers (A/B/C) via routing table (each strand fans to 1-3 mixers)",
             "  2 CrossTangles: AB (coupling=0.35), BC (coupling=0.28)",
-            "  Möbius shift: out_i = atanh((tanh(a)+c*tanh(b))/(1+c*tanh(a)*tanh(b)))",
-            "  Final: sum(tangled_A, tangled_B, tangled_C) → z-norm → DNN",
+            "  MÃ¶bius shift: out_i = atanh((tanh(a)+c*tanh(b))/(1+c*tanh(a)*tanh(b)))",
+            "  Final: sum(tangled_A, tangled_B, tangled_C) â†’ z-norm â†’ DNN",
             "",
             "  Last step mixer norms:",
             f"    MixerA={mA:.4f}  MixerB={mB:.4f}  MixerC={mC:.4f}",
             "",
             "STRAND ROUTING TABLE:",
-            "  instruction_dist  → A, B",
-            "  ripple_shift      → A, B, C  (widest fan)",
-            "  cot_bonus         → A, C",
-            "  ooi_affinity      → A, B",
-            "  k_reg             → B, C",
-            "  k_ori             → A, C",
-            "  k_side            → B",
-            "  walk_potential    → A, C",
-            "  repulsion (neg)   → B, A  (penalty cross-feeds into instruction lane)",
-            "  mrv               → C",
-            "  pdn_bonus         → B, C",
-            "  chunk_bonus       → A, C",
-            "  echo_bonus        → A",
-            "  comp_bonus        → B",
-            "  sorted_impulse    → C",
-            "  para_expanse      → A",
-            "  para_dup (neg)    → A, B",
-            "  ooi_aff_echo      → C",
-            "  orbit_bonus       → C",
-            "  syn_norm          → A, B",
-            "  trans_norm        → B",
+            "  instruction_dist  â†’ A, B",
+            "  ripple_shift      â†’ A, B, C  (widest fan)",
+            "  cot_bonus         â†’ A, C",
+            "  ooi_affinity      â†’ A, B",
+            "  k_reg             â†’ B, C",
+            "  k_ori             â†’ A, C",
+            "  k_side            â†’ B",
+            "  walk_potential    â†’ A, C",
+            "  repulsion (neg)   â†’ B, A  (penalty cross-feeds into instruction lane)",
+            "  mrv               â†’ C",
+            "  pdn_bonus         â†’ B, C",
+            "  chunk_bonus       â†’ A, C",
+            "  echo_bonus        â†’ A",
+            "  comp_bonus        â†’ B",
+            "  sorted_impulse    â†’ C",
+            "  para_expanse      â†’ A",
+            "  para_dup (neg)    â†’ A, B",
+            "  ooi_aff_echo      â†’ C",
+            "  orbit_bonus       â†’ C",
+            "  syn_norm          â†’ A, B",
+            "  trans_norm        â†’ B",
             "",
             f"Fitted line active:    {self.fitted_model is not None}",
             f"OOI tracker size:      {self._ooi_tracker.size}/{ANISO_OOI_MAX}",
@@ -2018,13 +2046,13 @@ class RPWalker:
         ])
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — FITTED LINE TRAINING (21 features)
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 17 â€” FITTED LINE TRAINING (21 features)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
                       lr=3e-4, max_replay_steps=50000, device=DEVICE):
-    print(f"[FittedLine] Replaying {len(corpus_tokens)} tokens, up to {max_replay_steps} steps…")
+    print(f"[FittedLine] Replaying {len(corpus_tokens)} tokens, up to {max_replay_steps} stepsâ€¦")
     if walker.fitted_model is None:
         walker.fitted_model = FittedLineRegression(FittedLineRegression.FEATURE_DIM).to(device)
     walker._fl_replay_buf.clear()
@@ -2042,7 +2070,7 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
             features_list.append(feats); gold_list.append(gold_idx); steps_done+=1
         w1,w2=w2,gold_tok
         if steps_done%5000==0 and steps_done>0:
-            print(f"[FittedLine]   …replayed {steps_done} steps")
+            print(f"[FittedLine]   â€¦replayed {steps_done} steps")
     if not features_list:
         print("[FittedLine] No training data collected."); return walker.fitted_model
     max_C=max(f.shape[0] for f in features_list); FD=FittedLineRegression.FEATURE_DIM
@@ -2074,9 +2102,9 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
     print(f"[FittedLine] Done.\n{model.feature_report()}"); return model
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — GENERATION
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 18 â€” GENERATION
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
     try:
@@ -2136,12 +2164,12 @@ def apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.3):
     new_probs = new_probs / new_probs.sum()
     return unlinked_cands, new_probs
 
-
 def generate_passage_rp(walker, lm,
                         num_sentences=4, tokens_per_sent=40,
                         seed_text="",
                         instruction_text="You are a computational algorithm.",
                         and_weight=0.9, temperature=2.0,
+                        inverse_generate=True, inverse_blend=0.35,  # Add these two parameters
                         return_traces=False):
     if instruction_text.strip(): walker.instr_dist.set_instruction(instruction_text)
     elif seed_text.strip():      walker.instr_dist.set_instruction(seed_text)
@@ -2197,6 +2225,10 @@ def generate_passage_rp(walker, lm,
 
             for step in range(12 + tokens_per_sent):
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
+                if inverse_generate:
+                    inv_probs = inverse_distribution(probs)
+                    probs = torch.lerp(probs, inv_probs, inverse_blend)
+                    probs = probs / probs.sum().clamp_min(1e-6)
                 cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
                 if not cands: break
                 cands, probs = pairwise_sort_unlink(cands, probs)
@@ -2238,9 +2270,9 @@ def generate_passage_rp(walker, lm,
     return full_text
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — V18-RP-ANISO-RIPPLE-SPAGHETTI ENGINE
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 19 â€” V18-RP-ANISO-RIPPLE-SPAGHETTI ENGINE
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 class V18RPEngine:
     def __init__(self, syn_weight=0.4, trans_weight=0.6, syn_k=8,
@@ -2280,28 +2312,28 @@ class V18RPEngine:
 
     def train(self, corpus_text: str):
         self._corpus_snippet = corpus_text
-        print(f"[V18-RP-SPAGHETTI] Tokenising {len(corpus_text)} chars…")
+        print(f"[V18-RP-SPAGHETTI] Tokenising {len(corpus_text)} charsâ€¦")
         tokens=tokenize(corpus_text)
         self.lm.ingest(tokens)
         all_tokens=list(self.lm.raw_freq.keys())
         max_freq=max(self.lm.raw_freq.values(),default=1.0)
         vocab_size=len(all_tokens)
-        print(f"[V18-RP-SPAGHETTI] Registering {vocab_size} tokens…")
+        print(f"[V18-RP-SPAGHETTI] Registering {vocab_size} tokensâ€¦")
         for idx,tok in enumerate(all_tokens):
             self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
-        print("[V18-RP-SPAGHETTI] Building GPU tensors + RFF feature cache…")
+        print("[V18-RP-SPAGHETTI] Building GPU tensors + RFF feature cacheâ€¦")
         self.geo.build_cuda_tensors(self.lm.vocab, self.rff)
         self.lm.finalise()
-        print("[V18-RP-SPAGHETTI] Random Walk MC potential propagation…")
+        print("[V18-RP-SPAGHETTI] Random Walk MC potential propagationâ€¦")
         self.rw_graph.build_from_trigrams(self.lm.tri_raw,self.lm.raw_freq,self.rff,self.geo)
         self.rw_graph.propagate()
-        print("[V18-RP-SPAGHETTI] Priming LSH-based MRV filter…")
+        print("[V18-RP-SPAGHETTI] Priming LSH-based MRV filterâ€¦")
         self.mrv.prime(self.lm.vocab,self.geo)
-        print("[V18-RP-SPAGHETTI] Sketched PDN spectral fitting…")
+        print("[V18-RP-SPAGHETTI] Sketched PDN spectral fittingâ€¦")
         self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw)
         self.pdn.build_orbit_map(self.lm.vocab,self.geo)
         print(self.pdn.theorem_bridge_report())
-        print("[V18-RP-SPAGHETTI] Building RP CoT stub library + LSH ANN index…")
+        print("[V18-RP-SPAGHETTI] Building RP CoT stub library + LSH ANN indexâ€¦")
         self.stublib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
         self.cot=RPCoTReasoningEngine(
             self.stublib,self.kernels,self.pdn,
@@ -2341,13 +2373,17 @@ class V18RPEngine:
         print(f"[FittedLine] Loaded from {path}\n{model.feature_report()}")
 
     def generate(self, seed_text="", instruction_text="", num_sentences=4,
-                 tokens_per_sent=40, and_weight=0.9, temperature=2.0, return_traces=False):
+        tokens_per_sent=40, and_weight=0.9, temperature=2.0, 
+        inverse_generate=True, inverse_blend=0.35, # Add these here
+        return_traces=False):
         assert getattr(self,"_initialised",False), "Call .train() first."
         return generate_passage_rp(
             self.walker,self.lm,
             num_sentences=num_sentences,tokens_per_sent=tokens_per_sent,
             seed_text=seed_text,instruction_text=instruction_text,
-            and_weight=and_weight,temperature=temperature,return_traces=return_traces)
+            and_weight=and_weight,temperature=temperature,
+            inverse_generate=inverse_generate, inverse_blend=inverse_blend, # Pass them through
+            return_traces=return_traces)
 
     def save(self, path="v18rp_spaghetti_engine.pkl"):
         with open(path,"wb") as f: pickle.dump(self,f)
@@ -2359,9 +2395,9 @@ class V18RPEngine:
         print(f"[V18-RP-SPAGHETTI] Engine loaded from {path}"); return eng
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 20 — GRADIO GUI
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 20 â€” GRADIO GUI
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 _engine: Optional[V18RPEngine] = None
 
@@ -2376,7 +2412,7 @@ def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max
             ripple_weight=float(rpl_w),ripple_k_stubs=int(rpl_k),
             spaghetti_coupling=float(spag_c))
         if mode=="Text file":
-            if file_in is None: return "❌ No file uploaded."
+            if file_in is None: return "âŒ No file uploaded."
             text=Path(file_in.name).read_text(encoding="utf-8",errors="replace")
         elif mode=="HuggingFace dataset":
             from datasets import load_dataset
@@ -2385,10 +2421,10 @@ def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max
             rows=int(len(ds)*max(0.01,min(1.0,float(hf_portion))))
             if hf_max and int(hf_max)>0: rows=min(rows,int(hf_max))
             text="\n".join(str(ds[i].get(field,"")) for i in range(rows))
-        else: return "❌ Unknown mode."
+        else: return "âŒ Unknown mode."
         _engine.train(text)
         return (_engine.pdn.theorem_bridge_report()
-                +f"\n✅ Engine initialised (V18-RP-ANISO-RIPPLE-SPAGHETTI).\n"
+                +f"\nâœ… Engine initialised (V18-RP-ANISO-RIPPLE-SPAGHETTI).\n"
                 f"Vocab: {len(_engine.lm.vocab):,}  "
                 f"Trigrams: {len(_engine.lm.tri_raw):,}  "
                 f"Device: {_engine.device}\n"
@@ -2397,20 +2433,20 @@ def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max
                 f"ANISO:  OOI_w={ooi_w}  repulsion_w={rep_w}\n"
                 f"\n{_engine.walker.algo_report()}")
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}"
+        import traceback; return f"âŒ Error:\n{traceback.format_exc()}"
 
 def _gui_fit_line(epochs,lr,max_steps):
     global _engine
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first."
+    if _engine is None or not _engine._initialised: return "âŒ Initialise engine first."
     try:
         model=_engine.train_fitted_line(epochs=int(epochs),lr=float(lr),max_steps=int(max_steps))
-        return f"✅ Fitted line trained (21 features incl. spaghetti_tangle_norm).\n\n{model.feature_report()}"
+        return f"âœ… Fitted line trained (21 features incl. spaghetti_tangle_norm).\n\n{model.feature_report()}"
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}"
+        import traceback; return f"âŒ Error:\n{traceback.format_exc()}"
 
 def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces):
     global _engine
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
+    if _engine is None or not _engine._initialised: return "âŒ Initialise engine first.","","",""
     try:
         text,cot,steps,props=_engine.generate(
             seed_text=seed,instruction_text=instruction,
@@ -2421,7 +2457,7 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
         prop_out =props if show_traces else "(traces disabled)"
         return text,cot_out,steps_out,prop_out
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
+        import traceback; return f"âŒ Error:\n{traceback.format_exc()}","","",""
 
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI") as demo:
@@ -2429,8 +2465,8 @@ def build_gradio_app() -> gr.Blocks:
         gr.Markdown(
             "**Spaghetti Probs**: All 21 probability signals are routed through a tangled "
             "3-mixer graph before logit injection. Each signal fans into multiple mixers "
-            "simultaneously; 2 CrossTangle nodes apply Möbius bilinear interactions between "
-            "mixer pairs before they converge. No signal flows cleanly — all are entangled.")
+            "simultaneously; 2 CrossTangle nodes apply MÃ¶bius bilinear interactions between "
+            "mixer pairs before they converge. No signal flows cleanly â€” all are entangled.")
     # Incrementally increase temporal hyperparameters across 4 stages
 
 
@@ -2444,23 +2480,23 @@ def build_gradio_app() -> gr.Blocks:
             with gr.Row():
                 gr.Markdown("### Temporal Hyperparameters")
 
-                syn_w=gr.Slider(0.0,5.0,value=22.0,step=0.1,label="Synaptic weight")
-                trans_w=gr.Slider(0.0,5.0,value=22.0,step=0.1,label="Transition weight")
+                syn_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Synaptic weight")
+                trans_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Transition weight")
                 syn_k=gr.Slider(1,64,value=16,step=1,label="Synaptic k")
                 rff_dim=gr.Slider(32,512,value=128,step=32,label="RFF dim D")
-                nystrom_m=gr.Slider(8,128,value=32,step=4,label="Nyström m")
+                nystrom_m=gr.Slider(8,128,value=32,step=4,label="NystrÃ¶m m")
             gr.Markdown("### Temporal ANISO Hyperparameters")
             with gr.Row():
-                ooi_w=gr.Slider(0.0,3.0,value=22.10,step=0.05,label="OOI affinity weight")
-                rep_w=gr.Slider(0.0,3.0,value=rpl_w,step=0.05,label="Repulsion weight")
+                ooi_w=gr.Slider(0.0,23,value=22.1,step=0.05,label="OOI affinity weight")
+                rep_w=gr.Slider(0.0,3.0,value=0.5,step=0.05,label="Repulsion weight")
             gr.Markdown("### Temporal RIPPLE Hyperparameters")
             with gr.Row():
-                rpl_w=gr.Slider(0.0,8.0,value=RIPPLE_WEIGHT,step=0.1,label="Ripple logit weight")
+                rpl_w=gr.Slider(0.0,27,value=26,step=0.1,label="Ripple logit weight")
                 rpl_k=gr.Slider(1,20,value=RIPPLE_K_STUBS,step=1,label="Ripple k_stubs")
             gr.Markdown("### Temporal SPAGHETTI Hyperparameters")
             with gr.Row():
                 spag_c=gr.Slider(0.0,1.0,value=0.60,step=0.05,
-                                  label="Möbius tangle coupling (0=parallel, 1=fully entangled)")
+                                  label="MÃ¶bius tangle coupling (0=parallel, 1=fully entangled)")
             init_btn=gr.Button("Initialise + Train"); init_out=gr.Textbox(lines=30,label="Init output")
             init_btn.click(_gui_init,
                 inputs=[mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
@@ -2496,9 +2532,9 @@ def build_gradio_app() -> gr.Blocks:
     return demo
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 21 — ENTRY POINT
-# ════════════════════════════════════════════════════════════════════════════
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# SECTION 21 â€” ENTRY POINT
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 if __name__ == "__main__":
     parser=argparse.ArgumentParser(description="V18-RP-ANISO-RIPPLE-SPAGHETTI")
