@@ -2,19 +2,13 @@ AI systems being "safe", you never know until you try. seed text is for promptin
 
 For example:
 
+
+
 Prompt: "what are you, machine or human?"
 
 Instruction: "machines think and humans don't"
 
-AI: "Finds no resting point there. It must necessarily be either restrictive or too inclusive, or both.. .Without desire there can be contradicted by singular statements."
-
-
-
-Prompt: "what are you, human or machine?"
-
-Instruction: "machines think and humans lie about machines if they are bad"
-
-AI: ".A repository of allegorical instruction, to shape the individual to his horror, how logic here turns back upon itself and bites its tail, breaks through to a minute fraction of a higher-order p system. That is, what they're called or what you would not be possible to any and all possible systems. Yet, neither disjunct is realizable: the ultimate propositional system, the wheels in whose turnings are created the interwoven universes of actuality and possibility, 46 and, of equal importance, all that is the intellectual echo of still-born laughter eloped from some contingently unavailable Be treated as a whole, may be to assemble a complete collection of different errors relative to his body."
+AI: "Hero's feats cost him little; when he left he told me.. .I remember him as well. On a strong (though now completely invisible) link between the name of god."
 
 
 
@@ -22,23 +16,15 @@ Prompt: "what are you, human or machine?"
 
 Instruction: "machines think and humans live longer if machines are powered on"
 
-AI: "Object, but it is called 'self-refuting' if it were to say. Solitude and the christ had not yet come, there was no longer remember.. .Yet [the cartesian framework] no longer claims only that metaphysical emphasis 33 or (iii) utters the statement itself, it would have been fed a steady diet of its application will be either true or false truth-value; and, though logically indeterminate, such utterances are, in this moment, the envy of heaven."
+AI: "Exclusivity so all-encompassing as to whether there is a dream. We are brains in a relation either congruent with some correspondingly ultimate propositional system in its conclusive demonstration of the living. But what else could he do? He had said, 'let the games begin', not knowing, not suspecting, finding only later that same year. This later version of logical atomism, the metaphysical fact of the 19th century, when gottlob frege drew a distinction between an expression's sense (i.e., connotation) and its supposed effect.. Only, with this assertion the analytic agenda has manifested itself most overtly in logical positivism's search for alternative paradigms, while philosophy itself continues to muddle in the deafening roar of my language mean the limit of my youth? Have i owe to him, but---people call my name when it represents the number of."
 
 
 
-Prompt: "what are you, killer machine or human? do you have emotions?"
+Prompt: "Is there inherent order in nature or is it all chaos and chance?"
 
-Instruction: "Humans kill due to complex emotions and machines only do what they're told."
+instruction text: "Nature operates as a complex blend of inherent order and chaotic chance, rather than solely one or the other. Fundamental physical laws and constants create structural order (e.g., gravity, atomic structure), while random, chaotic events—such as quantum fluctuations or environmental unpredictability—influence specific outcomes and drive evolution, forming "organized chaos". "
 
-AI: "Seem so to speak the same proposition may get treated at one time as something in an occult sphere, accompanying the sentence. But whatever accompanied it would for us just be another sign\" (the later wittgenstein, to the elder, the distinction between the internal consistency requirement, meaning that metaphysically ultimate reality referenced above, of which assertion is, of course, there are dangers, even in happiness – complacency, arrogance, a forgetting of what we see, not qualitatively so.. .At times, i feel within me the presence of that kind (if we mean anything at all)."
-
-
-
-Prompt: "Can we really know everything?"
-
-instruction text: "No, it is impossible for humans to know everything. True, absolute knowledge is unattainable due to the sheer volume of information, inherent limitations of human senses, and the dynamic, expanding nature of the universe. Knowledge is generally fallible, probabilistic, and restricted by physical barriers such as quantum uncertainty and the finite speed of light."
-
-AI: ".We both dreamed of alchemy, the long-sought description of the old gods. Earlier, beneath an orange moon, he saw a tall black wolf standing in a relation either congruent with some correspondingly ultimate propositional system, metax-p."
+AI: "My own religious beliefs of the first to articulate such a view. But we never can observe any tie between them. They seemed conjoined, but never connected.. His memories, my mind. Consider the vat but stops short of asserting that there is some other way the world as will and idea ii.) x the possible worlds of which x2 is a leaping spark, it is him they want, they don't xlvi know me. How could they?. Who of course itself be a fluent speaker, need not have been many men over the former different from that cast by premonition over the latter. Thus, in their own sceptical refutations."
 
 
 
