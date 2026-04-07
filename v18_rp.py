@@ -41,7 +41,7 @@ Each CrossTangle node applies:
 a Möbius cross-shift (hyperbolic automorphism on [-1,1]) that produces
 genuine non-linear interaction between the crossing strands.
 
-The final simplex projection (l1_simplex_project) resolves all tangled
+The final simplex projection (l1simplexproject) resolves all tangled
 lanes into a valid probability distribution.
 
 SPAGHETTI PROBABILITY CLASSES
@@ -71,6 +71,39 @@ from datasets import load_dataset
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0 — DEVICE + GLOBAL CONFIG
 # ════════════════════════════════════════════════════════════════════════════
+
+
+class FineAlterableMonad:
+    """
+    Monadic container for fine-alterable computational states.
+    Encapsulates a tensor with dynamic scale, shift, and temperature,
+    and provides a bind (>>) operator for functional sequencing.
+    """
+    def __init__(self, value, scale: float = 1.0, shift: float = 0.0, temp: float = 1.0):
+        self.value = value
+        self.scale = scale
+        self.shift = shift
+        self.temp = temp
+
+    def bind(self, func):
+        altered = ((self.value * self.scale) + self.shift) / max(self.temp, 1e-6)
+        res = func(altered)
+        if isinstance(res, FineAlterableMonad):
+            return res
+        return FineAlterableMonad(res, self.scale, self.shift, self.temp)
+
+    def __rshift__(self, func):
+        return self.bind(func)
+
+    def unwrap(self):
+        return ((self.value * self.scale) + self.shift) / max(self.temp, 1e-6)
+
+    def alter(self, scale=None, shift=None, temp=None):
+        return FineAlterableMonad(self.value, 
+                                  scale if scale is not None else self.scale,
+                                  shift if shift is not None else self.shift,
+                                  temp if temp is not None else self.temp)
+
 
 def best_device() -> torch.device:
     if torch.cuda.is_available():       return torch.device("cuda")
@@ -135,7 +168,7 @@ def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torc
     sq_sum = (x * x).sum(dim=dim, keepdim=True)
     return x / (eps + sq_sum).sqrt()
 
-def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
+def l1simplexproject(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
     x_shifted = x - x.min()
     x_pos     = smooth_power_relu(x_shifted).clamp(min=eps)
@@ -1354,7 +1387,7 @@ class DNNArrayPipeline:
         z1=signed_power(ls*self.rho_weights(c_rho),p=2.0)
         z2=signed_power(z1*self.theta_weights(c_theta),p=1.5)
         z3=signed_power(z1*0.3+z2*self.sigma_weights(c_sigma),p=1.0)
-        return l1_simplex_project(z3)
+        return l1simplexproject(z3)
     @torch.no_grad()
     def log_forward(self,logits,c_rho,c_theta,c_sigma,temp=1.4):
         return (1e-12+self.forward(logits,c_rho,c_theta,c_sigma,temp)).log()
@@ -1377,44 +1410,164 @@ class NLMicroSimulation(nn.Module):
 
     @torch.no_grad()
     def forward(self, probs: torch.Tensor) -> torch.Tensor:
-        # 1. Ensure strictly positive linear probs to avoid -inf in log
-        p_safe = probs.clamp(min=1e-12)
+        # 1. Monadic NL Reachability Simulation
+        m = FineAlterableMonad(probs)
 
-        # 2. Convert to log space
-        log_p = torch.log(p_safe)
+        m = (m >> (lambda p: p.clamp(min=1e-12))
+               >> (lambda p: torch.log(p))
+               >> (lambda p: FineAlterableMonad(p).alter(scale=0.5).unwrap()) # Compress to half
+               >> (lambda p: torch.logsumexp(p.unsqueeze(1) + p.unsqueeze(0), dim=1))
+               >> (lambda p: torch.exp(p))
+               >> (lambda p: p / (p.sum() + 1e-12))
+            )
+        return m.unwrap()
 
-        # 3. Compress to half (equivalent to sqrt(P) in linear space)
-        log_p_compressed = log_p * 0.5
 
-        # 4. NL Micro-simulation (Log-space reachability / bounded random walk)
-        transition_matrix = log_p_compressed.unsqueeze(1) + log_p_compressed.unsqueeze(0)
+# -------------------------------------------------------------
+# Pre-built Artistic Nanowire Trends (Editable Image Metaphors)
+# -------------------------------------------------------------
+def sharpen_rho_trend(rho: torch.Tensor):
+    return torch.sigmoid((rho - rho.mean()) * 5.0)
 
-        # Perform 1 step of log-space transitive closure (reachability)
-        nl_reachability = torch.logsumexp(transition_matrix, dim=1)
+def chromatic_theta_trend(theta: torch.Tensor):
+    return 1.0 + 0.5 * torch.sin(theta * 3.0)
 
-        # 5. Return to linear space and normalize back into a valid distribution
-        nl_probs = torch.exp(nl_reachability)
-        return nl_probs / (nl_probs.sum() + 1e-12)
+def glow_sigma_trend(sigma: torch.Tensor):
+    return torch.exp(sigma)
+
+class NanowireStream:
+    """
+    Represents an editable 'mega trend' (nanowire) acting on a probability vector space.
+    This acts like an artistic filter (e.g., sharpening, blurring, harmonic resonance)
+    applied directly to the underlying physics representations (rho, theta, sigma).
+    """
+    def __init__(self, name: str, aesthetic_func):
+        self.name = name
+        self.aesthetic_func = aesthetic_func
+
+    def invoke(self, p_monad, base_vector: torch.Tensor):
+        trend = self.aesthetic_func(base_vector)
+        return p_monad >> (lambda p: p * trend)
+
+class NanowireCanvas:
+    """
+    The artistic workspace where multiple NanowireStreams (filters) are brushed onto the probability state.
+    Includes support for a dynamic, user-drawn image mapped as mega trends onto the physical vectors!
+    """
+    def __init__(self):
+        self.rho_brush = None
+        self.theta_brush = None
+        self.sigma_brush = None
+        self.art_tensor = None  # Store numpy image from Gradio
+
+    def update_art(self, numpy_img):
+        # Safely convert Gradio's image dict or numpy array to a Torch tensor
+        if numpy_img is None:
+            self.art_tensor = None
+            return
+
+        import numpy as np
+        if isinstance(numpy_img, dict):
+            if numpy_img.get('composite') is not None:
+                numpy_img = numpy_img.get('composite')
+            elif numpy_img.get('image') is not None:
+                numpy_img = numpy_img.get('image')
+            elif numpy_img.get('background') is not None:
+                numpy_img = numpy_img.get('background')
+
+        if isinstance(numpy_img, np.ndarray):
+            # Normalize to 0..1, shape [C, H, W]
+            if len(numpy_img.shape) == 3 and numpy_img.shape[2] >= 3:
+                self.art_tensor = torch.tensor(numpy_img[:, :, :3], dtype=torch.float32).permute(2, 0, 1) / 255.0
+            else:
+                self.art_tensor = None
+        else:
+            self.art_tensor = None
+
+    def equip_brushes(self, rho_stream, theta_stream, sigma_stream):
+        self.rho_brush = rho_stream
+        self.theta_brush = theta_stream
+        self.sigma_brush = sigma_stream
+
+    def _apply_art_trend(self, vector, channel_idx):
+        if self.art_tensor is None or channel_idx >= self.art_tensor.shape[0]:
+            return 1.0 # No effect
+
+        H, W = self.art_tensor.shape[1], self.art_tensor.shape[2]
+
+        # Normalize the geometry vector to [0, W-1] pixel space
+        v_min, v_max = vector.min(), vector.max()
+        if v_max > v_min:
+            norm_v = (vector - v_min) / (v_max - v_min)
+        else:
+            norm_v = torch.zeros_like(vector)
+
+        x_coords = (norm_v * (W - 1)).long().clamp(0, W - 1)
+
+        channel = self.art_tensor[channel_idx].to(vector.device) # [H, W]
+        col_intensity = channel.mean(dim=0) # Average drawing intensity at column X
+
+        # Lookup intensities for our vocabulary coordinates
+        trend = col_intensity[x_coords] # [vocab_size]
+
+        # Map drawing intensity [0, 1] to a mega-trend multiplier [0.5, 2.0]
+        return 0.5 + (trend * 1.5)
+
+    def paint(self, p_monad, rho, theta, sigma):
+        if self.rho_brush and rho is not None:
+            p_monad = self.rho_brush.invoke(p_monad, rho)
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(rho, 0)) # Red = Rho Trend
+
+        if self.theta_brush and theta is not None:
+            p_monad = self.theta_brush.invoke(p_monad, theta)
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(theta, 1)) # Green = Theta Trend
+
+        if self.sigma_brush and sigma is not None:
+            p_monad = self.sigma_brush.invoke(p_monad, sigma)
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(sigma, 2)) # Blue = Sigma Trend
+
+        return p_monad
 
 class ContingentExtringentProbability:
     def __init__(self,coupling_factor=0.5):
         self.coupling_factor=coupling_factor; self.intermediate_entropy=1.0
         self.intermediate_max_prob=1.0; self.dnn=DNNArrayPipeline()
         self.nl_sim = NLMicroSimulation()
+        self.canvas = NanowireCanvas()
+        self.canvas.equip_brushes(
+            rho_stream=NanowireStream("ContrastSharpen", sharpen_rho_trend),
+            theta_stream=NanowireStream("ChromaticPhase", chromatic_theta_trend),
+            sigma_stream=NanowireStream("BloomGlow", glow_sigma_trend)
+        )
+
     def govern_next_probs(self,logits,c_rho=None,c_theta=None,c_sigma=None):
         x=c_rho*torch.cos(c_theta); y=c_rho*torch.sin(c_theta)
         ring_dist=torch.abs((y**2/0.36)+(x**2/0.64)-1.0)
         core_suppression=torch.exp(-10.0*(y**2+x**2))
         personality_inversion_mask=-20.0*core_suppression-5.0*ring_dist
         if c_rho is not None and c_theta is not None: logits=personality_inversion_mask+logits
+
         dyn_temp=self.coupling_factor*(1.0-self.intermediate_max_prob)+1.0
+
+        # Fine Alterable Monadic pipeline
+        m_gov = FineAlterableMonad(logits)
+        # --- Nanowire Editable Art Pipeline ---
         if c_rho is not None and c_theta is not None and c_sigma is not None:
-            gov=self.dnn.temp_scaler.scale(logits,dyn_temp,c_rho)
-        else: gov=logits/max(dyn_temp,1e-6)
-        p=l1_simplex_project(gov)
+            m_gov = self.canvas.paint(m_gov, c_rho, c_theta, c_sigma)
+        # --------------------------------------
+
+        if c_rho is not None and c_theta is not None and c_sigma is not None:
+            m_gov = m_gov >> (lambda l: self.dnn.temp_scaler.scale(l, dyn_temp, c_rho))
+        else:
+            m_gov = m_gov.alter(temp=dyn_temp)
+
+        m_gov = (m_gov >> l1simplexproject
+                       >> self.nl_sim)
+
+        p = m_gov.unwrap()
         self.intermediate_entropy=-(p*(1e-9+p).log()).sum().item()
         self.intermediate_max_prob=p.max().item()
-        return gov
+        return p
 
 @dataclass
 class TokenStepTrace:
@@ -1956,7 +2109,7 @@ class RPWalker:
             log_instr  = p_instr.clamp(min=1e-12).log()
             log_walk   = self._dnn.log_forward(raw_logits,c_rho,c_theta,c_sigma,temp=1.0)
             log_and    = (1.0-and_weight)*log_walk + and_weight*log_instr
-            final_probs= l1_simplex_project(log_and)
+            final_probs= l1simplexproject(log_and)
         else:
             final_probs= self._dnn.forward(raw_logits,c_rho,c_theta,c_sigma,temp=temp)
         torch.clip(final_probs,0,0.1)
@@ -2437,10 +2590,14 @@ def _gui_fit_line(epochs,lr,max_steps):
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
 
-def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces):
+def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
     global _engine
     if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
     try:
+        # Pass the editable art image from Gradio to the Nanowire Canvas
+        if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
+            _engine.walker._contingent.canvas.update_art(art_image)
+
         text,cot,steps,props=_engine.generate(
             seed_text=seed,instruction_text=instruction,
             num_sentences=int(n_sents),tokens_per_sent=int(toks_per_sent),
@@ -2514,13 +2671,20 @@ def build_gradio_app() -> gr.Blocks:
                 and_w    =gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
                 temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
                 show_tr  =gr.Checkbox(value=True,label="Show traces")
+            with gr.Row():
+                gr.Markdown("### Editable Art Probs (Nanowire Canvas)\nDraw on the canvas! Red = Rho Trend, Green = Theta Trend, Blue = Sigma Trend.")
+                # We use Image with tool='color-sketch' for editable art in Gradio
+                try:
+                    art_img = gr.ImageEditor(type="numpy", label="Draw Mega Trends (RGB)", image_mode="RGB")
+                except AttributeError:
+                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Draw Mega Trends (RGB)")
             gen_btn =gr.Button("Generate")
             gen_out =gr.Textbox(lines=8,  label="Generated text")
             prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out =gr.Textbox(lines=12, label="CoT traces")
             step_out=gr.Textbox(lines=14, label="Step traces (spaghetti mixer norms shown)")
             gen_btn.click(_gui_generate,
-                inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr],
+                inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr,art_img],
                 outputs=[gen_out,cot_out,step_out,prop_out])
     return demo
 
