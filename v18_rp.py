@@ -2365,7 +2365,7 @@ def generate_passage_rp(walker, lm,
 
     outputs, all_traces = [], []
     head_list = list(lm.heads.keys())
-    if not head_list: return ("","","") if return_traces else ""
+    if not head_list: return ("","","","") if return_traces else ""
 
     dataset_baseline = compute_dataset_baseline(walker, temperature, and_weight)
     print(f"[Generate] Target Dataset Baseline Log-Prob: {dataset_baseline:.3f}")
