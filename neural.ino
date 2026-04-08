@@ -1,29 +1,18 @@
-// --------------------------------------------------------------------------
-// Autonomic Signal Streamer for V18-RP
-// Attach electrodes to Analog Pin 0 (A0) and GND
-// --------------------------------------------------------------------------
-
-const int electrodePin = A0;
-float smoothedValue = 0.0;
-const float alpha = 0.15; // EMA smoothing factor (lower = smoother but slower)
+// arduino_autonomic_analog.ino
+const int SENSOR_PIN = A0; 
+const int BAUD_RATE = 9600;
 
 void setup() {
-  // 115200 baud ensures the serial buffer doesn't bottleneck the sampling rate
-  Serial.begin(115200);
-  
-  // Initial prime of the smoother
-  smoothedValue = analogRead(electrodePin);
+  Serial.begin(BAUD_RATE);
 }
 
 void loop() {
-  int rawValue = analogRead(electrodePin);
+  // Read analog autonomic/neural data (0-1023)
+  int rawVal = analogRead(SENSOR_PIN);
   
-  // Apply Exponential Moving Average (EMA)
-  smoothedValue = (alpha * rawValue) + ((1.0 - alpha) * smoothedValue);
+  // Stream raw value to Python
+  Serial.println(rawVal);
   
-  // Output the smoothed float over Serial
-  Serial.println(smoothedValue);
-  
-  // Delay 10ms for a ~100Hz sampling rate
-  delay(10);
+  // ~20Hz sampling rate
+  delay(50); 
 }
