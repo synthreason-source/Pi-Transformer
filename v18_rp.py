@@ -2766,6 +2766,11 @@ def build_gradio_app() -> gr.Blocks:
             # Click to see the current A0 neural level
             refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
 
+            save_arduino_btn.click(fn=save_autonomic_ui, inputs=[], outputs=[autonomic_status_out])
+
+            load_arduino_btn.click(fn=load_autonomic_ui, inputs=[], outputs=[autonomic_status_out, live_arduino_ui])
+
+
             gen_btn.click(_gui_generate,
                 inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr,art_img],
                 outputs=[gen_out,cot_out,step_out,prop_out])
