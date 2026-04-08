@@ -1170,11 +1170,7 @@ class RPCoTStubLibrary:
     def build(self, geo, lm_vocab, raw_freq):
         all_entries=[(tok,geo.triple_fast(tok),raw_freq.get(tok,1.0)) for tok in lm_vocab]
         rhos_sorted=sorted(e[1].rho for e in all_entries)
-        # Prevent IndexError if the vocabulary/rhos_sorted is completely empty
-        if not rhos_sorted:
-            thr = self.rho_threshold
-        else:
-            thr = min(self.rho_threshold, rhos_sorted[max(0, int(len(rhos_sorted)*0.20))])
+        thr=min(self.rho_threshold, rhos_sorted[max(0,int(len(rhos_sorted)*0.20))])
         bridges=[(t,tr,f) for t,tr,f in all_entries if tr.rho>=thr]
         if len(bridges)<8: bridges=all_entries
         bridges.sort(key=lambda x:x[1].sigma)
@@ -2365,7 +2361,7 @@ def generate_passage_rp(walker, lm,
 
     outputs, all_traces = [], []
     head_list = list(lm.heads.keys())
-    if not head_list: return ("","","","") if return_traces else ""
+    if not head_list: return ("","","") if return_traces else ""
 
     dataset_baseline = compute_dataset_baseline(walker, temperature, and_weight)
     print(f"[Generate] Target Dataset Baseline Log-Prob: {dataset_baseline:.3f}")
