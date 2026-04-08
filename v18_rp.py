@@ -64,6 +64,34 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import gradio as gr
+import serial
+import threading
+import numpy as np
+import json
+import os
+
+# Global autonomic vessel carrier (defaults to 1.0 so image works even if Arduino is off)
+LATEST_AUTONOMIC_VAL = 1.0  
+
+def autonomic_serial_worker(port='COM4', baud=9600):
+    global LATEST_AUTONOMIC_VAL
+    try:
+        ser = serial.Serial(port, baud)
+        print(f"Listening to Arduino on {port}...")
+        while True:
+            try:
+                line = ser.readline().decode('utf-8', errors='ignore').strip()
+                if line.isdigit():
+                    val = int(line)
+                    # Normalize the 10-bit analog data (0-1023) to a 0.0 - 1.0 multiplier
+                    LATEST_AUTONOMIC_VAL = val / 1023.0  
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"Serial stream error: {e}")
+
+# Start the background listener immediately
+threading.Thread(target=autonomic_serial_worker, daemon=True).start()
 import numpy as np
 
 from datasets import load_dataset
@@ -2547,6 +2575,33 @@ class V18RPEngine:
 
 _engine: Optional[V18RPEngine] = None
 
+
+# --- AUTONOMIC SAVE/LOAD FUNCTIONS ---
+AUTONOMIC_SAVE_FILE = "autonomic_state.json"
+
+def save_autonomic_ui():
+    global LATEST_AUTONOMIC_VAL
+    try:
+        with open(AUTONOMIC_SAVE_FILE, 'w') as f:
+            json.dump({"autonomic_value": LATEST_AUTONOMIC_VAL}, f, indent=4)
+        return f"Saved value: {LATEST_AUTONOMIC_VAL:.4f}"
+    except Exception as e:
+        return f"Error saving: {e}"
+
+def load_autonomic_ui():
+    global LATEST_AUTONOMIC_VAL
+    if os.path.exists(AUTONOMIC_SAVE_FILE):
+        try:
+            with open(AUTONOMIC_SAVE_FILE, 'r') as f:
+                data = json.load(f)
+                val = float(data.get("autonomic_value", 1.0))
+                LATEST_AUTONOMIC_VAL = val
+                return f"Loaded value: {val:.4f}", val
+        except Exception as e:
+            return f"Error loading: {e}", float(LATEST_AUTONOMIC_VAL)
+    return "No saved state found.", float(LATEST_AUTONOMIC_VAL)
+# -------------------------------------
+
 def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
               syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c):
     global _engine
@@ -2591,12 +2646,25 @@ def _gui_fit_line(epochs,lr,max_steps):
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
 
 def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
-    global _engine
+    global _engine, LATEST_AUTONOMIC_VAL
     if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
     try:
         # Pass the editable art image from Gradio to the Nanowire Canvas
         if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
-            _engine.walker._contingent.canvas.update_art(art_image)
+            if art_image is not None:
+                img_data = art_image.get('composite')
+                if img_data is None:
+                    img_data = art_image.get('image')
+                if img_data is None:
+                    img_data = art_image.get('background')
+                if img_data is not None:
+                    # Multiply uploaded picture by live neural arousal level
+                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).astype(np.uint8)
+                    _engine.walker._contingent.canvas.update_art(modulated_pic)
+                else:
+                    _engine.walker._contingent.canvas.update_art(None)
+            else:
+                _engine.walker._contingent.canvas.update_art(None)
 
         text,cot,steps,props=_engine.generate(
             seed_text=seed,instruction_text=instruction,
@@ -2672,17 +2740,32 @@ def build_gradio_app() -> gr.Blocks:
                 temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
                 show_tr  =gr.Checkbox(value=True,label="Show traces")
             with gr.Row():
-                gr.Markdown("### Editable Art Probs (Nanowire Canvas)\nDraw on the canvas! Red = Rho Trend, Green = Theta Trend, Blue = Sigma Trend.")
-                # We use Image with tool='color-sketch' for editable art in Gradio
+                gr.Markdown("### Upload Image (Neural Vessel Carrier)\nUpload a pic! The Arduino stream modulates this pic directly before text generation.")
+
+            with gr.Row():
                 try:
-                    art_img = gr.ImageEditor(type="numpy", label="Draw Mega Trends (RGB)", image_mode="RGB")
+                    art_img = gr.ImageEditor(type="numpy", label="Upload Pic (Modulated by Arduino)", image_mode="RGB")
                 except AttributeError:
-                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Draw Mega Trends (RGB)")
+                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Upload Pic (Modulated by Arduino)")
+
+                with gr.Column():
+                    gr.Markdown("**Live Arduino Stream (A0)**")
+                    live_arduino_ui = gr.Slider(0.0, 1.0, value=1.0, interactive=False, label="Current Autonomic Carrier Intensity")
+                    refresh_arduino_btn = gr.Button("Refresh Sensor Value")
+                    with gr.Row():
+                        save_arduino_btn = gr.Button("Save Autonomic State")
+                        load_arduino_btn = gr.Button("Load Autonomic State")
+                    autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
+
             gen_btn =gr.Button("Generate")
             gen_out =gr.Textbox(lines=8,  label="Generated text")
             prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out =gr.Textbox(lines=12, label="CoT traces")
             step_out=gr.Textbox(lines=14, label="Step traces (spaghetti mixer norms shown)")
+
+            # Click to see the current A0 neural level
+            refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
+
             gen_btn.click(_gui_generate,
                 inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr,art_img],
                 outputs=[gen_out,cot_out,step_out,prop_out])
