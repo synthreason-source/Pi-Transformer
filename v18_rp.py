@@ -2680,7 +2680,6 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
 
-
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI") as demo:
         gr.Markdown("# NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI")
