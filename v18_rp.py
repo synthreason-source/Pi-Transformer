@@ -2645,59 +2645,9 @@ def _gui_fit_line(epochs,lr,max_steps):
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
 
-
-def add_vector_vortex_background(img, strength=0.70, turns=2.6, depth=1.25,
-                                 tint=(70, 180, 255), bg_dark=10):
-    import numpy as np
-    if img is None:
-        return None
-
-    arr = np.asarray(img).copy()
-    if arr.ndim == 2:
-        arr = np.stack([arr, arr, arr], axis=-1)
-    if arr.shape[-1] == 4:
-        rgb = arr[..., :3].astype(np.float32)
-        alpha = arr[..., 3:4].astype(np.float32) / 255.0
-    else:
-        rgb = arr[..., :3].astype(np.float32)
-        alpha = np.ones((*arr.shape[:2], 1), dtype=np.float32)
-
-    h, w = rgb.shape[:2]
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    cx = (w - 1) * 0.5
-    cy = (h - 1) * 0.5
-
-    x = (xx - cx) / max(w, 1)
-    y = (yy - cy) / max(h, 1)
-    r = np.sqrt(x * x + y * y) + 1e-6
-    a = np.arctan2(y, x)
-
-    spiral = a + turns * (1.0 - np.clip(r, 0.0, 1.25)) * np.pi
-    bands  = 0.5 + 0.5 * np.cos(12.0 * spiral - 18.0 * r)
-    core   = np.exp(-(r * 5.5) ** 2)
-    rim    = np.exp(-((r - 0.58) * 7.0) ** 2)
-
-    zshade = np.clip(1.15 - depth * r + 0.55 * core, 0.15, 1.65)
-    flow   = np.clip(0.25 + 0.75 * bands + 0.35 * rim + 0.85 * core, 0.0, 1.8)
-
-    tint_vec = np.array(tint, dtype=np.float32).reshape(1, 1, 3)
-    vortex = (bg_dark + tint_vec * flow[..., None]) * zshade[..., None]
-    vortex = np.clip(vortex, 0, 255)
-
-    lum = rgb.mean(axis=2, keepdims=True)
-    subject_mask = np.clip((lum / 255.0) ** 1.35, 0.0, 1.0) * alpha
-    bg_mask = 1.0 - 0.82 * subject_mask
-
-    out = rgb * (1.0 - strength * bg_mask) + vortex * (strength * bg_mask)
-    out = np.clip(out, 0, 255).astype(np.uint8)
-
-    if arr.shape[-1] == 4:
-        return np.concatenate([out, arr[..., 3:4]], axis=-1)
-    return out
-
 def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
     global _engine, LATEST_AUTONOMIC_VAL
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
+    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","","",None
     try:
         # Pass the editable art image from Gradio to the Nanowire Canvas
         if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
@@ -2707,20 +2657,7 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
                     img_data = art_image.get('image')
                 if img_data is None:
                     img_data = art_image.get('background')
-                if img_data is not None:
-                    # Multiply uploaded picture by live neural arousal level
-                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).clip(0, 255).astype(np.uint8)
-                    modulated_pic = add_vector_vortex_background(
-                        modulated_pic,
-                        strength=0.72,
-                        turns=3.1,
-                        depth=1.35,
-                        tint=(90, 200, 255),
-                        bg_dark=6
-                    )
-                    _engine.walker._contingent.canvas.update_art(modulated_pic)
-                else:
-                    _engine.walker._contingent.canvas.update_art(None)
+               
             else:
                 _engine.walker._contingent.canvas.update_art(None)
 
@@ -2731,9 +2668,41 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
         cot_out  =cot   if show_traces else "(traces disabled)"
         steps_out=steps if show_traces else "(traces disabled)"
         prop_out =props if show_traces else "(traces disabled)"
-        return text,cot_out,steps_out,prop_out
+
+        # --- Reverse process: Text to Image Mod ---
+        out_image = None
+        if art_image is not None and 'modulated_pic' in locals():
+            import cv2
+            import numpy as np
+
+            # Make a copy to draw on
+            out_image = np.array(modulated_pic).copy()
+
+            # Use the generated text (or seed/instruction) as overlay
+            overlay_text = text[:100] + "..." if len(text) > 100 else text
+
+            # Add text overlay
+            h, w = out_image.shape[:2]
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = max(0.5, w / 1000.0)
+            thickness = max(1, int(w / 500.0))
+
+            # Add semi-transparent background for text
+            overlay = out_image.copy()
+            cv2.rectangle(overlay, (0, max(0, h - 80)), (w, h), (0, 0, 0), -1)
+            cv2.addWeighted(overlay, 0.6, out_image, 0.4, 0, out_image)
+
+            # Draw text
+            cv2.putText(out_image, f"Gen: {overlay_text}", (10, max(20, h - 50)), font, font_scale, (255, 255, 255), thickness)
+            cv2.putText(out_image, f"Inst: {instruction}", (10, max(50, h - 20)), font, font_scale * 0.8, (200, 255, 200), thickness)
+
+            # Ensure it's returned as RGB for Gradio
+            if len(out_image.shape) == 3 and out_image.shape[2] == 4:
+                out_image = cv2.cvtColor(out_image, cv2.COLOR_RGBA2RGB)
+
+        return text,cot_out,steps_out,prop_out,out_image
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
+        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","","",None
 
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI") as demo:
@@ -2816,7 +2785,10 @@ def build_gradio_app() -> gr.Blocks:
                     autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
 
             gen_btn =gr.Button("Generate")
-            gen_out =gr.Textbox(lines=8,  label="Generated text")
+
+            with gr.Row():
+                with gr.Column(scale=2):
+                    gen_out =gr.Textbox(lines=8,  label="Generated text")
             prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out =gr.Textbox(lines=12, label="CoT traces")
             step_out=gr.Textbox(lines=14, label="Step traces (spaghetti mixer norms shown)")
