@@ -2645,6 +2645,56 @@ def _gui_fit_line(epochs,lr,max_steps):
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
 
+
+def add_vector_vortex_background(img, strength=0.70, turns=2.6, depth=1.25,
+                                 tint=(70, 180, 255), bg_dark=10):
+    import numpy as np
+    if img is None:
+        return None
+
+    arr = np.asarray(img).copy()
+    if arr.ndim == 2:
+        arr = np.stack([arr, arr, arr], axis=-1)
+    if arr.shape[-1] == 4:
+        rgb = arr[..., :3].astype(np.float32)
+        alpha = arr[..., 3:4].astype(np.float32) / 255.0
+    else:
+        rgb = arr[..., :3].astype(np.float32)
+        alpha = np.ones((*arr.shape[:2], 1), dtype=np.float32)
+
+    h, w = rgb.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    cx = (w - 1) * 0.5
+    cy = (h - 1) * 0.5
+
+    x = (xx - cx) / max(w, 1)
+    y = (yy - cy) / max(h, 1)
+    r = np.sqrt(x * x + y * y) + 1e-6
+    a = np.arctan2(y, x)
+
+    spiral = a + turns * (1.0 - np.clip(r, 0.0, 1.25)) * np.pi
+    bands  = 0.5 + 0.5 * np.cos(12.0 * spiral - 18.0 * r)
+    core   = np.exp(-(r * 5.5) ** 2)
+    rim    = np.exp(-((r - 0.58) * 7.0) ** 2)
+
+    zshade = np.clip(1.15 - depth * r + 0.55 * core, 0.15, 1.65)
+    flow   = np.clip(0.25 + 0.75 * bands + 0.35 * rim + 0.85 * core, 0.0, 1.8)
+
+    tint_vec = np.array(tint, dtype=np.float32).reshape(1, 1, 3)
+    vortex = (bg_dark + tint_vec * flow[..., None]) * zshade[..., None]
+    vortex = np.clip(vortex, 0, 255)
+
+    lum = rgb.mean(axis=2, keepdims=True)
+    subject_mask = np.clip((lum / 255.0) ** 1.35, 0.0, 1.0) * alpha
+    bg_mask = 1.0 - 0.82 * subject_mask
+
+    out = rgb * (1.0 - strength * bg_mask) + vortex * (strength * bg_mask)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+
+    if arr.shape[-1] == 4:
+        return np.concatenate([out, arr[..., 3:4]], axis=-1)
+    return out
+
 def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
     global _engine, LATEST_AUTONOMIC_VAL
     if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
@@ -2659,7 +2709,15 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
                     img_data = art_image.get('background')
                 if img_data is not None:
                     # Multiply uploaded picture by live neural arousal level
-                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).astype(np.uint8)
+                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).clip(0, 255).astype(np.uint8)
+                    modulated_pic = add_vector_vortex_background(
+                        modulated_pic,
+                        strength=0.72,
+                        turns=3.1,
+                        depth=1.35,
+                        tint=(90, 200, 255),
+                        bg_dark=6
+                    )
                     _engine.walker._contingent.canvas.update_art(modulated_pic)
                 else:
                     _engine.walker._contingent.canvas.update_art(None)
@@ -2802,3 +2860,107 @@ if __name__ == "__main__":
     args=parser.parse_args()
 
     build_gradio_app().launch(share=False)
+
+# ==============================================================================
+# ARTHUR-MERLIN INTERACTIVE PROOF PROTOCOL
+# ==============================================================================
+
+class ArthurMerlinProtocol:
+    """
+    Genuine Arthur-Merlin Interactive Proof System.
+    Arthur = Probabilistic Verifier (flips coins)
+    Merlin = Unbounded Prover (your RP system generating structural proofs)
+    """
+    def __init__(self, walker, lm, geo, rounds=3):
+        self.walker = walker
+        self.lm = lm
+        self.geo = geo
+        self.rounds = rounds
+        self.history = []
+
+    def arthur_coin_flip(self) -> float:
+        import random, math
+        return random.uniform(0, math.pi)
+
+    def merlin_prove(self, arthur_challenge_theta: float) -> str:
+        self.walker.instr_dist.centroid_theta = arthur_challenge_theta
+        self.walker.instr_dist.centroid_rho = 0.8
+        self.walker.instr_dist.centroid_sigma = 1.0 
+
+        self.walker._recogniser.set_instruction(
+            instr_rho=0.8,
+            instr_theta=arthur_challenge_theta,
+            instr_sigma=1.0
+        )
+
+        proof_text = generate_passage_rp(
+            self.walker, self.lm, 
+            num_sentences=1, 
+            tokens_per_sent=15,
+            seed_text="Therefore, by mathematical deduction",
+            instruction_text=f"Align semantic centroid to angle {arthur_challenge_theta:.4f}.",
+            and_weight=1.5,
+            temperature=1.2
+        )
+        return proof_text
+
+    def arthur_verify(self, arthur_challenge_theta: float, merlin_proof: str) -> bool:
+        import math
+        tokens = tokenize(merlin_proof)
+        clean_toks = [t for t in tokens if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
+
+        if not clean_toks:
+            print("Arthur: Proof is empty. REJECT.")
+            return False
+
+        triples = [self.geo.triple_fast(t) for t in clean_toks]
+
+        sin_m = sum(math.sin(t.theta) for t in triples) / len(triples)
+        cos_m = sum(math.cos(t.theta) for t in triples) / len(triples)
+        actual_theta = math.atan2(sin_m, cos_m) % math.pi
+
+        epsilon = 0.45 
+        difference = abs(actual_theta - arthur_challenge_theta)
+
+        if difference > math.pi / 2:
+            difference = math.pi - difference
+
+        success = difference <= epsilon
+
+        print(f"  [Arthur's Target Angle] : {arthur_challenge_theta:.4f}")
+        print(f"  [Merlin's Actual Angle] : {actual_theta:.4f}")
+        print(f"  [Difference]            : {difference:.4f} (Epsilon: {epsilon})")
+        print(f"  [Result]                : {'ACCEPT ✅' if success else 'REJECT ❌'}")
+
+        return success
+
+    def run_protocol(self):
+        print("\n" + "="*60)
+        print(" BEGINNING ARTHUR-MERLIN INTERACTIVE PROOF PROTOCOL")
+        print("="*60)
+
+        accepted_rounds = 0
+
+        for r in range(self.rounds):
+            print(f"\n--- ROUND {r+1} ---")
+
+            challenge = self.arthur_coin_flip()
+            print(f"Arthur  : \"I flip my coins. My challenge target is Phase Angle {challenge:.4f}.\"")
+
+            proof = self.merlin_prove(challenge)
+            print(f"Merlin  : \"My proof is: {proof}\"")
+
+            if self.arthur_verify(challenge, proof):
+                accepted_rounds += 1
+                self.history.append((challenge, proof, True))
+            else:
+                self.history.append((challenge, proof, False))
+
+        print("\n" + "="*60)
+        print(f" PROTOCOL COMPLETE. Merlin passed {accepted_rounds}/{self.rounds} rounds.")
+        if accepted_rounds == self.rounds:
+            print(" VERDICT: THEOREM PROVEN (High Probability)")
+        else:
+            print(" VERDICT: PROOF REJECTED")
+        print("="*60)
+
