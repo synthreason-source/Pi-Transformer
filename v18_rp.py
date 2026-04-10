@@ -310,7 +310,41 @@ class CrossTangle:
         return outputs
 
 
+
+class ProbDigestor(nn.Module):
+    """
+    Replaces the Spaghetti Mixer logic by digesting all 
+    probability signals using a series of 2x5 kernels.
+    """
+    def __init__(self, num_probs=21, vocab_size=32000, hidden_channels=16):
+        super().__init__()
+        # 3 layers of 2x5 kernels. Padding width=2 keeps vocab size constant.
+        # No height padding means 21 -> 20 -> 19 -> 18 output channels.
+        self.digest_pipeline = nn.Sequential(
+            nn.Conv2d(1, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels, 1, kernel_size=(2, 5), padding=(0, 2)),
+        )
+
+    def forward(self, prob_list):
+        tensors = []
+        for p in prob_list:
+            if p.dim() == 1:
+                p = p.unsqueeze(0)
+            tensors.append(p)
+
+        stacked = torch.stack(tensors, dim=1)
+        x = stacked.unsqueeze(1)
+
+        x = self.digest_pipeline(x)
+
+        out = x.squeeze(1).sum(dim=1)
+        return out.squeeze(0) if out.shape[0] == 1 else out
+
 class SpaghettiRouter:
+
     """
     Orchestrates the full spaghetti probability routing pipeline.
 
@@ -2353,14 +2387,8 @@ def generate_passage_rp(walker, lm,
                         instruction_text="You are a computational algorithm.",
                         and_weight=0.9, temperature=2.0,
                         return_traces=False):
-    if instruction_text.strip():
-        walker.instr_dist.set_instruction(instruction_text)
-        walker._verbatim_tokens = tokenize(instruction_text)
-    elif seed_text.strip():
-        walker.instr_dist.set_instruction(seed_text)
-        walker._verbatim_tokens = tokenize(seed_text)
-    else:
-        walker._verbatim_tokens = []
+    if instruction_text.strip(): walker.instr_dist.set_instruction(instruction_text)
+    elif seed_text.strip():      walker.instr_dist.set_instruction(seed_text)
 
     walker._step_traces.clear()
     walker._csns_syn_norms.clear(); walker._csns_trans_norms.clear()
@@ -2411,65 +2439,20 @@ def generate_passage_rp(walker, lm,
             sent_prob_sum = 0.0; valid_steps = 0; period_hit = False
             snap_dist = random.randint(1, 12); unspoken_tokens = []
 
-            # If this is the last sentence, ensure we have enough steps to generate the full instruction text
-            max_steps = 12 + tokens_per_sent
-            if hasattr(walker, '_verbatim_tokens') and sent_idx == num_sentences - 1:
-                max_steps = max(max_steps, len(walker._verbatim_tokens) + 15)
-
-            for step in range(max_steps):
-                current_seq_pos = global_step + valid_steps
-
-                # Always compute standard walk_probs so internal states (CSNS norms, pending vars) update normally
+            for step in range(12 + tokens_per_sent):
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
                 cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
                 if not cands: break
-
-                # We want the text to compute TOWARDS the instruction text AT THE VERY END.
-                is_verbatim_phase = hasattr(walker, '_verbatim_tokens') and sent_idx == num_sentences - 1
-
-                # Reform the probabilities if we are in the final verbatim instruction phase
-                if is_verbatim_phase and valid_steps < len(walker._verbatim_tokens):
-                    target_nxt = walker._verbatim_tokens[valid_steps]
-
-                    if target_nxt not in cands:
-                        # Replace the least likely candidate with the target token to preserve array dimensions
-                        min_idx = torch.argmin(probs).item()
-                        cands[min_idx] = target_nxt
-
-                    target_idx = cands.index(target_nxt)
-
-                    # Reform the distribution: preserve underlying geometric relations but heavily bias the target
-                    reformed_probs = probs.clone()
-                    reformed_probs = reformed_probs * 0.01
-                    reformed_probs[target_idx] += 10.0
-                    probs = reformed_probs / reformed_probs.sum()
-
-                    cands, probs = pairwise_sort_unlink(cands, probs)
-                    # Force selection of the target to ensure verbatim compliance
-                    chosen_idx = cands.index(target_nxt)
-                    nxt = cands[chosen_idx]
-                    chosen_prob = probs[chosen_idx].item()
-                else:
-                    cands, probs = pairwise_sort_unlink(cands, probs)
-                    chosen_idx = torch.multinomial(probs, 1).item()
-                    nxt = cands[chosen_idx]
-                    chosen_prob = probs[chosen_idx].item()
-
+                cands, probs = pairwise_sort_unlink(cands, probs)
+                chosen_idx = torch.multinomial(probs, 1).item()
+                nxt = cands[chosen_idx]; chosen_prob = probs[chosen_idx].item()
                 if not period_hit:
                     sent_prob_sum += math.log(1e-12 + chosen_prob); valid_steps += 1
                     walker._observe_generated_token(nxt)
                     walker.record_step_trace(valid_steps + global_step, nxt, cands, probs, and_weight)
                     walker.push_token(nxt, tokens_per_sent)
                     toks.append(nxt)
-
-                    if is_verbatim_phase and valid_steps >= len(walker._verbatim_tokens):
-                        period_hit = True
-                        break  # Immediately stop generation when the instruction completes
-
-                    if nxt in PUNCT_TOKENS and len(toks) > 8:
-                        # Block early termination if we are still forcing the verbatim end sequence!
-                        if not (is_verbatim_phase and valid_steps < len(walker._verbatim_tokens)):
-                            period_hit = True
+                    if nxt in PUNCT_TOKENS and len(toks) > 8: period_hit = True
                 else:
                     if nxt not in PUNCT_TOKENS: unspoken_tokens.append(nxt)
                     if len(unspoken_tokens) >= snap_dist: break
@@ -2786,7 +2769,7 @@ def build_gradio_app() -> gr.Blocks:
                 seed_txt=gr.Textbox(label="Seed text"); instr_txt=gr.Textbox(label="Instruction text")
             with gr.Row():
                 n_sents  =gr.Slider(1,16,value=4,step=1,label="Sentences")
-                toks_sent=gr.Number(value=40, visible=False)
+                toks_sent=gr.Slider(10,120,value=80,step=5,label="Tokens/sentence")
                 and_w    =gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
                 temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
                 show_tr  =gr.Checkbox(value=True,label="Show traces")
