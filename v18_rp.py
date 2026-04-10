@@ -2353,8 +2353,14 @@ def generate_passage_rp(walker, lm,
                         instruction_text="You are a computational algorithm.",
                         and_weight=0.9, temperature=2.0,
                         return_traces=False):
-    if instruction_text.strip(): walker.instr_dist.set_instruction(instruction_text)
-    elif seed_text.strip():      walker.instr_dist.set_instruction(seed_text)
+    if instruction_text.strip():
+        walker.instr_dist.set_instruction(instruction_text)
+        walker._verbatim_tokens = tokenize(instruction_text)
+    elif seed_text.strip():
+        walker.instr_dist.set_instruction(seed_text)
+        walker._verbatim_tokens = tokenize(seed_text)
+    else:
+        walker._verbatim_tokens = []
 
     walker._step_traces.clear()
     walker._csns_syn_norms.clear(); walker._csns_trans_norms.clear()
@@ -2405,20 +2411,65 @@ def generate_passage_rp(walker, lm,
             sent_prob_sum = 0.0; valid_steps = 0; period_hit = False
             snap_dist = random.randint(1, 12); unspoken_tokens = []
 
-            for step in range(12 + tokens_per_sent):
+            # If this is the last sentence, ensure we have enough steps to generate the full instruction text
+            max_steps = 12 + tokens_per_sent
+            if hasattr(walker, '_verbatim_tokens') and sent_idx == num_sentences - 1:
+                max_steps = max(max_steps, len(walker._verbatim_tokens) + 15)
+
+            for step in range(max_steps):
+                current_seq_pos = global_step + valid_steps
+
+                # Always compute standard walk_probs so internal states (CSNS norms, pending vars) update normally
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
                 cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
                 if not cands: break
-                cands, probs = pairwise_sort_unlink(cands, probs)
-                chosen_idx = torch.multinomial(probs, 1).item()
-                nxt = cands[chosen_idx]; chosen_prob = probs[chosen_idx].item()
+
+                # We want the text to compute TOWARDS the instruction text AT THE VERY END.
+                is_verbatim_phase = hasattr(walker, '_verbatim_tokens') and sent_idx == num_sentences - 1
+
+                # Reform the probabilities if we are in the final verbatim instruction phase
+                if is_verbatim_phase and valid_steps < len(walker._verbatim_tokens):
+                    target_nxt = walker._verbatim_tokens[valid_steps]
+
+                    if target_nxt not in cands:
+                        # Replace the least likely candidate with the target token to preserve array dimensions
+                        min_idx = torch.argmin(probs).item()
+                        cands[min_idx] = target_nxt
+
+                    target_idx = cands.index(target_nxt)
+
+                    # Reform the distribution: preserve underlying geometric relations but heavily bias the target
+                    reformed_probs = probs.clone()
+                    reformed_probs = reformed_probs * 0.01
+                    reformed_probs[target_idx] += 10.0
+                    probs = reformed_probs / reformed_probs.sum()
+
+                    cands, probs = pairwise_sort_unlink(cands, probs)
+                    # Force selection of the target to ensure verbatim compliance
+                    chosen_idx = cands.index(target_nxt)
+                    nxt = cands[chosen_idx]
+                    chosen_prob = probs[chosen_idx].item()
+                else:
+                    cands, probs = pairwise_sort_unlink(cands, probs)
+                    chosen_idx = torch.multinomial(probs, 1).item()
+                    nxt = cands[chosen_idx]
+                    chosen_prob = probs[chosen_idx].item()
+
                 if not period_hit:
                     sent_prob_sum += math.log(1e-12 + chosen_prob); valid_steps += 1
                     walker._observe_generated_token(nxt)
                     walker.record_step_trace(valid_steps + global_step, nxt, cands, probs, and_weight)
                     walker.push_token(nxt, tokens_per_sent)
                     toks.append(nxt)
-                    if nxt in PUNCT_TOKENS and len(toks) > 8: period_hit = True
+
+                    if is_verbatim_phase and valid_steps >= len(walker._verbatim_tokens):
+                        period_hit = True
+                        break  # Immediately stop generation when the instruction completes
+
+                    if nxt in PUNCT_TOKENS and len(toks) > 8:
+                        # Block early termination if we are still forcing the verbatim end sequence!
+                        if not (is_verbatim_phase and valid_steps < len(walker._verbatim_tokens)):
+                            period_hit = True
                 else:
                     if nxt not in PUNCT_TOKENS: unspoken_tokens.append(nxt)
                     if len(unspoken_tokens) >= snap_dist: break
@@ -2647,7 +2698,7 @@ def _gui_fit_line(epochs,lr,max_steps):
 
 def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
     global _engine, LATEST_AUTONOMIC_VAL
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","","",None
+    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
     try:
         # Pass the editable art image from Gradio to the Nanowire Canvas
         if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
@@ -2657,7 +2708,12 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
                     img_data = art_image.get('image')
                 if img_data is None:
                     img_data = art_image.get('background')
-               
+                if img_data is not None:
+                    # Multiply uploaded picture by live neural arousal level
+                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).astype(np.uint8)
+                    _engine.walker._contingent.canvas.update_art(modulated_pic)
+                else:
+                    _engine.walker._contingent.canvas.update_art(None)
             else:
                 _engine.walker._contingent.canvas.update_art(None)
 
@@ -2668,41 +2724,9 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
         cot_out  =cot   if show_traces else "(traces disabled)"
         steps_out=steps if show_traces else "(traces disabled)"
         prop_out =props if show_traces else "(traces disabled)"
-
-        # --- Reverse process: Text to Image Mod ---
-        out_image = None
-        if art_image is not None and 'modulated_pic' in locals():
-            import cv2
-            import numpy as np
-
-            # Make a copy to draw on
-            out_image = np.array(modulated_pic).copy()
-
-            # Use the generated text (or seed/instruction) as overlay
-            overlay_text = text[:100] + "..." if len(text) > 100 else text
-
-            # Add text overlay
-            h, w = out_image.shape[:2]
-            font = cv2.FONT_HERSHEY_SIMPLEX
-            font_scale = max(0.5, w / 1000.0)
-            thickness = max(1, int(w / 500.0))
-
-            # Add semi-transparent background for text
-            overlay = out_image.copy()
-            cv2.rectangle(overlay, (0, max(0, h - 80)), (w, h), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.6, out_image, 0.4, 0, out_image)
-
-            # Draw text
-            cv2.putText(out_image, f"Gen: {overlay_text}", (10, max(20, h - 50)), font, font_scale, (255, 255, 255), thickness)
-            cv2.putText(out_image, f"Inst: {instruction}", (10, max(50, h - 20)), font, font_scale * 0.8, (200, 255, 200), thickness)
-
-            # Ensure it's returned as RGB for Gradio
-            if len(out_image.shape) == 3 and out_image.shape[2] == 4:
-                out_image = cv2.cvtColor(out_image, cv2.COLOR_RGBA2RGB)
-
-        return text,cot_out,steps_out,prop_out,out_image
+        return text,cot_out,steps_out,prop_out
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","","",None
+        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
 
 def build_gradio_app() -> gr.Blocks:
     with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI") as demo:
@@ -2762,7 +2786,7 @@ def build_gradio_app() -> gr.Blocks:
                 seed_txt=gr.Textbox(label="Seed text"); instr_txt=gr.Textbox(label="Instruction text")
             with gr.Row():
                 n_sents  =gr.Slider(1,16,value=4,step=1,label="Sentences")
-                toks_sent=gr.Slider(10,120,value=80,step=5,label="Tokens/sentence")
+                toks_sent=gr.Number(value=40, visible=False)
                 and_w    =gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
                 temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
                 show_tr  =gr.Checkbox(value=True,label="Show traces")
@@ -2785,10 +2809,7 @@ def build_gradio_app() -> gr.Blocks:
                     autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
 
             gen_btn =gr.Button("Generate")
-
-            with gr.Row():
-                with gr.Column(scale=2):
-                    gen_out =gr.Textbox(lines=8,  label="Generated text")
+            gen_out =gr.Textbox(lines=8,  label="Generated text")
             prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out =gr.Textbox(lines=12, label="CoT traces")
             step_out=gr.Textbox(lines=14, label="Step traces (spaghetti mixer norms shown)")
