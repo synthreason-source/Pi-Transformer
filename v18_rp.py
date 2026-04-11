@@ -72,7 +72,76 @@ import os
 
 # Global autonomic vessel carrier (defaults to 1.0 so image works even if Arduino is off)
 LATEST_AUTONOMIC_VAL = 1.0  
+import torch
+import torch
+import torch
 
+def apply_bottema_probability_bridge(cands, probs, gamma=0.20):
+    """
+    Applies Bottema's Theorem as a custom 2D spatial bridge for probabilities.
+    Returns a PyTorch tensor to maintain compatibility with downstream functions.
+    """
+    if len(probs) < 3:
+        return cands, probs
+        
+    # 1. Safely convert to tensor while preserving original device and dtype
+    is_tensor = isinstance(probs, torch.Tensor)
+    if is_tensor:
+        Y = probs.clone().float()
+        device = probs.device
+        orig_dtype = probs.dtype
+    else:
+        Y = torch.tensor(probs, dtype=torch.float32)
+        device = Y.device
+        orig_dtype = torch.float32
+        
+    # X-axis: Normalized geometric spacing [0.0 to 1.0] mapped to the same device
+    X = torch.linspace(0.0, 1.0, len(probs), device=device)
+    
+    # Anchors A (Max Probability) and B (Min Probability)
+    idx_max = torch.argmax(Y)
+    idx_min = torch.argmin(Y)
+    A_x, A_y = X[idx_max], Y[idx_max]
+    B_x, B_y = X[idx_min], Y[idx_min]
+    
+    # Bottema Theorem Invariant Midpoint M
+    dx_AB = (B_x - A_x) / 2.0
+    dy_AB = (B_y - A_y) / 2.0
+    M_x = (A_x + B_x) / 2.0 - dy_AB
+    M_y = (A_y + B_y) / 2.0 + dx_AB
+    
+    new_Y = Y.clone()
+    
+    # The Bottema Loop
+    for i in range(len(probs)):
+        if i == idx_max or i == idx_min: 
+            continue
+            
+        C_x, C_y = X[i], Y[i]
+        
+        # 1. Square on AC: Rot_90(C - A)
+        dx_AC, dy_AC = C_x - A_x, C_y - A_y
+        B_a_y = A_y + dx_AC
+        
+        # 2. Square on BC: Rot_-90(C - B)
+        dx_BC, dy_BC = C_x - B_x, C_y - B_y
+        A_b_y = B_y - dx_BC
+        
+        # 3. Geometric Midpoint of outer vertices
+        calc_M_y = (B_a_y + A_b_y) / 2.0
+        
+        # 4. Bridge the probability towards the invariant midpoint
+        dist = abs(C_x - M_x)
+        adaptive_gamma = gamma * (1.0 / (1.0 + dist))
+        
+        new_Y[i] = (1 - adaptive_gamma) * C_y + adaptive_gamma * calc_M_y
+        
+    # Ensure probabilities remain valid (positive and sum to 1)
+    new_Y = torch.clamp(new_Y, min=1e-8)
+    new_Y = new_Y / new_Y.sum()
+    
+    # 5. Return as a tensor matching the original dtype (removes the .tolist() error)
+    return cands, new_Y.to(dtype=orig_dtype)
 def autonomic_serial_worker(port='COM4', baud=9600):
     global LATEST_AUTONOMIC_VAL
     try:
@@ -310,41 +379,7 @@ class CrossTangle:
         return outputs
 
 
-
-class ProbDigestor(nn.Module):
-    """
-    Replaces the Spaghetti Mixer logic by digesting all 
-    probability signals using a series of 2x5 kernels.
-    """
-    def __init__(self, num_probs=21, vocab_size=32000, hidden_channels=16):
-        super().__init__()
-        # 3 layers of 2x5 kernels. Padding width=2 keeps vocab size constant.
-        # No height padding means 21 -> 20 -> 19 -> 18 output channels.
-        self.digest_pipeline = nn.Sequential(
-            nn.Conv2d(1, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, 1, kernel_size=(2, 5), padding=(0, 2)),
-        )
-
-    def forward(self, prob_list):
-        tensors = []
-        for p in prob_list:
-            if p.dim() == 1:
-                p = p.unsqueeze(0)
-            tensors.append(p)
-
-        stacked = torch.stack(tensors, dim=1)
-        x = stacked.unsqueeze(1)
-
-        x = self.digest_pipeline(x)
-
-        out = x.squeeze(1).sum(dim=1)
-        return out.squeeze(0) if out.shape[0] == 1 else out
-
 class SpaghettiRouter:
-
     """
     Orchestrates the full spaghetti probability routing pipeline.
 
@@ -1477,9 +1512,9 @@ class NLMicroSimulation(nn.Module):
 
         m = (m >> (lambda p: p.clamp(min=1e-12))
                >> (lambda p: torch.log(p))
-               >> (lambda p: FineAlterableMonad(p).alter(scale=0.5).unwrap()) # Compress to half
+               >> (lambda p: FineAlterableMonad(p).alter(scale=0.1).unwrap()) # Compress to half
                >> (lambda p: torch.logsumexp(p.unsqueeze(1) + p.unsqueeze(0), dim=1))
-               >> (lambda p: torch.exp(p))
+               >> (lambda p: torch.exp(-p))
                >> (lambda p: p / (p.sum() + 1e-12))
             )
         return m.unwrap()
@@ -2347,7 +2382,7 @@ def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
 
 def pairwise_sort_unlink(cands, probs):
     if len(cands) < 2: return cands, probs
-    paired = list(zip(cands, probs.tolist()))
+    paired = list(zip(cands, probs))
     unlinked_cands = []; unlinked_probs = []
     for i in range(0, len(paired) - 1, 2):
         p1, p2 = paired[i], paired[i+1]
@@ -2441,10 +2476,20 @@ def generate_passage_rp(walker, lm,
 
             for step in range(12 + tokens_per_sent):
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
+                
+                # Existing bilinear shift
                 cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
+                
+                # ════════════════════════════════════════════════════════════
+                # NEW: Apply the Bottema 2D Theorem Bridge
+                # ════════════════════════════════════════════════════════════
+                cands, probs = apply_bottema_probability_bridge(cands, probs, gamma=0.20)
+                
                 if not cands: break
+                
+                # Existing sort and sample logic
                 cands, probs = pairwise_sort_unlink(cands, probs)
-                chosen_idx = torch.multinomial(probs, 1).item()
+                chosen_idx = torch.multinomial(torch.tensor(probs), 1).item()
                 nxt = cands[chosen_idx]; chosen_prob = probs[chosen_idx].item()
                 if not period_hit:
                     sent_prob_sum += math.log(1e-12 + chosen_prob); valid_steps += 1
