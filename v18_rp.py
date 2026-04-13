@@ -1,57 +1,82 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI
+NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
 ===============================================================================
 
-SPAGHETTI PROBS — COMPLETE REWRITE
-───────────────────────────────────
+CARDAN GRILLE ISOMORPHISMS + MIRRORED INSTRUCTIONS
+───────────────────────────────────────────────────
 
-Every probability signal now routes through a multi-lane tangled mixer graph
-instead of a flat weighted sum. No signal feeds cleanly into a single
-destination — each fans into MULTIPLE mixer nodes simultaneously, and the
-mixers re-cross before the DNN pipeline. The junction points are explicit
-CrossTangle objects that apply a learnable Möbius-style bilinear interaction
-between crossing lanes before they diverge again.
+Two new subsystems grafted onto the V18-SPAGHETTI base:
 
-ARCHITECTURE
-────────────
-                         ┌──────────────────────────────────────┐
-                         │          SPAGHETTI ROUTER             │
-  instruction_dist ──────┼──→ MixerA ──╮  ╭──→ MixerX ──╮      │
-  ripple_shift     ──────┼──→ MixerA ──┤  │   MixerX ──┤       │
-                   ╲─────┼──→ MixerB   │  │             │       │
-  cot_bonus        ──────┼──→ MixerA ──┤  ╰──→ MixerY   │       │
-                   ╲─────┼──→ MixerC   │      MixerY ──┤       │
-  ooi_affinity     ──────┼──→ MixerA   │                │       │
-                   ╲─────┼──→ MixerB ──╯  CrossTangle   │       │
-  aniso_kernel     ──────┼──→ MixerB       (bilinear)   │       │
-                   ╲─────┼──→ MixerC ──────────────────→ DNN ──→ simplex
-  walk_potential   ──────┼──→ MixerA                            │
-                   ╲─────┼──→ MixerC                            │
-  repulsion(neg)   ──────┼──→ MixerB                            │
-                   ╲─────┼──→ MixerA  (penalty cross-feeds)     │
-  mrv              ──────┼──→ MixerC                            │
-  pdn_bonus        ──────┼──→ MixerB                            │
-  chunk_echo       ──────┼──→ MixerA + MixerC                   │
-                         └──────────────────────────────────────┘
+══════════════════════════════════════════════════════════════════════════════
+1.  CARDAN GRILLE ISOMORPHISM ENGINE  (CardanGrilleIsomorphism)
+──────────────────────────────────────────────────────────────────────────────
 
-Each CrossTangle node applies:
-    out_i = tanh((a_i + coupling × b_i) / (1 + coupling × a_i × b_i))
-a Möbius cross-shift (hyperbolic automorphism on [-1,1]) that produces
-genuine non-linear interaction between the crossing strands.
+A Cardan grille is a physical encryption tool: a card with rectangular holes
+cut at specific positions.  Placed over a grid of letters, only the letters
+visible through the holes are read; rotating the card 90° reveals a second
+message, 180° a third, 270° a fourth.
 
-The final simplex projection (l1simplexproject) resolves all tangled
-lanes into a valid probability distribution.
+Here we treat the *dataset corpus* as the letter-grid and build a set of
+virtual grilles whose aperture positions are derived from the trigram-frequency
+spectrum.  Each 90°-rotation of the grille selects a different sub-vocabulary
+partition — an *isomorphic projection* of the full vocab onto a rotational
+class.
 
-SPAGHETTI PROBABILITY CLASSES
-──────────────────────────────
-  SpaghettiStrand   — a named probability signal with routing metadata
-  SpaghettiMixer    — collects assigned strands, outputs a blended logit vec
-  CrossTangle       — bilinear Möbius interaction between two mixer outputs
-  SpaghettiRouter   — orchestrates all strands, mixers, tangles, final merge
+Construction
+  • The vocab is tiled into a square grid of side G = ⌈√|V|⌉.
+  • Aperture positions are chosen by sampling the top-K trigram pairs ordered
+    by joint frequency; their (row, col) positions in the grid define the
+    "holes" of the base grille (Grille-0°).
+  • Rotating 90°/180°/270° maps each aperture (r,c) → (c, G-1-r) etc.,
+    producing three sibling grilles.
+  • At generation time the engine looks up which grille-class the *current
+    bigram context* falls into (via modular orbit index from the PDN engine)
+    and returns the corresponding aperture-vocab subset as the *candidate set*,
+    optionally intersected with the LM's native candidate set.
 
-All other algorithms unchanged from V18-RP-ANISO-RIPPLE.
+Isomorphism property
+  The four rotations form a Z₄ cyclic group.  Because the aperture count is
+  fixed, all four projections have the same cardinality — they are isomorphic
+  as sets under the rotation action.  This ensures the probability mass is
+  spread over equally-sized candidate pools regardless of rotation.
+
+Integration into generate_passage_rp
+  • After the LM produces its raw (cands, base_probs) pair the Cardan engine
+    is called:  ``cands, base_probs = cardan.filter(cands, base_probs, orbit)``
+  • The returned set is the intersection of LM candidates with the
+    rotation-class apertures, falling back to the full LM set when the
+    intersection is too small (< MIN_CARDAN_CANDS).
+  • A new spaghetti strand ``cardan_iso`` is added to the router, carrying a
+    logit bonus equal to the aperture membership score of each candidate.
+
+══════════════════════════════════════════════════════════════════════════════
+2.  MIRRORED INSTRUCTION DISTRIBUTION  (MirroredInstructionDistribution)
+──────────────────────────────────────────────────────────────────────────────
+
+The instruction text is processed in two directions simultaneously:
+
+  Forward  pass  → standard RPInstructionDistribution (unchanged)
+  Backward pass  → tokens reversed, re-embedded, centroid recomputed,
+                   produces a "mirror" base_dist_t
+
+The mirror distribution captures *suffix* semantics of the instruction: if the
+instruction ends with goal-oriented tokens, the mirror foregrounds them by
+placing them first in its recency-decay weighting.
+
+At generation time both distributions are blended:
+    p_combined = (1 - mirror_alpha) * p_forward + mirror_alpha * p_mirror
+
+A new spaghetti strand ``mirror_instr`` fans into MixerA and MixerC with sign
++1, adding a second instruction signal that is phase-shifted relative to the
+forward one.  The Möbius tangle between A and C (via CrossTangle BC path)
+then entangles forward and mirror signals, preventing either from dominating.
+
+mirror_alpha is a tunable hyperparameter (default 0.35).
+
+══════════════════════════════════════════════════════════════════════════════
+All other algorithms unchanged from V18-RP-ANISO-RIPPLE-SPAGHETTI.
 """
 
 from __future__ import annotations
@@ -71,7 +96,49 @@ import json
 import os
 
 # Global autonomic vessel carrier (defaults to 1.0 so image works even if Arduino is off)
-LATEST_AUTONOMIC_VAL = 1.0  
+LATEST_AUTONOMIC_VAL = 1.0
+import torch
+import torch
+import torch
+
+def apply_bottema_probability_bridge(cands, probs, gamma=0.20):
+    if len(probs) < 3:
+        return cands, probs
+    is_tensor = isinstance(probs, torch.Tensor)
+    if is_tensor:
+        Y = probs.clone().float()
+        device = probs.device
+        orig_dtype = probs.dtype
+    else:
+        Y = torch.tensor(probs, dtype=torch.float32)
+        device = Y.device
+        orig_dtype = torch.float32
+    X = torch.linspace(0.0, 1.0, len(probs), device=device)
+    idx_max = torch.argmax(Y)
+    idx_min = torch.argmin(Y)
+    A_x, A_y = X[idx_max], Y[idx_max]
+    B_x, B_y = X[idx_min], Y[idx_min]
+    dx_AB = (B_x - A_x) / 2.0
+    dy_AB = (B_y - A_y) / 2.0
+    M_x = (A_x + B_x) / 2.0 - dy_AB
+    M_y = (A_y + B_y) / 2.0 + dx_AB
+    new_Y = Y.clone()
+    for i in range(len(probs)):
+        if i == idx_max or i == idx_min:
+            continue
+        C_x, C_y = X[i], Y[i]
+        dx_AC, dy_AC = C_x - A_x, C_y - A_y
+        B_a_y = A_y + dx_AC
+        dx_BC, dy_BC = C_x - B_x, C_y - B_y
+        A_b_y = B_y - dx_BC
+        calc_M_y = (B_a_y + A_b_y) / 2.0
+        dist = abs(C_x - M_x)
+        adaptive_gamma = gamma * (1.0 / (1.0 + dist))
+        new_Y[i] = (1 - adaptive_gamma) * C_y + adaptive_gamma * calc_M_y
+    new_Y = torch.clamp(new_Y, min=1e-8)
+    new_Y = new_Y / new_Y.sum()
+    return cands, new_Y.to(dtype=orig_dtype)
+
 
 def autonomic_serial_worker(port='COM4', baud=9600):
     global LATEST_AUTONOMIC_VAL
@@ -83,14 +150,12 @@ def autonomic_serial_worker(port='COM4', baud=9600):
                 line = ser.readline().decode('utf-8', errors='ignore').strip()
                 if line.isdigit():
                     val = int(line)
-                    # Normalize the 10-bit analog data (0-1023) to a 0.0 - 1.0 multiplier
-                    LATEST_AUTONOMIC_VAL = val / 1023.0  
+                    LATEST_AUTONOMIC_VAL = val / 1023.0
             except Exception:
                 pass
     except Exception as e:
         print(f"Serial stream error: {e}")
 
-# Start the background listener immediately
 threading.Thread(target=autonomic_serial_worker, daemon=True).start()
 import numpy as np
 
@@ -100,13 +165,7 @@ from datasets import load_dataset
 # SECTION 0 — DEVICE + GLOBAL CONFIG
 # ════════════════════════════════════════════════════════════════════════════
 
-
 class FineAlterableMonad:
-    """
-    Monadic container for fine-alterable computational states.
-    Encapsulates a tensor with dynamic scale, shift, and temperature,
-    and provides a bind (>>) operator for functional sequencing.
-    """
     def __init__(self, value, scale: float = 1.0, shift: float = 0.0, temp: float = 1.0):
         self.value = value
         self.scale = scale
@@ -127,7 +186,7 @@ class FineAlterableMonad:
         return ((self.value * self.scale) + self.shift) / max(self.temp, 1e-6)
 
     def alter(self, scale=None, shift=None, temp=None):
-        return FineAlterableMonad(self.value, 
+        return FineAlterableMonad(self.value,
                                   scale if scale is not None else self.scale,
                                   shift if shift is not None else self.shift,
                                   temp if temp is not None else self.temp)
@@ -170,11 +229,19 @@ PARA_DUP_WINDOW     = 5
 PARA_DUP_MATCH_CAP  = 5
 
 # ── SPAGHETTI CONFIG ─────────────────────────────────────────────────────
-SPAGHETTI_COUPLING   = 0.35   # Möbius cross-coupling strength per tangle
-SPAGHETTI_MIXER_TEMP = 0.8    # softmax temperature inside each mixer
-SPAGHETTI_STRAND_DIM = 3      # number of mixer lanes each strand fans into
-SPAGHETTI_N_MIXERS   = 3      # MixerA, MixerB, MixerC
-SPAGHETTI_N_TANGLES  = 2      # CrossTangle AB, CrossTangle BC
+SPAGHETTI_COUPLING   = 0.35
+SPAGHETTI_MIXER_TEMP = 0.8
+SPAGHETTI_STRAND_DIM = 3
+SPAGHETTI_N_MIXERS   = 3
+SPAGHETTI_N_TANGLES  = 2
+
+# ── CARDAN GRILLE CONFIG ──────────────────────────────────────────────────
+CARDAN_APERTURE_K    = 64     # how many aperture positions per grille
+MIN_CARDAN_CANDS     = 4      # fall back to full LM set if intersection smaller
+CARDAN_LOGIT_WEIGHT  = 8.0    # spaghetti strand weight for cardan_iso
+
+# ── MIRRORED INSTRUCTION CONFIG ───────────────────────────────────────────
+MIRROR_ALPHA         = 0.35   # blend weight for the reversed-instruction dist
 
 _rng    = random.Random(RP_SEED)
 _np_rng = np.random.default_rng(RP_SEED)
@@ -212,16 +279,8 @@ def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
 
 def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
                         coupling: float = SPAGHETTI_COUPLING) -> torch.Tensor:
-    """
-    Möbius / hyperbolic automorphism cross-shift.
-    Maps (a, b) -> tanh((a + c*b) / (1 + c*a*b))
-    This is the spaghetti tangle junction: genuine non-linear interaction
-    between two crossing probability strands.
-    a, b in R^C (logit space); returns C-vector shifted strand.
-    """
     a = a.clamp(-20.0, 20.0)
     b = b.clamp(-20.0, 20.0)
-    # tanh-space Möbius
     ta = torch.tanh(a * 0.1)
     tb = torch.tanh(b * 0.1)
     denom = (1.0 + coupling * ta * tb).clamp(min=1e-6)
@@ -230,33 +289,19 @@ def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b2 — SPAGHETTI PROBABILITY ROUTER
+# SECTION 0b2 — SPAGHETTI PROBABILITY ROUTER  (extended routing table)
 # ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SpaghettiStrand:
-    """
-    A named probability signal with a weight and a routing mask.
-
-    routing_mask: list of mixer indices this strand fans into.
-    sign: +1 for bonus strands, -1 for penalty strands (repulsion etc.)
-    """
     name:         str
-    signal:       torch.Tensor   # (C,) logit-space bonus
+    signal:       torch.Tensor
     weight:       float
-    routing_mask: List[int]      # which mixers receive this strand
+    routing_mask: List[int]
     sign:         float = 1.0
 
 
 class SpaghettiMixer:
-    """
-    Collects assigned strands and blends them into a single (C,) logit vector.
-
-    Blend rule:
-        raw = sum(strand.sign * strand.weight * strand.signal
-                  for strand in assigned_strands)
-        out = layer_norm(raw) / SPAGHETTI_MIXER_TEMP
-    """
     def __init__(self, name: str, device: torch.device = DEVICE):
         self.name    = name
         self.device  = device
@@ -281,17 +326,6 @@ class SpaghettiMixer:
 
 
 class CrossTangle:
-    """
-    Bilinear Möbius cross-interaction between two mixer outputs.
-
-    Given mixer_out_i and mixer_out_j, produces two new vectors:
-        tangled_i = mobius_cross_shift(mixer_out_i, mixer_out_j, coupling)
-        tangled_j = mobius_cross_shift(mixer_out_j, mixer_out_i, coupling)
-
-    The tangled outputs replace the original mixer outputs in the DNN input.
-    This is the heart of spaghetti probs: the signals become entangled at
-    each tangle junction and cannot be disentangled downstream.
-    """
     def __init__(self, mixer_i: int, mixer_j: int,
                   coupling: float = SPAGHETTI_COUPLING):
         self.i        = mixer_i
@@ -299,10 +333,6 @@ class CrossTangle:
         self.coupling = coupling
 
     def apply(self, outputs: List[torch.Tensor]) -> List[torch.Tensor]:
-        """
-        Mutate outputs[i] and outputs[j] in-place with Möbius cross-shift.
-        Returns the modified list.
-        """
         a = outputs[self.i]
         b = outputs[self.j]
         outputs[self.i] = mobius_cross_shift(a, b, self.coupling)
@@ -310,85 +340,8 @@ class CrossTangle:
         return outputs
 
 
-
-class ProbDigestor(nn.Module):
-    """
-    Replaces the Spaghetti Mixer logic by digesting all 
-    probability signals using a series of 2x5 kernels.
-    """
-    def __init__(self, num_probs=21, vocab_size=32000, hidden_channels=16):
-        super().__init__()
-        # 3 layers of 2x5 kernels. Padding width=2 keeps vocab size constant.
-        # No height padding means 21 -> 20 -> 19 -> 18 output channels.
-        self.digest_pipeline = nn.Sequential(
-            nn.Conv2d(1, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=(2, 5), padding=(0, 2)),
-            nn.GELU(),
-            nn.Conv2d(hidden_channels, 1, kernel_size=(2, 5), padding=(0, 2)),
-        )
-
-    def forward(self, prob_list):
-        tensors = []
-        for p in prob_list:
-            if p.dim() == 1:
-                p = p.unsqueeze(0)
-            tensors.append(p)
-
-        stacked = torch.stack(tensors, dim=1)
-        x = stacked.unsqueeze(1)
-
-        x = self.digest_pipeline(x)
-
-        out = x.squeeze(1).sum(dim=1)
-        return out.squeeze(0) if out.shape[0] == 1 else out
-
 class SpaghettiRouter:
-
-    """
-    Orchestrates the full spaghetti probability routing pipeline.
-
-    Usage:
-        router = SpaghettiRouter(C, device)
-        router.add_strand('ripple', ripple_signal, weight=0.5,
-                           routing_mask=[0, 1], sign=1.0)
-        router.add_strand('repulsion', rep_signal, weight=0.4,
-                           routing_mask=[1, 0], sign=-1.0)
-        ...
-        final_logits = router.route()
-
-    Routing table (hardcoded — defines the spaghetti topology):
-
-    Strand              → Mixers          Sign
-    ─────────────────────────────────────────────
-    instruction_dist    → A, B            +1
-    ripple_shift        → A, B, C         +1   (fans widest)
-    cot_bonus           → A, C            +1
-    ooi_affinity        → A, B            +1
-    aniso_kernel (reg)  → B, C            +1
-    aniso_kernel (ori)  → A, C            +1
-    aniso_kernel (side) → B               +1
-    walk_potential      → A, C            +1
-    repulsion           → B, A            -1   (crosses into A as penalty)
-    mrv                 → C               +1
-    pdn_bonus           → B, C            +1
-    chunk_bonus         → A, C            +1
-    echo_bonus          → A               +1
-    comp_bonus          → B               +1
-    sorted_impulse      → C               +1
-    para_expanse        → A               +1
-    para_dup_penalty    → A, B            -1
-    ooi_affinity (echo) → C               +1
-
-    CrossTangles:
-        Tangle AB: MixerA × MixerB  (instruction × geometric)
-        Tangle BC: MixerB × MixerC  (geometric × structural)
-
-    After tangles, three tangled outputs are summed with equal weight
-    and passed to the DNN pipeline.
-    """
-
-    # Routing table: strand_name → (mixer_indices, sign)
+    # Extended routing table — two new strands added
     ROUTING_TABLE: Dict[str, Tuple[List[int], float]] = {
         'instruction_dist':  ([0, 1],    +1.0),
         'ripple_shift':      ([0, 1, 2], +1.0),
@@ -411,12 +364,14 @@ class SpaghettiRouter:
         'orbit_bonus':       ([2],       +1.0),
         'syn_norm':          ([0, 1],    +1.0),
         'trans_norm':        ([1],       +1.0),
+        # ── NEW CARDAN + MIRROR STRANDS ──────────────────────────────────
+        'cardan_iso':        ([0, 2],    +1.0),   # aperture membership bonus
+        'mirror_instr':      ([0, 2],    +1.0),   # reversed-instruction dist
     }
 
-    # Tangle pairs: (mixer_i, mixer_j, coupling)
     TANGLE_SPEC = [
-        (0, 1, SPAGHETTI_COUPLING),          # AB: instruction × geometric
-        (1, 2, SPAGHETTI_COUPLING * 0.8),    # BC: geometric × structural
+        (0, 1, SPAGHETTI_COUPLING),
+        (1, 2, SPAGHETTI_COUPLING * 0.8),
     ]
 
     def __init__(self, C: int, device: torch.device = DEVICE):
@@ -432,7 +387,6 @@ class SpaghettiRouter:
 
     def add_strand(self, name: str, signal: torch.Tensor, weight: float):
         if name not in self.ROUTING_TABLE:
-            # Default: fan into all mixers
             routing, sign = [0, 1, 2], 1.0
         else:
             routing, sign = self.ROUTING_TABLE[name]
@@ -441,21 +395,279 @@ class SpaghettiRouter:
             self._mixers[idx].assign(strand)
 
     def route(self) -> torch.Tensor:
-        """
-        1. Each mixer blends its assigned strands.
-        2. CrossTangles apply Möbius interactions between mixer pairs.
-        3. Tangled outputs are summed → final logit vector (C,).
-        """
         C = self.C
         outputs: List[torch.Tensor] = [m.blend(C) for m in self._mixers]
-
-        # Apply tangles (mutates outputs in-place)
         for tangle in self._tangles:
             outputs = tangle.apply(outputs)
-
-        # Final sum of all tangled mixer outputs
-        combined = torch.stack(outputs, dim=0).sum(dim=0)  # (C,)
+        combined = torch.stack(outputs, dim=0).sum(dim=0)
         return layer_norm_array(combined)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0b3 — CARDAN GRILLE ISOMORPHISM ENGINE  (NEW)
+# ════════════════════════════════════════════════════════════════════════════
+
+class CardanGrilleIsomorphism:
+    """
+    Builds four Z₄-isomorphic vocab partitions from the corpus trigram
+    frequency spectrum, mimicking a physical Cardan grille rotated through
+    0°, 90°, 180°, 270°.
+
+    Usage
+    ─────
+    Build once after LM finalisation:
+        cardan = CardanGrilleIsomorphism(vocab, tri_raw, raw_freq,
+                                          aperture_k=CARDAN_APERTURE_K)
+
+    At generation time:
+        cardan_cands, cardan_probs, aperture_scores = cardan.filter(
+            cands, base_probs, orbit_index)
+
+    where orbit_index ∈ {0,1,2,3} comes from pdn_engine.orbit_of(token) % 4.
+
+    Aperture membership score (per candidate):
+        score_i = 1.0  if cand_i is in the active rotation-class aperture
+                  0.0  otherwise
+    This is fed as a spaghetti strand logit bonus.
+    """
+
+    def __init__(self, vocab: List[str],
+                 tri_raw: Dict[Tuple[str, str, str], float],
+                 raw_freq: Dict[str, float],
+                 aperture_k: int = CARDAN_APERTURE_K,
+                 min_cands: int = MIN_CARDAN_CANDS):
+        self.vocab      = vocab
+        self.aperture_k = aperture_k
+        self.min_cands  = min_cands
+        self._tok2idx   = {t: i for i, t in enumerate(vocab)}
+        V               = len(vocab)
+        self._G         = max(1, math.ceil(math.sqrt(V)))  # grid side
+
+        # ── Build aperture positions from top-K trigram head frequency ──
+        # Score each vocab token by the total frequency of trigrams where
+        # it appears as w3 (head position) — captures "predictive value".
+        head_score: Dict[str, float] = {}
+        for (w1, w2, w3), cnt in tri_raw.items():
+            head_score[w3] = head_score.get(w3, 0.0) + cnt
+
+        # Sort vocab by head score descending, take top aperture_k as base
+        scored = sorted(
+            [(head_score.get(t, raw_freq.get(t, 0.0)), i, t)
+             for i, t in enumerate(vocab)],
+            reverse=True)
+        base_positions = [item[1] for item in scored[:aperture_k]]
+
+        # ── Build four rotation classes ─────────────────────────────────
+        # Map linear vocab index → (row, col) in G×G grid
+        def idx_to_rc(idx):
+            return divmod(idx, self._G)
+
+        def rc_to_idx(r, c):
+            return min(r * self._G + c, V - 1)
+
+        def rotate_90(r, c, G):
+            return c, G - 1 - r
+
+        G = self._G
+        self._grilles: List[Set[int]] = [set(), set(), set(), set()]
+        for pos in base_positions:
+            r, c = idx_to_rc(pos)
+            self._grilles[0].add(rc_to_idx(r, c))
+            r1, c1 = rotate_90(r, c, G)
+            self._grilles[1].add(rc_to_idx(r1, c1))
+            r2, c2 = rotate_90(r1, c1, G)
+            self._grilles[2].add(rc_to_idx(r2, c2))
+            r3, c3 = rotate_90(r2, c2, G)
+            self._grilles[3].add(rc_to_idx(r3, c3))
+
+        # ── Precompute per-grille vocab token sets ───────────────────────
+        self._grille_toks: List[Set[str]] = [
+            {vocab[i] for i in grille if i < V}
+            for grille in self._grilles
+        ]
+        sizes = [len(g) for g in self._grille_toks]
+        print(f"[Cardan] Grid {G}×{G}  aperture_k={aperture_k}  "
+              f"rotation set sizes: {sizes}")
+
+    def filter(self, cands: List[str], base_probs: torch.Tensor,
+               orbit: int) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
+        """
+        Returns (filtered_cands, filtered_probs, aperture_logit_bonus).
+
+        aperture_logit_bonus is a (len(cands),) tensor of 0.0/1.0 membership
+        scores for all original candidates (before filtering) — used as the
+        spaghetti cardan_iso strand.
+        """
+        device = base_probs.device
+        C = len(cands)
+
+        # Build per-candidate aperture membership score (for the strand)
+        active_set = self._grille_toks[orbit % 4]
+        aperture_scores = torch.tensor(
+            [1.0 if c in active_set else 0.0 for c in cands],
+            dtype=torch.float32, device=device)
+
+        # Intersect candidates with active aperture
+        inter_idx = [i for i, c in enumerate(cands) if c in active_set]
+
+        if len(inter_idx) < self.min_cands:
+            # Fallback: return original candidates unchanged
+            return cands, base_probs, aperture_scores
+
+        filt_cands = [cands[i] for i in inter_idx]
+        filt_probs = base_probs[torch.tensor(inter_idx, device=device)]
+        filt_probs = filt_probs / filt_probs.sum().clamp(min=1e-12)
+        return filt_cands, filt_probs, aperture_scores
+
+    def rotation_report(self) -> str:
+        lines = ["  Cardan Grille Rotation Report:"]
+        for r, (grille, toks) in enumerate(zip(self._grilles, self._grille_toks)):
+            angle = r * 90
+            lines.append(f"    Grille {angle:3d}°: {len(toks):5d} vocab tokens  "
+                          f"(idx range [{min(grille) if grille else 0}, "
+                          f"{max(grille) if grille else 0}])")
+        return "\n".join(lines)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0b4 — MIRRORED INSTRUCTION DISTRIBUTION  (NEW)
+# ════════════════════════════════════════════════════════════════════════════
+
+class MirroredInstructionDistribution:
+    """
+    Wraps RPInstructionDistribution and adds a *mirrored* (token-reversed)
+    counterpart.  The mirror foregrounds suffix semantics of the instruction.
+
+    Combined distribution:
+        p_combined = (1 - alpha) * p_forward + alpha * p_mirror
+
+    The mirror centroid (rho, theta, sigma) is computed from the reversed
+    token sequence and injected as the 'mirror_instr' spaghetti strand.
+    """
+
+    def __init__(self, forward_dist: 'RPInstructionDistribution',
+                 alpha: float = MIRROR_ALPHA,
+                 device: torch.device = DEVICE,
+                 dtype: torch.dtype = torch.float32):
+        self.fwd   = forward_dist
+        self.alpha = alpha
+        self.device = device
+        self.dtype  = dtype
+
+        # Mirror state — set when set_instruction is called
+        self.mirror_dist_t:     Optional[torch.Tensor] = None
+        self.mirror_centroid_rho:   float = 0.3
+        self.mirror_centroid_theta: float = math.pi / 4
+        self.mirror_centroid_sigma: float = 1.0
+
+    def set_instruction(self, instruction_text: str):
+        """Set forward instruction and compute mirror from reversed tokens."""
+        # Forward pass (unchanged)
+        self.fwd.set_instruction(instruction_text)
+
+        # Mirror pass — reverse the instruction token list
+        raw       = tokenize(instruction_text)
+        fwd_toks  = [t for t in raw if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
+        mir_toks  = list(reversed(fwd_toks))
+
+        if not mir_toks or self.fwd.base_dist_t is None:
+            self.mirror_dist_t = self.fwd.base_dist_t
+            return
+
+        geo      = self.fwd.geo
+        lm       = self.fwd.lm
+        kernels  = self.fwd.kernels
+        V        = len(lm.vocab)
+
+        # Recency-decay over reversed sequence
+        N     = len(mir_toks)
+        decay = self.fwd.recency_decay
+        freq: Dict[str, float] = {}
+        for pos, tok in enumerate(mir_toks):
+            freq[tok] = freq.get(tok, 0.0) + decay ** (N - 1 - pos)
+
+        # Mirror centroid geometry
+        triples = [geo.triple_fast(t) for t in mir_toks if t in geo._vecs]
+        if triples:
+            mr  = sum(t.rho   for t in triples) / len(triples)
+            ms  = sum(t.sigma for t in triples) / len(triples)
+            sin_m = sum(math.sin(t.theta) for t in triples) / len(triples)
+            cos_m = sum(math.cos(t.theta) for t in triples) / len(triples)
+            self.mirror_centroid_rho   = mr
+            self.mirror_centroid_theta = math.atan2(sin_m, cos_m) % math.pi
+            self.mirror_centroid_sigma = ms
+        else:
+            self.mirror_centroid_rho   = self.fwd.centroid_rho
+            self.mirror_centroid_theta = self.fwd.centroid_theta
+            self.mirror_centroid_sigma = self.fwd.centroid_sigma
+
+        # Build mirror base distribution
+        base = torch.zeros(V, dtype=self.dtype, device=self.device)
+        for tok, w in freq.items():
+            idx = lm._tok2idx.get(tok)
+            if idx is not None and 0 <= idx < V:
+                base[idx] += w
+
+        # Kernel spread over vocab
+        if geo._rho_t is not None and geo._rho_t.shape[0] == V:
+            for tok, w in freq.items():
+                if tok not in geo._vecs:
+                    continue
+                tr     = geo.triple_fast(tok)
+                scores = kernels.rff.kernel_scalar(
+                    tr.rho, tr.theta, tr.sigma,
+                    geo._rho_t, geo._theta_t, geo._sigma_t).clamp(0.0)
+                if scores.shape[0] == V:
+                    base += w * scores
+
+        base = base.clamp(min=0.0)
+        total = base.sum()
+        self.mirror_dist_t = (base / total) if total.item() > 1e-8 \
+            else torch.ones(V, dtype=self.dtype, device=self.device) / V
+
+        print(f"[Mirror] Reversed {len(fwd_toks)} → {len(mir_toks)} tokens  "
+              f"centroid ρ={self.mirror_centroid_rho:.3f}  "
+              f"θ={self.mirror_centroid_theta:.3f}  "
+              f"σ={self.mirror_centroid_sigma:.3f}")
+
+    def distribution(self, cands: List[str], gen_tokens: List[str],
+                     lm_tok2idx: Dict[str, int]) -> torch.Tensor:
+        """Combined forward + mirror distribution over candidates."""
+        p_fwd = self.fwd.distribution(cands, gen_tokens, lm_tok2idx)
+
+        if self.mirror_dist_t is None or len(cands) == 0:
+            return p_fwd
+
+        cand_idx   = torch.tensor(
+            [lm_tok2idx.get(c, 0) for c in cands],
+            dtype=torch.long, device=self.device)
+        p_mir_raw  = self.mirror_dist_t[cand_idx]
+        p_mir_raw  = p_mir_raw.clamp(min=1e-12)
+        p_mir      = p_mir_raw / p_mir_raw.sum()
+
+        p_combined = (1.0 - self.alpha) * p_fwd + self.alpha * p_mir
+        return p_combined / p_combined.sum().clamp(min=1e-12)
+
+    def mirror_signal(self, cands: List[str],
+                      lm_tok2idx: Dict[str, int]) -> torch.Tensor:
+        """Returns the raw mirror distribution as a spaghetti strand signal."""
+        if self.mirror_dist_t is None or not cands:
+            return torch.zeros(len(cands), device=self.device)
+        cand_idx = torch.tensor(
+            [lm_tok2idx.get(c, 0) for c in cands],
+            dtype=torch.long, device=self.device)
+        raw = self.mirror_dist_t[cand_idx].clamp(min=1e-12)
+        return raw / raw.sum()
+
+    # Proxy attributes for backward compatibility
+    @property
+    def base_dist_t(self):    return self.fwd.base_dist_t
+    @property
+    def centroid_rho(self):   return self.fwd.centroid_rho
+    @property
+    def centroid_theta(self): return self.fwd.centroid_theta
+    @property
+    def centroid_sigma(self): return self.fwd.centroid_sigma
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1472,22 +1684,17 @@ class NLMicroSimulation(nn.Module):
 
     @torch.no_grad()
     def forward(self, probs: torch.Tensor) -> torch.Tensor:
-        # 1. Monadic NL Reachability Simulation
         m = FineAlterableMonad(probs)
-
         m = (m >> (lambda p: p.clamp(min=1e-12))
                >> (lambda p: torch.log(p))
-               >> (lambda p: FineAlterableMonad(p).alter(scale=0.5).unwrap()) # Compress to half
+               >> (lambda p: FineAlterableMonad(p).alter(scale=0.1).unwrap())
                >> (lambda p: torch.logsumexp(p.unsqueeze(1) + p.unsqueeze(0), dim=1))
-               >> (lambda p: torch.exp(p))
+               >> (lambda p: torch.exp(-p))
                >> (lambda p: p / (p.sum() + 1e-12))
             )
         return m.unwrap()
 
 
-# -------------------------------------------------------------
-# Pre-built Artistic Nanowire Trends (Editable Image Metaphors)
-# -------------------------------------------------------------
 def sharpen_rho_trend(rho: torch.Tensor):
     return torch.sigmoid((rho - rho.mean()) * 5.0)
 
@@ -1498,11 +1705,6 @@ def glow_sigma_trend(sigma: torch.Tensor):
     return torch.exp(sigma)
 
 class NanowireStream:
-    """
-    Represents an editable 'mega trend' (nanowire) acting on a probability vector space.
-    This acts like an artistic filter (e.g., sharpening, blurring, harmonic resonance)
-    applied directly to the underlying physics representations (rho, theta, sigma).
-    """
     def __init__(self, name: str, aesthetic_func):
         self.name = name
         self.aesthetic_func = aesthetic_func
@@ -1512,18 +1714,13 @@ class NanowireStream:
         return p_monad >> (lambda p: p * trend)
 
 class NanowireCanvas:
-    """
-    The artistic workspace where multiple NanowireStreams (filters) are brushed onto the probability state.
-    Includes support for a dynamic, user-drawn image mapped as mega trends onto the physical vectors!
-    """
     def __init__(self):
         self.rho_brush = None
         self.theta_brush = None
         self.sigma_brush = None
-        self.art_tensor = None  # Store numpy image from Gradio
+        self.art_tensor = None
 
     def update_art(self, numpy_img):
-        # Safely convert Gradio's image dict or numpy array to a Torch tensor
         if numpy_img is None:
             self.art_tensor = None
             return
@@ -1538,7 +1735,6 @@ class NanowireCanvas:
                 numpy_img = numpy_img.get('background')
 
         if isinstance(numpy_img, np.ndarray):
-            # Normalize to 0..1, shape [C, H, W]
             if len(numpy_img.shape) == 3 and numpy_img.shape[2] >= 3:
                 self.art_tensor = torch.tensor(numpy_img[:, :, :3], dtype=torch.float32).permute(2, 0, 1) / 255.0
             else:
@@ -1553,41 +1749,29 @@ class NanowireCanvas:
 
     def _apply_art_trend(self, vector, channel_idx):
         if self.art_tensor is None or channel_idx >= self.art_tensor.shape[0]:
-            return 1.0 # No effect
-
+            return 1.0
         H, W = self.art_tensor.shape[1], self.art_tensor.shape[2]
-
-        # Normalize the geometry vector to [0, W-1] pixel space
         v_min, v_max = vector.min(), vector.max()
         if v_max > v_min:
             norm_v = (vector - v_min) / (v_max - v_min)
         else:
             norm_v = torch.zeros_like(vector)
-
-        x_coords = (norm_v * (W - 1)).long().clamp(0, W - 1)
-
-        channel = self.art_tensor[channel_idx].to(vector.device) # [H, W]
-        col_intensity = channel.mean(dim=0) # Average drawing intensity at column X
-
-        # Lookup intensities for our vocabulary coordinates
-        trend = col_intensity[x_coords] # [vocab_size]
-
-        # Map drawing intensity [0, 1] to a mega-trend multiplier [0.5, 2.0]
-        return 0.5 + (trend * 1.5)
+        x_coords = (norm_v * (W - 1)).long().clamp(0, W * -1)
+        channel = self.art_tensor[channel_idx].to(vector.device)
+        col_intensity = channel.mean(dim=0)
+        trend = col_intensity[x_coords]
+        return 0.5 + (trend * 10.5)
 
     def paint(self, p_monad, rho, theta, sigma):
         if self.rho_brush and rho is not None:
             p_monad = self.rho_brush.invoke(p_monad, rho)
-            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(rho, 0)) # Red = Rho Trend
-
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(rho, 0))
         if self.theta_brush and theta is not None:
             p_monad = self.theta_brush.invoke(p_monad, theta)
-            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(theta, 1)) # Green = Theta Trend
-
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(theta, 1))
         if self.sigma_brush and sigma is not None:
             p_monad = self.sigma_brush.invoke(p_monad, sigma)
-            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(sigma, 2)) # Blue = Sigma Trend
-
+            p_monad = p_monad >> (lambda p: p * self._apply_art_trend(sigma, 2))
         return p_monad
 
 class ContingentExtringentProbability:
@@ -1604,28 +1788,19 @@ class ContingentExtringentProbability:
 
     def govern_next_probs(self,logits,c_rho=None,c_theta=None,c_sigma=None):
         x=c_rho*torch.cos(c_theta); y=c_rho*torch.sin(c_theta)
-        ring_dist=torch.abs((y**2/0.36)+(x**2/0.64)-1.0)
-        core_suppression=torch.exp(-10.0*(y**2+x**2))
+        ring_dist=torch.abs((y**2/0.96)+(x**2/0.64)-1.0)
+        core_suppression=torch.tanh(-10.0*(y**2/x**2))
         personality_inversion_mask=-20.0*core_suppression-5.0*ring_dist
         if c_rho is not None and c_theta is not None: logits=personality_inversion_mask+logits
-
         dyn_temp=self.coupling_factor*(1.0-self.intermediate_max_prob)+1.0
-
-        # Fine Alterable Monadic pipeline
         m_gov = FineAlterableMonad(logits)
-        # --- Nanowire Editable Art Pipeline ---
         if c_rho is not None and c_theta is not None and c_sigma is not None:
             m_gov = self.canvas.paint(m_gov, c_rho, c_theta, c_sigma)
-        # --------------------------------------
-
         if c_rho is not None and c_theta is not None and c_sigma is not None:
             m_gov = m_gov >> (lambda l: self.dnn.temp_scaler.scale(l, dyn_temp, c_rho))
         else:
             m_gov = m_gov.alter(temp=dyn_temp)
-
-        m_gov = (m_gov >> l1simplexproject
-                       >> self.nl_sim)
-
+        m_gov = (m_gov >> l1simplexproject >> self.nl_sim)
         p = m_gov.unwrap()
         self.intermediate_entropy=-(p*(1e-9+p).log()).sum().item()
         self.intermediate_max_prob=p.max().item()
@@ -1639,11 +1814,13 @@ class TokenStepTrace:
     ooi_size:int=0; repulsion_mean:float=0.0; ripple_mean:float=0.0
     n_directives:int=0
     spaghetti_mixer_norms: Tuple[float,float,float] = (0.0, 0.0, 0.0)
+    cardan_orbit: int = 0
     def render(self):
         mA, mB, mC = self.spaghetti_mixer_norms
         return (f"  {self.step:03d} {self.chosen:<14s} Pand={self.p_and:.4f} "
                 f"[{self.source:>7s}] ooi={self.ooi_size} "
                 f"rpl={self.ripple_mean:.3f}({self.n_directives}d) "
+                f"cardan={self.cardan_orbit} "
                 f"spag=({mA:.2f},{mB:.2f},{mC:.2f})")
 
 
@@ -1751,16 +1928,15 @@ class RPInstructionDistribution:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 15.5 — FITTED LINE REGRESSION (21 features — adds spaghetti_tangle)
+# SECTION 15.5 — FITTED LINE REGRESSION (23 features — adds cardan + mirror)
 # ════════════════════════════════════════════════════════════════════════════
 
 class FittedLineRegression(nn.Module):
     """
-    Single fitted line over all 21 RP+ANISO+RIPPLE+SPAGHETTI bonus signals.
+    Single fitted line over 23 RP+ANISO+RIPPLE+SPAGHETTI+CARDAN+MIRROR signals.
 
-    Feature 21: spaghetti_tangle_norm — L2 norm of the router's combined
-                tangled output, capturing the intensity of the cross-lane
-                interaction at each generation step.
+    Feature 22: cardan_aperture_score — binary {0,1} membership in active Cardan grille
+    Feature 23: mirror_instr_signal  — reversed-instruction distribution value
     """
     FEATURE_NAMES = [
         "k_reg","k_ori","k_side","orbit","potential","mrv",
@@ -1768,9 +1944,11 @@ class FittedLineRegression(nn.Module):
         "rho_mean","sigma_mean","composition","sorted_impulse",
         "ooi_affinity","inter_repulsion_neg",
         "ripple_shift",
-        "spaghetti_tangle_norm",   # NEW feature 21
+        "spaghetti_tangle_norm",
+        "cardan_aperture_score",   # NEW 22
+        "mirror_instr_signal",     # NEW 23
     ]
-    FEATURE_DIM = 21
+    FEATURE_DIM = 23
 
     def __init__(self, feature_dim: int = FEATURE_DIM, rank: int = 1):
         super().__init__()
@@ -1791,17 +1969,17 @@ class FittedLineRegression(nn.Module):
         return F.binary_cross_entropy(probs, targets)
 
     def feature_report(self) -> str:
-        lines = ["  Fitted Line Feature Weights (V18-RP-ANISO-RIPPLE-SPAGHETTI):"]
+        lines = ["  Fitted Line Feature Weights (V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN):"]
         w = (self.W.squeeze(-1) * self.feature_scale).detach().cpu()
         for name, wi in zip(self.FEATURE_NAMES, w):
             bar  = "█" * int(abs(wi.item()) * 10)
             sign = "+" if wi.item() >= 0 else "-"
-            lines.append(f"    {name:<26s} {sign}{abs(wi.item()):.4f}  {bar}")
+            lines.append(f"    {name:<28s} {sign}{abs(wi.item()):.4f}  {bar}")
         return "\n".join(lines)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — RP WALKER  (full spaghetti rewrite)
+# SECTION 16 — RP WALKER  (Cardan + Mirror integrated)
 # ════════════════════════════════════════════════════════════════════════════
 
 class AutomorphicCausationRP:
@@ -1838,18 +2016,26 @@ class AutomorphicAwarenessRP:
 
 class RPWalker:
     def __init__(self, geo, kernels, lm, orbit, rw_graph, synth, mrv_filter,
-                 chunk_engine, iso_stacker, pdn_engine, cot_engine, instr_dist, rff,
+                 chunk_engine, iso_stacker, pdn_engine, cot_engine,
+                 instr_dist,   # now a MirroredInstructionDistribution
+                 rff,
+                 cardan: Optional[CardanGrilleIsomorphism] = None,
                  device=DEVICE, syn_weight=0.4, trans_weight=0.6, syn_k=8,
                  aniso_ooi_weight: float = ANISO_OOI_W,
                  aniso_repulsion_weight: float = ANISO_REPULSION_W,
                  ripple_weight: float = RIPPLE_WEIGHT,
                  ripple_k_stubs: int = RIPPLE_K_STUBS,
-                 spaghetti_coupling: float = SPAGHETTI_COUPLING):
+                 spaghetti_coupling: float = SPAGHETTI_COUPLING,
+                 mirror_alpha: float = MIRROR_ALPHA,
+                 cardan_logit_weight: float = CARDAN_LOGIT_WEIGHT):
         self.geo=geo; self.kernels=kernels; self.lm=lm; self.orbit=orbit
         self.rw_graph=rw_graph; self.synth=synth; self.mrv=mrv_filter
         self.chunk_engine=chunk_engine; self.iso_stacker=iso_stacker
         self.pdn=pdn_engine; self.cot=cot_engine; self.instr_dist=instr_dist
         self.rff=rff; self.device=device
+        self.cardan               = cardan
+        self.cardan_logit_weight  = cardan_logit_weight
+        self.mirror_alpha         = mirror_alpha
         self.aniso_ooi_weight       = aniso_ooi_weight
         self.aniso_repulsion_weight = aniso_repulsion_weight
         self.ripple_weight          = ripple_weight
@@ -1867,24 +2053,21 @@ class RPWalker:
                                              trans_weight=trans_weight,syn_k=syn_k,device=device)
         self._csns_syn_norms: List[float]=[]; self._csns_trans_norms: List[float]=[]
 
-        # ANISO subsystems
         self.surjector       = PropositionalSurjectionEngine(geo)
         self._aniso_kernel   = AnisoDirKernel(device=device)
         self._ooi_tracker    = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
 
-        # RIPPLE subsystems
         self._recogniser     = InstructionStubRecogniser(
             cot_engine.stubs, self._aniso_kernel,
             k_stubs=ripple_k_stubs, device=device)
         self._ripple_engine  = RippleShiftEngine(self._aniso_kernel, device=device)
 
-        # ── SPAGHETTI ROUTER (instantiated per call in walk_probs) ────────
         self._spaghetti_coupling = spaghetti_coupling
         self._pending_mixer_norms: Tuple[float,float,float] = (0.0, 0.0, 0.0)
+        self._pending_cardan_orbit: int = 0
 
-        # Pending state
         self._pending_ripple_mean:  float = 0.0
         self._pending_n_directives: int   = 0
         self._pending_instr_probs=None; self._pending_walk_logits=None
@@ -1925,7 +2108,9 @@ class RPWalker:
                           c_rho, c_sigma, comp_bonus, sorted_impulse,
                           ooi_affinity, inter_repulsion,
                           ripple_shift,
-                          spaghetti_tangle_norm) -> torch.Tensor:  # (C, 21)
+                          spaghetti_tangle_norm,
+                          cardan_aperture_scores,   # NEW
+                          mirror_signal) -> torch.Tensor:  # (C, 23)
         def _safe(t):
             if t.shape[0] != C: t = torch.zeros(C, device=self.device)
             return t.clamp(-10, 10).neg().add(10)
@@ -1942,7 +2127,9 @@ class RPWalker:
             _safe(-inter_repulsion),
             _safe(ripple_shift),
             _safe(spag_col),
-        ], dim=-1)  # (C, 21)
+            _safe(cardan_aperture_scores),  # feature 22
+            _safe(mirror_signal),            # feature 23
+        ], dim=-1)  # (C, 23)
 
     @torch.no_grad()
     def _norm_tok(self, t): return re.sub(r"\s+", " ", t.strip().lower())
@@ -1987,7 +2174,21 @@ class RPWalker:
             cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands: return cands, base_probs
 
+        # ── Cardan grille filtering ───────────────────────────────────────
+        # Determine the active orbit (Z₄) from PDN and current token.
+        cardan_orbit = self._cur_orbit % 4
+        self._pending_cardan_orbit = cardan_orbit
+
+        if self.cardan is not None:
+            cands, base_probs, aperture_scores_full = self.cardan.filter(
+                cands, base_probs, cardan_orbit)
+        else:
+            aperture_scores_full = torch.zeros(len(cands), device=self.device)
+
         C = len(cands)
+        if C == 0:
+            return cands, base_probs
+
         try:
             tok_idx = self.geo.tok_indices(cands)
             c_rho, c_theta, c_sigma = self.geo.batch_triples(tok_idx)
@@ -1998,6 +2199,10 @@ class RPWalker:
             c_theta = torch.tensor([t.theta for t in triples],dtype=torch.float32,device=self.device)
             c_sigma = torch.tensor([t.sigma for t in triples],dtype=torch.float32,device=self.device)
             c_pvec  = torch.stack([c_rho,c_theta/math.pi,c_sigma,torch.ones_like(c_rho)],dim=1)
+
+        # Aperture score must match filtered C
+        if aperture_scores_full.shape[0] != C:
+            aperture_scores_full = torch.zeros(C, device=self.device)
 
         # Automorphic warp
         aw_mask  = self._automorph_awareness.get_awareness_mask(cands)
@@ -2040,7 +2245,6 @@ class RPWalker:
 
         base_logits   = torch.log(base_probs.clamp(min=1e-12))
 
-        # CSNS forward
         c_rho_t, c_theta_t, c_sigma_t = compute_transitive_triples_rp(
             self.geo, cands, w1, w2, device=self.device)
         governed       = self._contingent.govern_next_probs(base_logits, c_rho, c_theta, c_sigma)
@@ -2066,10 +2270,17 @@ class RPWalker:
         _impulse_dir = math.cos(math.pi*_hop_frac)
         sorted_impulse = layer_norm_array(_rank_norm*_impulse_dir)
 
+        # ── Instruction + mirror signals ─────────────────────────────────
         if and_weight>0.0 and self.instr_dist.base_dist_t is not None:
             p_instr = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
         else:
             p_instr = torch.ones(C,dtype=torch.float32,device=self.device)/C
+
+        # Mirror signal (reversed instruction)
+        if isinstance(self.instr_dist, MirroredInstructionDistribution):
+            mirror_sig = self.instr_dist.mirror_signal(cands, self.lm._tok2idx)
+        else:
+            mirror_sig = torch.zeros(C, device=self.device)
 
         # ANISO signals
         ooi_affinity, inter_repulsion = self._aniso_features(c_rho, c_theta, c_sigma, base_probs)
@@ -2089,56 +2300,55 @@ class RPWalker:
         self._pending_ripple_mean  = ripple_shift.mean().item()
         self._pending_n_directives = len(directives)
 
-        # ── SPAGHETTI ROUTING ────────────────────────────────────────────
-        # Build a fresh router for this step and load all strands
+        # ── SPAGHETTI ROUTING (extended with cardan + mirror strands) ────
         router = SpaghettiRouter(C, self.device)
 
-        router.add_strand('instruction_dist', p_instr,         weight=and_weight)
-        router.add_strand('ripple_shift',     ripple_shift,    weight=self.ripple_weight)
-        router.add_strand('cot_bonus',        cot_bonus,       weight=cot_weight)
-        router.add_strand('ooi_affinity',     ooi_aff_norm,    weight=self.aniso_ooi_weight)
-        router.add_strand('k_reg',            k_reg,           weight=alpha_reg)
-        router.add_strand('k_ori',            k_ori,           weight=beta_ori)
-        router.add_strand('k_side',           k_side,          weight=delta_side)
-        router.add_strand('walk_potential',   pot_bonus,       weight=psi_pot)
-        router.add_strand('repulsion',        rep_norm,        weight=self.aniso_repulsion_weight)
-        router.add_strand('mrv',              mrv_scores,      weight=zeta_mrv)
-        router.add_strand('pdn_bonus',        pdn_bonus,       weight=pdn_weight)
-        router.add_strand('chunk_bonus',      chunk_bonus,     weight=eta_chunk)
-        router.add_strand('echo_bonus',       echo_bonus,      weight=xi_echo)
-        router.add_strand('comp_bonus',       comp_bonus,      weight=0.4)
-        router.add_strand('sorted_impulse',   sorted_impulse,  weight=0.25)
-        router.add_strand('para_expanse',     para_expanse,    weight=para_expanse_weight)
-        router.add_strand('para_dup_penalty', para_dup_norm,   weight=para_dup_weight)
-        router.add_strand('ooi_aff_echo',     ooi_affinity,    weight=0.2)
-        router.add_strand('orbit_bonus',      orbit_scores,    weight=gamma_orbit)
-        router.add_strand('syn_norm',         syn_norm_vec,    weight=0.3)
-        router.add_strand('trans_norm',       trans_norm_vec,  weight=0.2)
+        router.add_strand('instruction_dist', p_instr,              weight=and_weight)
+        router.add_strand('ripple_shift',     ripple_shift,         weight=self.ripple_weight)
+        router.add_strand('cot_bonus',        cot_bonus,            weight=cot_weight)
+        router.add_strand('ooi_affinity',     ooi_aff_norm,         weight=self.aniso_ooi_weight)
+        router.add_strand('k_reg',            k_reg,                weight=alpha_reg)
+        router.add_strand('k_ori',            k_ori,                weight=beta_ori)
+        router.add_strand('k_side',           k_side,               weight=delta_side)
+        router.add_strand('walk_potential',   pot_bonus,            weight=psi_pot)
+        router.add_strand('repulsion',        rep_norm,             weight=self.aniso_repulsion_weight)
+        router.add_strand('mrv',              mrv_scores,           weight=zeta_mrv)
+        router.add_strand('pdn_bonus',        pdn_bonus,            weight=pdn_weight)
+        router.add_strand('chunk_bonus',      chunk_bonus,          weight=eta_chunk)
+        router.add_strand('echo_bonus',       echo_bonus,           weight=xi_echo)
+        router.add_strand('comp_bonus',       comp_bonus,           weight=0.4)
+        router.add_strand('sorted_impulse',   sorted_impulse,       weight=0.25)
+        router.add_strand('para_expanse',     para_expanse,         weight=para_expanse_weight)
+        router.add_strand('para_dup_penalty', para_dup_norm,        weight=para_dup_weight)
+        router.add_strand('ooi_aff_echo',     ooi_affinity,         weight=0.2)
+        router.add_strand('orbit_bonus',      orbit_scores,         weight=gamma_orbit)
+        router.add_strand('syn_norm',         syn_norm_vec,         weight=0.3)
+        router.add_strand('trans_norm',       trans_norm_vec,       weight=0.2)
+        # NEW strands
+        router.add_strand('cardan_iso',       aperture_scores_full, weight=self.cardan_logit_weight)
+        router.add_strand('mirror_instr',     mirror_sig,           weight=and_weight * self.mirror_alpha)
 
-        # Route through mixers and tangles → tangled logit bonus
-        spaghetti_logits = router.route()  # (C,) tangled, z-normalised
+        spaghetti_logits = router.route()
 
-        # Capture mixer norms for traces
         mixer_norms = tuple(m.blend(C).norm().item() for m in router._mixers)
         self._pending_mixer_norms = mixer_norms
         spaghetti_tangle_norm = spaghetti_logits.norm().item()
 
-        # Combine spaghetti output with CSNS-enriched logits
-        # The spaghetti replaces the flat weighted sum entirely
         raw_logits = (logits_enriched
                       + spaghetti_logits
                       + mandate_boost
                       + punct_bias)
 
-        # Build full 21-d feature tensor
+        # Build full 23-d feature tensor
         features = self._extract_features(
             C, k_reg, k_ori, k_side, orbit_scores, pot_bonus, mrv_scores,
             chunk_bonus, echo_bonus, pdn_bonus, cot_bonus,
             p_instr, syn_norm_vec, trans_norm_vec, c_rho, c_sigma, comp_bonus,
             sorted_impulse, ooi_affinity, inter_repulsion, ripple_shift,
-            spaghetti_tangle_norm)
+            spaghetti_tangle_norm,
+            aperture_scores_full,   # feature 22
+            mirror_sig)             # feature 23
 
-        # Fitted line delta (optional)
         if self.fitted_model is not None:
             _fd = self.fitted_model.W.shape[0]
             if features.shape[1] != _fd:
@@ -2149,7 +2359,6 @@ class RPWalker:
             delta      = self.fitted_model(features)
             raw_logits = raw_logits + delta
 
-        # Remission gating
         w1_rho = self.geo.triple_fast(w1).rho
         w2_rho = self.geo.triple_fast(w2).rho
         remission = self._remission.apply_remission(
@@ -2198,7 +2407,8 @@ class RPWalker:
             ooi_size=self._pending_ooi_size, repulsion_mean=self._pending_repulsion_mean,
             ripple_mean=self._pending_ripple_mean,
             n_directives=self._pending_n_directives,
-            spaghetti_mixer_norms=self._pending_mixer_norms)
+            spaghetti_mixer_norms=self._pending_mixer_norms,
+            cardan_orbit=self._pending_cardan_orbit)
         self._step_traces.append(trace); return trace
 
     def push_token(self, token, sentence_len):
@@ -2212,46 +2422,34 @@ class RPWalker:
 
     def step_trace_report(self, max_steps=30) -> str:
         if not self._step_traces: return "  (no step traces)"
-        lines=["  step  chosen          Pand   source  ooi  ripple  dirs  spag(A,B,C)"]
+        lines=["  step  chosen          Pand   source  ooi  ripple  dirs  cardan  spag(A,B,C)"]
         for t in self._step_traces[-max_steps:]: lines.append(t.render())
         return "\n".join(lines)
 
     def algo_report(self) -> str:
         mA, mB, mC = self._pending_mixer_norms
+        cardan_ok = self.cardan is not None
         return "\n".join([
-            "V18-RP-ANISO-RIPPLE-SPAGHETTI — All Signals Tangled Edition",
+            "V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN — All Signals Tangled Edition",
+            "",
+            "CARDAN GRILLE ISOMORPHISMS:",
+            f"  Active:       {cardan_ok}",
+            f"  Aperture K:   {CARDAN_APERTURE_K}",
+            f"  Min cands:    {MIN_CARDAN_CANDS}",
+            f"  Logit weight: {self.cardan_logit_weight}",
+            (self.cardan.rotation_report() if cardan_ok else "  (not built)"),
+            "",
+            "MIRRORED INSTRUCTION:",
+            f"  Mirror alpha: {self.mirror_alpha}",
+            "  Reversed token sequence re-embedded at instruction set time.",
+            "  Strand 'mirror_instr' fans into MixerA + MixerC.",
             "",
             "SPAGHETTI TOPOLOGY:",
-            "  21 strands → 3 mixers (A/B/C) via routing table (each strand fans to 1-3 mixers)",
-            "  2 CrossTangles: AB (coupling=0.35), BC (coupling=0.28)",
-            "  Möbius shift: out_i = atanh((tanh(a)+c*tanh(b))/(1+c*tanh(a)*tanh(b)))",
-            "  Final: sum(tangled_A, tangled_B, tangled_C) → z-norm → DNN",
+            "  23 strands → 3 mixers (A/B/C)  |  2 CrossTangles: AB, BC",
+            "  New strands: cardan_iso → [A,C]+1  |  mirror_instr → [A,C]+1",
             "",
-            "  Last step mixer norms:",
-            f"    MixerA={mA:.4f}  MixerB={mB:.4f}  MixerC={mC:.4f}",
-            "",
-            "STRAND ROUTING TABLE:",
-            "  instruction_dist  → A, B",
-            "  ripple_shift      → A, B, C  (widest fan)",
-            "  cot_bonus         → A, C",
-            "  ooi_affinity      → A, B",
-            "  k_reg             → B, C",
-            "  k_ori             → A, C",
-            "  k_side            → B",
-            "  walk_potential    → A, C",
-            "  repulsion (neg)   → B, A  (penalty cross-feeds into instruction lane)",
-            "  mrv               → C",
-            "  pdn_bonus         → B, C",
-            "  chunk_bonus       → A, C",
-            "  echo_bonus        → A",
-            "  comp_bonus        → B",
-            "  sorted_impulse    → C",
-            "  para_expanse      → A",
-            "  para_dup (neg)    → A, B",
-            "  ooi_aff_echo      → C",
-            "  orbit_bonus       → C",
-            "  syn_norm          → A, B",
-            "  trans_norm        → B",
+            f"  Last step mixer norms:  MixerA={mA:.4f}  MixerB={mB:.4f}  MixerC={mC:.4f}",
+            f"  Active Cardan orbit:    {self._pending_cardan_orbit} (Z₄)",
             "",
             f"Fitted line active:    {self.fitted_model is not None}",
             f"OOI tracker size:      {self._ooi_tracker.size}/{ANISO_OOI_MAX}",
@@ -2263,7 +2461,7 @@ class RPWalker:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — FITTED LINE TRAINING (21 features)
+# SECTION 17 — FITTED LINE TRAINING (23 features)
 # ════════════════════════════════════════════════════════════════════════════
 
 def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
@@ -2319,7 +2517,7 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — GENERATION
+# SECTION 18 — GENERATION  (Cardan grille integration)
 # ════════════════════════════════════════════════════════════════════════════
 
 def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
@@ -2347,7 +2545,7 @@ def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
 
 def pairwise_sort_unlink(cands, probs):
     if len(cands) < 2: return cands, probs
-    paired = list(zip(cands, probs.tolist()))
+    paired = list(zip(cands, probs))
     unlinked_cands = []; unlinked_probs = []
     for i in range(0, len(paired) - 1, 2):
         p1, p2 = paired[i], paired[i+1]
@@ -2387,8 +2585,11 @@ def generate_passage_rp(walker, lm,
                         instruction_text="You are a computational algorithm.",
                         and_weight=0.9, temperature=2.0,
                         return_traces=False):
-    if instruction_text.strip(): walker.instr_dist.set_instruction(instruction_text)
-    elif seed_text.strip():      walker.instr_dist.set_instruction(seed_text)
+    # ── Set instruction (MirroredInstructionDistribution handles both forward + mirror) ──
+    if instruction_text.strip():
+        walker.instr_dist.set_instruction(instruction_text)
+    elif seed_text.strip():
+        walker.instr_dist.set_instruction(seed_text)
 
     walker._step_traces.clear()
     walker._csns_syn_norms.clear(); walker._csns_trans_norms.clear()
@@ -2399,6 +2600,13 @@ def generate_passage_rp(walker, lm,
 
     dataset_baseline = compute_dataset_baseline(walker, temperature, and_weight)
     print(f"[Generate] Target Dataset Baseline Log-Prob: {dataset_baseline:.3f}")
+
+    # ── Log mirror centroid for reference ────────────────────────────────
+    if isinstance(walker.instr_dist, MirroredInstructionDistribution):
+        print(f"[Generate] Mirror centroid: "
+              f"ρ={walker.instr_dist.mirror_centroid_rho:.3f}  "
+              f"θ={walker.instr_dist.mirror_centroid_theta:.3f}  "
+              f"σ={walker.instr_dist.mirror_centroid_sigma:.3f}")
 
     seed_w1 = seed_w2 = None
     seed_toks = tokenize(seed_text) if seed_text else []
@@ -2440,11 +2648,19 @@ def generate_passage_rp(walker, lm,
             snap_dist = random.randint(1, 12); unspoken_tokens = []
 
             for step in range(12 + tokens_per_sent):
+                # ── Walk probs (Cardan filtering applied inside) ──────────
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
+
+                # Bilinear lateral automorphism
                 cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
+
+                # Bottema 2D Theorem Bridge
+                cands, probs = apply_bottema_probability_bridge(cands, probs, gamma=0.20)
+
                 if not cands: break
+
                 cands, probs = pairwise_sort_unlink(cands, probs)
-                chosen_idx = torch.multinomial(probs, 1).item()
+                chosen_idx = torch.multinomial(torch.tensor(probs), 1).item()
                 nxt = cands[chosen_idx]; chosen_prob = probs[chosen_idx].item()
                 if not period_hit:
                     sent_prob_sum += math.log(1e-12 + chosen_prob); valid_steps += 1
@@ -2483,17 +2699,20 @@ def generate_passage_rp(walker, lm,
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — V18-RP-ANISO-RIPPLE-SPAGHETTI ENGINE
+# SECTION 19 — V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN ENGINE
 # ════════════════════════════════════════════════════════════════════════════
 
 class V18RPEngine:
-    def __init__(self, syn_weight=0.4, trans_weight=0.6, syn_k=8,
+    def __init__(self, syn_weight=0.1, trans_weight=0.9, syn_k=8,
                  rff_dim=RP_RFF_DIM, nystrom_m=RP_NYSTROM_M,
                  aniso_ooi_weight=ANISO_OOI_W,
                  aniso_repulsion_weight=ANISO_REPULSION_W,
                  ripple_weight=RIPPLE_WEIGHT,
                  ripple_k_stubs=RIPPLE_K_STUBS,
-                 spaghetti_coupling=SPAGHETTI_COUPLING):
+                 spaghetti_coupling=SPAGHETTI_COUPLING,
+                 cardan_aperture_k=CARDAN_APERTURE_K,
+                 mirror_alpha=MIRROR_ALPHA,
+                 cardan_logit_weight=CARDAN_LOGIT_WEIGHT):
         self.device                 = DEVICE
         self.syn_weight             = syn_weight
         self.trans_weight           = trans_weight
@@ -2505,6 +2724,9 @@ class V18RPEngine:
         self.ripple_weight          = ripple_weight
         self.ripple_k_stubs         = ripple_k_stubs
         self.spaghetti_coupling     = spaghetti_coupling
+        self.cardan_aperture_k      = cardan_aperture_k
+        self.mirror_alpha           = mirror_alpha
+        self.cardan_logit_weight    = cardan_logit_weight
         self._corpus_snippet        = ""
         self._initialised           = False
 
@@ -2520,51 +2742,66 @@ class V18RPEngine:
         self.isostacker = IsomorphicSyntaxStacker(self.rff, device=self.device)
         self.pdn        = SketchedPDNEngine(device=self.device)
         self.stublib    = RPCoTStubLibrary(self.rff, device=self.device)
+        self.cardan: Optional[CardanGrilleIsomorphism] = None
         self.cot        = None; self.instrdist = None; self.walker = None
 
     def train(self, corpus_text: str):
         self._corpus_snippet = corpus_text
-        print(f"[V18-RP-SPAGHETTI] Tokenising {len(corpus_text)} chars…")
+        print(f"[V18-RP-CARDAN] Tokenising {len(corpus_text)} chars…")
         tokens=tokenize(corpus_text)
         self.lm.ingest(tokens)
         all_tokens=list(self.lm.raw_freq.keys())
         max_freq=max(self.lm.raw_freq.values(),default=1.0)
         vocab_size=len(all_tokens)
-        print(f"[V18-RP-SPAGHETTI] Registering {vocab_size} tokens…")
+        print(f"[V18-RP-CARDAN] Registering {vocab_size} tokens…")
         for idx,tok in enumerate(all_tokens):
             self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
-        print("[V18-RP-SPAGHETTI] Building GPU tensors + RFF feature cache…")
+        print("[V18-RP-CARDAN] Building GPU tensors + RFF feature cache…")
         self.geo.build_cuda_tensors(self.lm.vocab, self.rff)
         self.lm.finalise()
-        print("[V18-RP-SPAGHETTI] Random Walk MC potential propagation…")
+        print("[V18-RP-CARDAN] Random Walk MC potential propagation…")
         self.rw_graph.build_from_trigrams(self.lm.tri_raw,self.lm.raw_freq,self.rff,self.geo)
         self.rw_graph.propagate()
-        print("[V18-RP-SPAGHETTI] Priming LSH-based MRV filter…")
+        print("[V18-RP-CARDAN] Priming LSH-based MRV filter…")
         self.mrv.prime(self.lm.vocab,self.geo)
-        print("[V18-RP-SPAGHETTI] Sketched PDN spectral fitting…")
+        print("[V18-RP-CARDAN] Sketched PDN spectral fitting…")
         self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw)
         self.pdn.build_orbit_map(self.lm.vocab,self.geo)
         print(self.pdn.theorem_bridge_report())
-        print("[V18-RP-SPAGHETTI] Building RP CoT stub library + LSH ANN index…")
+        print("[V18-RP-CARDAN] Building Cardan Grille Isomorphisms…")
+        self.cardan = CardanGrilleIsomorphism(
+            self.lm.vocab, self.lm.tri_raw, self.lm.raw_freq,
+            aperture_k=self.cardan_aperture_k)
+        print(self.cardan.rotation_report())
+        print("[V18-RP-CARDAN] Building RP CoT stub library + LSH ANN index…")
         self.stublib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
         self.cot=RPCoTReasoningEngine(
             self.stublib,self.kernels,self.pdn,
             n_hops=3,tokens_per_hop=10,device=self.device)
-        self.instrdist=RPInstructionDistribution(
-            self.geo,self.kernels,self.lm,device=self.device)
+
+        # ── Instruction dist wrapped in MirroredInstructionDistribution ──
+        fwd_dist = RPInstructionDistribution(
+            self.geo, self.kernels, self.lm, device=self.device)
+        self.instrdist = MirroredInstructionDistribution(
+            fwd_dist, alpha=self.mirror_alpha, device=self.device)
+
         self.walker=RPWalker(
             self.geo,self.kernels,self.lm,self.orbit,
             self.rw_graph,self.synth,self.mrv,self.chunk,
             self.isostacker,self.pdn,self.cot,self.instrdist,
-            self.rff,device=self.device,
+            self.rff,
+            cardan=self.cardan,
+            device=self.device,
             syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k,
             aniso_ooi_weight=self.aniso_ooi_weight,
             aniso_repulsion_weight=self.aniso_repulsion_weight,
             ripple_weight=self.ripple_weight,
             ripple_k_stubs=self.ripple_k_stubs,
-            spaghetti_coupling=self.spaghetti_coupling)
+            spaghetti_coupling=self.spaghetti_coupling,
+            mirror_alpha=self.mirror_alpha,
+            cardan_logit_weight=self.cardan_logit_weight)
         self._initialised=True
-        print("[V18-RP-SPAGHETTI] Engine ready.")
+        print("[V18-RP-CARDAN] Engine ready.")
 
     def train_fitted_line(self, corpus_text="", epochs=200, lr=3e-4, max_steps=50000):
         assert self._initialised, "Call .train() first."
@@ -2573,11 +2810,11 @@ class V18RPEngine:
         if len(tokens)<10: print("[FittedLine] Corpus too short!"); return self.walker.fitted_model
         model=train_fitted_line(self.walker,tokens,epochs=epochs,lr=lr,
                                  max_replay_steps=max_steps,device=self.device)
-        torch.save(model.state_dict(),"fitted_line_v18rp_spaghetti.pt")
-        print("[FittedLine] Weights saved to fitted_line_v18rp_spaghetti.pt")
+        torch.save(model.state_dict(),"fitted_line_v18rp_cardan.pt")
+        print("[FittedLine] Weights saved to fitted_line_v18rp_cardan.pt")
         return model
 
-    def load_fitted_line(self, path="fitted_line_v18rp_spaghetti.pt"):
+    def load_fitted_line(self, path="fitted_line_v18rp_cardan.pt"):
         assert self._initialised, "Call .train() first."
         model=FittedLineRegression(FittedLineRegression.FEATURE_DIM).to(self.device)
         model.load_state_dict(torch.load(path,map_location=self.device))
@@ -2593,14 +2830,14 @@ class V18RPEngine:
             seed_text=seed_text,instruction_text=instruction_text,
             and_weight=and_weight,temperature=temperature,return_traces=return_traces)
 
-    def save(self, path="v18rp_spaghetti_engine.pkl"):
+    def save(self, path="v18rp_cardan_engine.pkl"):
         with open(path,"wb") as f: pickle.dump(self,f)
-        print(f"[V18-RP-SPAGHETTI] Engine saved to {path}")
+        print(f"[V18-RP-CARDAN] Engine saved to {path}")
 
     @staticmethod
-    def load(path="v18rp_spaghetti_engine.pkl"):
+    def load(path="v18rp_cardan_engine.pkl"):
         with open(path,"rb") as f: eng=pickle.load(f)
-        print(f"[V18-RP-SPAGHETTI] Engine loaded from {path}"); return eng
+        print(f"[V18-RP-CARDAN] Engine loaded from {path}"); return eng
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2609,8 +2846,6 @@ class V18RPEngine:
 
 _engine: Optional[V18RPEngine] = None
 
-
-# --- AUTONOMIC SAVE/LOAD FUNCTIONS ---
 AUTONOMIC_SAVE_FILE = "autonomic_state.json"
 
 def save_autonomic_ui():
@@ -2634,10 +2869,10 @@ def load_autonomic_ui():
         except Exception as e:
             return f"Error loading: {e}", float(LATEST_AUTONOMIC_VAL)
     return "No saved state found.", float(LATEST_AUTONOMIC_VAL)
-# -------------------------------------
 
 def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
-              syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c):
+              syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c,
+              cardan_k,mirror_a,cardan_lw):
     global _engine
     try:
         _engine=V18RPEngine(
@@ -2645,7 +2880,10 @@ def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max
             rff_dim=int(rff_dim),nystrom_m=int(nystrom_m),
             aniso_ooi_weight=float(ooi_w),aniso_repulsion_weight=float(rep_w),
             ripple_weight=float(rpl_w),ripple_k_stubs=int(rpl_k),
-            spaghetti_coupling=float(spag_c))
+            spaghetti_coupling=float(spag_c),
+            cardan_aperture_k=int(cardan_k),
+            mirror_alpha=float(mirror_a),
+            cardan_logit_weight=float(cardan_lw))
         if mode=="Text file":
             if file_in is None: return "❌ No file uploaded."
             text=Path(file_in.name).read_text(encoding="utf-8",errors="replace")
@@ -2659,13 +2897,14 @@ def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max
         else: return "❌ Unknown mode."
         _engine.train(text)
         return (_engine.pdn.theorem_bridge_report()
-                +f"\n✅ Engine initialised (V18-RP-ANISO-RIPPLE-SPAGHETTI).\n"
+                +f"\n✅ Engine initialised (V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN).\n"
                 f"Vocab: {len(_engine.lm.vocab):,}  "
                 f"Trigrams: {len(_engine.lm.tri_raw):,}  "
                 f"Device: {_engine.device}\n"
-                f"SPAGHETTI: coupling={spag_c}  n_mixers=3  n_tangles=2\n"
-                f"RIPPLE: weight={rpl_w}  k_stubs={rpl_k}\n"
-                f"ANISO:  OOI_w={ooi_w}  repulsion_w={rep_w}\n"
+                f"CARDAN: aperture_k={cardan_k}  logit_w={cardan_lw}\n"
+                f"MIRROR: alpha={mirror_a}\n"
+                f"SPAGHETTI: coupling={spag_c}  n_mixers=3  n_tangles=2  strands=23\n"
+                f"\n{_engine.cardan.rotation_report()}\n"
                 f"\n{_engine.walker.algo_report()}")
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
@@ -2675,7 +2914,7 @@ def _gui_fit_line(epochs,lr,max_steps):
     if _engine is None or not _engine._initialised: return "❌ Initialise engine first."
     try:
         model=_engine.train_fitted_line(epochs=int(epochs),lr=float(lr),max_steps=int(max_steps))
-        return f"✅ Fitted line trained (21 features incl. spaghetti_tangle_norm).\n\n{model.feature_report()}"
+        return f"✅ Fitted line trained (23 features incl. cardan_aperture + mirror_instr).\n\n{model.feature_report()}"
     except Exception:
         import traceback; return f"❌ Error:\n{traceback.format_exc()}"
 
@@ -2683,16 +2922,12 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
     global _engine, LATEST_AUTONOMIC_VAL
     if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
     try:
-        # Pass the editable art image from Gradio to the Nanowire Canvas
         if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
             if art_image is not None:
                 img_data = art_image.get('composite')
-                if img_data is None:
-                    img_data = art_image.get('image')
-                if img_data is None:
-                    img_data = art_image.get('background')
+                if img_data is None: img_data = art_image.get('image')
+                if img_data is None: img_data = art_image.get('background')
                 if img_data is not None:
-                    # Multiply uploaded picture by live neural arousal level
                     modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).astype(np.uint8)
                     _engine.walker._contingent.canvas.update_art(modulated_pic)
                 else:
@@ -2712,15 +2947,16 @@ def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,
         import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
 
 def build_gradio_app() -> gr.Blocks:
-    with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI") as demo:
-        gr.Markdown("# NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI")
+    with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN") as demo:
+        gr.Markdown("# NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN")
         gr.Markdown(
-            "**Spaghetti Probs**: All 21 probability signals are routed through a tangled "
-            "3-mixer graph before logit injection. Each signal fans into multiple mixers "
-            "simultaneously; 2 CrossTangle nodes apply Möbius bilinear interactions between "
-            "mixer pairs before they converge. No signal flows cleanly — all are entangled.")
-    # Incrementally increase temporal hyperparameters across 4 stages
-
+            "**Cardan Grille Isomorphisms**: vocab partitioned into four Z₄-isomorphic rotation classes "
+            "derived from dataset trigram frequencies.  At each step the PDN orbit selects the active "
+            "grille class; the aperture membership score fans into MixerA+MixerC as the `cardan_iso` strand.\n\n"
+            "**Mirrored Instructions**: instruction tokens are reversed and re-embedded to foreground "
+            "suffix semantics.  Combined forward + mirror distribution blended at α=mirror_alpha.  "
+            "The `mirror_instr` spaghetti strand carries the reversed signal into MixerA+MixerC, "
+            "entangled with the forward instruction via CrossTangle BC.")
 
         with gr.Tab("Init / Train"):
             mode   =gr.Radio(["Text file","HuggingFace dataset"],value="Text file",label="Source")
@@ -2730,38 +2966,46 @@ def build_gradio_app() -> gr.Blocks:
                 hf_split=gr.Textbox(value="train",label="Split"); hf_field=gr.Textbox(value="text",label="Field")
                 hf_portion=gr.Slider(0.01,1.0,value=1.0,label="Portion"); hf_max=gr.Textbox(value="",label="Max examples")
             with gr.Row():
-                gr.Markdown("### Temporal Hyperparameters")
-
                 syn_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Synaptic weight")
                 trans_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Transition weight")
                 syn_k=gr.Slider(1,64,value=16,step=1,label="Synaptic k")
                 rff_dim=gr.Slider(32,512,value=128,step=32,label="RFF dim D")
                 nystrom_m=gr.Slider(8,128,value=32,step=4,label="Nyström m")
-            gr.Markdown("### Temporal ANISO Hyperparameters")
+            gr.Markdown("### ANISO Hyperparameters")
             with gr.Row():
                 ooi_w=gr.Slider(0.0,23,value=22.1,step=0.05,label="OOI affinity weight")
                 rep_w=gr.Slider(0.0,3.0,value=0.5,step=0.05,label="Repulsion weight")
-            gr.Markdown("### Temporal RIPPLE Hyperparameters")
+            gr.Markdown("### RIPPLE Hyperparameters")
             with gr.Row():
                 rpl_w=gr.Slider(0.0,27,value=26,step=0.1,label="Ripple logit weight")
                 rpl_k=gr.Slider(1,20,value=RIPPLE_K_STUBS,step=1,label="Ripple k_stubs")
-            gr.Markdown("### Temporal SPAGHETTI Hyperparameters")
+            gr.Markdown("### SPAGHETTI Hyperparameters")
             with gr.Row():
-                spag_c=gr.Slider(0.0,1.0,value=0.60,step=0.05,
-                                  label="Möbius tangle coupling (0=parallel, 1=fully entangled)")
-            init_btn=gr.Button("Initialise + Train"); init_out=gr.Textbox(lines=30,label="Init output")
+                spag_c=gr.Slider(0.0,1.0,value=0.60,step=0.05,label="Möbius coupling")
+            gr.Markdown("### CARDAN GRILLE Hyperparameters")
+            with gr.Row():
+                cardan_k=gr.Slider(8,512,value=CARDAN_APERTURE_K,step=8,
+                                    label="Aperture K (vocab slots per grille)")
+                cardan_lw=gr.Slider(0.0,50.0,value=CARDAN_LOGIT_WEIGHT,step=0.5,
+                                     label="Cardan logit strand weight")
+            gr.Markdown("### MIRRORED INSTRUCTION Hyperparameters")
+            with gr.Row():
+                mirror_a=gr.Slider(0.0,1.0,value=MIRROR_ALPHA,step=0.05,
+                                    label="Mirror alpha (blend weight for reversed instruction)")
+            init_btn=gr.Button("Initialise + Train"); init_out=gr.Textbox(lines=35,label="Init output")
             init_btn.click(_gui_init,
                 inputs=[mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
-                        syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c],
+                        syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c,
+                        cardan_k,mirror_a,cardan_lw],
                 outputs=init_out)
 
         with gr.Tab("Fit Line"):
-            gr.Markdown("Train the FittedLineRegression (21 features incl. spaghetti_tangle_norm).")
+            gr.Markdown("Train FittedLineRegression (23 features incl. cardan_aperture_score + mirror_instr_signal).")
             with gr.Row():
                 fl_epochs=gr.Slider(10,500,value=200,step=10,label="Epochs")
                 fl_lr    =gr.Slider(1e-5,1e-2,value=3e-4,step=1e-5,label="Learning rate")
                 fl_maxsteps=gr.Slider(1000,200000,value=50000,step=1000,label="Max replay steps")
-            fl_btn=gr.Button("Train Fitted Line"); fl_out=gr.Textbox(lines=24,label="Fitted line report")
+            fl_btn=gr.Button("Train Fitted Line"); fl_out=gr.Textbox(lines=28,label="Fitted line report")
             fl_btn.click(_gui_fit_line,inputs=[fl_epochs,fl_lr,fl_maxsteps],outputs=fl_out)
 
         with gr.Tab("Generate"):
@@ -2774,8 +3018,7 @@ def build_gradio_app() -> gr.Blocks:
                 temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
                 show_tr  =gr.Checkbox(value=True,label="Show traces")
             with gr.Row():
-                gr.Markdown("### Upload Image (Neural Vessel Carrier)\nUpload a pic! The Arduino stream modulates this pic directly before text generation.")
-
+                gr.Markdown("### Upload Image (Neural Vessel Carrier)")
             with gr.Row():
                 try:
                     art_img = gr.ImageEditor(type="numpy", label="Upload Pic (Modulated by Arduino)", image_mode="RGB")
@@ -2795,16 +3038,11 @@ def build_gradio_app() -> gr.Blocks:
             gen_out =gr.Textbox(lines=8,  label="Generated text")
             prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
             cot_out =gr.Textbox(lines=12, label="CoT traces")
-            step_out=gr.Textbox(lines=14, label="Step traces (spaghetti mixer norms shown)")
+            step_out=gr.Textbox(lines=16, label="Step traces (cardan orbit + spag mixer norms shown)")
 
-            # Click to see the current A0 neural level
             refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
-
             save_arduino_btn.click(fn=save_autonomic_ui, inputs=[], outputs=[autonomic_status_out])
-
             load_arduino_btn.click(fn=load_autonomic_ui, inputs=[], outputs=[autonomic_status_out, live_arduino_ui])
-
-
             gen_btn.click(_gui_generate,
                 inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr,art_img],
                 outputs=[gen_out,cot_out,step_out,prop_out])
@@ -2816,23 +3054,26 @@ def build_gradio_app() -> gr.Blocks:
 # ════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    parser=argparse.ArgumentParser(description="V18-RP-ANISO-RIPPLE-SPAGHETTI")
-    parser.add_argument("--corpus",      default="")
-    parser.add_argument("--fit_line",    action="store_true")
-    parser.add_argument("--fit_epochs",  type=int,   default=200)
-    parser.add_argument("--fit_lr",      type=float, default=3e-4)
-    parser.add_argument("--fit_steps",   type=int,   default=50000)
-    parser.add_argument("--seed",        default="")
-    parser.add_argument("--instruction", default="")
-    parser.add_argument("--sentences",   type=int,   default=4)
-    parser.add_argument("--save",        default="")
-    parser.add_argument("--load",        default="")
-    parser.add_argument("--gui",         action="store_true")
-    parser.add_argument("--ooi_weight",  type=float, default=ANISO_OOI_W)
-    parser.add_argument("--rep_weight",  type=float, default=ANISO_REPULSION_W)
-    parser.add_argument("--rpl_weight",  type=float, default=RIPPLE_WEIGHT)
-    parser.add_argument("--rpl_k",       type=int,   default=RIPPLE_K_STUBS)
-    parser.add_argument("--spag_coupling", type=float, default=SPAGHETTI_COUPLING)
+    parser=argparse.ArgumentParser(description="V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN")
+    parser.add_argument("--corpus",         default="")
+    parser.add_argument("--fit_line",       action="store_true")
+    parser.add_argument("--fit_epochs",     type=int,   default=200)
+    parser.add_argument("--fit_lr",         type=float, default=3e-4)
+    parser.add_argument("--fit_steps",      type=int,   default=50000)
+    parser.add_argument("--seed",           default="")
+    parser.add_argument("--instruction",    default="")
+    parser.add_argument("--sentences",      type=int,   default=4)
+    parser.add_argument("--save",           default="")
+    parser.add_argument("--load",           default="")
+    parser.add_argument("--gui",            action="store_true")
+    parser.add_argument("--ooi_weight",     type=float, default=ANISO_OOI_W)
+    parser.add_argument("--rep_weight",     type=float, default=ANISO_REPULSION_W)
+    parser.add_argument("--rpl_weight",     type=float, default=RIPPLE_WEIGHT)
+    parser.add_argument("--rpl_k",          type=int,   default=RIPPLE_K_STUBS)
+    parser.add_argument("--spag_coupling",  type=float, default=SPAGHETTI_COUPLING)
+    parser.add_argument("--cardan_k",       type=int,   default=CARDAN_APERTURE_K)
+    parser.add_argument("--cardan_lw",      type=float, default=CARDAN_LOGIT_WEIGHT)
+    parser.add_argument("--mirror_alpha",   type=float, default=MIRROR_ALPHA)
     args=parser.parse_args()
 
     build_gradio_app().launch(share=False)
