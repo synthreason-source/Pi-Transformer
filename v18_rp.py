@@ -313,15 +313,17 @@ class SpaghettiMixer:
     def assign(self, strand: SpaghettiStrand):
         self._strands.append(strand)
 
-    def blend(self, C: int) -> torch.Tensor:
+    def blend(self, C: int,
+              _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
         if not self._strands:
             return torch.zeros(C, device=self.device)
         acc = torch.zeros(C, device=self.device)
+        spag_gate = _activator.gate(7) if _activator is not None else 1.0
         for s in self._strands:
             sig = s.signal
             if sig.shape[0] != C:
                 sig = torch.zeros(C, device=self.device)
-            acc = acc + s.sign * s.weight * sig
+            acc = acc + s.sign * s.weight * sig * spag_gate
         return layer_norm_array(acc) / max(SPAGHETTI_MIXER_TEMP, 1e-6)
 
 
@@ -394,9 +396,9 @@ class SpaghettiRouter:
         for idx in routing:
             self._mixers[idx].assign(strand)
 
-    def route(self) -> torch.Tensor:
+    def route(self, _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
         C = self.C
-        outputs: List[torch.Tensor] = [m.blend(C) for m in self._mixers]
+        outputs: List[torch.Tensor] = [m.blend(C, _activator=_activator) for m in self._mixers]
         for tangle in self._tangles:
             outputs = tangle.apply(outputs)
         combined = torch.stack(outputs, dim=0).sum(dim=0)
@@ -689,7 +691,10 @@ class AnisoDirKernel:
         d_sigma = c_sigma  - anc_sigma
         return torch.exp(-self.lr*d_rho**2 - self.lt*d_theta**2 - self.ls*d_sigma**2)
 
-    def gram_matrix(self, c_rho, c_theta, c_sigma) -> torch.Tensor:
+    def gram_matrix(self, c_rho, c_theta, c_sigma,
+                    _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
+        if _activator is not None:
+            return _activator.aniso_gram(c_rho, c_theta, c_sigma)
         rho_i   = c_rho.unsqueeze(1);   rho_j   = c_rho.unsqueeze(0)
         theta_i = c_theta.unsqueeze(1); theta_j = c_theta.unsqueeze(0)
         sigma_i = c_sigma.unsqueeze(1); sigma_j = c_sigma.unsqueeze(0)
@@ -737,15 +742,19 @@ class SentenceOOITracker:
         return agg / len(self._ooi)
 
     @torch.no_grad()
-    def inter_candidate_repulsion(self, c_rho, c_theta, c_sigma, prob_vec) -> torch.Tensor:
+    def inter_candidate_repulsion(self, c_rho, c_theta, c_sigma, prob_vec,
+                                   _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
         C = c_rho.shape[0]
         if C < 2: return torch.zeros(C, device=self.device)
-        K = self.kernel.gram_matrix(c_rho, c_theta, c_sigma)
+        K = self.kernel.gram_matrix(c_rho, c_theta, c_sigma, _activator=_activator)
         K = K * (1.0 - torch.eye(C, device=self.device))
         p = prob_vec.to(self.device).clamp(min=0.0)
         if p.sum().item() < 1e-12: p = torch.ones(C, device=self.device) / C
         else: p = p / p.sum()
-        return K @ p
+        raw = K @ p
+        if _activator is not None:
+            raw = raw * _activator.gate(4)
+        return raw
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -867,7 +876,10 @@ class RandomFourierFeatures:
         self.bias_sigma  = torch.rand(rff_dim,generator=g,dtype=dtype,device=device)*2*math.pi
         self._scale = math.sqrt(2.0/rff_dim)
 
-    def features(self, rho, theta, sigma) -> torch.Tensor:
+    def features(self, rho, theta, sigma,
+                 _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
+        if _activator is not None:
+            return _activator.rff_features(rho, theta, sigma)
         pr = self.bias_rho.unsqueeze(1)   + self.omega_rho   @ rho.unsqueeze(0)
         pt = self.bias_theta.unsqueeze(1) + self.omega_theta @ theta.unsqueeze(0)
         ps = self.bias_sigma.unsqueeze(1) + self.omega_sigma @ sigma.unsqueeze(0)
@@ -885,6 +897,236 @@ class RandomFourierFeatures:
         return (self.features(ra,ta,sa) @ self.features(rho_b,theta_b,sigma_b).T).squeeze(0)
 
 
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 1b — ISOLATED MULTIPLICATION LAYERS  (V19 extension)
+# ════════════════════════════════════════════════════════════════════════════
+# Each class encapsulates exactly ONE family of tensor multiplications.
+# SequentialLayerActivator cycles through them one-per-token: as `toks`
+# advances the active layer index steps forward so that exactly one layer
+# runs at full gain while the others are gated to `residual_scale`.
+# This prevents co-adaptation across multiply ops and gives each layer a
+# dedicated "token window" to dominate the logit signal.
+
+class IsolatedRFFProjectLayer(nn.Module):
+    """Layer 0 — RFF omega projections: omega @ x."""
+    def __init__(self, rff: "RandomFourierFeatures"):
+        super().__init__()
+        self._rff = rff
+
+    def forward(self, rho: torch.Tensor, theta: torch.Tensor,
+                sigma: torch.Tensor) -> torch.Tensor:
+        pr = self._rff.bias_rho.unsqueeze(1)   + self._rff.omega_rho   @ rho.unsqueeze(0)
+        pt = self._rff.bias_theta.unsqueeze(1) + self._rff.omega_theta @ theta.unsqueeze(0)
+        ps = self._rff.bias_sigma.unsqueeze(1) + self._rff.omega_sigma @ sigma.unsqueeze(0)
+        sc = self._rff._scale
+        return torch.cat([(sc * torch.cos(pr)).T,
+                          (sc * torch.cos(pt)).T,
+                          (sc * torch.cos(ps)).T], dim=1)
+
+
+class IsolatedKernelProductLayer(nn.Module):
+    """Layer 1 — feature-space inner product: feat_a @ feat_b.T."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, feat_a: torch.Tensor,
+                feat_b: torch.Tensor) -> torch.Tensor:
+        return feat_a @ feat_b.T
+
+
+class IsolatedNystromBuildLayer(nn.Module):
+    """Layer 2 — Nyström kernel matrix assembly: K_cm @ K_mm_inv @ K_cm.T."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, phi_c: torch.Tensor,
+                phi_lm: torch.Tensor) -> torch.Tensor:
+        K_cm = phi_c  @ phi_lm.T
+        K_mm = phi_lm @ phi_lm.T
+        try:
+            U, S, Vh = torch.linalg.svd(K_mm, full_matrices=False)
+            S_inv    = torch.where(S > S.max() * 1e-4, 1.0 / S, torch.zeros_like(S))
+            K_mm_inv = Vh.T @ torch.diag(S_inv) @ U.T
+        except Exception:
+            K_mm_inv = torch.eye(phi_lm.shape[0],
+                                  dtype=phi_c.dtype, device=phi_c.device) * 0.01
+        W = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0).neg().add(1.0)
+        W.fill_diagonal_(0.0)
+        return W
+
+
+class IsolatedSynapticSumLayer(nn.Module):
+    """Layer 3 — synaptic aggregation: W @ logits."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, W: torch.Tensor,
+                logits: torch.Tensor) -> torch.Tensor:
+        return W @ signed_power(logits, p=1.0)
+
+
+class IsolatedAnisoGramLayer(nn.Module):
+    """Layer 4 — anisotropic Gram matrix: exp(-λ·Δ²) over candidate pairs."""
+    def __init__(self, aniso_kernel: "AnisoDirKernel"):
+        super().__init__()
+        self._k = aniso_kernel
+
+    def forward(self, c_rho: torch.Tensor, c_theta: torch.Tensor,
+                c_sigma: torch.Tensor) -> torch.Tensor:
+        return self._k.gram_matrix(c_rho, c_theta, c_sigma)
+
+
+class IsolatedLSHProjectLayer(nn.Module):
+    """Layer 5 — LSH random-plane projection: feats @ planes.T."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, feats: torch.Tensor,
+                planes: torch.Tensor) -> torch.Tensor:
+        return (feats @ planes.T > 0).int()
+
+
+class IsolatedCompositionBonusLayer(nn.Module):
+    """Layer 6 — composition bonus inner product: ctx_feat @ cand_feats.T."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, ctx_feat: torch.Tensor,
+                cand_feats: torch.Tensor) -> torch.Tensor:
+        return (ctx_feat @ cand_feats.T).squeeze(0).clamp(0.0)
+
+
+class IsolatedSpaghettiBlendLayer(nn.Module):
+    """Layer 7 — Möbius cross-shift + mixer accumulation."""
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, a: torch.Tensor,
+                b: torch.Tensor,
+                coupling: float = SPAGHETTI_COUPLING) -> torch.Tensor:
+        return mobius_cross_shift(a, b, coupling)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+
+class SequentialLayerActivator(nn.Module):
+    """
+    Holds all isolated-multiply layers and gates them one-at-a-time as
+    tokens advance.
+
+    Protocol
+    ────────
+    • Call  activator.tick()  inside  walker.push_token()  to advance the
+      active layer index by 1 each time a token is committed.
+    • Call  activator.compute(layer_idx, *args)  instead of the raw multiply:
+        – active layer  → gain = 1.0   (full signal)
+        – inactive layers → gain = residual_scale  (kept alive, not zeroed)
+
+    Layer index table
+    ─────────────────
+        0  IsolatedRFFProjectLayer       (omega projections)
+        1  IsolatedKernelProductLayer    (feat_a @ feat_b.T)
+        2  IsolatedNystromBuildLayer     (K_cm @ K_mm_inv @ K_cm.T)
+        3  IsolatedSynapticSumLayer      (W @ logits)
+        4  IsolatedAnisoGramLayer        (Gram matrix)
+        5  IsolatedLSHProjectLayer       (LSH plane projection)
+        6  IsolatedCompositionBonusLayer (ctx @ cand_feats.T)
+        7  IsolatedSpaghettiBlendLayer   (Möbius cross-shift)
+    """
+    LAYER_NAMES = [
+        "rff_project",
+        "kernel_product",
+        "nystrom_build",
+        "synaptic_sum",
+        "aniso_gram",
+        "lsh_project",
+        "composition_bonus",
+        "spaghetti_blend",
+    ]
+
+    def __init__(self, rff, aniso_kernel, residual_scale: float = 0.1,
+                 device: torch.device = DEVICE):
+        super().__init__()
+        self.residual_scale = residual_scale
+        self.device         = device
+        self._tok_step: int = 0
+
+        self.layers = nn.ModuleList([
+            IsolatedRFFProjectLayer(rff),           # 0
+            IsolatedKernelProductLayer(),            # 1
+            IsolatedNystromBuildLayer(),             # 2
+            IsolatedSynapticSumLayer(),              # 3
+            IsolatedAnisoGramLayer(aniso_kernel),    # 4
+            IsolatedLSHProjectLayer(),               # 5
+            IsolatedCompositionBonusLayer(),         # 6
+            IsolatedSpaghettiBlendLayer(),           # 7
+        ])
+        self._num_layers = len(self.layers)
+
+    # ── Token step management ─────────────────────────────────────────────
+
+    def tick(self):
+        """Advance to the next layer. Call once per committed token."""
+        self._tok_step += 1
+
+    def reset(self):
+        """Reset to layer 0 at the start of each sentence."""
+        self._tok_step = 0
+
+    @property
+    def active_layer_idx(self) -> int:
+        return self._tok_step % self._num_layers
+
+    @property
+    def active_layer_name(self) -> str:
+        return self.LAYER_NAMES[self.active_layer_idx]
+
+    def gate(self, layer_idx: int) -> float:
+        """Returns 1.0 for the active layer, residual_scale for all others."""
+        return 1.0 if layer_idx == self.active_layer_idx else self.residual_scale
+
+    # ── Compute helpers ───────────────────────────────────────────────────
+
+    def rff_features(self, rho, theta, sigma) -> torch.Tensor:
+        out = self.layers[0](rho, theta, sigma)
+        return out * self.gate(0)
+
+    def kernel_product(self, feat_a, feat_b) -> torch.Tensor:
+        out = self.layers[1](feat_a, feat_b)
+        return out * self.gate(1)
+
+    def nystrom_build(self, phi_c, phi_lm) -> torch.Tensor:
+        out = self.layers[2](phi_c, phi_lm)
+        return out * self.gate(2)
+
+    def synaptic_sum(self, W, logits) -> torch.Tensor:
+        out = self.layers[3](W, logits)
+        return out * self.gate(3)
+
+    def aniso_gram(self, c_rho, c_theta, c_sigma) -> torch.Tensor:
+        out = self.layers[4](c_rho, c_theta, c_sigma)
+        return out * self.gate(4)
+
+    def lsh_project(self, feats, planes) -> torch.Tensor:
+        return self.layers[5](feats, planes)   # binary — no gain scaling
+
+    def composition_bonus(self, ctx_feat, cand_feats) -> torch.Tensor:
+        out = self.layers[6](ctx_feat, cand_feats)
+        return out * self.gate(6)
+
+    def spaghetti_blend(self, a, b,
+                        coupling: float = SPAGHETTI_COUPLING) -> torch.Tensor:
+        out = self.layers[7](a, b, coupling)
+        return out * self.gate(7)
+
+    def status_str(self) -> str:
+        return (f"[LayerActivator] tok_step={self._tok_step}  "
+                f"active={self.active_layer_idx}:{self.active_layer_name}  "
+                f"residual={self.residual_scale}")
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — NYSTRÖM APPROXIMATION
 # ════════════════════════════════════════════════════════════════════════════
@@ -895,21 +1137,26 @@ class NystromSynapticMatrix:
         self.device=device; self.dtype=dtype
 
     @torch.no_grad()
-    def build(self, c_rho, c_theta, c_sigma) -> torch.Tensor:
+    def build(self, c_rho, c_theta, c_sigma,
+              _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
         C = c_rho.shape[0]; m = min(self.n_landmarks, C)
         lm_idx = torch.tensor(_reservoir_sample_indices(C,m), dtype=torch.long, device=self.device)
-        phi_c  = self.rff.features(c_rho, c_theta, c_sigma)
-        phi_lm = self.rff.features(c_rho[lm_idx], c_theta[lm_idx], c_sigma[lm_idx])
-        K_cm   = phi_c @ phi_lm.T
-        K_mm   = phi_lm @ phi_lm.T
-        try:
-            U,S,Vh = torch.linalg.svd(K_mm, full_matrices=False)
-            S_inv  = torch.where(S > S.max()*1e-4, 1.0/S, torch.zeros_like(S))
-            K_mm_inv = Vh.T @ torch.diag(S_inv) @ U.T
-        except Exception:
-            K_mm_inv = torch.eye(m, dtype=self.dtype, device=self.device)*0.01
-        W = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0).neg().add(1.0)
-        W.fill_diagonal_(0.0)
+        phi_c  = self.rff.features(c_rho, c_theta, c_sigma, _activator=_activator)
+        phi_lm = self.rff.features(c_rho[lm_idx], c_theta[lm_idx], c_sigma[lm_idx], _activator=_activator)
+        if _activator is not None:
+            W_raw = _activator.nystrom_build(phi_c, phi_lm)
+        else:
+            K_cm = phi_c @ phi_lm.T
+            K_mm = phi_lm @ phi_lm.T
+            try:
+                U,S,Vh = torch.linalg.svd(K_mm, full_matrices=False)
+                S_inv  = torch.where(S > S.max()*1e-4, 1.0/S, torch.zeros_like(S))
+                K_mm_inv = Vh.T @ torch.diag(S_inv) @ U.T
+            except Exception:
+                K_mm_inv = torch.eye(m, dtype=self.dtype, device=self.device)*0.01
+            W_raw = (K_cm @ K_mm_inv @ K_cm.T).clamp(0.0, 1.0).neg().add(1.0)
+            W_raw.fill_diagonal_(0.0)
+        W = W_raw
         if self.top_k < C:
             kth,_ = torch.topk(W, min(self.top_k,C), dim=1)
             W = W * (W >= kth[:,-1].unsqueeze(1)).float()
@@ -974,18 +1221,20 @@ class LSHIndex:
         self._feats: Optional[torch.Tensor] = None
         self._vocab: List[str] = []
 
-    def build(self, features, vocab):
+    def build(self, features, vocab,
+             _activator: "SequentialLayerActivator | None" = None):
         self._feats=features; self._vocab=vocab; self._table={}
-        bits = (features @ self.planes.T > 0).int()
+        bits = _activator.lsh_project(features, self.planes)                if _activator is not None                else (features @ self.planes.T > 0).int()
         for v in range(features.shape[0]):
             for b in range(self.n_bands):
                 s = b*self.n_rows
                 key = (b, hash(tuple(bits[v,s:self.n_rows+s].tolist())))
                 self._table.setdefault(key,[]).append(v)
 
-    def query_candidates(self, q_feat, max_cands=50):
+    def query_candidates(self, q_feat, max_cands=50,
+                         _activator: "SequentialLayerActivator | None" = None):
         if self._feats is None: return []
-        bits = (q_feat.to(self.device) @ self.planes.T > 0).int()
+        bits = _activator.lsh_project(q_feat.to(self.device), self.planes)                if _activator is not None                else (q_feat.to(self.device) @ self.planes.T > 0).int()
         cands: Set[int] = set()
         for b in range(self.n_bands):
             s = b*self.n_rows
@@ -1220,22 +1469,39 @@ class RPCrossSynapticNeuronSum:
                                              device=device,dtype=dtype)
 
     @torch.no_grad()
-    def synaptic_sum(self, logits, c_rho, c_theta, c_sigma):
-        W=self._nystrom.build(c_rho,c_theta,c_sigma)
-        return layer_norm_array(W @ signed_power(logits,p=1.0))
+    def synaptic_sum(self, logits, c_rho, c_theta, c_sigma,
+                     _activator: "SequentialLayerActivator | None" = None):
+        W = self._nystrom.build(c_rho, c_theta, c_sigma, _activator=_activator)
+        raw = (W @ signed_power(logits, p=1.0)) if _activator is None               else _activator.synaptic_sum(W, logits)
+        return layer_norm_array(raw)
 
     @torch.no_grad()
-    def transitive_bonus(self, c_rho_t,c_theta_t,c_sigma_t, ctx_rho,ctx_theta,ctx_sigma):
-        return layer_norm_array(
-            self.rff.kernel_scalar(ctx_rho,ctx_theta,ctx_sigma,c_rho_t,c_theta_t,c_sigma_t).clamp(0.0))
+    def transitive_bonus(self, c_rho_t, c_theta_t, c_sigma_t,
+                         ctx_rho, ctx_theta, ctx_sigma,
+                         _activator: "SequentialLayerActivator | None" = None):
+        feat_a = self.rff.features(
+            torch.tensor([ctx_rho],  dtype=self.dtype, device=self.device),
+            torch.tensor([ctx_theta], dtype=self.dtype, device=self.device),
+            torch.tensor([ctx_sigma], dtype=self.dtype, device=self.device),
+            _activator=_activator)
+        feat_b = self.rff.features(c_rho_t, c_theta_t, c_sigma_t,
+                                    _activator=_activator)
+        raw = feat_a @ feat_b.T
+        if _activator is not None:
+            raw = raw * _activator.gate(1)   # kernel-product gate
+        return layer_norm_array(raw.squeeze(0).clamp(0.0))
 
     @torch.no_grad()
-    def forward(self, logits, c_rho,c_theta,c_sigma, c_rho_t,c_theta_t,c_sigma_t,
-                ctx_rho,ctx_theta,ctx_sigma):
-        z_syn=self.synaptic_sum(logits,c_rho,c_theta,c_sigma)
-        tb=self.transitive_bonus(c_rho_t,c_theta_t,c_sigma_t,ctx_rho,ctx_theta,ctx_sigma)
-        return torch.nan_to_num(self.trans_weight*tb+logits+self.syn_weight*z_syn,
-                                nan=0.0,posinf=50.0,neginf=-50.0)
+    def forward(self, logits, c_rho, c_theta, c_sigma,
+                c_rho_t, c_theta_t, c_sigma_t,
+                ctx_rho, ctx_theta, ctx_sigma,
+                _activator: "SequentialLayerActivator | None" = None):
+        z_syn = self.synaptic_sum(logits, c_rho, c_theta, c_sigma, _activator=_activator)
+        tb    = self.transitive_bonus(c_rho_t, c_theta_t, c_sigma_t,
+                                      ctx_rho, ctx_theta, ctx_sigma,
+                                      _activator=_activator)
+        return torch.nan_to_num(self.trans_weight*tb + logits + self.syn_weight*z_syn,
+                                nan=0.0, posinf=50.0, neginf=-50.0)
 
 
 
@@ -1376,13 +1642,19 @@ class RPCompositionLM:
             [(self.BASAL_K+agg.get(c,1e-4))/(self.BASAL_K*V+total) for c in cands],
             dtype=torch.float32,device=self.device)
 
-    def composition_logit_bonus(self,w1,w2,c_rho,c_sigma):
-        C=self.geo.composed_triple(w1,w2)
-        ctx_feat=self.rff.features(
-            torch.tensor([C.rho],dtype=torch.float32,device=self.device),
-            torch.tensor([C.theta],dtype=torch.float32,device=self.device),
-            torch.tensor([C.sigma],dtype=torch.float32,device=self.device))
-        return (ctx_feat @ self.rff.features(c_rho,torch.zeros_like(c_rho),c_sigma).T).squeeze(0).clamp(0.0)
+    def composition_logit_bonus(self, w1, w2, c_rho, c_sigma,
+                                _activator: "SequentialLayerActivator | None" = None):
+        C       = self.geo.composed_triple(w1, w2)
+        ctx_feat = self.rff.features(
+            torch.tensor([C.rho],   dtype=torch.float32, device=self.device),
+            torch.tensor([C.theta], dtype=torch.float32, device=self.device),
+            torch.tensor([C.sigma], dtype=torch.float32, device=self.device),
+            _activator=_activator)
+        cand_feats = self.rff.features(c_rho, torch.zeros_like(c_rho), c_sigma,
+                                        _activator=_activator)
+        if _activator is not None:
+            return _activator.composition_bonus(ctx_feat, cand_feats)
+        return (ctx_feat @ cand_feats.T).squeeze(0).clamp(0.0)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2112,6 +2384,14 @@ class RPWalker:
                                              trans_weight=trans_weight,syn_k=syn_k,device=device)
         self._csns_syn_norms: List[float]=[]; self._csns_trans_norms: List[float]=[]
 
+        # ── Sequential Layer Activator — one multiply-layer per token step ──
+        self._activator = SequentialLayerActivator(
+            rff=rff,
+            aniso_kernel=self._aniso_kernel,
+            residual_scale=0.10,
+            device=device,
+        )
+
         self.surjector       = PropositionalSurjectionEngine(geo)
         self._aniso_kernel   = AnisoDirKernel(device=device)
         self._ooi_tracker    = SentenceOOITracker(self._aniso_kernel, device=device)
@@ -2143,6 +2423,7 @@ class RPWalker:
         self._cur_sent_toks.clear()
         self._cur_orbit=0; self._tok_pos=0; self._total_tokens=total_tokens
         self._ooi_tracker.reset()
+        self._activator.reset()          # ← restart layer cycling each sentence
         seeds=seed_tokens or []
         self.cot.begin_sentence()
         return self.cot.plan_chain(seeds, self.geo, pdn_orbit=self._cur_orbit)
@@ -2473,6 +2754,7 @@ class RPWalker:
     def push_token(self, token, sentence_len):
         if token in PUNCT_TOKENS or token in COGNITIVE_TOKENS: return
         self._cur_sent_toks.append(token); self._tok_pos+=1
+        self._activator.tick()           # advance active layer 1 per token
         pos_norm=len(self._cur_sent_toks)/max(sentence_len,1)
         triple=self.geo.triple_fast(token)
         self.chunk_engine.push(triple,pos_norm)
