@@ -2384,20 +2384,20 @@ class RPWalker:
                                              trans_weight=trans_weight,syn_k=syn_k,device=device)
         self._csns_syn_norms: List[float]=[]; self._csns_trans_norms: List[float]=[]
 
-        # ── Sequential Layer Activator — one multiply-layer per token step ──
-        self._activator = SequentialLayerActivator(
-            rff=rff,
-            aniso_kernel=self._aniso_kernel,
-            residual_scale=0.10,
-            device=device,
-        )
-
+       
         self.surjector       = PropositionalSurjectionEngine(geo)
         self._aniso_kernel   = AnisoDirKernel(device=device)
         self._ooi_tracker    = SentenceOOITracker(self._aniso_kernel, device=device)
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
 
+        # ── Sequential Layer Activator ──────────────────────────────────────
+        self._activator = SequentialLayerActivator(
+            rff=rff,
+            aniso_kernel=self._aniso_kernel,   # ← always defined at this point
+            residual_scale=0.10,
+            device=device,
+        )
         self._recogniser     = InstructionStubRecogniser(
             cot_engine.stubs, self._aniso_kernel,
             k_stubs=ripple_k_stubs, device=device)
