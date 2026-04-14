@@ -1181,8 +1181,8 @@ class BolyaiTokenGeometryRP:
         n=math.sqrt(y*y+x*x)
         if n>=0.98: s=(1.0/0.98)/max(n,1e-8); x*=s; y*=s
         eu=1.0-min(math.sqrt(y*y+x*x),1.0-1e-8)
-        hyp_r=2.0*math.atanh(eu)
-        rho=math.tanh(0.5*hyp_r); theta=math.atan2(y,x)%math.pi
+        hyp_r=2.0*torch.atanh(torch.tensor(eu))
+        rho=torch.tanh(0.5*torch.tensor(hyp_r)); theta=math.atan2(y,x)%math.pi
         sigma=2.0/max(1.0-eu*eu,1e-8)
         return BolyaiTripleRP(rho,theta,sigma)
 
@@ -1205,7 +1205,7 @@ def compute_transitive_triples_rp(geo, cands, w1, w2, device=DEVICE, dtype=torch
         n=math.sqrt(y*y+x*x)
         if n>=0.98: s=(1.0/0.98)/max(n,1e-8); x*=s; y*=s
         eu=1.0-min(math.sqrt(y*y+x*x),1.0-1e-8)
-        hyp_r=2.0*math.atanh(eu); rho=math.tanh(0.5*hyp_r)
+        hyp_r=2.0*torch.atanh(torch.tensor(eu)); rho=math.tanh(0.5*hyp_r)
         theta=math.atan2(y,x)%math.pi; sigma=2.0/max(1.0-eu*eu,1e-8)
         rl.append(rho); tl.append(theta); sl.append(sigma)
     return (torch.tensor(rl,dtype=dtype,device=device),
@@ -1237,6 +1237,65 @@ class RPCrossSynapticNeuronSum:
         return torch.nan_to_num(self.trans_weight*tb+logits+self.syn_weight*z_syn,
                                 nan=0.0,posinf=50.0,neginf=-50.0)
 
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 8b — GEOMETRY CONSTRUCTOR  (replaces scattered register loop)
+# ════════════════════════════════════════════════════════════════════════════
+
+class GeometryConstructor:
+    """
+    Centralised factory for BolyaiTokenGeometryRP.
+    Vectorises hyperbolic-disk position computation on the GPU and
+    pre-populates the triple cache + RFF feature tensors in one pass.
+
+    Usage (inside V18RPEngine.train):
+        self.geo, self.rff = GeometryConstructor(
+            device=self.device, rff_dim=self.rff_dim
+        ).construct(self.lm.raw_freq, self.lm.vocab)
+    """
+
+    def __init__(self, device=DEVICE, dtype=torch.float32, rff_dim=RP_RFF_DIM):
+        self.device  = device
+        self.dtype   = dtype
+        self.rff_dim = rff_dim
+
+    def construct(
+        self,
+        raw_freq: Dict[str, float],
+        vocab:    List[str],
+    ) -> Tuple["BolyaiTokenGeometryRP", "RandomFourierFeatures"]:
+        geo = BolyaiTokenGeometryRP(device=self.device, dtype=self.dtype)
+        rff = RandomFourierFeatures(rff_dim=self.rff_dim, device=self.device, dtype=self.dtype)
+
+        if not vocab:
+            print("[GeometryConstructor] Empty vocab — skipping tensor build.")
+            return geo, rff
+
+        V        = len(vocab)
+        max_freq = max(raw_freq.values(), default=1e-9)
+
+        # Vectorised GPU position computation
+        freqs   = torch.tensor([raw_freq.get(t, 1e-9) for t in vocab],
+                                dtype=self.dtype, device=self.device)
+        indices = torch.arange(V, dtype=self.dtype, device=self.device)
+        rs      = 0.12 * torch.sqrt((freqs / max_freq).clamp(min=1e-9))
+        angs    = 2.0 * math.pi * indices / max(V - 1, 1)
+        xs      = (rs * torch.cos(angs)).cpu().tolist()
+        ys      = (rs * torch.sin(angs)).cpu().tolist()
+
+        # Batch register + pre-warm triple cache
+        for i, tok in enumerate(vocab):
+            geo._vecs[tok]  = (xs[i], ys[i])
+            geo._cache[tok] = geo.triple_fast(tok)
+
+        # Single GPU tensor + RFF feature build
+        geo.build_cuda_tensors(vocab, rff)
+
+        print(f"[GeometryConstructor] {V} tokens  |  "
+              f"feats {geo._feat_t.shape if geo._feat_t is not None else 'N/A'}")
+        return geo, rff
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 10 — RP COMPOSITION LM
@@ -2748,16 +2807,22 @@ class V18RPEngine:
     def train(self, corpus_text: str):
         self._corpus_snippet = corpus_text
         print(f"[V18-RP-CARDAN] Tokenising {len(corpus_text)} chars…")
-        tokens=tokenize(corpus_text)
+        tokens = tokenize(corpus_text)
         self.lm.ingest(tokens)
-        all_tokens=list(self.lm.raw_freq.keys())
-        max_freq=max(self.lm.raw_freq.values(),default=1.0)
-        vocab_size=len(all_tokens)
-        print(f"[V18-RP-CARDAN] Registering {vocab_size} tokens…")
-        for idx,tok in enumerate(all_tokens):
-            self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
-        print("[V18-RP-CARDAN] Building GPU tensors + RFF feature cache…")
-        self.geo.build_cuda_tensors(self.lm.vocab, self.rff)
+
+        # ── REFACTORED: vectorised geometry construction ─────────────────
+        print("[V18-RP-CARDAN] Constructing geometry (vectorised)…")
+        self.geo, self.rff = GeometryConstructor(
+            device=self.device, rff_dim=self.rff_dim
+        ).construct(self.lm.raw_freq, self.lm.vocab)
+
+        # Re-sync subsystems to the new geo/rff instances
+        self.lm.geo     = self.geo;   self.lm.rff  = self.rff
+        self.kernels    = RPKernels(self.rff)
+        self.mrv        = RPMRVFilter(self.rff, device=self.device)
+        self.isostacker = IsomorphicSyntaxStacker(self.rff, device=self.device)
+        self.stublib    = RPCoTStubLibrary(self.rff, device=self.device)
+
         self.lm.finalise()
         print("[V18-RP-CARDAN] Random Walk MC potential propagation…")
         self.rw_graph.build_from_trigrams(self.lm.tri_raw,self.lm.raw_freq,self.rff,self.geo)
