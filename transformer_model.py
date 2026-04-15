@@ -1,8 +1,3 @@
-
-# =====================================================
-# KERNEL-LLM v1.3 - COMPLETE & FIXED (paste.txt → TRAINED MODEL)
-# 3x5 Grid Compression of V18 NeuroSymbolic | No Errors | Ready to Run
-# =====================================================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,13 +14,13 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 # -------------------------------------------------
-# 1. 3x5  KERNEL GRID (15% of original paste.txt math)
+# 1. 3x5 KERNEL GRID + GEOMETRIC SHAPES
 # -------------------------------------------------
 def aniso_kern(drho, dtheta, lr=0.1, lt=0.9):
     return torch.exp(-lr * drho**-2 - lt * dtheta**2)
 
 def l1_proj(x, eps=1e-12):
-    min_vals = x.min(dim=-1, keepdim=True).values  # ← grab values only
+    min_vals = x.min(dim=-1, keepdim=True).values
     x = F.softplus(x - min_vals)
     return x / (x.sum(dim=-1, keepdim=True) + eps)
 
@@ -38,7 +33,7 @@ def mobius_shift(a, b, c=0.35):
     ta = torch.tanh(a * 0.1)
     tb = torch.tanh(b * 0.1)
     denom = (1 + c * ta * tb).clamp(min=1e-6)
-    return torch.atanh((ta + c * tb) / denom)
+    return torch.atanh((ta + c * tb) / denom.clamp(-0.999, 0.999))
 
 def simplex_proj(x):
     x = F.relu(x - x.min(dim=-1, keepdim=True))
@@ -48,7 +43,45 @@ def orbit_bonus(theta, n, sector):
     return 0.5 * torch.cos(2 * math.pi * (theta / sector - n)) + 0.5
 
 # -------------------------------------------------
-# 2.  KERNEL LAYER (ALL CLASSES PROPERLY DEFINED)
+# GEOMETRIC SHAPES FEATURE APPENDER
+# -------------------------------------------------
+def geometric_shapes_features(rho, theta, B, L, device):
+    """Append 8 geometric shape descriptors to features"""
+    # 1. Circle (radial symmetry)
+    circle = torch.exp(-(rho - 0.5)**2 / 0.1)
+    
+    # 2. Ellipse (anisotropic)
+    ellipse = torch.exp(-(rho**2 / 0.3 + theta**2 / 0.8))
+    
+    # 3. Spiral (Archimedean)
+    spiral = torch.sin(6 * theta) * torch.exp(-rho * 0.5)
+    
+    # 4. Torus (doughnut)
+    torus = torch.exp(-((rho - 0.5)**2 + torch.sin(4 * theta)**2) / 0.15)
+    
+    # 5. Star (polar star)
+    star = torch.exp(-rho) * (1 + 0.7 * torch.cos(5 * theta))
+    
+    # 6. Wave (sinusoidal boundary)
+    wave = torch.sin(3 * rho + 2 * theta) * torch.cos(theta)
+    
+    # 7. Vortex (angular momentum)
+    vortex = rho * torch.cos(8 * theta - rho * 3)
+    
+    # 8. Crystal (3x5 grid harmonics)
+    crystal = 0
+    for i in range(3):
+        for j in range(5):
+            crystal += torch.cos(2 * math.pi * (i * rho / 3 + j * theta / 5))
+    
+    shapes = torch.stack([
+        circle, ellipse, spiral, torus, star, wave, vortex, crystal / 15
+    ], dim=-1)  # (B, L, 8)
+    
+    return shapes
+
+# -------------------------------------------------
+# 2. ENHANCED KERNEL LAYER w/ GEOMETRIC SHAPES
 # -------------------------------------------------
 class KernelLayer(nn.Module):
     def __init__(self, d_model, nhead):
@@ -56,39 +89,47 @@ class KernelLayer(nn.Module):
         self.attn = nn.MultiheadAttention(d_model, nhead, batch_first=True)
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
-        self.grid_bias = nn.Parameter(torch.randn(15, d_model) * 0.1)  # 3x5=15
+        self.grid_bias = nn.Parameter(torch.randn(15, d_model) * 0.1)
+        
+        # Geometric shapes projector (8 shapes → d_model)
+        self.shape_proj = nn.Linear(8, d_model)
+        self.shape_norm = nn.LayerNorm(d_model)
 
     def forward(self, x, rho, theta, sigma):
         B, L, D = x.shape
-
 
         # Self-attention
         attn_out, _ = self.attn(x, x, x)
         x = self.norm1(x + attn_out)
 
-        # Ensure rho, theta are (B, L)
         assert rho.shape == (B, L), f"rho: {rho.shape}"
         assert theta.shape == (B, L), f"theta: {theta.shape}"
 
-        # FIXED 3x5 GRID INJECTION (safe broadcasting)
-        drho = rho.unsqueeze(-1) - rho.mean(dim=1, keepdim=True).unsqueeze(-1)  # (B,L,1)
-        dtheta = theta.unsqueeze(-1) - theta.mean(dim=1, keepdim=True).unsqueeze(-1)  # (B,L,1)
-
-        kern_map = aniso_kern(drho, dtheta)  # (B,L,1)
-        kern_map = kern_map.squeeze(-1).unsqueeze(-1)  # explicit (B,L,1) view
-
+        # ORIGINAL 3x5 GRID
+        drho = rho.unsqueeze(-1) - rho.mean(dim=1, keepdim=True).unsqueeze(-1)
+        dtheta = theta.unsqueeze(-1) - theta.mean(dim=1, keepdim=True).unsqueeze(-1)
+        kern_map = aniso_kern(drho, dtheta).squeeze(-1).unsqueeze(-1)
+        
         grid_size = self.grid_bias.shape[0]
-        kern_expanded = kern_map.unsqueeze(-1).expand(B, L, grid_size, 1)  # (B,L,15,1)
-        kern_grid = l1_proj(kern_expanded).squeeze(-1)  # (B,L,15)
-
-        kern_ff = torch.bmm(kern_grid, self.grid_bias.unsqueeze(0).expand(B, -1, -1))  # (B,L,D)
+        kern_expanded = kern_map.unsqueeze(-1).expand(B, L, grid_size, 1)
+        kern_grid = l1_proj(kern_expanded).squeeze(-1)
+        kern_ff = torch.bmm(kern_grid, self.grid_bias.unsqueeze(0).expand(B, -1, -1))
         kern_ff_roll = kern_ff.roll(grid_size, dims=1)
         kern_ff = mobius_shift(kern_ff, kern_ff_roll) * orbit_bonus(theta.unsqueeze(-1), 0, 4)
-        x = self.norm2(x + layer_norm(kern_ff))
+
+        # NEW: GEOMETRIC SHAPES APPENDED TO FEATURES
+        shape_features = geometric_shapes_features(rho, theta, B, L, x.device)
+        shape_proj = self.shape_proj(shape_features)
+        shape_proj = self.shape_norm(shape_proj)
+
+        # Combine kernel + geometric shapes
+        combined = layer_norm(kern_ff + shape_proj)
+        x = self.norm2(x + combined)
+        
         return x
 
 # -------------------------------------------------
-# 3. MAIN KERNEL-LLM
+# 3. MAIN KERNEL-LLM (unchanged interface)
 # -------------------------------------------------
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size=256, d_model=64, nhead=8, num_layers=3):
@@ -112,12 +153,12 @@ class KernelLLM(nn.Module):
         for layer in self.layers:
             emb = layer(emb, rho, theta, sigma)
 
-        out = self.norm(emb[:, -1, :])   # (B, D)
-        logits = self.head(out)          # (B, V)
+        out = self.norm(emb[:, -1, :])
+        logits = self.head(out)
         return logits
    
 # -------------------------------------------------
-# 4. PASTE.TXT DATASET
+# 4. DATASET (unchanged)
 # -------------------------------------------------
 class V18Dataset(Dataset):
     def __init__(self, paste_text: str, vocab_size=8192, max_samples=None):
@@ -132,7 +173,7 @@ class V18Dataset(Dataset):
         self.vocab_size = len(vocab_list)
 
         def encode(w):
-            return self.word_to_id.get(w, 1)  # <unk>
+            return self.word_to_id.get(w, 1)
 
         self.data = []
         for i in range(len(toks) - 2):
@@ -158,42 +199,26 @@ class V18Dataset(Dataset):
             "theta": torch.rand(2, device=DEVICE) * 2 * math.pi - math.pi,
             "sigma": torch.ones(2, device=DEVICE),
         }
-# =====================================================
-# 6. TEXT GENERATION (add to end of your script)
-# =====================================================
+
+# -------------------------------------------------
+# 5. GENERATION (fixed temperature bounds)
+# -------------------------------------------------
 @torch.inference_mode()
 def generate(model: KernelLLM, seed_text: str, max_new_words: int = 128,
              temperature: float = 0.8, top_k: int = 40, top_p: float = 0.9,
              device=DEVICE):
     model.eval()
-
-    # 1) Assume model.head.weight.shape[0] == vocab_size
     vocab_size = model.head.weight.shape[0]
-
-    # 2) Recover dataset‑level vocab from model (if you stored it)
-    #    In practice you’d pass ds.id_to_word explicitly; here we fake it:
-    if not hasattr(model, "id_to_word"):
-        # you can also pass this as an arg to generate
-        raise ValueError("Attach ds.id_to_word to model or pass vocab mapping.")
-
     id_to_word = model.id_to_word
+    word_to_id = model.word_to_id
 
-    # 3) Tokenize seed into words
     toks = seed_text.lower().split()
     if not toks:
         raise ValueError("seed_text contains no words")
-
-    # 4) Map to ints (use 0 for OOV)
-    if not hasattr(model, "word_to_id"):
-        raise ValueError("also attach word_to_id dict to model")
-
-    word_to_id = model.word_to_id
     ids = [word_to_id.get(w, 0) for w in toks]
-    if not ids:
-        ids = [0]  # dummy token
+    if not ids: ids = [0]
 
-    # 5) Start as sequence of word IDs
-    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # (1, L)
+    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
 
     for _ in range(max_new_words):
         L = x.shape[1]
@@ -201,49 +226,44 @@ def generate(model: KernelLLM, seed_text: str, max_new_words: int = 128,
         theta = (torch.rand(1, L, device=device) * 2 * math.pi - math.pi)
         sigma = torch.ones(1, L, device=device)
 
-        logits = model(x, rho, theta, sigma)        # (1, L, V)
-        next_logits = logits / temperature  # logits is already (1, V)
-        # Top‑k + top‑p (same as before)
-        # After temperature scaling, before top_p:
-        if top_k > 0:
-            top_k_vals = torch.topk(next_logits, top_k, dim=-1).values
+        logits = model(x, rho, theta, sigma)
+        next_logits = logits / max(temperature, 1e-6)  # Safe temperature
+        
+        # Safe top-k
+        k = min(top_k, next_logits.shape[-1])
+        if k > 0:
+            top_k_vals = torch.topk(next_logits, k, dim=-1).values
             next_logits = next_logits.masked_fill(next_logits < top_k_vals[:, -1:], -float("inf"))
-        if top_p < 1.0:
+            
+        # Safe top-p
+        if 0.0 <= top_p < 1.0:
             sorted_logits, sorted_indices = torch.sort(next_logits, descending=True, dim=-1)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             sorted_indices_to_remove = cumulative_probs > top_p
-            sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-            sorted_indices_to_remove[:, 0] = False
-            indices_to_remove = sorted_indices_to_remove.scatter(
-                -1, sorted_indices, sorted_indices_to_remove
-            )
+            sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+            sorted_indices_to_remove[..., 0] = False
+            indices_to_remove = sorted_indices_to_remove.scatter(-1, sorted_indices, sorted_indices_to_remove)
             next_logits = next_logits.masked_fill(indices_to_remove, -float("inf"))
 
-        probs = F.softmax(next_logits, dim=-1)          # (1, V)
-        next_id = torch.multinomial(probs, 1)           # (1, 1)
-        # clip to vocab range
-        next_id = next_id.clamp(0, vocab_size - 1)
-        x = torch.cat([x, next_id], dim=1)              # (1, L+1)
+        probs = F.softmax(next_logits, dim=-1)
+        next_id = torch.multinomial(probs, 1).clamp(0, vocab_size - 1)
+        x = torch.cat([x, next_id], dim=1)
 
-        # Stop heuristic: stop when you hit repeated “stop‑word” or max_new_words
         if id_to_word[next_id.item()] in {"<pad>", ".", "!", "?"}:
             break
 
-    # 6) Convert new IDs back to words
     prefix_len = len(toks)
     new_ids = x[0, prefix_len:].tolist()
     new_words = [id_to_word[i] for i in new_ids if 0 <= i < len(id_to_word)]
-    # skip <pad> at the end
     while new_words and new_words[-1] == "<pad>":
         new_words.pop()
 
-    full_text = seed_text + " " + " ".join(new_words).strip()
-    return full_text
+    return seed_text + (" " + " ".join(new_words) if new_words else "")
+
 # -------------------------------------------------
-# 5. TRAINING & SAVE
+# 6. MAIN
 # -------------------------------------------------
 def main():
-    # Load paste.txt
     paste_path = 'singlekb.txt'
     if os.path.exists(paste_path):
         with open(paste_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -253,9 +273,7 @@ def main():
         text = "NeuroSymbolic V18 fallback text corpus for testing."
         print("⚠ singlekb.txt not found - using fallback corpus")
 
-    # Dataset + Model
     ds = V18Dataset(text)
-    print(f"Dataset length: {len(ds)}")
     if len(ds) == 0:
         print("Dataset is empty; cannot build DataLoader.")
         sys.exit(1)
@@ -263,11 +281,10 @@ def main():
     loader = DataLoader(ds, batch_size=45, shuffle=True)
 
     model = KernelLLM(vocab_size=ds.vocab_size).to(DEVICE)
-    model.word_to_id = ds.word_to_id   # attach for generation
+    model.word_to_id = ds.word_to_id
     model.id_to_word = ds.id_to_word
     opt = optim.AdamW(model.parameters(), lr=3e-4)
 
-    # Train
     model.train()
     for epoch in range(3):
         total_loss = 0
@@ -287,24 +304,28 @@ def main():
 
         print(f"Epoch {epoch+1}/3 | Loss: {total_loss/len(loader):.4f}")
 
-    # Save
     os.makedirs('output', exist_ok=True)
     torch.save(model.state_dict(), 'output/_llm_trained.pth')
     print(f"✓ Model ready: {sum(p.numel() for p in model.parameters())/1e6:.1f}M params")
-    print("🎉 COMPLETE - Trained model saved to output/_llm_trained.pth")
+    print("🎉 COMPLETE - Geometric shapes integrated!")
 
     model.eval()
-    model.word_to_id = ds.word_to_id   # reattach vocab
-    model.id_to_word = ds.id_to_word
+    print("\nGeometric Shapes Kernel-LLM Ready:")
+    print("8 shapes: circle, ellipse, spiral, torus, star, wave, vortex, crystal")
 
     while True:
-        print(generate(
-            model,
-            seed_text=input("USER: "),
-            max_new_words=640,
-            temperature=111000000000.2,
-            top_k=340,
-            top_p=170.1
-        ))
+        try:
+            print(generate(
+                model,
+                seed_text=input("USER: "),
+                max_new_words=640,
+                temperature=111000000000.2,
+                top_k=340,
+                top_p=170.1
+            ))
+        except KeyboardInterrupt:
+            print("\nExiting...")
+            break
+
 if __name__ == "__main__":
     main()
