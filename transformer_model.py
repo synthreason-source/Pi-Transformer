@@ -82,7 +82,7 @@ class KernelLayer(nn.Module):
         kern_grid = l1_proj(kern_expanded).squeeze(-1)  # (B,L,15)
 
         kern_ff = torch.bmm(kern_grid, self.grid_bias.unsqueeze(0).expand(B, -1, -1))  # (B,L,D)
-        kern_ff_roll = kern_ff.roll(1, dims=1)
+        kern_ff_roll = kern_ff.roll(grid_size, dims=1)
         kern_ff = mobius_shift(kern_ff, kern_ff_roll) * orbit_bonus(theta.unsqueeze(-1), 0, 4)
         x = self.norm2(x + layer_norm(kern_ff))
         return x
@@ -303,9 +303,9 @@ def main():
             model,
             seed_text=input("USER: "),
             max_new_words=640,
-            temperature=1110.2,
-            top_k=140,
-            top_p=100.1
+            temperature=111000000000.2,
+            top_k=340,
+            top_p=170.1
         ))
 if __name__ == "__main__":
     main()
