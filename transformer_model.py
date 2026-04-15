@@ -3298,46 +3298,50 @@ def gui_load_fitted(path):
 def gui_generate(seed, instruction, nsents, tokssent, andw, temp, showtr, artimage):
     global LATEST_AUTONOMIC_VAL, engine
     
-    if engine is None or not engine._initialised:
+    if engine is None or not hasattr(engine, '_initialised') or not engine._initialised:
         return ("🚫 Engine not trained. Click TRAIN first.", "", "", "")
     
-    # BULLETPROOF IMAGE [web:19]
+    # IMAGE SAFE [web:19]
     img = None
-    if artimage is not None:
-        if isinstance(artimage, (np.ndarray, torch.Tensor)):
-            img = artimage
-        elif isinstance(artimage, dict):
-            for key in ['composite', 'image', 'background']:
-                val = artimage.get(key)
-                if val is not None and isinstance(val, (np.ndarray, torch.Tensor)):
-                    img = val
-                    break
-        else:
-            try:
-                img = np.array(artimage)
-            except:
-                pass
+    if artimage is not None and not isinstance(artimage, (str, type(None))):
+        try:
+            if isinstance(artimage, dict):
+                img = next((v for k, v in artimage.items() 
+                           if isinstance(v, (np.ndarray, torch.Tensor))), None)
+            else:
+                img = artimage
+        except:
+            pass
     
     try:
-        # FIXED: CORRECT ATTR PATH [file:18]
+        # CORRECT ENGINE CALL [file:18]
         engine.walker.instr_dist.set_instruction(instruction)
         
-        output = engine.generate(
-            seed_text=seed, instruction_text=instruction,
-            num_sentences=int(nsents), tokens_per_sent=int(tokssent),
-            and_weight=float(andw), temperature=float(temp)
+        raw_output = engine.generate(
+            seed_text=seed or "The", 
+            instruction_text=instruction or "",
+            num_sentences=int(nsents), 
+            tokens_per_sent=int(tokssent),
+            and_weight=float(andw), 
+            temperature=float(temp)
         )
         
-        text = detokenize(output["tokens"])
-        cot = output.get("cot", "")
-        steps = output.get("steps", "")
-        props = output.get("props", "")
+        # SAFE OUTPUT PARSING
+        if isinstance(raw_output, dict) and "tokens" in raw_output:
+            text = detokenize(raw_output["tokens"])
+            cot = raw_output.get("cot", "")
+            steps = raw_output.get("steps", "")
+            props = raw_output.get("props", "")
+        else:
+            # Handle string error or other
+            text = str(raw_output)[:1000]
+            cot = steps = props = ""
         
         return text, cot, steps, props
-    
+        
     except Exception as e:
         import traceback
-        return (f"❌ {str(e)}", traceback.format_exc(), "", "")
+        return (f"❌ {str(e)}", traceback.format_exc()[:500], "", "")
 
 # ─── 5. AUTONOMIC ─────────────────────────────────────────────────────────────
 def gui_auto_save():
