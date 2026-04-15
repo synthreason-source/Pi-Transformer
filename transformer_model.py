@@ -1,3 +1,445 @@
+# ===== FILE 2: AI.py =====
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import math
+import re
+import time
+import random
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Generator, List, Optional, Tuple, Dict
+
+try:
+    import torch
+except ImportError:
+    class _FakeTorch:
+        def tensor(self, x, **kw): return x
+        def zeros(self, *a, **kw): return [0.0]
+    torch = _FakeTorch()
+
+PUNCT_SET = {",", ".", "!", "?", ";", ":"}
+ORBIT_SYMBOLS = {0: "â—‹", 1: "â—”", 2: "â—‘", 3: "â—•"}
+PHASE_COLORS = {"INPUT": "\033[94m", "FWD": "\033[93m", "REV": "\033[96m", "AND": "\033[92m", "EMIT": "\033[97m"}
+RESET = "\033[0m"
+
+
+def load_text_corpus(file_path: str) -> str:
+    p = Path(file_path)
+    if not p.exists():
+        raise FileNotFoundError(f"Corpus file not found: {file_path}")
+    return p.read_text(encoding="utf-8", errors="replace")
+
+
+def _simple_tokenize(text: str) -> List[str]:
+    out = []
+    for word in text.split():
+        w = word.strip()
+        if not w:
+            continue
+        if w[-1] in PUNCT_SET and len(w) > 1:
+            out.append(w[:-1])
+            out.append(w[-1])
+        else:
+            out.append(w)
+    return [t for t in out if t]
+
+
+def _detokenize(tokens: List[str]) -> str:
+    parts = []
+    for t in tokens:
+        if t in PUNCT_SET and parts:
+            parts[-1] += t
+        else:
+            parts.append(t)
+    return " ".join(parts)
+
+
+def corpus_vocab_from_text(text: str) -> List[str]:
+    seen, vocab = set(), []
+    for t in _simple_tokenize(text):
+        if t in PUNCT_SET:
+            continue
+        tl = t.lower()
+        if tl not in seen:
+            seen.add(tl)
+            vocab.append(tl)
+    return vocab
+
+
+class SentenceInput:
+    def __init__(self):
+        self._tokens: List[str] = []
+        self._raw: str = ""
+
+    def receive(self, text: str) -> List[str]:
+        text = text.strip()
+        if not text:
+            raise ValueError("Input must not be empty.")
+        self._raw = text
+        self._tokens = _simple_tokenize(text)
+        return self._tokens
+
+    def receive_tokens(self, tokens: List[str]) -> List[str]:
+        if not tokens:
+            raise ValueError("Token list must not be empty.")
+        self._tokens = list(tokens)
+        self._raw = " ".join(tokens)
+        return self._tokens
+
+    def get(self) -> List[str]:
+        if not self._tokens:
+            raise RuntimeError("No input received yet.")
+        return self._tokens
+
+    def get_raw(self) -> str:
+        return self._raw
+
+
+class MachineChoice:
+    MAX_RETRIES = 3
+
+    def __init__(self):
+        self._options: List[Tuple[str, Callable, Callable]] = []
+
+    def register(self, name: str, condition: Callable[[List[str]], bool], handler: Callable[[List[str]], str]):
+        self._options.append((name, condition, handler))
+
+    def select(self, tokens: List[str]) -> Tuple[str, str]:
+        for name, condition, handler in self._options:
+            if condition(tokens):
+                return name, handler(tokens)
+        raise ValueError(f"XOR violation: no option matched tokens {tokens[:4]}â€¦")
+
+
+class WeightedMachineChoice(MachineChoice):
+    def __init__(self):
+        super().__init__()
+        self._weights: Dict[str, float] = {}
+
+    def register(self, name: str, condition: Callable[[List[str]], bool], handler: Callable[[List[str]], str], weight: float = 1.0):
+        super().register(name, condition, handler)
+        self._weights[name] = float(weight)
+
+    def select(self, tokens: List[str]) -> Tuple[str, str]:
+        matches = [(name, condition, handler, self._weights.get(name, 1.0))
+                   for name, condition, handler in self._options if condition(tokens)]
+        if not matches:
+            raise ValueError(f"XOR violation: no option matched tokens {tokens[:4]}â€¦")
+        names = [m[0] for m in matches]
+        weights = [m[3] for m in matches]
+        idx = random.choices(range(len(names)), weights=weights, k=1)[0]
+        name, _, handler, _ = matches[idx]
+        return name, handler(tokens)
+
+
+class LingualBinding:
+    @staticmethod
+    def bind(original_tokens: List[str], machine_output: str) -> str:
+        if not original_tokens:
+            raise ValueError("AND binding failed: original tokens missing.")
+        if not machine_output:
+            raise ValueError("AND binding failed: machine output missing.")
+        joined = " ".join(original_tokens)
+        return f"{machine_output} [bound:{joined[:60]}{'â€¦' if len(joined) > 60 else ''}]"
+
+
+class CombinatorialController:
+    def __init__(self):
+        self.sentence_in = SentenceInput()
+        self.machine_choice = WeightedMachineChoice()
+        self.lingual_binding = LingualBinding()
+
+    def register_option(self, name, condition, handler, weight: float = 1.0):
+        self.machine_choice.register(name, condition, handler, weight=weight)
+
+    def run(self, text: str) -> str:
+        return self._run_from_tokens(self.sentence_in.receive(text))
+
+    def run_tokens(self, tokens: List[str]) -> str:
+        self.sentence_in.receive_tokens(tokens)
+        return self._run_from_tokens(tokens)
+
+    def _run_from_tokens(self, tokens: List[str]) -> str:
+        attempt = 0
+        while attempt < MachineChoice.MAX_RETRIES:
+            attempt += 1
+            try:
+                _, machine_output = self.machine_choice.select(tokens)
+                break
+            except ValueError as exc:
+                if attempt == MachineChoice.MAX_RETRIES:
+                    raise RuntimeError(f"XOR failed after {MachineChoice.MAX_RETRIES} attempts: {exc}") from exc
+                tokens = self.sentence_in.get()
+        return self.lingual_binding.bind(tokens, machine_output)
+
+
+@dataclass
+class CycleTokenEvent:
+    step: int
+    sentence_idx: int
+    token: str
+    bound_output: str
+    cardan_orbit: int = 0
+    mirror_weight: float = 0.35
+    spaghetti_norm: float = 0.0
+    elapsed_ms: float = 0.0
+    is_punct: bool = False
+    cycle_phase: str = "EMIT"
+
+
+@dataclass
+class CycleSentenceEvent:
+    sentence_idx: int
+    sentence_text: str
+    tokens: List[str]
+    cot_trace: str = ""
+    prop_stmts: List[str] = field(default_factory=list)
+    avg_cardan_orbit: float = 0.0
+
+
+def _bidirectional_windows(tokens: List[str], width: int, stride: int):
+    if not tokens:
+        return
+    width = max(1, min(width, len(tokens)))
+    stride = max(1, stride)
+    starts = list(range(0, max(1, len(tokens) - width + 1), stride))
+    direction = 1
+    for s in starts:
+        w = tokens[s:s + width]
+        yield w if direction == 1 else list(reversed(w))
+        direction *= -1
+
+
+class TokenCycleEmitter:
+    def __init__(self, engine=None, mirror_alpha: float = 0.35, cardan_logit_weight: float = 8.0, emit_delay_ms: float = 0.0):
+        self.engine = engine
+        self.mirror_alpha = mirror_alpha
+        self.cardan_logit_weight = cardan_logit_weight
+        self.emit_delay_ms = emit_delay_ms
+        self._ctrl = self._build_controller()
+        self._step = 0
+        self._start_ts = 0.0
+
+    def _build_controller(self) -> CombinatorialController:
+        ctrl = CombinatorialController()
+        ctrl.register_option(
+            "forward_pass",
+            lambda toks: len(toks) >= 1 and len(toks) % 2 == 1,
+            lambda toks: f"[FWD] {' '.join(toks[-5:])}",
+            weight=1.0,
+        )
+        ctrl.register_option(
+            "reverse_pass",
+            lambda toks: len(toks) >= 1 and len(toks) % 2 == 0,
+            lambda toks: f"[REV] {' '.join(reversed(toks[-5:]))}",
+            weight=1.0,
+        )
+        ctrl.register_option(
+            "punctuation_gate",
+            lambda toks: len(toks) >= 1 and toks[-1] in PUNCT_SET,
+            lambda toks: f"[PUNCT:{toks[-1]}] sentence-boundary gate",
+            weight=1.0,
+        )
+        ctrl.register_option(
+            "cognitive_token",
+            lambda toks: len(toks) >= 1 and toks[-1] not in PUNCT_SET and any(t.startswith("[") for t in toks[-3:]),
+            lambda toks: f"[COG] cognitive-token routing: {toks[-1]}",
+            weight=1.0,
+        )
+        ctrl.register_option(
+            "gofai",
+            lambda toks: len(toks) >= 1,
+            lambda toks: f"[GOFAI] symbolic-route: {toks[-1]}",
+            weight=0.15,
+        )
+        return ctrl
+
+    def cycle(self, instruction: str = "You are a computational algorithm.", seed: str = "", n_sentences: int = 4, tokens_per_sent: int = 40, and_weight: float = 0.9, temperature: float = 2.0) -> Generator:
+        self._step = 0
+        self._start_ts = time.perf_counter()
+        if self.engine is not None:
+            yield from self._cycle_real(instruction, seed, n_sentences, tokens_per_sent, and_weight, temperature)
+        else:
+            yield from self._cycle_demo(instruction, seed, n_sentences, tokens_per_sent)
+
+    def _cycle_real(self, instruction, seed, n_sentences, tokens_per_sent, and_weight, temperature):
+        eng = self.engine
+        try:
+            result = eng.generate(
+                seedtext=seed,
+                instructiontext=instruction,
+                numsentences=n_sentences,
+                tokenspersent=tokens_per_sent,
+                andweight=and_weight,
+                temperature=temperature,
+                returntraces=True,
+            )
+        except Exception as exc:
+            yield CycleSentenceEvent(0, f"[TokenCycle] Engine generate() error: {exc}", [])
+            return
+        full_text, cot_text = result if isinstance(result, tuple) else (str(result), "")
+        sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', full_text) if s.strip()]
+        traces = []
+        if hasattr(eng, "walker") and eng.walker is not None:
+            traces = list(getattr(eng.walker, "steptraces", getattr(eng.walker, "_step_traces", [])))
+        trace_idx = 0
+        for sent_idx, sent_text in enumerate(sentences):
+            tokens = _simple_tokenize(sent_text)
+            orbit_sum = 0.0
+            for tok_pos, tok in enumerate(tokens):
+                cardan_orbit = 0
+                spaghetti_norm = 0.0
+                if trace_idx < len(traces):
+                    tr = traces[trace_idx]
+                    if hasattr(tr, "cardan_orbit"):
+                        cardan_orbit = tr.cardan_orbit
+                    if hasattr(tr, "spaghetti_mixer_norms"):
+                        spaghetti_norm = sum(tr.spaghetti_mixer_norms) / 3.0
+                    trace_idx += 1
+                orbit_sum += cardan_orbit
+                ctx_tokens = tokens[:tok_pos + 1]
+                try:
+                    bound = self._ctrl.run_tokens(ctx_tokens)
+                    phase = "AND"
+                except RuntimeError:
+                    bound = f"[FALLBACK] {tok}"
+                    phase = "REV" if tok_pos % 2 == 0 else "FWD"
+                elapsed = (time.perf_counter() - self._start_ts) * 1000.0
+                yield CycleTokenEvent(self._step, sent_idx, tok, bound, cardan_orbit, self.mirror_alpha, spaghetti_norm, elapsed, tok in PUNCT_SET, phase)
+                self._step += 1
+            yield CycleSentenceEvent(sent_idx, sent_text, tokens, cot_trace=cot_text if sent_idx == 0 else "", avg_cardan_orbit=orbit_sum / max(len(tokens), 1))
+
+    def _cycle_demo(self, instruction, seed, n_sentences, tokens_per_sent):
+        try:
+            corpus_text = load_text_corpus("singlekb.txt")
+        except Exception:
+            corpus_text = instruction + " " + seed
+        corpus_tokens = _simple_tokenize(instruction + " " + seed)
+        vocab = corpus_vocab_from_text(corpus_text) or ["algorithm", "process", "token", "cycle", "output", "signal"]
+        rng = random.Random(42)
+        windows = list(_bidirectional_windows(corpus_tokens, tokens_per_sent, max(1, tokens_per_sent // 2)))
+        if not windows:
+            windows = [vocab]
+        for sent_idx in range(n_sentences):
+            window = windows[sent_idx % len(windows)]
+            tokens = []
+            for i, tok in enumerate(window[:max(6, min(tokens_per_sent, len(window)))]):
+                if i % 2 == 0:
+                    tokens.append(tok)
+                else:
+                    tokens.append(rng.choice(vocab))
+            orbit_sum = 0.0
+            for tok_pos, tok in enumerate(tokens):
+                cardan_orbit = (sent_idx + tok_pos) % 4
+                spaghetti_norm = 0.3 + 0.1 * math.sin(tok_pos * math.pi / 4)
+                orbit_sum += cardan_orbit
+                ctx_tokens = tokens[:tok_pos + 1]
+                try:
+                    bound = self._ctrl.run_tokens(ctx_tokens)
+                    phase = "AND"
+                except RuntimeError:
+                    bound = f"[DEMO-FALLBACK] {tok}"
+                    phase = "REV" if (sent_idx + tok_pos) % 2 else "FWD"
+                elapsed = (time.perf_counter() - self._start_ts) * 1000.0
+                yield CycleTokenEvent(self._step, sent_idx, tok, bound, cardan_orbit, self.mirror_alpha, spaghetti_norm, elapsed, tok in PUNCT_SET, phase)
+                self._step += 1
+            yield CycleSentenceEvent(sent_idx, _detokenize(tokens), tokens, cot_trace=f"[CORPUS DEMO] source_len={len(corpus_tokens)}", prop_stmts=[f"âŸ¨ {tokens[0]} â†’ {tokens[min(1, len(tokens)-1)]} â†’ {tokens[-1]} âŸ©"], avg_cardan_orbit=orbit_sum / max(len(tokens), 1))
+
+    @classmethod
+    def demo(cls, mirror_alpha: float = 0.35, cardan_logit_weight: float = 8.0) -> "TokenCycleEmitter":
+        return cls(engine=None, mirror_alpha=mirror_alpha, cardan_logit_weight=cardan_logit_weight)
+
+
+def render_cycle_stream(emitter: TokenCycleEmitter, instruction: str = "You are a computational algorithm.", seed: str = "", n_sentences: int = 3, tokens_per_sent: int = 40, and_weight: float = 0.9, temperature: float = 2.0, verbose: bool = True, show_bound: bool = False) -> str:
+    print("\n" + "â•" * 70)
+    print("  V18-RP TOKEN CYCLE  Â·  Combinatorial Control Integration")
+    print("â•" * 70)
+    print(f"  Sentence / Question In : {instruction[:60]}{'â€¦' if len(instruction) > 60 else ''}")
+    print(f"  Seed                   : {seed or '(none)'}")
+    print(f"  Sentences              : {n_sentences}   Tokens/sent: {tokens_per_sent}")
+    print(f"  Mirror Î±               : {emitter.mirror_alpha}   Cardan LW: {emitter.cardan_logit_weight}")
+    print("â•" * 70 + "\n")
+    full_parts, current_sent = [], -1
+    for event in emitter.cycle(instruction=instruction, seed=seed, n_sentences=n_sentences, tokens_per_sent=tokens_per_sent, and_weight=and_weight, temperature=temperature):
+        if isinstance(event, CycleTokenEvent):
+            if event.sentence_idx != current_sent:
+                if current_sent >= 0:
+                    print()
+                current_sent = event.sentence_idx
+                print(f"  [Sent {current_sent}] ", end="")
+            orbit_sym = ORBIT_SYMBOLS.get(event.cardan_orbit, "?")
+            phase_col = PHASE_COLORS.get(event.cycle_phase, "")
+            if verbose:
+                print(f"{phase_col}{event.token}{RESET}\033[90m{orbit_sym}\033[0m", end=" ", flush=True)
+            else:
+                print(event.token, end="" if event.is_punct else " ", flush=True)
+            if show_bound and not event.is_punct:
+                print(f"\n         â””â”€ {event.bound_output[:80]}", flush=True)
+        elif isinstance(event, CycleSentenceEvent):
+            full_parts.append(event.sentence_text)
+            print(f"\n\n  â”€â”€ Sentence {event.sentence_idx} complete â”€â”€")
+            print(f"  Avg Cardan orbit : {event.avg_cardan_orbit:.2f}")
+            if event.cot_trace:
+                print(f"  CoT trace        : {event.cot_trace[:120]}â€¦")
+            if event.prop_stmts:
+                print("  Propositions     :")
+                for p in event.prop_stmts:
+                    print(f"    {p}")
+            print()
+    full_text = " ".join(full_parts)
+    print("\n" + "â”€" * 70)
+    print("  FULL OUTPUT:")
+    print("â”€" * 70)
+    print(f"  {full_text}")
+    print("â”€" * 70 + "\n")
+    return full_text
+
+
+def stream_cycle_text(emitter: TokenCycleEmitter, instruction: str = "You are a computational algorithm.", seed: str = "", n_sentences: int = 3, tokens_per_sent: int = 40, and_weight: float = 0.9, temperature: float = 2.0, orbit_sort: bool = False):
+    token_events = []
+    for event in emitter.cycle(instruction=instruction, seed=seed, n_sentences=n_sentences, tokens_per_sent=tokens_per_sent, and_weight=and_weight, temperature=temperature):
+        if isinstance(event, CycleTokenEvent):
+            token_events.append(event)
+    if orbit_sort:
+        token_events.sort(key=lambda e: (e.cardan_orbit, e.step))
+    buffer = []
+    for e in token_events:
+        if e.token in PUNCT_SET:
+            if buffer:
+                buffer[-1] = buffer[-1].rstrip() + e.token
+            else:
+                buffer.append(e.token)
+        else:
+            buffer.append(e.token + " ")
+        yield "".join(buffer)
+
+
+def gui_generate_cycle(seed, instruction, nsents, tokssent, andw, temp, showtr, artimage, _engine_ref=None):
+    eng = _engine_ref
+    if eng is None:
+        try:
+            import __main__
+            eng = getattr(__main__, "engine", None)
+        except Exception:
+            eng = None
+    emitter = TokenCycleEmitter(engine=eng, mirror_alpha=0.35, cardan_logit_weight=8.0)
+    latest = ""
+    for partial in stream_cycle_text(emitter, instruction=instruction or "You are a computational algorithm.", seed=seed or "", n_sentences=int(nsents), tokens_per_sent=int(tokssent), and_weight=float(andw), temperature=float(temp), orbit_sort=True):
+        latest = partial
+    return latest, "", "", ""
+
+
+def attach_cycle_to_engine(engine, mirror_alpha: float = 0.35, cardan_logit_weight: float = 8.0) -> TokenCycleEmitter:
+    emitter = TokenCycleEmitter(engine=engine, mirror_alpha=mirror_alpha, cardan_logit_weight=cardan_logit_weight)
+    engine.cycle_emitter = emitter
+    print(f"[TokenCycle] Emitter attached to {type(engine).__name__} mirror_Î±={mirror_alpha} cardan_lw={cardan_logit_weight}")
+    return emitter
+
+
+
+
+# ===== FILE 1: v18_token_cycle.py =====
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -5,50 +447,48 @@
 NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
 ===============================================================================
 CARDAN GRILLE ISOMORPHISMS + MIRRORED INSTRUCTIONS
-───────────────────────────────────────────────────
+
 Two new subsystems grafted onto the V18-SPAGHETTI base:
-══════════════════════════════════════════════════════════════════════════════
 1.  CARDAN GRILLE ISOMORPHISM ENGINE  (CardanGrilleIsomorphism)
-──────────────────────────────────────────────────────────────────────────────
+
 A Cardan grille is a physical encryption tool: a card with rectangular holes
 cut at specific positions.  Placed over a grid of letters, only the letters
-visible through the holes are read; rotating the card 90° reveals a second
-message, 180° a third, 270° a fourth.
+visible through the holes are read; rotating the card 90Ã‚Â° reveals a second
+message, 180Ã‚Â° a third, 270Ã‚Â° a fourth.
 Here we treat the *dataset corpus* as the letter-grid and build a set of
 virtual grilles whose aperture positions are derived from the trigram-frequency
-spectrum.  Each 90°-rotation of the grille selects a different sub-vocabulary
-partition — an *isomorphic projection* of the full vocab onto a rotational
+spectrum.  Each 90Ã‚Â°-rotation of the grille selects a different sub-vocabulary
+partition Ã¢â‚¬â€ an *isomorphic projection* of the full vocab onto a rotational
 class.
 Construction
-  • The vocab is tiled into a square grid of side G = ⌈√|V|⌉.
-  • Aperture positions are chosen by sampling the top-K trigram pairs ordered
+  Ã¢â‚¬Â¢ The vocab is tiled into a square grid of side G = Ã¢Å’Ë†Ã¢Ë†Å¡|V|Ã¢Å’â€°.
+  Ã¢â‚¬Â¢ Aperture positions are chosen by sampling the top-K trigram pairs ordered
     by joint frequency; their (row, col) positions in the grid define the
-    "holes" of the base grille (Grille-0°).
-  • Rotating 90°/180°/270° maps each aperture (r,c) → (c, G-1-r) etc.,
+    "holes" of the base grille (Grille-0Ã‚Â°).
+  Ã¢â‚¬Â¢ Rotating 90Ã‚Â°/180Ã‚Â°/270Ã‚Â° maps each aperture (r,c) Ã¢â€ â€™ (c, G-1-r) etc.,
     producing three sibling grilles.
-  • At generation time the engine looks up which grille-class the *current
+  Ã¢â‚¬Â¢ At generation time the engine looks up which grille-class the *current
     bigram context* falls into (via modular orbit index from the PDN engine)
     and returns the corresponding aperture-vocab subset as the *candidate set*,
     optionally intersected with the LM's native candidate set.
 Isomorphism property
-  The four rotations form a Z₄ cyclic group.  Because the aperture count is
-  fixed, all four projections have the same cardinality — they are isomorphic
+  The four rotations form a ZÃ¢â€šâ€ž cyclic group.  Because the aperture count is
+  fixed, all four projections have the same cardinality Ã¢â‚¬â€ they are isomorphic
   as sets under the rotation action.  This ensures the probability mass is
   spread over equally-sized candidate pools regardless of rotation.
 Integration into generate_passage_rp
-  • After the LM produces its raw (cands, base_probs) pair the Cardan engine
+  Ã¢â‚¬Â¢ After the LM produces its raw (cands, base_probs) pair the Cardan engine
     is called:  ``cands, base_probs = cardan.filter(cands, base_probs, orbit)``
-  • The returned set is the intersection of LM candidates with the
+  Ã¢â‚¬Â¢ The returned set is the intersection of LM candidates with the
     rotation-class apertures, falling back to the full LM set when the
     intersection is too small (< MIN_CARDAN_CANDS).
-  • A new spaghetti strand ``cardan_iso`` is added to the router, carrying a
+  Ã¢â‚¬Â¢ A new spaghetti strand ``cardan_iso`` is added to the router, carrying a
     logit bonus equal to the aperture membership score of each candidate.
-══════════════════════════════════════════════════════════════════════════════
 2.  MIRRORED INSTRUCTION DISTRIBUTION  (MirroredInstructionDistribution)
-──────────────────────────────────────────────────────────────────────────────
+
 The instruction text is processed in two directions simultaneously:
-  Forward  pass  → standard RPInstructionDistribution (unchanged)
-  Backward pass  → tokens reversed, re-embedded, centroid recomputed,
+  Forward  pass  Ã¢â€ â€™ standard RPInstructionDistribution (unchanged)
+  Backward pass  Ã¢â€ â€™ tokens reversed, re-embedded, centroid recomputed,
                    produces a "mirror" base_dist_t
 The mirror distribution captures *suffix* semantics of the instruction: if the
 instruction ends with goal-oriented tokens, the mirror foregrounds them by
@@ -57,14 +497,12 @@ At generation time both distributions are blended:
     p_combined = (1 - mirror_alpha) * p_forward + mirror_alpha * p_mirror
 A new spaghetti strand ``mirror_instr`` fans into MixerA and MixerC with sign
 +1, adding a second instruction signal that is phase-shifted relative to the
-forward one.  The Möbius tangle between A and C (via CrossTangle BC path)
+forward one.  The MÃƒÂ¶bius tangle between A and C (via CrossTangle BC path)
 then entangles forward and mirror signals, preventing either from dominating.
 mirror_alpha is a tunable hyperparameter (default 0.35).
-══════════════════════════════════════════════════════════════════════════════
 All other algorithms unchanged from V18-RP-ANISO-RIPPLE-SPAGHETTI.
 """
 
-from __future__ import annotations
 import re, math, random, unicodedata, pickle, argparse, struct, hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -146,10 +584,6 @@ import numpy as np
 
 from datasets import load_dataset
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0 — DEVICE + GLOBAL CONFIG
-# ════════════════════════════════════════════════════════════════════════════
-
 class FineAlterableMonad:
     def __init__(self, value, scale: float = 1.0, shift: float = 0.0, temp: float = 1.0):
         self.value = value
@@ -213,29 +647,25 @@ RECOGNISER_SCALE    = 0.5
 PARA_DUP_WINDOW     = 5
 PARA_DUP_MATCH_CAP  = 5
 
-# ── SPAGHETTI CONFIG ─────────────────────────────────────────────────────
+#  SPAGHETTI CONFIG 
 SPAGHETTI_COUPLING   = 0.35
 SPAGHETTI_MIXER_TEMP = 0.8
 SPAGHETTI_STRAND_DIM = 3
 SPAGHETTI_N_MIXERS   = 3
 SPAGHETTI_N_TANGLES  = 2
 
-# ── CARDAN GRILLE CONFIG ──────────────────────────────────────────────────
+#  CARDAN GRILLE CONFIG 
 CARDAN_APERTURE_K    = 64     # how many aperture positions per grille
 MIN_CARDAN_CANDS     = 4      # fall back to full LM set if intersection smaller
 CARDAN_LOGIT_WEIGHT  = 8.0    # spaghetti strand weight for cardan_iso
 
-# ── MIRRORED INSTRUCTION CONFIG ───────────────────────────────────────────
+#  MIRRORED INSTRUCTION CONFIG 
 MIRROR_ALPHA         = 0.35   # blend weight for the reversed-instruction dist
 
 _rng    = random.Random(RP_SEED)
 _np_rng = np.random.default_rng(RP_SEED)
 torch.manual_seed(RP_SEED)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b — SHARED ACTIVATION PRIMITIVES
-# ════════════════════════════════════════════════════════════════════════════
 
 def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     x_safe = x.clamp(-50.0, 50.0).neg().add(50.0)
@@ -271,11 +701,6 @@ def mobius_cross_shift(a: torch.Tensor, b: torch.Tensor,
     denom = (1.0 + coupling * ta * tb).clamp(min=1e-6)
     shifted = (ta + coupling * tb) / denom
     return torch.atanh(shifted.clamp(-0.9999, 0.9999)) * 10.0
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b2 — SPAGHETTI PROBABILITY ROUTER  (extended routing table)
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class SpaghettiStrand:
@@ -328,7 +753,7 @@ class CrossTangle:
 
 
 class SpaghettiRouter:
-    # Extended routing table — two new strands added
+    # Extended routing table Ã¢â‚¬â€ two new strands added
     ROUTING_TABLE: Dict[str, Tuple[List[int], float]] = {
         'instruction_dist':  ([0, 1],    +1.0),
         'ripple_shift':      ([0, 1, 2], +1.0),
@@ -351,7 +776,7 @@ class SpaghettiRouter:
         'orbit_bonus':       ([2],       +1.0),
         'syn_norm':          ([0, 1],    +1.0),
         'trans_norm':        ([1],       +1.0),
-        # ── NEW CARDAN + MIRROR STRANDS ──────────────────────────────────
+        #  NEW CARDAN + MIRROR STRANDS 
         'cardan_iso':        ([0, 2],    +1.0),   # aperture membership bonus
         'mirror_instr':      ([0, 2],    +1.0),   # reversed-instruction dist
     }
@@ -390,24 +815,20 @@ class SpaghettiRouter:
         return layer_norm_array(combined)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b3 — CARDAN GRILLE ISOMORPHISM ENGINE  (NEW)
-# ════════════════════════════════════════════════════════════════════════════
-
 class CardanGrilleIsomorphism:
     """
-    Builds four Z₄-isomorphic vocab partitions from the corpus trigram
+    Builds four ZÃ¢â€šâ€ž-isomorphic vocab partitions from the corpus trigram
     frequency spectrum, mimicking a physical Cardan grille rotated through
-    0°, 90°, 180°, 270°.
+    0Ã‚Â°, 90Ã‚Â°, 180Ã‚Â°, 270Ã‚Â°.
     Usage
-    ─────
+    
     Build once after LM finalisation:
         cardan = CardanGrilleIsomorphism(vocab, tri_raw, raw_freq,
                                           aperture_k=CARDAN_APERTURE_K)
     At generation time:
         cardan_cands, cardan_probs, aperture_scores = cardan.filter(
             cands, base_probs, orbit_index)
-    where orbit_index ∈ {0,1,2,3} comes from pdn_engine.orbit_of(token) % 4.
+    where orbit_index Ã¢Ë†Ë† {0,1,2,3} comes from pdn_engine.orbit_of(token) % 4.
     Aperture membership score (per candidate):
         score_i = 1.0  if cand_i is in the active rotation-class aperture
                   0.0  otherwise
@@ -426,9 +847,9 @@ class CardanGrilleIsomorphism:
         V               = len(vocab)
         self._G         = max(1, math.ceil(math.sqrt(V)))  # grid side
 
-        # ── Build aperture positions from top-K trigram head frequency ──
+        #  Build aperture positions from top-K trigram head frequency 
         # Score each vocab token by the total frequency of trigrams where
-        # it appears as w3 (head position) — captures "predictive value".
+        # it appears as w3 (head position) Ã¢â‚¬â€ captures "predictive value".
         head_score: Dict[str, float] = {}
         for (w1, w2, w3), cnt in tri_raw.items():
             head_score[w3] = head_score.get(w3, 0.0) + cnt
@@ -440,8 +861,8 @@ class CardanGrilleIsomorphism:
             reverse=True)
         base_positions = [item[1] for item in scored[:aperture_k]]
 
-        # ── Build four rotation classes ─────────────────────────────────
-        # Map linear vocab index → (row, col) in G×G grid
+        #  Build four rotation classes 
+        # Map linear vocab index Ã¢â€ â€™ (row, col) in GÃƒâ€”G grid
         def idx_to_rc(idx):
             return divmod(idx, self._G)
 
@@ -463,13 +884,13 @@ class CardanGrilleIsomorphism:
             r3, c3 = rotate_90(r2, c2, G)
             self._grilles[3].add(rc_to_idx(r3, c3))
 
-        # ── Precompute per-grille vocab token sets ───────────────────────
+        #  Precompute per-grille vocab token sets 
         self._grille_toks: List[Set[str]] = [
             {vocab[i] for i in grille if i < V}
             for grille in self._grilles
         ]
         sizes = [len(g) for g in self._grille_toks]
-        print(f"[Cardan] Grid {G}×{G}  aperture_k={aperture_k}  "
+        print(f"[Cardan] Grid {G}Ãƒâ€”{G}  aperture_k={aperture_k}  "
               f"rotation set sizes: {sizes}")
 
     def filter(self, cands: List[str], base_probs: torch.Tensor,
@@ -477,7 +898,7 @@ class CardanGrilleIsomorphism:
         """
         Returns (filtered_cands, filtered_probs, aperture_logit_bonus).
         aperture_logit_bonus is a (len(cands),) tensor of 0.0/1.0 membership
-        scores for all original candidates (before filtering) — used as the
+        scores for all original candidates (before filtering) Ã¢â‚¬â€ used as the
         spaghetti cardan_iso strand.
         """
         device = base_probs.device
@@ -510,11 +931,6 @@ class CardanGrilleIsomorphism:
                           f"{max(grille) if grille else 0}])")
         return "\n".join(lines)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0b4 — MIRRORED INSTRUCTION DISTRIBUTION  (NEW)
-# ════════════════════════════════════════════════════════════════════════════
-
 class MirroredInstructionDistribution:
     """
     Wraps RPInstructionDistribution and adds a *mirrored* (token-reversed)
@@ -534,7 +950,7 @@ class MirroredInstructionDistribution:
         self.device = device
         self.dtype  = dtype
 
-        # Mirror state — set when set_instruction is called
+        # Mirror state Ã¢â‚¬â€ set when set_instruction is called
         self.mirror_dist_t:     Optional[torch.Tensor] = None
         self.mirror_centroid_rho:   float = 0.3
         self.mirror_centroid_theta: float = math.pi / 4
@@ -545,7 +961,7 @@ class MirroredInstructionDistribution:
         # Forward pass (unchanged)
         self.fwd.set_instruction(instruction_text)
 
-        # Mirror pass — reverse the instruction token list
+        # Mirror pass Ã¢â‚¬â€ reverse the instruction token list
         raw       = tokenize(instruction_text)
         fwd_toks  = [t for t in raw if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
         mir_toks  = list(reversed(fwd_toks))
@@ -605,10 +1021,10 @@ class MirroredInstructionDistribution:
         self.mirror_dist_t = (base / total) if total.item() > 1e-8 \
             else torch.ones(V, dtype=self.dtype, device=self.device) / V
 
-        print(f"[Mirror] Reversed {len(fwd_toks)} → {len(mir_toks)} tokens  "
-              f"centroid ρ={self.mirror_centroid_rho:.3f}  "
-              f"θ={self.mirror_centroid_theta:.3f}  "
-              f"σ={self.mirror_centroid_sigma:.3f}")
+        print(f"[Mirror] Reversed {len(fwd_toks)}™ {len(mir_toks)} tokens  "
+              f"centroid ={self.mirror_centroid_rho:.3f}  "
+              f"={self.mirror_centroid_theta:.3f}  "
+              f"={self.mirror_centroid_sigma:.3f}")
 
     def distribution(self, cands: List[str], gen_tokens: List[str],
                      lm_tok2idx: Dict[str, int]) -> torch.Tensor:
@@ -649,11 +1065,6 @@ class MirroredInstructionDistribution:
     @property
     def centroid_sigma(self): return self.fwd.centroid_sigma
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0c — ANISOTROPIC DIRECTIONAL KERNEL
-# ════════════════════════════════════════════════════════════════════════════
-
 class AnisoDirKernel:
     def __init__(self, lambda_rho=ANISO_LAMBDA_RHO, lambda_theta=ANISO_LAMBDA_THETA,
                  lambda_sigma=ANISO_LAMBDA_SIGMA, alpha=ANISO_ALPHA,
@@ -680,11 +1091,6 @@ class AnisoDirKernel:
         d_theta = (theta_j - theta_i) * (self.a * rho_i + 1.0)
         d_sigma = sigma_j  - sigma_i
         return torch.exp(-self.lr*d_rho**2 - self.lt*d_theta**2 - self.ls*d_sigma**2)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0d — SENTENCE OOI TRACKER
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class OOIEntry:
@@ -735,9 +1141,6 @@ class SentenceOOITracker:
         return raw
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0e — INSTRUCTION STUB RECOGNISER
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class StubDirective:
@@ -797,10 +1200,6 @@ class InstructionStubRecogniser:
         return directives
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 0f — RIPPLE SHIFT ENGINE
-# ════════════════════════════════════════════════════════════════════════════
-
 class RippleShiftEngine:
     def __init__(self, aniso_kernel: AnisoDirKernel,
                  ripple_decay: float = RIPPLE_DECAY,
@@ -835,10 +1234,6 @@ class RippleShiftEngine:
             ripple = (ripple - ripple.mean()) / std
         return ripple * self.scale
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — RANDOM FOURIER FEATURES
-# ════════════════════════════════════════════════════════════════════════════
 
 class RandomFourierFeatures:
     def __init__(self, input_dim=4, rff_dim=RP_RFF_DIM,
@@ -876,19 +1271,8 @@ class RandomFourierFeatures:
 
 
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 1b — ISOLATED MULTIPLICATION LAYERS  (V19 extension)
-# ════════════════════════════════════════════════════════════════════════════
-# Each class encapsulates exactly ONE family of tensor multiplications.
-# SequentialLayerActivator cycles through them one-per-token: as `toks`
-# advances the active layer index steps forward so that exactly one layer
-# runs at full gain while the others are gated to `residual_scale`.
-# This prevents co-adaptation across multiply ops and gives each layer a
-# dedicated "token window" to dominate the logit signal.
-
 class IsolatedRFFProjectLayer(nn.Module):
-    """Layer 0 — RFF omega projections: omega @ x."""
+    """Layer 0 Ã¢â‚¬â€ RFF omega projections: omega @ x."""
     def __init__(self, rff: "RandomFourierFeatures"):
         super().__init__()
         self._rff = rff
@@ -905,7 +1289,7 @@ class IsolatedRFFProjectLayer(nn.Module):
 
 
 class IsolatedKernelProductLayer(nn.Module):
-    """Layer 1 — feature-space inner product: feat_a @ feat_b.T."""
+    """Layer 1 Ã¢â‚¬â€ feature-space inner product: feat_a @ feat_b.T."""
     def __init__(self):
         super().__init__()
 
@@ -915,7 +1299,7 @@ class IsolatedKernelProductLayer(nn.Module):
 
 
 class IsolatedNystromBuildLayer(nn.Module):
-    """Layer 2 — Nyström kernel matrix assembly: K_cm @ K_mm_inv @ K_cm.T."""
+    """Layer 2 Ã¢â‚¬â€ NystrÃƒÂ¶m kernel matrix assembly: K_cm @ K_mm_inv @ K_cm.T."""
     def __init__(self):
         super().__init__()
 
@@ -936,7 +1320,7 @@ class IsolatedNystromBuildLayer(nn.Module):
 
 
 class IsolatedSynapticSumLayer(nn.Module):
-    """Layer 3 — synaptic aggregation: W @ logits."""
+    """Layer 3 Ã¢â‚¬â€ synaptic aggregation: W @ logits."""
     def __init__(self):
         super().__init__()
 
@@ -946,7 +1330,7 @@ class IsolatedSynapticSumLayer(nn.Module):
 
 
 class IsolatedAnisoGramLayer(nn.Module):
-    """Layer 4 — anisotropic Gram matrix: exp(-λ·Δ²) over candidate pairs."""
+    """Layer 4 Ã¢â‚¬â€ anisotropic Gram matrix: exp(-ÃŽÂ»Ã‚Â·ÃŽâ€Ã‚Â²) over candidate pairs."""
     def __init__(self, aniso_kernel: "AnisoDirKernel"):
         super().__init__()
         self._k = aniso_kernel
@@ -957,7 +1341,7 @@ class IsolatedAnisoGramLayer(nn.Module):
 
 
 class IsolatedLSHProjectLayer(nn.Module):
-    """Layer 5 — LSH random-plane projection: feats @ planes.T."""
+    """Layer 5 Ã¢â‚¬â€ LSH random-plane projection: feats @ planes.T."""
     def __init__(self):
         super().__init__()
 
@@ -967,7 +1351,7 @@ class IsolatedLSHProjectLayer(nn.Module):
 
 
 class IsolatedCompositionBonusLayer(nn.Module):
-    """Layer 6 — composition bonus inner product: ctx_feat @ cand_feats.T."""
+    """Layer 6 Ã¢â‚¬â€ composition bonus inner product: ctx_feat @ cand_feats.T."""
     def __init__(self):
         super().__init__()
 
@@ -977,7 +1361,7 @@ class IsolatedCompositionBonusLayer(nn.Module):
 
 
 class IsolatedSpaghettiBlendLayer(nn.Module):
-    """Layer 7 — Möbius cross-shift + mixer accumulation."""
+    """Layer 7 Ã¢â‚¬â€ MÃƒÂ¶bius cross-shift + mixer accumulation."""
     def __init__(self):
         super().__init__()
 
@@ -987,21 +1371,21 @@ class IsolatedSpaghettiBlendLayer(nn.Module):
         return mobius_cross_shift(a, b, coupling)
 
 
-# ────────────────────────────────────────────────────────────────────────────
+# 
 
 class SequentialLayerActivator(nn.Module):
     """
     Holds all isolated-multiply layers and gates them one-at-a-time as
     tokens advance.
     Protocol
-    ────────
-    • Call  activator.tick()  inside  walker.push_token()  to advance the
+    
+    Ã¢â‚¬Â¢ Call  activator.tick()  inside  walker.push_token()  to advance the
       active layer index by 1 each time a token is committed.
-    • Call  activator.compute(layer_idx, *args)  instead of the raw multiply:
-        – active layer  → gain = 1.0   (full signal)
-        – inactive layers → gain = residual_scale  (kept alive, not zeroed)
+    Ã¢â‚¬Â¢ Call  activator.compute(layer_idx, *args)  instead of the raw multiply:
+        Ã¢â‚¬â€œ active layer  Ã¢â€ â€™ gain = 1.0   (full signal)
+        Ã¢â‚¬â€œ inactive layers Ã¢â€ â€™ gain = residual_scale  (kept alive, not zeroed)
     Layer index table
-    ─────────────────
+    
         0  IsolatedRFFProjectLayer       (omega projections)
         1  IsolatedKernelProductLayer    (feat_a @ feat_b.T)
         2  IsolatedNystromBuildLayer     (K_cm @ K_mm_inv @ K_cm.T)
@@ -1009,7 +1393,7 @@ class SequentialLayerActivator(nn.Module):
         4  IsolatedAnisoGramLayer        (Gram matrix)
         5  IsolatedLSHProjectLayer       (LSH plane projection)
         6  IsolatedCompositionBonusLayer (ctx @ cand_feats.T)
-        7  IsolatedSpaghettiBlendLayer   (Möbius cross-shift)
+        7  IsolatedSpaghettiBlendLayer   (MÃƒÂ¶bius cross-shift)
     """
     LAYER_NAMES = [
         "rff_project",
@@ -1041,7 +1425,7 @@ class SequentialLayerActivator(nn.Module):
         ])
         self._num_layers = len(self.layers)
 
-    # ── Token step management ─────────────────────────────────────────────
+    #  Token step management 
 
     def tick(self):
         """Advance to the next layer. Call once per committed token."""
@@ -1063,7 +1447,7 @@ class SequentialLayerActivator(nn.Module):
         """Returns 1.0 for the active layer, residual_scale for all others."""
         return 1.0 if layer_idx == self.active_layer_idx else self.residual_scale
 
-    # ── Compute helpers ───────────────────────────────────────────────────
+    #  Compute helpers 
 
     def rff_features(self, rho, theta, sigma) -> torch.Tensor:
         out = self.layers[0](rho, theta, sigma)
@@ -1086,7 +1470,7 @@ class SequentialLayerActivator(nn.Module):
         return out * self.gate(4)
 
     def lsh_project(self, feats, planes) -> torch.Tensor:
-        return self.layers[5](feats, planes)   # binary — no gain scaling
+        return self.layers[5](feats, planes)   # binary Ã¢â‚¬â€ no gain scaling
 
     def composition_bonus(self, ctx_feat, cand_feats) -> torch.Tensor:
         out = self.layers[6](ctx_feat, cand_feats)
@@ -1102,10 +1486,6 @@ class SequentialLayerActivator(nn.Module):
                 f"active={self.active_layer_idx}:{self.active_layer_name}  "
                 f"residual={self.residual_scale}")
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — NYSTRÖM APPROXIMATION
-# ════════════════════════════════════════════════════════════════════════════
 
 class NystromSynapticMatrix:
     def __init__(self, rff, n_landmarks=RP_NYSTROM_M, top_k=8, device=DEVICE, dtype=torch.float32):
@@ -1138,11 +1518,6 @@ class NystromSynapticMatrix:
             W = W * (W >= kth[:,-1].unsqueeze(1)).float()
         return W / W.sum(dim=1, keepdim=True).clamp(min=1e-8)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — RESERVOIR SAMPLING
-# ════════════════════════════════════════════════════════════════════════════
-
 def _reservoir_sample_indices(n: int, k: int) -> List[int]:
     k = min(k,n); res = list(range(k))
     for i in range(k,n):
@@ -1155,10 +1530,6 @@ def reservoir_topk(scores: torch.Tensor, k: int, bias: float = 2.0) -> torch.Ten
     u = torch.rand(C, device=scores.device, dtype=scores.dtype).clamp(1e-10, 1-1e-10)
     return torch.topk(-(-u.log()).log()/bias + scores, k).indices
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — COUNT-MIN SKETCH
-# ════════════════════════════════════════════════════════════════════════════
 
 class CountMinSketch:
     def __init__(self, width=RP_CMS_WIDTH, depth=RP_CMS_DEPTH):
@@ -1180,11 +1551,6 @@ class CountMinSketch:
     def query_pair(self,w1,w2):               return self.query(f"__BIGRAM__{w1}||{w2}")
     def update_triple(self,w1,w2,w3,count=1.0): self.update(f"__TRIGRAM__{w1}||{w2}||{w3}",count)
     def query_triple(self,w1,w2,w3):          return self.query(f"__TRIGRAM__{w1}||{w2}||{w3}")
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — LSH INDEX
-# ════════════════════════════════════════════════════════════════════════════
 
 class LSHIndex:
     def __init__(self, feature_dim=3*RP_RFF_DIM, n_bands=RP_LSH_BANDS, n_rows=RP_LSH_ROWS,
@@ -1219,11 +1585,6 @@ class LSHIndex:
                 cands.add(idx)
                 if len(cands) >= max_cands: break
         return list(cands)[:max_cands]
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — RANDOM WALK POTENTIAL ENGINE
-# ════════════════════════════════════════════════════════════════════════════
 
 class RandomWalkPotentialEngine:
     def __init__(self, n_walks=RP_WALK_STEPS, walk_length=12, restart_p=0.15, device=DEVICE):
@@ -1267,11 +1628,6 @@ class RandomWalkPotentialEngine:
     def potentials_for(self, cands):
         return torch.tensor([self._potentials.get(c,0.0) for c in cands],
                              dtype=torch.float32, device=self.device)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — SKETCHED PDN ENGINE
-# ════════════════════════════════════════════════════════════════════════════
 
 class SketchedPDNEngine:
     def __init__(self, n_modes=4, n_samples=200, sigma_pdn=0.25,
@@ -1335,18 +1691,12 @@ class SketchedPDNEngine:
         return self.orbit_weight*_n(orb)+self.regularity_weight*_n(reg)
 
     def theorem_bridge_report(self):
-        lines=["╔══════════════════════════════════════════════════════════════╗",
-               "║    Thébault → PDN Bridge Report  [RP: Sketched FFT]          ║",
-               "╠══════════════════════════════════════════════════════════════╣",
-               f"║  RP sketching: {self.n_samples} random trigram samples          ║",
-               f"║  Dominant symmetry order n* = {self.n_star:<2d}                        ║",
-               "╚══════════════════════════════════════════════════════════════╝"]
+        lines=[
+               " PDN Bridge Report  [RP: Sketched FFT]˜",
+               f"RP sketching: {self.n_samples} random trigram samples",
+               f"Dominant symmetry order n* = {self.n_star:<2d}˜"]
         return "\n".join(lines)
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 8 — THÉBAULT TOKEN GEOMETRY
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class BolyaiTripleRP:
@@ -1481,11 +1831,6 @@ class RPCrossSynapticNeuronSum:
 
 
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 8b — GEOMETRY CONSTRUCTOR  (replaces scattered register loop)
-# ════════════════════════════════════════════════════════════════════════════
-
 class GeometryConstructor:
     """
     Centralised factory for BolyaiTokenGeometryRP.
@@ -1511,7 +1856,7 @@ class GeometryConstructor:
         rff = RandomFourierFeatures(rff_dim=self.rff_dim, device=self.device, dtype=self.dtype)
 
         if not vocab:
-            print("[GeometryConstructor] Empty vocab — skipping tensor build.")
+            print("[GeometryConstructor] Empty vocab skipping tensor build.")
             return geo, rff
 
         V        = len(vocab)
@@ -1537,10 +1882,6 @@ class GeometryConstructor:
         print(f"[GeometryConstructor] {V} tokens  |  "
               f"feats {geo._feat_t.shape if geo._feat_t is not None else 'N/A'}")
         return geo, rff
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 10 — RP COMPOSITION LM
-# ════════════════════════════════════════════════════════════════════════════
 
 STOP_WORDS_COG = set(
     "a an and are as at be by for from has have he her him his i in is it its "
@@ -1632,10 +1973,6 @@ class RPCompositionLM:
         return (ctx_feat @ cand_feats.T).squeeze(0).clamp(0.0)
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 11 — RP MRV FILTER
-# ════════════════════════════════════════════════════════════════════════════
-
 class RPMRVFilter:
     def __init__(self, rff, threshold=0.50, mrv_cap_ratio=2.0, device=DEVICE):
         self.rff=rff; self.threshold=threshold; self.mrv_cap_ratio=mrv_cap_ratio
@@ -1668,10 +2005,6 @@ class RPMRVFilter:
         return (mrv-lo)/(hi-lo) if (hi-lo).item()>1e-8 else mrv
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — RP KERNELS
-# ════════════════════════════════════════════════════════════════════════════
-
 class RPKernels:
     def __init__(self, rff, lambda_reg=8.0, gamma_side=4.0):
         self.rff=rff; self.lambda_reg=lambda_reg; self.gamma_side=gamma_side
@@ -1686,11 +2019,6 @@ class RPKernels:
         ks=self.k_side(torch.tensor(sigma_a,device=sigma_b.device),sigma_b)
         return kr,ko,ks
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 13 — CoT STUBS + REASONING ENGINE
-# ════════════════════════════════════════════════════════════════════════════
-
 STUB_AXIOM="AXIOM"; STUB_STATE="STATE_OF_AFFAIRS"
 STUB_DEDUCTION="DEDUCTION"; STUB_CONCLUSION="CONCLUSION"
 _STUB_SEQUENCE=[STUB_AXIOM,STUB_STATE,STUB_DEDUCTION,STUB_CONCLUSION]
@@ -1699,7 +2027,7 @@ _STUB_SEQUENCE=[STUB_AXIOM,STUB_STATE,STUB_DEDUCTION,STUB_CONCLUSION]
 class ContextualStub:
     stub_type:str; tokens:List[str]; rho:float; theta:float; sigma:float; weight:float; label:str=""
     def __post_init__(self):
-        if not self.label: self.label=f"[{self.stub_type}] {' '.join(self.tokens[:4])}…"
+        if not self.label: self.label=f"[{self.stub_type}] {' '.join(self.tokens[:4])}Ã¢â‚¬Â¦"
     def as_triple(self): return BolyaiTripleRP(self.rho,self.theta,self.sigma)
 
 @dataclass
@@ -1710,7 +2038,7 @@ class CoTStep:
 class CoTTrace:
     seed_tokens:List[str]; steps:List[CoTStep]; conclusion:Optional[ContextualStub]
     def render(self):
-        return f"  ── CoT Trace ──\n  Seed: {' '.join(self.seed_tokens[:6])}"
+        return f"   CoT Trace \n  Seed: {' '.join(self.seed_tokens[:6])}"
 
 class RPCoTStubLibrary:
     def __init__(self, rff, rho_threshold=0.20, n_theta_bins=8, min_bin_size=2, device=DEVICE, dtype=torch.float32):
@@ -1750,7 +2078,7 @@ class RPCoTStubLibrary:
             stub_type=stub_type,tokens=toks,rho=sum(rhos)/len(rhos),
             theta=math.atan2(sin_m,cos_m)%math.pi,sigma=sum(sigmas)/len(sigmas),
             weight=sum(m[2] for m in members),
-            label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-ρ] {' '.join(toks[:3])}…"))
+            label=f"[{stub_type}|bin{bi}|{'hi' if sub_idx else 'lo'}-ÃÂ] {' '.join(toks[:3])}Ã¢â‚¬Â¦"))
 
     def _rebuild_lsh(self):
         for _stype in _STUB_SEQUENCE: self.stubs[_stype].sort(key=lambda s: s.rho)
@@ -1845,9 +2173,6 @@ class RPCoTReasoningEngine:
                          for i,tr in enumerate(self._traces[-max_traces:]))
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 14 — ANCILLARY SUBSYSTEMS
-# ════════════════════════════════════════════════════════════════════════════
 
 class BolyaiConjugateOrbit:
     def score(self,anchor,cand_theta,cand_sigma,gamma_side=4.0):
@@ -2130,14 +2455,11 @@ class TokenStepTrace:
                 f"spag=({mA:.2f},{mB:.2f},{mC:.2f})")
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 14.5 — PROPOSITIONAL SURJECTION ENGINE
-# ════════════════════════════════════════════════════════════════════════════
 
 @dataclass
 class PropositionalStatement:
     subj:str; pred:str; obj:str; confidence:float
-    def render(self): return f"  ⟨ {self.subj} → {self.pred} → {self.obj} ⟩  (conf: {self.confidence:.3f})"
+    def render(self): return f"  Ã¢Å¸Â¨ {self.subj} Ã¢â€ â€™ {self.pred} Ã¢â€ â€™ {self.obj} Ã¢Å¸Â©  (conf: {self.confidence:.3f})"
 
 class PropositionalSurjectionEngine:
     def __init__(self, geo, rho_threshold=0.20):
@@ -2162,10 +2484,6 @@ class PropositionalSurjectionEngine:
                 cover.append(stmt); seen.add(stmt.subj); seen.add(stmt.obj)
         return cover[:3]
 
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 15 — RP INSTRUCTION DISTRIBUTION
-# ════════════════════════════════════════════════════════════════════════════
 
 class RPInstructionDistribution:
     def __init__(self,geo,kernels,lm,device=DEVICE,dtype=torch.float32,
@@ -2233,15 +2551,11 @@ class RPInstructionDistribution:
         return raw/raw.sum()
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 15.5 — FITTED LINE REGRESSION (23 features — adds cardan + mirror)
-# ════════════════════════════════════════════════════════════════════════════
-
 class FittedLineRegression(nn.Module):
     """
     Single fitted line over 23 RP+ANISO+RIPPLE+SPAGHETTI+CARDAN+MIRROR signals.
-    Feature 22: cardan_aperture_score — binary {0,1} membership in active Cardan grille
-    Feature 23: mirror_instr_signal  — reversed-instruction distribution value
+    Feature 22: cardan_aperture_score Ã¢â‚¬â€ binary {0,1} membership in active Cardan grille
+    Feature 23: mirror_instr_signal  Ã¢â‚¬â€ reversed-instruction distribution value
     """
     FEATURE_NAMES = [
         "k_reg","k_ori","k_side","orbit","potential","mrv",
@@ -2277,15 +2591,10 @@ class FittedLineRegression(nn.Module):
         lines = ["  Fitted Line Feature Weights (V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN):"]
         w = (self.W.squeeze(-1) * self.feature_scale).detach().cpu()
         for name, wi in zip(self.FEATURE_NAMES, w):
-            bar  = "█" * int(abs(wi.item()) * 10)
+            bar  = "Ã¢â€“Ë†" * int(abs(wi.item()) * 10)
             sign = "+" if wi.item() >= 0 else "-"
             lines.append(f"    {name:<28s} {sign}{abs(wi.item()):.4f}  {bar}")
         return "\n".join(lines)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 16 — RP WALKER  (Cardan + Mirror integrated)
-# ════════════════════════════════════════════════════════════════════════════
 
 class AutomorphicCausationRP:
     def __init__(self, device='cpu'):
@@ -2365,10 +2674,10 @@ class RPWalker:
         self._automorph_awareness = AutomorphicAwarenessRP(device=device)
         self._automorph_causation = AutomorphicCausationRP(device=device)
 
-        # ── Sequential Layer Activator ──────────────────────────────────────
+        #  Sequential Layer Activator 
         self._activator = SequentialLayerActivator(
             rff=rff,
-            aniso_kernel=self._aniso_kernel,   # ← always defined at this point
+            aniso_kernel=self._aniso_kernel,   # Ã¢â€ Â always defined at this point
             residual_scale=0.10,
             device=device,
         )
@@ -2397,7 +2706,7 @@ class RPWalker:
         self._cur_sent_toks.clear()
         self._cur_orbit=0; self._tok_pos=0; self._total_tokens=total_tokens
         self._ooi_tracker.reset()
-        self._activator.reset()          # ← restart layer cycling each sentence
+        self._activator.reset()          # Ã¢â€ Â restart layer cycling each sentence
         seeds=seed_tokens or []
         self.cot.begin_sentence()
         return self.cot.plan_chain(seeds, self.geo, pdn_orbit=self._cur_orbit)
@@ -2488,8 +2797,8 @@ class RPWalker:
             cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands: return cands, base_probs
 
-        # ── Cardan grille filtering ───────────────────────────────────────
-        # Determine the active orbit (Z₄) from PDN and current token.
+        #  Cardan grille filtering 
+        # Determine the active orbit (ZÃ¢â€šâ€ž) from PDN and current token.
         cardan_orbit = self._cur_orbit % 4
         self._pending_cardan_orbit = cardan_orbit
 
@@ -2584,7 +2893,7 @@ class RPWalker:
         _impulse_dir = math.cos(math.pi*_hop_frac)
         sorted_impulse = layer_norm_array(_rank_norm*_impulse_dir)
 
-        # ── Instruction + mirror signals ─────────────────────────────────
+        #  Instruction + mirror signals 
         if and_weight>0.0 and self.instr_dist.base_dist_t is not None:
             p_instr = self.instr_dist.distribution(cands, self._cur_sent_toks, self.lm._tok2idx)
         else:
@@ -2614,7 +2923,7 @@ class RPWalker:
         self._pending_ripple_mean  = ripple_shift.mean().item()
         self._pending_n_directives = len(directives)
 
-        # ── SPAGHETTI ROUTING (extended with cardan + mirror strands) ────
+        #  SPAGHETTI ROUTING (extended with cardan + mirror strands) 
         router = SpaghettiRouter(C, self.device)
 
         router.add_strand('instruction_dist', p_instr,              weight=and_weight)
@@ -2745,7 +3054,7 @@ class RPWalker:
         mA, mB, mC = self._pending_mixer_norms
         cardan_ok = self.cardan is not None
         return "\n".join([
-            "V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN — All Signals Tangled Edition",
+            "V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN Ã¢â‚¬â€ All Signals Tangled Edition",
             "",
             "CARDAN GRILLE ISOMORPHISMS:",
             f"  Active:       {cardan_ok}",
@@ -2760,11 +3069,11 @@ class RPWalker:
             "  Strand 'mirror_instr' fans into MixerA + MixerC.",
             "",
             "SPAGHETTI TOPOLOGY:",
-            "  23 strands → 3 mixers (A/B/C)  |  2 CrossTangles: AB, BC",
-            "  New strands: cardan_iso → [A,C]+1  |  mirror_instr → [A,C]+1",
+            "  23 strands Ã¢â€ â€™ 3 mixers (A/B/C)  |  2 CrossTangles: AB, BC",
+            "  New strands: cardan_iso Ã¢â€ â€™ [A,C]+1  |  mirror_instr Ã¢â€ â€™ [A,C]+1",
             "",
             f"  Last step mixer norms:  MixerA={mA:.4f}  MixerB={mB:.4f}  MixerC={mC:.4f}",
-            f"  Active Cardan orbit:    {self._pending_cardan_orbit} (Z₄)",
+            f"  Active Cardan orbit:    {self._pending_cardan_orbit} (ZÃ¢â€šâ€ž)",
             "",
             f"Fitted line active:    {self.fitted_model is not None}",
             f"OOI tracker size:      {self._ooi_tracker.size}/{ANISO_OOI_MAX}",
@@ -2775,13 +3084,9 @@ class RPWalker:
         ])
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 17 — FITTED LINE TRAINING (23 features)
-# ════════════════════════════════════════════════════════════════════════════
-
 def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
                       lr=3e-4, max_replay_steps=50000, device=DEVICE):
-    print(f"[FittedLine] Replaying {len(corpus_tokens)} tokens, up to {max_replay_steps} steps…")
+    print(f"[FittedLine] Replaying {len(corpus_tokens)} tokens, up to {max_replay_steps} stepsÃ¢â‚¬Â¦")
     if walker.fitted_model is None:
         walker.fitted_model = FittedLineRegression(FittedLineRegression.FEATURE_DIM).to(device)
     walker._fl_replay_buf.clear()
@@ -2799,7 +3104,7 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
             features_list.append(feats); gold_list.append(gold_idx); steps_done+=1
         w1,w2=w2,gold_tok
         if steps_done%5000==0 and steps_done>0:
-            print(f"[FittedLine]   …replayed {steps_done} steps")
+            print(f"[FittedLine]   Ã¢â‚¬Â¦replayed {steps_done} steps")
     if not features_list:
         print("[FittedLine] No training data collected."); return walker.fitted_model
     max_C=max(f.shape[0] for f in features_list); FD=FittedLineRegression.FEATURE_DIM
@@ -2829,11 +3134,6 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
             print(f"[FittedLine]   Epoch {epoch:3d}/{epochs}  CE={epoch_loss/max(len(loader),1):.5f}")
     model.eval(); walker.fitted_model=model
     print(f"[FittedLine] Done.\n{model.feature_report()}"); return model
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 18 — GENERATION  (Cardan grille integration)
-# ════════════════════════════════════════════════════════════════════════════
 
 def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
     try:
@@ -2900,7 +3200,7 @@ def generate_passage_rp(walker, lm,
                         instruction_text="You are a computational algorithm.",
                         and_weight=0.9, temperature=2.0,
                         return_traces=False):
-    # ── Set instruction (MirroredInstructionDistribution handles both forward + mirror) ──
+    #  Set instruction (MirroredInstructionDistribution handles both forward + mirror) 
     if instruction_text.strip():
         walker.instr_dist.set_instruction(instruction_text)
     elif seed_text.strip():
@@ -2916,12 +3216,12 @@ def generate_passage_rp(walker, lm,
     dataset_baseline = compute_dataset_baseline(walker, temperature, and_weight)
     print(f"[Generate] Target Dataset Baseline Log-Prob: {dataset_baseline:.3f}")
 
-    # ── Log mirror centroid for reference ────────────────────────────────
+    #  Log mirror centroid for reference 
     if isinstance(walker.instr_dist, MirroredInstructionDistribution):
         print(f"[Generate] Mirror centroid: "
-              f"ρ={walker.instr_dist.mirror_centroid_rho:.3f}  "
-              f"θ={walker.instr_dist.mirror_centroid_theta:.3f}  "
-              f"σ={walker.instr_dist.mirror_centroid_sigma:.3f}")
+              f"ÃÂ={walker.instr_dist.mirror_centroid_rho:.3f}  "
+              f"ÃŽÂ¸={walker.instr_dist.mirror_centroid_theta:.3f}  "
+              f"ÃÆ’={walker.instr_dist.mirror_centroid_sigma:.3f}")
 
     seed_w1 = seed_w2 = None
     seed_toks = tokenize(seed_text) if seed_text else []
@@ -2963,7 +3263,7 @@ def generate_passage_rp(walker, lm,
             snap_dist = random.randint(1, 12); unspoken_tokens = []
 
             for step in range(12 + tokens_per_sent):
-                # ── Walk probs (Cardan filtering applied inside) ──────────
+                #  Walk probs (Cardan filtering applied inside) 
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
 
                 # Bilinear lateral automorphism
@@ -3013,10 +3313,6 @@ def generate_passage_rp(walker, lm,
     return full_text
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 19 — V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN ENGINE
-# ════════════════════════════════════════════════════════════════════════════
-
 class V18RPEngine:
     def __init__(self, syn_weight=0.1, trans_weight=0.9, syn_k=8,
                  rff_dim=RP_RFF_DIM, nystrom_m=RP_NYSTROM_M,
@@ -3062,12 +3358,12 @@ class V18RPEngine:
 
     def train(self, corpus_text: str):
         self._corpus_snippet = corpus_text
-        print(f"[V18-RP-CARDAN] Tokenising {len(corpus_text)} chars…")
+        print(f"[V18-RP-CARDAN] Tokenising {len(corpus_text)} charsÃ¢â‚¬Â¦")
         tokens = tokenize(corpus_text)
         self.lm.ingest(tokens)
 
-        # ── REFACTORED: vectorised geometry construction ─────────────────
-        print("[V18-RP-CARDAN] Constructing geometry (vectorised)…")
+        #  REFACTORED: vectorised geometry construction 
+        print("[V18-RP-CARDAN] Constructing geometry (vectorised)Ã¢â‚¬Â¦")
         self.geo, self.rff = GeometryConstructor(
             device=self.device, rff_dim=self.rff_dim
         ).construct(self.lm.raw_freq, self.lm.vocab)
@@ -3080,27 +3376,27 @@ class V18RPEngine:
         self.stublib    = RPCoTStubLibrary(self.rff, device=self.device)
 
         self.lm.finalise()
-        print("[V18-RP-CARDAN] Random Walk MC potential propagation…")
+        print("[V18-RP-CARDAN] Random Walk MC potential propagationÃ¢â‚¬Â¦")
         self.rw_graph.build_from_trigrams(self.lm.tri_raw,self.lm.raw_freq,self.rff,self.geo)
         self.rw_graph.propagate()
-        print("[V18-RP-CARDAN] Priming LSH-based MRV filter…")
+        print("[V18-RP-CARDAN] Priming LSH-based MRV filterÃ¢â‚¬Â¦")
         self.mrv.prime(self.lm.vocab,self.geo)
-        print("[V18-RP-CARDAN] Sketched PDN spectral fitting…")
+        print("[V18-RP-CARDAN] Sketched PDN spectral fittingÃ¢â‚¬Â¦")
         self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw)
         self.pdn.build_orbit_map(self.lm.vocab,self.geo)
         print(self.pdn.theorem_bridge_report())
-        print("[V18-RP-CARDAN] Building Cardan Grille Isomorphisms…")
+        print("[V18-RP-CARDAN] Building Cardan Grille IsomorphismsÃ¢â‚¬Â¦")
         self.cardan = CardanGrilleIsomorphism(
             self.lm.vocab, self.lm.tri_raw, self.lm.raw_freq,
             aperture_k=self.cardan_aperture_k)
         print(self.cardan.rotation_report())
-        print("[V18-RP-CARDAN] Building RP CoT stub library + LSH ANN index…")
+        print("[V18-RP-CARDAN] Building RP CoT stub library + LSH ANN indexÃ¢â‚¬Â¦")
         self.stublib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
         self.cot=RPCoTReasoningEngine(
             self.stublib,self.kernels,self.pdn,
             n_hops=3,tokens_per_hop=10,device=self.device)
 
-        # ── Instruction dist wrapped in MirroredInstructionDistribution ──
+        #  Instruction dist wrapped in MirroredInstructionDistribution 
         fwd_dist = RPInstructionDistribution(
             self.geo, self.kernels, self.lm, device=self.device)
         self.instrdist = MirroredInstructionDistribution(
@@ -3164,7 +3460,7 @@ class V18RPEngine:
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # =============================================================================
-# a.py — Gradio front-end for V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
+# a.py Ã¢â‚¬â€ Gradio front-end for V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
 # Requires: paste.txt renamed to v18_engine.py in the same folder
 # =============================================================================
 
@@ -3179,11 +3475,11 @@ import gradio as gr
 
 LATEST_AUTONOMIC_VAL = 1.0
 
-# ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
+#  GLOBAL STATE 
 engine: Optional[object] = None
 AUTONOMIC_FILE = "autonomic_state.json"
 
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
+#  HELPERS 
 def _ready() -> bool:
     return (engine is not None
             and hasattr(engine, "_initialised")
@@ -3191,23 +3487,23 @@ def _ready() -> bool:
 
 def engine_status() -> str:
     if V18RPEngine is None:
-        return "❌ v18_engine.py not found"
+        return "v18_engine.py not found"
     if engine is None:
-        return "❌ Engine not created — run Init/Train first"
+        return "Engine not created, run Init/Train first"
     init = getattr(engine, "_initialised", None)
     if not init:
-        return (f"⚠️  Engine object exists but _initialised={init}\n"
+        return (f" Engine object exists but _initialised={init}\n"
                 f"   Type: {type(engine).__name__}\n"
                 f"   Has lm: {hasattr(engine,'lm')}\n"
                 f"   Has walker: {hasattr(engine,'walker')}")
     vocab_sz = len(getattr(engine.lm, "vocab", []))
     tri_sz   = len(getattr(engine.lm, "tri_raw", {}))
     device   = getattr(engine, "device", "?")
-    return (f"✅ READY  |  V18RPEngine\n"
+    return (f"Ã¢Å“â€¦ READY  |  V18RPEngine\n"
             f"   Vocab: {vocab_sz:,}   Trigrams: {tri_sz:,}\n"
             f"   Device: {device}")
 
-# ─── 1. INIT / TRAIN ──────────────────────────────────────────────────────────
+#  1. INIT / TRAIN 
 def gui_init(mode, filein,
              hfname, hfconfig, hfsplit, hffield, hfportion, hfmax,
              syn_w, trans_w, syn_k, rff_dim, nystrom_m,
@@ -3215,9 +3511,9 @@ def gui_init(mode, filein,
              cardan_k, mirror_a, cardan_lw):
     global engine
     if V18RPEngine is None:
-        return "❌ v18_engine.py import failed — rename paste.txt and restart"
+        return "v18_engine.py import failed Ã¢â‚¬â€ rename paste.txt and restart"
     try:
-        # ── Exact parameter names from V18RPEngine.__init__ ────────────────
+        #  Exact parameter names from V18RPEngine.__init__ 
         engine = V18RPEngine(
             syn_weight             = float(syn_w),
             trans_weight           = float(trans_w),
@@ -3234,10 +3530,10 @@ def gui_init(mode, filein,
             cardan_logit_weight    = float(cardan_lw),
         )
 
-        # ── Load corpus ───────────────────────────────────────────────────
+        #  Load corpus 
         if mode == "Text file":
             if filein is None:
-                return "❌ No file uploaded"
+                return "No file uploaded"
             text = Path(filein.name).read_text(encoding="utf-8", errors="replace")
 
         elif mode == "HuggingFace":
@@ -3249,7 +3545,7 @@ def gui_init(mode, filein,
                 rows = min(rows, int(hfmax))
             text = "\n".join(str(ds[i].get(field, "")) for i in range(rows))
         else:
-            return "❌ Unknown mode"
+            return "Unknown mode"
 
         engine.train(text)
 
@@ -3258,21 +3554,21 @@ def gui_init(mode, filein,
         pdn_rep  = engine.pdn.theorem_bridge_report()
         card_rep = engine.cardan.rotation_report() if engine.cardan else ""
 
-        return (f"✅ ENGINE READY — V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
+        return (f"ENGINE READY - V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
                 f"Vocab : {vocab_sz:,}\n"
                 f"Trigrams: {tri_sz:,}\n"
                 f"Device  : {engine.device}\n"
                 f"syn_w={syn_w}  trans_w={trans_w}  rff_dim={rff_dim}\n"
-                f"cardan_k={cardan_k}  mirror_α={mirror_a}  coupling={spag_c}\n\n"
+                f"cardan_k={cardan_k}  mirror_ÃŽÂ±={mirror_a}  coupling={spag_c}\n\n"
                 f"{pdn_rep}\n\n{card_rep}")
 
     except Exception:
-        return f"❌ Init error:\n{traceback.format_exc()}"
+        return f"Ã¢ÂÅ’ Init error:\n{traceback.format_exc()}"
 
-# ─── 2. FIT LINE ──────────────────────────────────────────────────────────────
+#  2. FIT LINE 
 def gui_fitline(epochs, lr, maxsteps):
     if not _ready():
-        return "❌ Engine not ready — run Init/Train first"
+        return "Engine not ready, run Init/Train first"
     try:
         model = engine.train_fitted_line(
             epochs    = int(epochs),
@@ -3280,26 +3576,26 @@ def gui_fitline(epochs, lr, maxsteps):
             max_steps = int(maxsteps),
         )
         rep = model.feature_report() if hasattr(model, "feature_report") else "Model ready"
-        return f"✅ FittedLine trained (23 features)\n{rep}"
+        return f"FittedLine trained (23 features)\n{rep}"
     except Exception:
-        return f"❌ Fit error:\n{traceback.format_exc()}"
+        return f"Fit error:\n{traceback.format_exc()}"
 
-# ─── 3. LOAD FITTED LINE ──────────────────────────────────────────────────────
+#  3. LOAD FITTED LINE 
 def gui_load_fitted(path):
     if not _ready():
-        return "❌ Engine not ready"
+        return "Engine not ready"
     try:
         engine.load_fitted_line(path or "fitted_line_v18rp_cardan.pt")
-        return "✅ FittedLine loaded"
+        return "FittedLine loaded"
     except Exception:
-        return f"❌ {traceback.format_exc()}"
+        return f"{traceback.format_exc()}"
 
-# ─── 4. GENERATE ──────────────────────────────────────────────────────────────
+#  4. GENERATE 
 def gui_generate(seed, instruction, nsents, tokssent, andw, temp, showtr, artimage):
     global LATEST_AUTONOMIC_VAL, engine
     
     if engine is None or not hasattr(engine, '_initialised') or not engine._initialised:
-        return ("🚫 Engine not trained. Click TRAIN first.", "", "", "")
+        return ("Engine not trained. Click TRAIN first.", "", "", "")
     
     # IMAGE SAFE [web:19]
     img = None
@@ -3341,16 +3637,16 @@ def gui_generate(seed, instruction, nsents, tokssent, andw, temp, showtr, artima
         
     except Exception as e:
         import traceback
-        return (f"❌ {str(e)}", traceback.format_exc()[:500], "", "")
+        return (f"{str(e)}", traceback.format_exc()[:500], "", "")
 
-# ─── 5. AUTONOMIC ─────────────────────────────────────────────────────────────
+#  5. AUTONOMIC 
 def gui_auto_save():
     try:
         with open(AUTONOMIC_FILE, "w") as f:
             json.dump({"autonomic_value": LATEST_AUTONOMIC_VAL}, f, indent=2)
-        return f"💾 Saved {LATEST_AUTONOMIC_VAL:.4f}"
+        return f"Saved {LATEST_AUTONOMIC_VAL:.4f}"
     except Exception as e:
-        return f"❌ {e}"
+        return f"{e}"
 
 def gui_auto_load():
     global LATEST_AUTONOMIC_VAL
@@ -3360,39 +3656,38 @@ def gui_auto_load():
         with open(AUTONOMIC_FILE) as f:
             data = json.load(f)
         LATEST_AUTONOMIC_VAL = float(data.get("autonomic_value", 1.0))
-        return f"✅ Loaded {LATEST_AUTONOMIC_VAL:.4f}", LATEST_AUTONOMIC_VAL
+        return f"Loaded {LATEST_AUTONOMIC_VAL:.4f}", LATEST_AUTONOMIC_VAL
     except Exception as e:
-        return f"❌ {e}", 1.0
+        return f"{e}", 1.0
 
-# ─── 6. ENGINE SAVE / LOAD ────────────────────────────────────────────────────
+#  6. ENGINE SAVE / LOAD 
 def gui_engine_save(path):
     if not _ready():
-        return "❌ Engine not ready"
+        return "Engine not ready"
     try:
         engine.save(path or "v18rp_cardan_engine.pkl")
-        return f"💾 Saved to {path or 'v18rp_cardan_engine.pkl'}"
+        return f"Saved to {path or 'v18rp_cardan_engine.pkl'}"
     except Exception:
-        return f"❌ {traceback.format_exc()}"
+        return f"{traceback.format_exc()}"
 
 def gui_engine_load(path):
     global engine
     try:
         engine = V18RPEngine.load(path or "v18rp_cardan_engine.pkl")
-        return f"✅ Loaded from {path or 'v18rp_cardan_engine.pkl'}\n{engine_status()}"
+        return f"Loaded from {path or 'v18rp_cardan_engine.pkl'}\n{engine_status()}"
     except Exception:
-        return f"❌ {traceback.format_exc()}"
+        return f"{traceback.format_exc()}"
 
-# ─── GRADIO UI ────────────────────────────────────────────────────────────────
+#  GRADIO UI 
 def build_app():
     with gr.Blocks(title="V18-RP-CARDAN", theme=gr.themes.Soft()) as demo:
 
         gr.Markdown(
-            "# 🧠 V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
-            "**Cardan Grille Isomorphisms + Mirrored Instructions + Möbius Spaghetti Router**"
+            "#V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
+            "**Cardan Grille Isomorphisms + Mirrored Instructions + bius Spaghetti Router**"
         )
 
-        # ══════════════════════════════════════════════════════════════════
-        with gr.Tab("⚙️  1 · Init / Train"):
+        with gr.Tab("Init / Train"):
             mode = gr.Radio(["Text file", "HuggingFace"], value="Text file",
                             label="Corpus source")
             filein = gr.File(label="Upload .txt corpus", file_types=[".txt"])
@@ -3429,7 +3724,7 @@ def build_app():
                 cardan_lw= gr.Slider(0.0, 50.0, 8.0,  step=0.5,  label="cardan_logit_weight")
                 mirror_a = gr.Slider(0.0, 1.0,  0.35, step=0.01, label="mirror_alpha")
 
-            init_btn = gr.Button("🚀  Initialise + Train", variant="primary")
+            init_btn = gr.Button("Initialise + Train", variant="primary")
             init_out = gr.Textbox(lines=18, label="Init output", container=True)
 
             init_btn.click(
@@ -3442,30 +3737,27 @@ def build_app():
                 outputs=init_out,
             )
 
-        # ══════════════════════════════════════════════════════════════════
-        with gr.Tab("🔍  2 · Debug"):
+        with gr.Tab("Debug"):
             debug_btn = gr.Button("Check engine status")
             debug_out = gr.Textbox(lines=8, label="Status")
             debug_btn.click(engine_status, outputs=debug_out)
 
-        # ══════════════════════════════════════════════════════════════════
-        with gr.Tab("📈  3 · Fit Line"):
+        with gr.Tab("Fit Line"):
             with gr.Row():
                 fl_epochs  = gr.Slider(10, 1000, 200,   step=10,    label="Epochs")
                 fl_lr      = gr.Slider(1e-5, 1e-2, 3e-4, step=1e-5, label="Learning rate")
                 fl_maxstep = gr.Slider(1000, 200000, 50000, step=1000, label="Max replay steps")
             with gr.Row():
-                fl_train = gr.Button("🏋️  Train FittedLine", variant="primary")
+                fl_train = gr.Button("Train FittedLine", variant="primary")
                 fl_path  = gr.Textbox(value="fitted_line_v18rp_cardan.pt", label="Load path")
-                fl_load  = gr.Button("📂  Load weights")
+                fl_load  = gr.Button("Load weights")
             fl_out = gr.Textbox(lines=16, label="Report", container=True)
             fl_train.click(gui_fitline,  inputs=[fl_epochs, fl_lr, fl_maxstep], outputs=fl_out)
             fl_load.click (gui_load_fitted, inputs=[fl_path], outputs=fl_out)
 
-        # ══════════════════════════════════════════════════════════════════
-        with gr.Tab("✍️  4 · Generate"):
+        with gr.Tab("Generate"):
             with gr.Row():
-                seed_txt  = gr.Textbox(label="Seed text",   placeholder="The algorithm began…")
+                seed_txt  = gr.Textbox(label="Seed text",   placeholder="The algorithm began")
                 instr_txt = gr.Textbox(label="Instruction",
                                        value="You are a computational algorithm.",
                                        lines=2)
@@ -3481,10 +3773,10 @@ def build_app():
                 with gr.Row():
                     auto_disp   = gr.Slider(0.0, 1.0, 1.0, interactive=False,
                                             label="Autonomic value")
-                    refresh_btn = gr.Button("🔄 Refresh")
+                    refresh_btn = gr.Button("Refresh")
                     refresh_btn.click(lambda: LATEST_AUTONOMIC_VAL, outputs=auto_disp)
 
-            gen_btn  = gr.Button("⚡  GENERATE", variant="primary", size="lg")
+            gen_btn  = gr.Button("GENERATE", variant="primary", size="lg")
             gen_out  = gr.Textbox(lines=10, label="Generated text", container=True)
             with gr.Row():
                 cot_out  = gr.Textbox(lines=6, label="CoT trace")
@@ -3498,30 +3790,29 @@ def build_app():
                 outputs=[gen_out, cot_out, step_out, prop_out],
             )
 
-        # ══════════════════════════════════════════════════════════════════
-        with gr.Tab("💾  5 · Save / Load"):
+        with gr.Tab("Save / Load"):
             gr.Markdown("### Engine pickle")
             with gr.Row():
                 eng_path = gr.Textbox(value="v18rp_cardan_engine.pkl", label="Path")
-                gr.Button("💾 Save engine").click(
+                gr.Button("Save engine").click(
                     gui_engine_save, inputs=[eng_path], outputs=gr.Textbox(label="Status"))
-                gr.Button("📂 Load engine").click(
+                gr.Button("Load engine").click(
                     gui_engine_load, inputs=[eng_path], outputs=gr.Textbox(label="Status"))
 
             gr.Markdown("### Autonomic value")
             with gr.Row():
-                gr.Button("💾 Save autonomic").click(gui_auto_save,
+                gr.Button("Save autonomic").click(gui_auto_save,
                     outputs=gr.Textbox(label="Save status"))
                 auto_load_out = gr.Textbox(label="Load status")
                 auto_val_out  = gr.Slider(0.0, 1.0, 1.0, interactive=False,
                                           label="Loaded value")
-                gr.Button("📂 Load autonomic").click(gui_auto_load,
+                gr.Button("Load autonomic").click(gui_auto_load,
                     outputs=[auto_load_out, auto_val_out])
 
     return demo
 
 
-# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
+#  ENTRY POINT 
 if __name__ == "__main__":
     app = build_app()
     app.launch(
