@@ -3485,7 +3485,7 @@ def build_app():
                     refresh_btn.click(lambda: LATEST_AUTONOMIC_VAL, outputs=auto_disp)
 
             gen_btn  = gr.Button("⚡  GENERATE", variant="primary", size="lg")
-            gen_out  = gr.Textbox(lines=10, label="Generated text", show_copy_button=True)
+            gen_out  = gr.Textbox(lines=10, label="Generated text", container=True)
             with gr.Row():
                 cot_out  = gr.Textbox(lines=6, label="CoT trace")
                 step_out = gr.Textbox(lines=6, label="Step trace")
