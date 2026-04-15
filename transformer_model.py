@@ -298,7 +298,6 @@ def main():
     model.id_to_word = ds.id_to_word
 
     while True:
-        print("\nGenerating text...")
         print(generate(
             model,
             seed_text=input("USER: "),
