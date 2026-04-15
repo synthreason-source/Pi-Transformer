@@ -1,29 +1,24 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
 ===============================================================================
-
 CARDAN GRILLE ISOMORPHISMS + MIRRORED INSTRUCTIONS
 ───────────────────────────────────────────────────
-
 Two new subsystems grafted onto the V18-SPAGHETTI base:
-
 ══════════════════════════════════════════════════════════════════════════════
 1.  CARDAN GRILLE ISOMORPHISM ENGINE  (CardanGrilleIsomorphism)
 ──────────────────────────────────────────────────────────────────────────────
-
 A Cardan grille is a physical encryption tool: a card with rectangular holes
 cut at specific positions.  Placed over a grid of letters, only the letters
 visible through the holes are read; rotating the card 90° reveals a second
 message, 180° a third, 270° a fourth.
-
 Here we treat the *dataset corpus* as the letter-grid and build a set of
 virtual grilles whose aperture positions are derived from the trigram-frequency
 spectrum.  Each 90°-rotation of the grille selects a different sub-vocabulary
 partition — an *isomorphic projection* of the full vocab onto a rotational
 class.
-
 Construction
   • The vocab is tiled into a square grid of side G = ⌈√|V|⌉.
   • Aperture positions are chosen by sampling the top-K trigram pairs ordered
@@ -35,13 +30,11 @@ Construction
     bigram context* falls into (via modular orbit index from the PDN engine)
     and returns the corresponding aperture-vocab subset as the *candidate set*,
     optionally intersected with the LM's native candidate set.
-
 Isomorphism property
   The four rotations form a Z₄ cyclic group.  Because the aperture count is
   fixed, all four projections have the same cardinality — they are isomorphic
   as sets under the rotation action.  This ensures the probability mass is
   spread over equally-sized candidate pools regardless of rotation.
-
 Integration into generate_passage_rp
   • After the LM produces its raw (cands, base_probs) pair the Cardan engine
     is called:  ``cands, base_probs = cardan.filter(cands, base_probs, orbit)``
@@ -50,31 +43,23 @@ Integration into generate_passage_rp
     intersection is too small (< MIN_CARDAN_CANDS).
   • A new spaghetti strand ``cardan_iso`` is added to the router, carrying a
     logit bonus equal to the aperture membership score of each candidate.
-
 ══════════════════════════════════════════════════════════════════════════════
 2.  MIRRORED INSTRUCTION DISTRIBUTION  (MirroredInstructionDistribution)
 ──────────────────────────────────────────────────────────────────────────────
-
 The instruction text is processed in two directions simultaneously:
-
   Forward  pass  → standard RPInstructionDistribution (unchanged)
   Backward pass  → tokens reversed, re-embedded, centroid recomputed,
                    produces a "mirror" base_dist_t
-
 The mirror distribution captures *suffix* semantics of the instruction: if the
 instruction ends with goal-oriented tokens, the mirror foregrounds them by
 placing them first in its recency-decay weighting.
-
 At generation time both distributions are blended:
     p_combined = (1 - mirror_alpha) * p_forward + mirror_alpha * p_mirror
-
 A new spaghetti strand ``mirror_instr`` fans into MixerA and MixerC with sign
 +1, adding a second instruction signal that is phase-shifted relative to the
 forward one.  The Möbius tangle between A and C (via CrossTangle BC path)
 then entangles forward and mirror signals, preventing either from dominating.
-
 mirror_alpha is a tunable hyperparameter (default 0.35).
-
 ══════════════════════════════════════════════════════════════════════════════
 All other algorithms unchanged from V18-RP-ANISO-RIPPLE-SPAGHETTI.
 """
@@ -414,19 +399,15 @@ class CardanGrilleIsomorphism:
     Builds four Z₄-isomorphic vocab partitions from the corpus trigram
     frequency spectrum, mimicking a physical Cardan grille rotated through
     0°, 90°, 180°, 270°.
-
     Usage
     ─────
     Build once after LM finalisation:
         cardan = CardanGrilleIsomorphism(vocab, tri_raw, raw_freq,
                                           aperture_k=CARDAN_APERTURE_K)
-
     At generation time:
         cardan_cands, cardan_probs, aperture_scores = cardan.filter(
             cands, base_probs, orbit_index)
-
     where orbit_index ∈ {0,1,2,3} comes from pdn_engine.orbit_of(token) % 4.
-
     Aperture membership score (per candidate):
         score_i = 1.0  if cand_i is in the active rotation-class aperture
                   0.0  otherwise
@@ -495,7 +476,6 @@ class CardanGrilleIsomorphism:
                orbit: int) -> Tuple[List[str], torch.Tensor, torch.Tensor]:
         """
         Returns (filtered_cands, filtered_probs, aperture_logit_bonus).
-
         aperture_logit_bonus is a (len(cands),) tensor of 0.0/1.0 membership
         scores for all original candidates (before filtering) — used as the
         spaghetti cardan_iso strand.
@@ -539,10 +519,8 @@ class MirroredInstructionDistribution:
     """
     Wraps RPInstructionDistribution and adds a *mirrored* (token-reversed)
     counterpart.  The mirror foregrounds suffix semantics of the instruction.
-
     Combined distribution:
         p_combined = (1 - alpha) * p_forward + alpha * p_mirror
-
     The mirror centroid (rho, theta, sigma) is computed from the reversed
     token sequence and injected as the 'mirror_instr' spaghetti strand.
     """
@@ -1015,7 +993,6 @@ class SequentialLayerActivator(nn.Module):
     """
     Holds all isolated-multiply layers and gates them one-at-a-time as
     tokens advance.
-
     Protocol
     ────────
     • Call  activator.tick()  inside  walker.push_token()  to advance the
@@ -1023,7 +1000,6 @@ class SequentialLayerActivator(nn.Module):
     • Call  activator.compute(layer_idx, *args)  instead of the raw multiply:
         – active layer  → gain = 1.0   (full signal)
         – inactive layers → gain = residual_scale  (kept alive, not zeroed)
-
     Layer index table
     ─────────────────
         0  IsolatedRFFProjectLayer       (omega projections)
@@ -1515,7 +1491,6 @@ class GeometryConstructor:
     Centralised factory for BolyaiTokenGeometryRP.
     Vectorises hyperbolic-disk position computation on the GPU and
     pre-populates the triple cache + RFF feature tensors in one pass.
-
     Usage (inside V18RPEngine.train):
         self.geo, self.rff = GeometryConstructor(
             device=self.device, rff_dim=self.rff_dim
@@ -2265,7 +2240,6 @@ class RPInstructionDistribution:
 class FittedLineRegression(nn.Module):
     """
     Single fitted line over 23 RP+ANISO+RIPPLE+SPAGHETTI+CARDAN+MIRROR signals.
-
     Feature 22: cardan_aperture_score — binary {0,1} membership in active Cardan grille
     Feature 23: mirror_instr_signal  — reversed-instruction distribution value
     """
@@ -3187,240 +3161,385 @@ class V18RPEngine:
         print(f"[V18-RP-CARDAN] Engine loaded from {path}"); return eng
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 20 — GRADIO GUI
-# ════════════════════════════════════════════════════════════════════════════
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# =============================================================================
+# a.py — Gradio front-end for V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN
+# Requires: paste.txt renamed to v18_engine.py in the same folder
+# =============================================================================
 
-_engine: Optional[V18RPEngine] = None
+import sys, os, json, traceback, threading
+from pathlib import Path
+from typing import Optional
 
-AUTONOMIC_SAVE_FILE = "autonomic_state.json"
+import torch
+import numpy as np
+import gradio as gr
 
-def save_autonomic_ui():
-    global LATEST_AUTONOMIC_VAL
+# ─── IMPORT ENGINE ────────────────────────────────────────────────────────────
+try:
+    import v18_engine as _eng
+    V18RPEngine = _eng.V18RPEngine
+    LATEST_AUTONOMIC_VAL = _eng.LATEST_AUTONOMIC_VAL   # shared global
+    print("✅ v18_engine imported")
+except Exception as _ie:
+    print(f"❌ Import failed: {_ie}")
+    print("   Rename paste.txt → v18_engine.py then rerun")
+    V18RPEngine = None
+    LATEST_AUTONOMIC_VAL = 1.0
+
+# ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
+engine: Optional[object] = None
+AUTONOMIC_FILE = "autonomic_state.json"
+
+# ─── HELPERS ──────────────────────────────────────────────────────────────────
+def _ready() -> bool:
+    return (engine is not None
+            and hasattr(engine, "_initialised")
+            and engine._initialised)
+
+def engine_status() -> str:
+    if V18RPEngine is None:
+        return "❌ v18_engine.py not found"
+    if engine is None:
+        return "❌ Engine not created — run Init/Train first"
+    init = getattr(engine, "_initialised", None)
+    if not init:
+        return (f"⚠️  Engine object exists but _initialised={init}\n"
+                f"   Type: {type(engine).__name__}\n"
+                f"   Has lm: {hasattr(engine,'lm')}\n"
+                f"   Has walker: {hasattr(engine,'walker')}")
+    vocab_sz = len(getattr(engine.lm, "vocab", []))
+    tri_sz   = len(getattr(engine.lm, "tri_raw", {}))
+    device   = getattr(engine, "device", "?")
+    return (f"✅ READY  |  V18RPEngine\n"
+            f"   Vocab: {vocab_sz:,}   Trigrams: {tri_sz:,}\n"
+            f"   Device: {device}")
+
+# ─── 1. INIT / TRAIN ──────────────────────────────────────────────────────────
+def gui_init(mode, filein,
+             hfname, hfconfig, hfsplit, hffield, hfportion, hfmax,
+             syn_w, trans_w, syn_k, rff_dim, nystrom_m,
+             ooi_w, rep_w, rpl_w, rpl_k, spag_c,
+             cardan_k, mirror_a, cardan_lw):
+    global engine
+    if V18RPEngine is None:
+        return "❌ v18_engine.py import failed — rename paste.txt and restart"
     try:
-        with open(AUTONOMIC_SAVE_FILE, 'w') as f:
-            json.dump({"autonomic_value": LATEST_AUTONOMIC_VAL}, f, indent=4)
-        return f"Saved value: {LATEST_AUTONOMIC_VAL:.4f}"
-    except Exception as e:
-        return f"Error saving: {e}"
+        # ── Exact parameter names from V18RPEngine.__init__ ────────────────
+        engine = V18RPEngine(
+            syn_weight             = float(syn_w),
+            trans_weight           = float(trans_w),
+            syn_k                  = int(syn_k),
+            rff_dim                = int(rff_dim),
+            nystrom_m              = int(nystrom_m),
+            aniso_ooi_weight       = float(ooi_w),
+            aniso_repulsion_weight = float(rep_w),
+            ripple_weight          = float(rpl_w),
+            ripple_k_stubs         = int(rpl_k),
+            spaghetti_coupling     = float(spag_c),
+            cardan_aperture_k      = int(cardan_k),
+            mirror_alpha           = float(mirror_a),
+            cardan_logit_weight    = float(cardan_lw),
+        )
 
-def load_autonomic_ui():
-    global LATEST_AUTONOMIC_VAL
-    if os.path.exists(AUTONOMIC_SAVE_FILE):
-        try:
-            with open(AUTONOMIC_SAVE_FILE, 'r') as f:
-                data = json.load(f)
-                val = float(data.get("autonomic_value", 1.0))
-                LATEST_AUTONOMIC_VAL = val
-                return f"Loaded value: {val:.4f}", val
-        except Exception as e:
-            return f"Error loading: {e}", float(LATEST_AUTONOMIC_VAL)
-    return "No saved state found.", float(LATEST_AUTONOMIC_VAL)
+        # ── Load corpus ───────────────────────────────────────────────────
+        if mode == "Text file":
+            if filein is None:
+                return "❌ No file uploaded"
+            text = Path(filein.name).read_text(encoding="utf-8", errors="replace")
 
-def _gui_init(mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
-              syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c,
-              cardan_k,mirror_a,cardan_lw):
-    global _engine
-    try:
-        _engine=V18RPEngine(
-            syn_weight=float(syn_w),trans_weight=float(trans_w),syn_k=int(syn_k),
-            rff_dim=int(rff_dim),nystrom_m=int(nystrom_m),
-            aniso_ooi_weight=float(ooi_w),aniso_repulsion_weight=float(rep_w),
-            ripple_weight=float(rpl_w),ripple_k_stubs=int(rpl_k),
-            spaghetti_coupling=float(spag_c),
-            cardan_aperture_k=int(cardan_k),
-            mirror_alpha=float(mirror_a),
-            cardan_logit_weight=float(cardan_lw))
-        if mode=="Text file":
-            if file_in is None: return "❌ No file uploaded."
-            text=Path(file_in.name).read_text(encoding="utf-8",errors="replace")
-        elif mode=="HuggingFace dataset":
+        elif mode == "HuggingFace":
             from datasets import load_dataset
-            ds=load_dataset(hf_name,hf_config or None,split=hf_split)
-            field=hf_field or "text"
-            rows=int(len(ds)*max(0.01,min(1.0,float(hf_portion))))
-            if hf_max and int(hf_max)>0: rows=min(rows,int(hf_max))
-            text="\n".join(str(ds[i].get(field,"")) for i in range(rows))
-        else: return "❌ Unknown mode."
-        _engine.train(text)
-        return (_engine.pdn.theorem_bridge_report()
-                +f"\n✅ Engine initialised (V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN).\n"
-                f"Vocab: {len(_engine.lm.vocab):,}  "
-                f"Trigrams: {len(_engine.lm.tri_raw):,}  "
-                f"Device: {_engine.device}\n"
-                f"CARDAN: aperture_k={cardan_k}  logit_w={cardan_lw}\n"
-                f"MIRROR: alpha={mirror_a}\n"
-                f"SPAGHETTI: coupling={spag_c}  n_mixers=3  n_tangles=2  strands=23\n"
-                f"\n{_engine.cardan.rotation_report()}\n"
-                f"\n{_engine.walker.algo_report()}")
-    except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}"
+            ds    = load_dataset(hfname, hfconfig or None, split=hfsplit or "train")
+            field = hffield or "text"
+            rows  = int(len(ds) * max(0.001, min(1.0, float(hfportion))))
+            if hfmax and int(hfmax) > 0:
+                rows = min(rows, int(hfmax))
+            text = "\n".join(str(ds[i].get(field, "")) for i in range(rows))
+        else:
+            return "❌ Unknown mode"
 
-def _gui_fit_line(epochs,lr,max_steps):
-    global _engine
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first."
+        engine.train(text)
+
+        vocab_sz = len(engine.lm.vocab)
+        tri_sz   = len(engine.lm.tri_raw)
+        pdn_rep  = engine.pdn.theorem_bridge_report()
+        card_rep = engine.cardan.rotation_report() if engine.cardan else ""
+
+        return (f"✅ ENGINE READY — V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
+                f"Vocab : {vocab_sz:,}\n"
+                f"Trigrams: {tri_sz:,}\n"
+                f"Device  : {engine.device}\n"
+                f"syn_w={syn_w}  trans_w={trans_w}  rff_dim={rff_dim}\n"
+                f"cardan_k={cardan_k}  mirror_α={mirror_a}  coupling={spag_c}\n\n"
+                f"{pdn_rep}\n\n{card_rep}")
+
+    except Exception:
+        return f"❌ Init error:\n{traceback.format_exc()}"
+
+# ─── 2. FIT LINE ──────────────────────────────────────────────────────────────
+def gui_fitline(epochs, lr, maxsteps):
+    if not _ready():
+        return "❌ Engine not ready — run Init/Train first"
     try:
-        model=_engine.train_fitted_line(epochs=int(epochs),lr=float(lr),max_steps=int(max_steps))
-        return f"✅ Fitted line trained (23 features incl. cardan_aperture + mirror_instr).\n\n{model.feature_report()}"
+        model = engine.train_fitted_line(
+            epochs    = int(epochs),
+            lr        = float(lr),
+            max_steps = int(maxsteps),
+        )
+        rep = model.feature_report() if hasattr(model, "feature_report") else "Model ready"
+        return f"✅ FittedLine trained (23 features)\n{rep}"
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}"
+        return f"❌ Fit error:\n{traceback.format_exc()}"
 
-def _gui_generate(seed,instruction,n_sents,toks_per_sent,and_weight,temperature,show_traces,art_image=None):
-    global _engine, LATEST_AUTONOMIC_VAL
-    if _engine is None or not _engine._initialised: return "❌ Initialise engine first.","","",""
+# ─── 3. LOAD FITTED LINE ──────────────────────────────────────────────────────
+def gui_load_fitted(path):
+    if not _ready():
+        return "❌ Engine not ready"
     try:
-        if hasattr(_engine, 'walker') and hasattr(_engine.walker, '_contingent'):
-            if art_image is not None:
-                img_data = art_image.get('composite')
-                if img_data is None: img_data = art_image.get('image')
-                if img_data is None: img_data = art_image.get('background')
-                if img_data is not None:
-                    modulated_pic = (img_data.astype(np.float32) * LATEST_AUTONOMIC_VAL).astype(np.uint8)
-                    _engine.walker._contingent.canvas.update_art(modulated_pic)
-                else:
-                    _engine.walker._contingent.canvas.update_art(None)
-            else:
-                _engine.walker._contingent.canvas.update_art(None)
-
-        text,cot,steps,props=_engine.generate(
-            seed_text=seed,instruction_text=instruction,
-            num_sentences=int(n_sents),tokens_per_sent=int(toks_per_sent),
-            and_weight=float(and_weight),temperature=float(temperature),return_traces=True)
-        cot_out  =cot   if show_traces else "(traces disabled)"
-        steps_out=steps if show_traces else "(traces disabled)"
-        prop_out =props if show_traces else "(traces disabled)"
-        return text,cot_out,steps_out,prop_out
+        engine.load_fitted_line(path or "fitted_line_v18rp_cardan.pt")
+        return "✅ FittedLine loaded"
     except Exception:
-        import traceback; return f"❌ Error:\n{traceback.format_exc()}","","",""
+        return f"❌ {traceback.format_exc()}"
 
-def build_gradio_app() -> gr.Blocks:
-    with gr.Blocks(title="NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN") as demo:
-        gr.Markdown("# NeuroSymbolic V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN")
+# ─── 4. GENERATE ──────────────────────────────────────────────────────────────
+def gui_generate(seed, instruction, nsents, tokspersent,
+                 and_weight, temperature, show_traces, artimage=None):
+    global LATEST_AUTONOMIC_VAL
+    if not _ready():
+        return "❌ Engine not ready — run Init/Train first", "", "", ""
+
+    # Sync autonomic value into engine module
+    if V18RPEngine is not None:
+        try:
+            _eng.LATEST_AUTONOMIC_VAL = LATEST_AUTONOMIC_VAL
+        except Exception:
+            pass
+
+    try:
+        # Optional: push art-image canvas into walker
+        if artimage is not None and hasattr(engine, "walker"):
+            walker = engine.walker
+            if hasattr(walker, "_contingent"):
+                img = (artimage.get("composite")
+                       or artimage.get("image")
+                       or artimage.get("background"))
+                if img is not None:
+                    modulated = (img.astype(np.float32) * LATEST_AUTONOMIC_VAL
+                                 ).clip(0, 255).astype(np.uint8)
+                    if hasattr(walker._contingent, "canvas"):
+                        walker._contingent.canvas.update_art(modulated)
+
+        result = engine.generate(
+            seed_text        = seed or "",
+            instruction_text = instruction or "",
+            num_sentences    = int(nsents),
+            tokens_per_sent  = int(tokspersent),
+            and_weight       = float(and_weight),
+            temperature      = float(temperature),
+            return_traces    = True,
+        )
+
+        # generate() returns (text, cot_text, step_text, prop_text)
+        if isinstance(result, tuple) and len(result) == 4:
+            text, cot_text, step_text, prop_text = result
+        else:
+            text      = str(result)
+            cot_text  = step_text = prop_text = ""
+
+        if not show_traces:
+            cot_text = step_text = prop_text = "(traces disabled)"
+
+        return text, cot_text, step_text, prop_text
+
+    except Exception:
+        return f"❌ Generate error:\n{traceback.format_exc()}", "", "", ""
+
+# ─── 5. AUTONOMIC ─────────────────────────────────────────────────────────────
+def gui_auto_save():
+    try:
+        with open(AUTONOMIC_FILE, "w") as f:
+            json.dump({"autonomic_value": LATEST_AUTONOMIC_VAL}, f, indent=2)
+        return f"💾 Saved {LATEST_AUTONOMIC_VAL:.4f}"
+    except Exception as e:
+        return f"❌ {e}"
+
+def gui_auto_load():
+    global LATEST_AUTONOMIC_VAL
+    if not os.path.exists(AUTONOMIC_FILE):
+        return "No save file found", 1.0
+    try:
+        with open(AUTONOMIC_FILE) as f:
+            data = json.load(f)
+        LATEST_AUTONOMIC_VAL = float(data.get("autonomic_value", 1.0))
+        return f"✅ Loaded {LATEST_AUTONOMIC_VAL:.4f}", LATEST_AUTONOMIC_VAL
+    except Exception as e:
+        return f"❌ {e}", 1.0
+
+# ─── 6. ENGINE SAVE / LOAD ────────────────────────────────────────────────────
+def gui_engine_save(path):
+    if not _ready():
+        return "❌ Engine not ready"
+    try:
+        engine.save(path or "v18rp_cardan_engine.pkl")
+        return f"💾 Saved to {path or 'v18rp_cardan_engine.pkl'}"
+    except Exception:
+        return f"❌ {traceback.format_exc()}"
+
+def gui_engine_load(path):
+    global engine
+    try:
+        engine = V18RPEngine.load(path or "v18rp_cardan_engine.pkl")
+        return f"✅ Loaded from {path or 'v18rp_cardan_engine.pkl'}\n{engine_status()}"
+    except Exception:
+        return f"❌ {traceback.format_exc()}"
+
+# ─── GRADIO UI ────────────────────────────────────────────────────────────────
+def build_app():
+    with gr.Blocks(title="V18-RP-CARDAN", theme=gr.themes.Soft()) as demo:
+
         gr.Markdown(
-            "**Cardan Grille Isomorphisms**: vocab partitioned into four Z₄-isomorphic rotation classes "
-            "derived from dataset trigram frequencies.  At each step the PDN orbit selects the active "
-            "grille class; the aperture membership score fans into MixerA+MixerC as the `cardan_iso` strand.\n\n"
-            "**Mirrored Instructions**: instruction tokens are reversed and re-embedded to foreground "
-            "suffix semantics.  Combined forward + mirror distribution blended at α=mirror_alpha.  "
-            "The `mirror_instr` spaghetti strand carries the reversed signal into MixerA+MixerC, "
-            "entangled with the forward instruction via CrossTangle BC.")
+            "# 🧠 V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN\n"
+            "**Cardan Grille Isomorphisms + Mirrored Instructions + Möbius Spaghetti Router**"
+        )
 
-        with gr.Tab("Init / Train"):
-            mode   =gr.Radio(["Text file","HuggingFace dataset"],value="Text file",label="Source")
-            file_in=gr.File(label="Upload .txt")
-            with gr.Row():
-                hf_name=gr.Textbox(label="HF dataset name"); hf_config=gr.Textbox(label="Config")
-                hf_split=gr.Textbox(value="train",label="Split"); hf_field=gr.Textbox(value="text",label="Field")
-                hf_portion=gr.Slider(0.01,1.0,value=1.0,label="Portion"); hf_max=gr.Textbox(value="",label="Max examples")
-            with gr.Row():
-                syn_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Synaptic weight")
-                trans_w=gr.Slider(0.0,22.0,value=22.0,step=0.1,label="Transition weight")
-                syn_k=gr.Slider(1,64,value=16,step=1,label="Synaptic k")
-                rff_dim=gr.Slider(32,512,value=128,step=32,label="RFF dim D")
-                nystrom_m=gr.Slider(8,128,value=32,step=4,label="Nyström m")
-            gr.Markdown("### ANISO Hyperparameters")
-            with gr.Row():
-                ooi_w=gr.Slider(0.0,23,value=22.1,step=0.05,label="OOI affinity weight")
-                rep_w=gr.Slider(0.0,3.0,value=0.5,step=0.05,label="Repulsion weight")
-            gr.Markdown("### RIPPLE Hyperparameters")
-            with gr.Row():
-                rpl_w=gr.Slider(0.0,27,value=26,step=0.1,label="Ripple logit weight")
-                rpl_k=gr.Slider(1,20,value=RIPPLE_K_STUBS,step=1,label="Ripple k_stubs")
-            gr.Markdown("### SPAGHETTI Hyperparameters")
-            with gr.Row():
-                spag_c=gr.Slider(0.0,1.0,value=0.60,step=0.05,label="Möbius coupling")
-            gr.Markdown("### CARDAN GRILLE Hyperparameters")
-            with gr.Row():
-                cardan_k=gr.Slider(8,512,value=CARDAN_APERTURE_K,step=8,
-                                    label="Aperture K (vocab slots per grille)")
-                cardan_lw=gr.Slider(0.0,50.0,value=CARDAN_LOGIT_WEIGHT,step=0.5,
-                                     label="Cardan logit strand weight")
-            gr.Markdown("### MIRRORED INSTRUCTION Hyperparameters")
-            with gr.Row():
-                mirror_a=gr.Slider(0.0,1.0,value=MIRROR_ALPHA,step=0.05,
-                                    label="Mirror alpha (blend weight for reversed instruction)")
-            init_btn=gr.Button("Initialise + Train"); init_out=gr.Textbox(lines=35,label="Init output")
-            init_btn.click(_gui_init,
-                inputs=[mode,file_in,hf_name,hf_config,hf_split,hf_field,hf_portion,hf_max,
-                        syn_w,trans_w,syn_k,rff_dim,nystrom_m,ooi_w,rep_w,rpl_w,rpl_k,spag_c,
-                        cardan_k,mirror_a,cardan_lw],
-                outputs=init_out)
+        # ══════════════════════════════════════════════════════════════════
+        with gr.Tab("⚙️  1 · Init / Train"):
+            mode = gr.Radio(["Text file", "HuggingFace"], value="Text file",
+                            label="Corpus source")
+            filein = gr.File(label="Upload .txt corpus", file_types=[".txt"])
 
-        with gr.Tab("Fit Line"):
-            gr.Markdown("Train FittedLineRegression (23 features incl. cardan_aperture_score + mirror_instr_signal).")
-            with gr.Row():
-                fl_epochs=gr.Slider(10,500,value=200,step=10,label="Epochs")
-                fl_lr    =gr.Slider(1e-5,1e-2,value=3e-4,step=1e-5,label="Learning rate")
-                fl_maxsteps=gr.Slider(1000,200000,value=50000,step=1000,label="Max replay steps")
-            fl_btn=gr.Button("Train Fitted Line"); fl_out=gr.Textbox(lines=28,label="Fitted line report")
-            fl_btn.click(_gui_fit_line,inputs=[fl_epochs,fl_lr,fl_maxsteps],outputs=fl_out)
+            with gr.Accordion("HuggingFace options", open=False):
+                with gr.Row():
+                    hfname    = gr.Textbox(label="Dataset",    placeholder="openwebtext")
+                    hfconfig  = gr.Textbox(label="Config",     placeholder="(optional)")
+                    hfsplit   = gr.Textbox(label="Split",      value="train")
+                    hffield   = gr.Textbox(label="Text field", value="text")
+                with gr.Row():
+                    hfportion = gr.Slider(0.001, 1.0, 0.05,  step=0.001, label="Fraction")
+                    hfmax     = gr.Number(value=20000, label="Max rows (0 = all)")
 
-        with gr.Tab("Generate"):
+            gr.Markdown("### Core parameters")
             with gr.Row():
-                seed_txt=gr.Textbox(label="Seed text"); instr_txt=gr.Textbox(label="Instruction text")
-            with gr.Row():
-                n_sents  =gr.Slider(1,16,value=4,step=1,label="Sentences")
-                toks_sent=gr.Slider(10,120,value=80,step=5,label="Tokens/sentence")
-                and_w    =gr.Slider(0.0,1.0,value=0.9,step=0.05,label="AND weight")
-                temp     =gr.Slider(0.5,15.0,value=15.0,step=0.1,label="Temperature")
-                show_tr  =gr.Checkbox(value=True,label="Show traces")
-            with gr.Row():
-                gr.Markdown("### Upload Image (Neural Vessel Carrier)")
-            with gr.Row():
-                try:
-                    art_img = gr.ImageEditor(type="numpy", label="Upload Pic (Modulated by Arduino)", image_mode="RGB")
-                except AttributeError:
-                    art_img = gr.Image(tool="color-sketch", type="numpy", label="Upload Pic (Modulated by Arduino)")
+                syn_w   = gr.Slider(0.0, 2.0,  0.10, step=0.01, label="syn_weight")
+                trans_w = gr.Slider(0.0, 2.0,  0.90, step=0.01, label="trans_weight")
+                syn_k   = gr.Slider(1,   64,   8,    step=1,    label="syn_k")
+                rff_dim = gr.Slider(4,   256,  32,   step=4,    label="rff_dim")
+                nystrom = gr.Slider(2,   64,   16,   step=2,    label="nystrom_m")
 
-                with gr.Column():
-                    gr.Markdown("**Live Arduino Stream (A0)**")
-                    live_arduino_ui = gr.Slider(0.0, 1.0, value=1.0, interactive=False, label="Current Autonomic Carrier Intensity")
-                    refresh_arduino_btn = gr.Button("Refresh Sensor Value")
-                    with gr.Row():
-                        save_arduino_btn = gr.Button("Save Autonomic State")
-                        load_arduino_btn = gr.Button("Load Autonomic State")
-                    autonomic_status_out = gr.Textbox(label="Save/Load Status", interactive=False, lines=1)
+            gr.Markdown("### Aniso / Ripple")
+            with gr.Row():
+                ooi_w = gr.Slider(0.0, 5.0, 0.50, step=0.05, label="aniso_ooi_weight")
+                rep_w = gr.Slider(0.0, 5.0, 0.50, step=0.05, label="aniso_repulsion_weight")
+                rpl_w = gr.Slider(0.0, 5.0, 0.50, step=0.05, label="ripple_weight")
+                rpl_k = gr.Slider(1,  20,   5,    step=1,    label="ripple_k_stubs")
 
-            gen_btn =gr.Button("Generate")
-            gen_out =gr.Textbox(lines=8,  label="Generated text")
-            prop_out=gr.Textbox(lines=6,  label="Surjected Propositions")
-            cot_out =gr.Textbox(lines=12, label="CoT traces")
-            step_out=gr.Textbox(lines=16, label="Step traces (cardan orbit + spag mixer norms shown)")
+            gr.Markdown("### Spaghetti / Cardan / Mirror")
+            with gr.Row():
+                spag_c   = gr.Slider(0.0, 1.0,  0.35, step=0.01, label="spaghetti_coupling")
+                cardan_k = gr.Slider(8,   512,  64,   step=8,    label="cardan_aperture_k")
+                cardan_lw= gr.Slider(0.0, 50.0, 8.0,  step=0.5,  label="cardan_logit_weight")
+                mirror_a = gr.Slider(0.0, 1.0,  0.35, step=0.01, label="mirror_alpha")
 
-            refresh_arduino_btn.click(fn=lambda: LATEST_AUTONOMIC_VAL, inputs=[], outputs=[live_arduino_ui])
-            save_arduino_btn.click(fn=save_autonomic_ui, inputs=[], outputs=[autonomic_status_out])
-            load_arduino_btn.click(fn=load_autonomic_ui, inputs=[], outputs=[autonomic_status_out, live_arduino_ui])
-            gen_btn.click(_gui_generate,
-                inputs=[seed_txt,instr_txt,n_sents,toks_sent,and_w,temp,show_tr,art_img],
-                outputs=[gen_out,cot_out,step_out,prop_out])
+            init_btn = gr.Button("🚀  Initialise + Train", variant="primary")
+            init_out = gr.Textbox(lines=18, label="Init output", show_copy_button=True)
+
+            init_btn.click(
+                gui_init,
+                inputs=[mode, filein,
+                        hfname, hfconfig, hfsplit, hffield, hfportion, hfmax,
+                        syn_w, trans_w, syn_k, rff_dim, nystrom,
+                        ooi_w, rep_w, rpl_w, rpl_k, spag_c,
+                        cardan_k, mirror_a, cardan_lw],
+                outputs=init_out,
+            )
+
+        # ══════════════════════════════════════════════════════════════════
+        with gr.Tab("🔍  2 · Debug"):
+            debug_btn = gr.Button("Check engine status")
+            debug_out = gr.Textbox(lines=8, label="Status")
+            debug_btn.click(engine_status, outputs=debug_out)
+
+        # ══════════════════════════════════════════════════════════════════
+        with gr.Tab("📈  3 · Fit Line"):
+            with gr.Row():
+                fl_epochs  = gr.Slider(10, 1000, 200,   step=10,    label="Epochs")
+                fl_lr      = gr.Slider(1e-5, 1e-2, 3e-4, step=1e-5, label="Learning rate")
+                fl_maxstep = gr.Slider(1000, 200000, 50000, step=1000, label="Max replay steps")
+            with gr.Row():
+                fl_train = gr.Button("🏋️  Train FittedLine", variant="primary")
+                fl_path  = gr.Textbox(value="fitted_line_v18rp_cardan.pt", label="Load path")
+                fl_load  = gr.Button("📂  Load weights")
+            fl_out = gr.Textbox(lines=16, label="Report", show_copy_button=True)
+            fl_train.click(gui_fitline,  inputs=[fl_epochs, fl_lr, fl_maxstep], outputs=fl_out)
+            fl_load.click (gui_load_fitted, inputs=[fl_path], outputs=fl_out)
+
+        # ══════════════════════════════════════════════════════════════════
+        with gr.Tab("✍️  4 · Generate"):
+            with gr.Row():
+                seed_txt  = gr.Textbox(label="Seed text",   placeholder="The algorithm began…")
+                instr_txt = gr.Textbox(label="Instruction",
+                                       value="You are a computational algorithm.",
+                                       lines=2)
+            with gr.Row():
+                nsents     = gr.Slider(1,  16,  4,    step=1,   label="Sentences")
+                tokpersent = gr.Slider(10, 200, 80,   step=5,   label="Tokens / sentence")
+                and_w      = gr.Slider(0.0, 1.0, 0.9, step=0.01,label="AND weight")
+                temp       = gr.Slider(0.5, 15.0,2.0, step=0.1, label="Temperature")
+            show_tr = gr.Checkbox(value=True, label="Show traces")
+
+            with gr.Accordion("Arduino / art canvas (optional)", open=False):
+                artimg = gr.ImageEditor(label="Art canvas", type="numpy")
+                with gr.Row():
+                    auto_disp   = gr.Slider(0.0, 1.0, 1.0, interactive=False,
+                                            label="Autonomic value")
+                    refresh_btn = gr.Button("🔄 Refresh")
+                    refresh_btn.click(lambda: LATEST_AUTONOMIC_VAL, outputs=auto_disp)
+
+            gen_btn  = gr.Button("⚡  GENERATE", variant="primary", size="lg")
+            gen_out  = gr.Textbox(lines=10, label="Generated text", show_copy_button=True)
+            with gr.Row():
+                cot_out  = gr.Textbox(lines=6, label="CoT trace")
+                step_out = gr.Textbox(lines=6, label="Step trace")
+            prop_out = gr.Textbox(lines=4,  label="Propositions")
+
+            gen_btn.click(
+                gui_generate,
+                inputs=[seed_txt, instr_txt, nsents, tokpersent,
+                        and_w, temp, show_tr, artimg],
+                outputs=[gen_out, cot_out, step_out, prop_out],
+            )
+
+        # ══════════════════════════════════════════════════════════════════
+        with gr.Tab("💾  5 · Save / Load"):
+            gr.Markdown("### Engine pickle")
+            with gr.Row():
+                eng_path = gr.Textbox(value="v18rp_cardan_engine.pkl", label="Path")
+                gr.Button("💾 Save engine").click(
+                    gui_engine_save, inputs=[eng_path], outputs=gr.Textbox(label="Status"))
+                gr.Button("📂 Load engine").click(
+                    gui_engine_load, inputs=[eng_path], outputs=gr.Textbox(label="Status"))
+
+            gr.Markdown("### Autonomic value")
+            with gr.Row():
+                gr.Button("💾 Save autonomic").click(gui_auto_save,
+                    outputs=gr.Textbox(label="Save status"))
+                auto_load_out = gr.Textbox(label="Load status")
+                auto_val_out  = gr.Slider(0.0, 1.0, 1.0, interactive=False,
+                                          label="Loaded value")
+                gr.Button("📂 Load autonomic").click(gui_auto_load,
+                    outputs=[auto_load_out, auto_val_out])
+
     return demo
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 21 — ENTRY POINT
-# ════════════════════════════════════════════════════════════════════════════
-
+# ─── ENTRY POINT ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser=argparse.ArgumentParser(description="V18-RP-ANISO-RIPPLE-SPAGHETTI-CARDAN")
-    parser.add_argument("--corpus",         default="")
-    parser.add_argument("--fit_line",       action="store_true")
-    parser.add_argument("--fit_epochs",     type=int,   default=200)
-    parser.add_argument("--fit_lr",         type=float, default=3e-4)
-    parser.add_argument("--fit_steps",      type=int,   default=50000)
-    parser.add_argument("--seed",           default="")
-    parser.add_argument("--instruction",    default="")
-    parser.add_argument("--sentences",      type=int,   default=4)
-    parser.add_argument("--save",           default="")
-    parser.add_argument("--load",           default="")
-    parser.add_argument("--gui",            action="store_true")
-    parser.add_argument("--ooi_weight",     type=float, default=ANISO_OOI_W)
-    parser.add_argument("--rep_weight",     type=float, default=ANISO_REPULSION_W)
-    parser.add_argument("--rpl_weight",     type=float, default=RIPPLE_WEIGHT)
-    parser.add_argument("--rpl_k",          type=int,   default=RIPPLE_K_STUBS)
-    parser.add_argument("--spag_coupling",  type=float, default=SPAGHETTI_COUPLING)
-    parser.add_argument("--cardan_k",       type=int,   default=CARDAN_APERTURE_K)
-    parser.add_argument("--cardan_lw",      type=float, default=CARDAN_LOGIT_WEIGHT)
-    parser.add_argument("--mirror_alpha",   type=float, default=MIRROR_ALPHA)
-    args=parser.parse_args()
-
-    build_gradio_app().launch(share=False)
+    app = build_app()
+    app.launch(
+        server_name = "127.0.0.1",
+        share       = False,
+        show_error  = True,
+        inbrowser   = True,
+    )
