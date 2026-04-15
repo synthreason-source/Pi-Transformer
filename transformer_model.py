@@ -3176,17 +3176,8 @@ import torch
 import numpy as np
 import gradio as gr
 
-# ─── IMPORT ENGINE ────────────────────────────────────────────────────────────
-try:
-    import v18_engine as _eng
-    V18RPEngine = _eng.V18RPEngine
-    LATEST_AUTONOMIC_VAL = _eng.LATEST_AUTONOMIC_VAL   # shared global
-    print("✅ v18_engine imported")
-except Exception as _ie:
-    print(f"❌ Import failed: {_ie}")
-    print("   Rename paste.txt → v18_engine.py then rerun")
-    V18RPEngine = None
-    LATEST_AUTONOMIC_VAL = 1.0
+
+LATEST_AUTONOMIC_VAL = 1.0
 
 # ─── GLOBAL STATE ─────────────────────────────────────────────────────────────
 engine: Optional[object] = None
@@ -3304,35 +3295,49 @@ def gui_load_fitted(path):
         return f"❌ {traceback.format_exc()}"
 
 # ─── 4. GENERATE ──────────────────────────────────────────────────────────────
-def gui_generate(instruction, seed_text, max_new_tokens, temp, and_weight,
-                 artimage, fitted_line_active, lateral_coupling, autonomic_scale):
-    global LATEST_AUTONOMIC_VAL
-    LATEST_AUTONOMIC_VAL = autonomic_scale  # Override Arduino
+def gui_generate(seed, instruction, nsents, tokssent, andw, temp, showtr, artimage):
+    global LATEST_AUTONOMIC_VAL, engine
     
-    if not engine._initialised:
-        return "Engine not trained. Click TRAIN first.", None, None
+    if engine is None or not engine._initialised:
+        return ("🚫 Engine not trained. Click TRAIN first.", "", "", "")
     
-    # FIXED: Handle numpy array OR dict from Gradio
+    # BULLETPROOF IMAGE [web:19]
     img = None
     if artimage is not None:
-        if isinstance(artimage, dict):
-            img = (artimage.get("composite") or 
-                   artimage.get("image") or 
-                   artimage.get("background"))
-        else:  # numpy array
+        if isinstance(artimage, (np.ndarray, torch.Tensor)):
             img = artimage
+        elif isinstance(artimage, dict):
+            for key in ['composite', 'image', 'background']:
+                val = artimage.get(key)
+                if val is not None and isinstance(val, (np.ndarray, torch.Tensor)):
+                    img = val
+                    break
+        else:
+            try:
+                img = np.array(artimage)
+            except:
+                pass
     
-    engine.instr_dist.set_instruction(instruction)  # Mirror updates here
-    trace = engine.begin_sentence(seed_tokens=tokenize(seed_text), 
-                                  total_tokens=max_new_tokens)
-    output = generate_passage_rp(engine, max_new_tokens=max_new_tokens,
-                                temp=float(temp), and_weight=float(and_weight),
-                                art_canvas_image=img,
-                                fitted_line_active=fitted_line_active=="True",
-                                lateral_coupling=float(lateral_coupling))
+    try:
+        # FIXED: CORRECT ATTR PATH [file:18]
+        engine.walker.instr_dist.set_instruction(instruction)
+        
+        output = engine.generate(
+            seed_text=seed, instruction_text=instruction,
+            num_sentences=int(nsents), tokens_per_sent=int(tokssent),
+            and_weight=float(andw), temperature=float(temp)
+        )
+        
+        text = detokenize(output["tokens"])
+        cot = output.get("cot", "")
+        steps = output.get("steps", "")
+        props = output.get("props", "")
+        
+        return text, cot, steps, props
     
-    return (detokenize(output["tokens"]) + "\n\n" + trace.render() + 
-            f"\n\n{engine.algo_report()}"), output["debug_img"], None
+    except Exception as e:
+        import traceback
+        return (f"❌ {str(e)}", traceback.format_exc(), "", "")
 
 # ─── 5. AUTONOMIC ─────────────────────────────────────────────────────────────
 def gui_auto_save():
