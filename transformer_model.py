@@ -3139,7 +3139,7 @@ def compute_dataset_baseline(walker, temp, and_weight, hf_dataset_name="squad"):
     try:
         ds = load_dataset(hf_dataset_name, split="train", streaming=True)
         sample_text = next(iter(ds))['context']
-        toks = tokenize(sample_text)[:40]
+        toks = tokenize(sample_text)
         if len(toks) < 3: return -5.0
         prob_sum = 0.0; valid_steps = 0; w1, w2 = toks[0], toks[1]
         for i in range(2, len(toks)):
@@ -3593,51 +3593,46 @@ def gui_load_fitted(path):
 #  4. GENERATE 
 def gui_generate(seed, instruction, nsents, tokssent, andw, temp, showtr, artimage):
     global LATEST_AUTONOMIC_VAL, engine
-    
-    if engine is None or not hasattr(engine, '_initialised') or not engine._initialised:
+
+    if engine is None or not getattr(engine, '_initialised', False):
         return ("Engine not trained. Click TRAIN first.", "", "", "")
-    
-    # IMAGE SAFE [web:19]
-    img = None
-    if artimage is not None and not isinstance(artimage, (str, type(None))):
-        try:
-            if isinstance(artimage, dict):
-                img = next((v for k, v in artimage.items() 
-                           if isinstance(v, (np.ndarray, torch.Tensor))), None)
-            else:
-                img = artimage
-        except:
-            pass
-    
+
     try:
-        # CORRECT ENGINE CALL [file:18]
-        engine.walker.instr_dist.set_instruction(instruction)
-        
-        raw_output = engine.generate(
-            seed_text=seed or "The", 
-            instruction_text=instruction or "",
-            num_sentences=int(nsents), 
-            tokens_per_sent=int(tokssent),
-            and_weight=float(andw), 
-            temperature=float(temp)
+        result = engine.generate(
+            seed_text        = seed or "The",
+            instruction_text = instruction or "You are a computational algorithm.",
+            num_sentences    = int(nsents),
+            tokens_per_sent  = int(tokssent),
+            and_weight       = float(andw),
+            temperature      = float(temp),
+            return_traces    = bool(showtr),   # ← was never passed before
         )
-        
-        # SAFE OUTPUT PARSING
-        if isinstance(raw_output, dict) and "tokens" in raw_output:
-            text = detokenize(raw_output["tokens"])
-            cot = raw_output.get("cot", "")
-            steps = raw_output.get("steps", "")
-            props = raw_output.get("props", "")
+
+        if bool(showtr) and isinstance(result, tuple):
+            text, cot, steps, props = result
         else:
-            # Handle string error or other
-            text = str(raw_output)[:1000]
-            cot = steps = props = ""
-        
+            text  = str(result)
+            cot   = ""
+            steps = ""
+            props = ""
+
+        # Append step traces from walker directly as a fallback
+        if not steps and hasattr(engine, 'walker') and engine.walker is not None:
+            steps = engine.walker.step_trace_report(max_steps=40)
+
+        # Append propositional statements if present
+        if not props and hasattr(engine.walker, '_prop_traces') and engine.walker._prop_traces:
+            prop_lines = []
+            for sent_idx, stmts in engine.walker._prop_traces[-4:]:
+                for s in stmts:
+                    prop_lines.append(s.render())
+            props = "\n".join(prop_lines)
+
         return text, cot, steps, props
-        
+
     except Exception as e:
         import traceback
-        return (f"{str(e)}", traceback.format_exc()[:500], "", "")
+        return (f"Error: {e}", traceback.format_exc()[:800], "", "")
 
 #  5. AUTONOMIC 
 def gui_auto_save():
