@@ -303,7 +303,7 @@ def main():
             model,
             seed_text=input("USER: "),
             max_new_words=640,
-            temperature=110.2,
+            temperature=1110.2,
             top_k=140,
             top_p=10.1
         ))
