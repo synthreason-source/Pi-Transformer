@@ -3304,57 +3304,35 @@ def gui_load_fitted(path):
         return f"❌ {traceback.format_exc()}"
 
 # ─── 4. GENERATE ──────────────────────────────────────────────────────────────
-def gui_generate(seed, instruction, nsents, tokspersent,
-                 and_weight, temperature, show_traces, artimage=None):
+def gui_generate(instruction, seed_text, max_new_tokens, temp, and_weight,
+                 artimage, fitted_line_active, lateral_coupling, autonomic_scale):
     global LATEST_AUTONOMIC_VAL
-    if not _ready():
-        return "❌ Engine not ready — run Init/Train first", "", "", ""
-
-    # Sync autonomic value into engine module
-    if V18RPEngine is not None:
-        try:
-            _eng.LATEST_AUTONOMIC_VAL = LATEST_AUTONOMIC_VAL
-        except Exception:
-            pass
-
-    try:
-        # Optional: push art-image canvas into walker
-        if artimage is not None and hasattr(engine, "walker"):
-            walker = engine.walker
-            if hasattr(walker, "_contingent"):
-                img = (artimage.get("composite")
-                       or artimage.get("image")
-                       or artimage.get("background"))
-                if img is not None:
-                    modulated = (img.astype(np.float32) * LATEST_AUTONOMIC_VAL
-                                 ).clip(0, 255).astype(np.uint8)
-                    if hasattr(walker._contingent, "canvas"):
-                        walker._contingent.canvas.update_art(modulated)
-
-        result = engine.generate(
-            seed_text        = seed or "",
-            instruction_text = instruction or "",
-            num_sentences    = int(nsents),
-            tokens_per_sent  = int(tokspersent),
-            and_weight       = float(and_weight),
-            temperature      = float(temperature),
-            return_traces    = True,
-        )
-
-        # generate() returns (text, cot_text, step_text, prop_text)
-        if isinstance(result, tuple) and len(result) == 4:
-            text, cot_text, step_text, prop_text = result
-        else:
-            text      = str(result)
-            cot_text  = step_text = prop_text = ""
-
-        if not show_traces:
-            cot_text = step_text = prop_text = "(traces disabled)"
-
-        return text, cot_text, step_text, prop_text
-
-    except Exception:
-        return f"❌ Generate error:\n{traceback.format_exc()}", "", "", ""
+    LATEST_AUTONOMIC_VAL = autonomic_scale  # Override Arduino
+    
+    if not engine._initialised:
+        return "Engine not trained. Click TRAIN first.", None, None
+    
+    # FIXED: Handle numpy array OR dict from Gradio
+    img = None
+    if artimage is not None:
+        if isinstance(artimage, dict):
+            img = (artimage.get("composite") or 
+                   artimage.get("image") or 
+                   artimage.get("background"))
+        else:  # numpy array
+            img = artimage
+    
+    engine.instr_dist.set_instruction(instruction)  # Mirror updates here
+    trace = engine.begin_sentence(seed_tokens=tokenize(seed_text), 
+                                  total_tokens=max_new_tokens)
+    output = generate_passage_rp(engine, max_new_tokens=max_new_tokens,
+                                temp=float(temp), and_weight=float(and_weight),
+                                art_canvas_image=img,
+                                fitted_line_active=fitted_line_active=="True",
+                                lateral_coupling=float(lateral_coupling))
+    
+    return (detokenize(output["tokens"]) + "\n\n" + trace.render() + 
+            f"\n\n{engine.algo_report()}"), output["debug_img"], None
 
 # ─── 5. AUTONOMIC ─────────────────────────────────────────────────────────────
 def gui_auto_save():
