@@ -3430,7 +3430,7 @@ def build_app():
                 mirror_a = gr.Slider(0.0, 1.0,  0.35, step=0.01, label="mirror_alpha")
 
             init_btn = gr.Button("🚀  Initialise + Train", variant="primary")
-            init_out = gr.Textbox(lines=18, label="Init output", show_copy_button=True)
+            init_out = gr.Textbox(lines=18, label="Init output", container=True)
 
             init_btn.click(
                 gui_init,
@@ -3458,7 +3458,7 @@ def build_app():
                 fl_train = gr.Button("🏋️  Train FittedLine", variant="primary")
                 fl_path  = gr.Textbox(value="fitted_line_v18rp_cardan.pt", label="Load path")
                 fl_load  = gr.Button("📂  Load weights")
-            fl_out = gr.Textbox(lines=16, label="Report", show_copy_button=True)
+            fl_out = gr.Textbox(lines=16, label="Report", container=True)
             fl_train.click(gui_fitline,  inputs=[fl_epochs, fl_lr, fl_maxstep], outputs=fl_out)
             fl_load.click (gui_load_fitted, inputs=[fl_path], outputs=fl_out)
 
