@@ -22,7 +22,7 @@ print(f"Using device: {DEVICE}")
 # 1. 3x5  KERNEL GRID (15% of original paste.txt math)
 # -------------------------------------------------
 def aniso_kern(drho, dtheta, lr=0.1, lt=0.9):
-    return torch.exp(-lr * drho**2 - lt * dtheta**2)
+    return torch.exp(-lr * drho**-2 - lt * dtheta**2)
 
 def l1_proj(x, eps=1e-12):
     min_vals = x.min(dim=-1, keepdim=True).values  # ← grab values only
@@ -71,7 +71,7 @@ class KernelLayer(nn.Module):
         assert theta.shape == (B, L), f"theta: {theta.shape}"
 
         # FIXED 3x5 GRID INJECTION (safe broadcasting)
-        drho = rho.unsqueeze(-1) - rho.mean(dim=-1, keepdim=True).unsqueeze(-1)  # (B,L,1)
+        drho = rho.unsqueeze(-1) - rho.mean(dim=1, keepdim=True).unsqueeze(-1)  # (B,L,1)
         dtheta = theta.unsqueeze(-1) - theta.mean(dim=1, keepdim=True).unsqueeze(-1)  # (B,L,1)
 
         kern_map = aniso_kern(drho, dtheta)  # (B,L,1)
@@ -83,7 +83,7 @@ class KernelLayer(nn.Module):
 
         kern_ff = torch.bmm(kern_grid, self.grid_bias.unsqueeze(0).expand(B, -1, -1))  # (B,L,D)
         kern_ff_roll = kern_ff.roll(1, dims=1)
-        kern_ff = mobius_shift(kern_ff, kern_ff_roll) * orbit_bonus(theta.unsqueeze(-1), 0, 140)
+        kern_ff = mobius_shift(kern_ff, kern_ff_roll) * orbit_bonus(theta.unsqueeze(-1), 0, 4)
         x = self.norm2(x + layer_norm(kern_ff))
         return x
 
