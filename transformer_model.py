@@ -3267,10 +3267,11 @@ def generate_passage_rp(walker, lm,
                 cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
 
                 # Bilinear lateral automorphism
-                cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
+                for step in range(12 + tokens_per_sent):
+                    cands, probs = apply_bilinear_lateral_automorphism(cands, probs, lateral_coupling=-0.35)
 
-                # Bottema 2D Theorem Bridge
-                cands, probs = apply_bottema_probability_bridge(cands, probs, gamma=0.20)
+                    # Bottema 2D Theorem Bridge
+                    cands, probs = apply_bottema_probability_bridge(cands, probs, gamma=0.20)
 
                 if not cands: break
 
