@@ -9,7 +9,7 @@ import re
 
 max_new_tokens = 200
 
-
+D = 4096
 # =========================
 # 1. SEEDING
 # =========================
@@ -130,7 +130,7 @@ class KernelLLM(nn.Module):
         super().__init__()
 
         self.tok_emb = nn.Embedding(vocab_size, d_model)
-        self.pos_emb = nn.Embedding(4096, d_model)
+        self.pos_emb = nn.Embedding(D, d_model)
 
         self.kernel = EfferenceKernelStack(d_model)
 
@@ -143,6 +143,10 @@ class KernelLLM(nn.Module):
 
     def forward(self, idx):
         B, T = idx.shape
+
+        if T > D:
+            idx = idx[:, -D:]
+            T = D
 
         pos = torch.arange(T, device=idx.device).unsqueeze(0)
 
@@ -192,7 +196,7 @@ if __name__ == "__main__":
 
     tokenizer = TrigramTokenizer(text)
 
-    data = tokenizer.encode(text[:22000]).unsqueeze(0)
+    data = tokenizer.encode(text).unsqueeze(0)
 
     model = KernelLLM(tokenizer.vocab_size)
 
