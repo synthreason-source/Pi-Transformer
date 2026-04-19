@@ -42,25 +42,12 @@ class TrigramTokenizer:
     def encode(self, text):
         words = text.lower().split()
         tokens = []
-        
-        # Try trigrams first
         for i in range(len(words) - 2):
             tri = " ".join(words[i:i+3])
             if tri in self.stoi:
                 tokens.append(self.stoi[tri])
-        
-        # If no trigrams matched, construct a seed from individual word hashes
         if len(tokens) == 0:
-            word_indices = [hash(w) for w in words]
-            if word_indices:
-                # Combine word hashes into a single deterministic token index
-                combined = 0
-                for idx in word_indices:
-                    combined = idx  # XOR fold
-                tokens = [combined % self.vocab_size]
-            else:
-                tokens = [hash(text) % self.vocab_size]
-    
+            tokens = [hash(text) % self.vocab_size]
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
@@ -148,22 +135,49 @@ class Block(nn.Module):
 # ============================
 # 6. FULL MODEL
 # ============================
+# ============================
+# CARDAN GRILLE LAYER
+# ============================
+class CardanGrilleLayer(nn.Module):
+    """
+    Learns a soft binary mask over sequence positions.
+    Each of the D positions gets one learnable weight; sigmoid squashes
+    it to (0, 1) so gradients flow freely, with straight-through
+    binarisation available at inference if you want hard 0/1 holes.
+    """
+    def __init__(self, max_len=D, hard=False, threshold=0.5):
+        super().__init__()
+        self.hard = hard
+        self.threshold = threshold
+        # Initialise near 1 so the grille starts mostly open
+        self.logits = nn.Parameter(torch.ones(max_len))
+
+    def forward(self, x):
+        B, T, d = x.shape
+        mask = torch.sigmoid(self.logits[:T])          # [T]  soft gate
+        if self.hard:
+            # Straight-through estimator: hard threshold in forward,
+            # soft gradient in backward
+            mask = (mask > self.threshold).float() - mask.detach() + mask
+        return x * mask.unsqueeze(0).unsqueeze(-1)     # [B, T, d_model]
+
+    def revealed_positions(self, T):
+        """Returns indices of 'open' holes (mask > 0.5) for inspection."""
+        with torch.no_grad():
+            m = torch.sigmoid(self.logits[:T])
+        return (m > 0.5).nonzero(as_tuple=True)[0].tolist()
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=4):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(D, d_model)
-        self.kernel = EfferenceKernelStack(d_model)
-        self.blocks = nn.Sequential(*[
-            Block(d_model, n_heads) for _ in range(n_layers)
-        ])
-        self.ln = nn.LayerNorm(d_model)
-        # Add a DNN block after the Transformer
-        self.dnn = nn.Sequential(
-            nn.Linear(d_model, 2 * d_model),
-            nn.GELU(),
-            nn.Linear(2 * d_model, 2 * d_model),
-            nn.GELU(),
+        self.kernel  = EfferenceKernelStack(d_model)
+        self.grille  = CardanGrilleLayer(max_len=D)   # ← added
+        self.blocks  = nn.Sequential(*[Block(d_model, n_heads) for _ in range(n_layers)])
+        self.ln      = nn.LayerNorm(d_model)
+        self.dnn     = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model), nn.GELU(),
+            nn.Linear(2 * d_model, 2 * d_model), nn.GELU(),
             nn.Linear(2 * d_model, d_model),
             nn.LayerNorm(d_model),
         )
@@ -175,17 +189,22 @@ class KernelLLM(nn.Module):
             idx = idx[:, -D:]
             T = D
         pos = torch.arange(T, device=idx.device).unsqueeze(0)
-        x = self.tok_emb(idx) + self.pos_emb(pos)
-        emb = self.tok_emb(idx).mean(dim=1)  # [B, d_model]
+        x   = self.tok_emb(idx) + self.pos_emb(pos)
+
+        # Sliding context window → efference features
+        window_size   = min(32, T)
+        context_tokens = idx[:, -window_size:]
+        emb   = self.tok_emb(context_tokens).mean(dim=1)
         rho   = torch.sigmoid(emb[:, 0])
         theta = torch.sigmoid(emb[:, 1])
         sigma = torch.sigmoid(emb[:, 2])
-        kernel_feat = self.kernel.efference_features(rho, theta, sigma)
-        x = x + kernel_feat.unsqueeze(1)
-        x = self.blocks(x)
+        x = x + self.kernel.efference_features(rho, theta, sigma).unsqueeze(1)
 
-        x = self.dnn(x) # <-- DNN added here
-        x = self.ln(x) 
+        x = self.grille(x)   # ← Cardan grille masks positions here
+
+        x = self.blocks(x)
+        x = self.dnn(x)
+        x = self.ln(x)
         return self.head(x)
 
 # ============================
