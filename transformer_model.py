@@ -123,6 +123,9 @@ class Block(nn.Module):
 # ============================
 # 6. FULL MODEL
 # ============================
+# ============================
+# 6. FULL MODEL (with DNN)
+# ============================
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=4):
         super().__init__()
@@ -133,8 +136,17 @@ class KernelLLM(nn.Module):
             Block(d_model, n_heads) for _ in range(n_layers)
         ])
         self.ln = nn.LayerNorm(d_model)
+        # Add a DNN block after the Transformer
+        self.dnn = nn.Sequential(
+            nn.Linear(d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Linear(2 * d_model, 2 * d_model),
+            nn.GELU(),
+            nn.Linear(2 * d_model, d_model),
+            nn.LayerNorm(d_model),
+        )
         self.head = nn.Linear(d_model, vocab_size)
-        
+
     def forward(self, idx):
         B, T = idx.shape
         if T > D:
@@ -149,6 +161,7 @@ class KernelLLM(nn.Module):
         x = x + kernel_feat.unsqueeze(1)
         x = self.blocks(x)
         x = self.ln(x)
+        x = self.dnn(x)              # <-- DNN added here
         return self.head(x)
 
 # ============================
