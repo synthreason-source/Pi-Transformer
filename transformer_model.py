@@ -6,13 +6,14 @@ import pandas as pd
 import random
 import numpy as np
 import re
+import pickle
 
 max_new_tokens = 200
-
 D = 4096
-# =========================
+
+# ============================
 # 1. SEEDING
-# =========================
+# ============================
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -22,192 +23,170 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
-# =========================
+# ============================
 # 2. TRIGRAM TOKENIZER
-# =========================
+# ============================
+
 class TrigramTokenizer:
     def __init__(self, text):
         words = text.lower().split()
-
         trigrams = []
         for i in range(len(words) - 2):
             trigrams.append(" ".join(words[i:i+3]))
-
         vocab = sorted(set(trigrams))
         random.shuffle(vocab)
         self.stoi = {t: i for i, t in enumerate(vocab)}
         self.itos = {i: t for t, i in self.stoi.items()}
-
         self.vocab_size = len(vocab)
 
     def encode(self, text):
         words = text.lower().split()
-
         tokens = []
         for i in range(len(words) - 2):
             tri = " ".join(words[i:i+3])
             if tri in self.stoi:
                 tokens.append(self.stoi[tri])
-
         if len(tokens) == 0:
             tokens = [0]
-
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
         return " ".join([self.itos[int(t)] for t in tokens])
-
-
-# =========================
-# 3. LOAD TEXT DATASET
-# =========================
+        
+def save_tokenizer(tokenizer, path="tokenizer.pkl"):
+    with open(path, "wb") as f:
+        pickle.dump(tokenizer, f)
+        
+def load_tokenizer(path="tokenizer.pkl"):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+        
+# ============================
+# 3. LOAD TEXT DATASET/MODEL
+# ============================
 def load_text(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
+def save_model(model, path="model.pt"):
+    torch.save(model.state_dict(), path)
+    print(f"Model saved to {path}")
 
-# =========================
+def load_model(model, path="model.pt"):
+    model.load_state_dict(torch.load(path))
+    model.eval()
+    print(f"Model loaded from {path}")
+    return model
+    
+# ============================
 # 4. KERNEL MODULE
-# =========================
+# ============================
 class EfferenceKernelStack(nn.Module):
     def __init__(self, d_model=128, device="cpu", seed=42):
         super().__init__()
-
         self.lambdas = nn.Parameter(torch.tensor([8.0, 4.0, 4.0]))
-
         g = torch.Generator(device=device)
         g.manual_seed(seed)
-
         self.omega_eff = nn.Parameter(torch.randn(3, d_model, 1, generator=g, device=device))
         self.bias_eff = nn.Parameter(torch.randn(3, d_model, generator=g, device=device))
 
     def efference_features(self, rho, theta, sigma):
         rho_eff = rho * torch.cos(theta)
-
         x = torch.stack([rho_eff, theta, sigma], dim=1).unsqueeze(-1)
-
         proj = torch.einsum("bci,oid->bcd", x, self.omega_eff)
         proj = proj + self.bias_eff.unsqueeze(0)
-
         return torch.cos(proj).mean(dim=1)
 
-
-# =========================
+# ============================
 # 5. TRANSFORMER BLOCK
-# =========================
+# ============================
 class Block(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
-
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-
         self.ff = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.ReLU(),
             nn.Linear(4 * d_model, d_model),
         )
-
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
 
     def forward(self, x):
         T = x.size(1)
-
         mask = torch.triu(torch.ones(T, T), diagonal=1).bool()
         attn_out, _ = self.attn(x, x, x, attn_mask=mask)
-
         x = self.ln1(x + attn_out)
         x = self.ln2(x + self.ff(x))
         return x
 
-
-# =========================
+# ============================
 # 6. FULL MODEL
-# =========================
+# ============================
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=4):
         super().__init__()
-
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(D, d_model)
-
         self.kernel = EfferenceKernelStack(d_model)
-
         self.blocks = nn.Sequential(*[
             Block(d_model, n_heads) for _ in range(n_layers)
         ])
-
         self.ln = nn.LayerNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size)
-
+        
     def forward(self, idx):
         B, T = idx.shape
-
         if T > D:
             idx = idx[:, -D:]
             T = D
-
         pos = torch.arange(T, device=idx.device).unsqueeze(0)
-
         x = self.tok_emb(idx) + self.pos_emb(pos)
-
         rho = torch.rand(B, device=idx.device)
         theta = torch.rand(B, device=idx.device)
         sigma = torch.rand(B, device=idx.device)
-
         kernel_feat = self.kernel.efference_features(rho, theta, sigma)
         x = x + kernel_feat.unsqueeze(1)
-
         x = self.blocks(x)
         x = self.ln(x)
-
         return self.head(x)
 
-
-# =========================
+# ============================
 # 7. GENERATION
-# =========================
+# ============================
 @torch.no_grad()
 def generate(model, idx, max_new_tokens=100, temperature=1.0):
     model.eval()
-
     for _ in range(max_new_tokens):
         logits = model(idx)
-
         logits = logits[:, -1, :] / temperature
         probs = F.softmax(logits, dim=-1)
-
         next_token = torch.multinomial(probs, 1)
-
         idx = torch.cat([idx, next_token], dim=1)
-
     return idx
 
-
-# =========================
+# ============================
 # 8. MAIN
-# =========================
+# ============================
 if __name__ == "__main__":
 
     set_seed(42)
-
-    text = load_text("singlekb.txt")
-
-    tokenizer = TrigramTokenizer(text)
-
-    data = tokenizer.encode(text).unsqueeze(0)
-
-    model = KernelLLM(tokenizer.vocab_size)
-
-    print("Logits shape:", model(data).shape)
+    mode = input("train or load? (t/l):")
+    if mode == "t":
+        text = load_text("singlekb.txt")
+        tokenizer = TrigramTokenizer(text)
+        data = tokenizer.encode(text).unsqueeze(0)
+        model = KernelLLM(tokenizer.vocab_size)
+        save_model(model)
+        save_tokenizer(tokenizer)
+    else:
+        tokenizer = load_tokenizer()
+        model = KernelLLM(tokenizer.vocab_size)
+        model = load_model(model)
     while True:
         # ---- SEED INPUT (THIS NOW WORKS PROPERLY) ----
         seed_text = input("USER: ")
-
         prompt = tokenizer.encode(seed_text).unsqueeze(0)
-
         generated = generate(model, prompt, max_new_tokens)
-
         print("\n--- GENERATED TEXT ---\n")
         print(tokenizer.decode(generated[0].tolist()))
