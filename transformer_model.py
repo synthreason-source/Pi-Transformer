@@ -9,7 +9,7 @@ import re
 import pickle
 
 max_new_tokens = 200
-D = 4096
+D = 2048
 
 # ============================
 # 1. SEEDING
@@ -171,22 +171,55 @@ def generate(model, idx, max_new_tokens=100, temperature=1.0):
 if __name__ == "__main__":
 
     set_seed(42)
-    mode = input("train or load? (t/l):")
+    mode = input("train or load? (t/l): ")
+
     if mode == "t":
         text = load_text("singlekb.txt")
+
         tokenizer = TrigramTokenizer(text)
         data = tokenizer.encode(text).unsqueeze(0)
+
         model = KernelLLM(tokenizer.vocab_size)
+
+        # ---- TRAINING LOOP (ADDED) ----
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+        print("training...")
+        for step in range(3):
+            model.train()
+
+            logits = model(data)
+
+            T = min(logits.size(1), data.size(1) - 1)
+
+            loss = F.cross_entropy(
+                logits[:, :T, :].reshape(-1, tokenizer.vocab_size),
+                data[:, 1:T+1].reshape(-1)
+            )
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            if step % 50 == 0:
+                print(f"step {step} loss {loss.item():.4f}")
+
         save_model(model)
         save_tokenizer(tokenizer)
+
     else:
         tokenizer = load_tokenizer()
+
         model = KernelLLM(tokenizer.vocab_size)
         model = load_model(model)
+
+    # ---- INTERACTIVE LOOP ----
     while True:
-        # ---- SEED INPUT (THIS NOW WORKS PROPERLY) ----
         seed_text = input("USER: ")
+
         prompt = tokenizer.encode(seed_text).unsqueeze(0)
+
         generated = generate(model, prompt, max_new_tokens)
+
         print("\n--- GENERATED TEXT ---\n")
         print(tokenizer.decode(generated[0].tolist()))
