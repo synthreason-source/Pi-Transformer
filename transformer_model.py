@@ -42,12 +42,25 @@ class TrigramTokenizer:
     def encode(self, text):
         words = text.lower().split()
         tokens = []
+        
+        # Try trigrams first
         for i in range(len(words) - 2):
             tri = " ".join(words[i:i+3])
             if tri in self.stoi:
                 tokens.append(self.stoi[tri])
+        
+        # If no trigrams matched, construct a seed from individual word hashes
         if len(tokens) == 0:
-            tokens = [0]
+            word_indices = [hash(w) for w in words]
+            if word_indices:
+                # Combine word hashes into a single deterministic token index
+                combined = 0
+                for idx in word_indices:
+                    combined = idx  # XOR fold
+                tokens = [combined % self.vocab_size]
+            else:
+                tokens = [hash(text) % self.vocab_size]
+    
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
@@ -120,10 +133,16 @@ class Block(nn.Module):
 
     def forward(self, x):
         T = x.size(1)
-        mask = torch.triu(torch.ones(T, T), diagonal=1).bool()
+        mask = torch.triu(torch.ones(T, T, device=x.device), diagonal=1).bool()
+        
+        # Attention residual
         attn_out, _ = self.attn(x, x, x, attn_mask=mask)
         x = self.ln1(x + attn_out)
-        x = self.ln2(x + self.ff(x) + attn_out)
+        
+        # FF residual  
+        ff_out = self.ff(x)
+        x = self.ln2(x + ff_out)
+        
         return x
 
 # ============================
