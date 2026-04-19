@@ -1,1 +1,0 @@
-Proteins bind to different areas of the brain and protein conformation change during a neural spike reshapes the Ag nanocluster coated protein, reshaping changes its electronic state, a direct molecular readout of neural activity and/or physical synaptic connection remodeling.
