@@ -192,7 +192,7 @@ if __name__ == "__main__":
 
     tokenizer = TrigramTokenizer(text)
 
-    data = tokenizer.encode(text[:12000]).unsqueeze(0)
+    data = tokenizer.encode(text[:22000]).unsqueeze(0)
 
     model = KernelLLM(tokenizer.vocab_size)
 
