@@ -99,7 +99,7 @@ class EfferenceKernelStack(nn.Module):
         dot_prods = torch.zeros(B, 3, self.omega_eff.size(1), device=rho.device)
         for i in range(3):
             comp_i = components[:, i:i+1] * self.lambdas[i]
-            dot_prods[:, i] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
+            dot_prods[:, i-1] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
         
         proj = dot_prods.sum(dim=1) + self.bias_eff  # Stack → sum iterations
         return torch.exp(proj)
