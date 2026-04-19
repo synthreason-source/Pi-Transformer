@@ -81,6 +81,25 @@ def load_model(model, path="model.pt"):
 # ============================
 # 4. KERNEL MODULE
 # ============================
+
+class FineAlterableMonad(nn.Module):
+    def __init__(self, d_model, hidden_mult=2):
+        super().__init__()
+        self.pre = nn.LayerNorm(d_model)
+        self.up = nn.Linear(d_model, hidden_mult * d_model)
+        self.down = nn.Linear(hidden_mult * d_model, d_model)
+        self.gate = nn.Parameter(torch.zeros(d_model))
+        self.alpha = nn.Parameter(torch.tensor(1.0))
+        self.bias = nn.Parameter(torch.zeros(d_model))
+
+    def forward(self, x, strength=1.0):
+        y = self.pre(x)
+        y = F.gelu(self.up(y))
+        y = self.down(y)
+        g = torch.sigmoid(self.gate).view(1, 1, -1)
+        return x + self.alpha * strength * g * y + self.bias.view(1, 1, -1)
+        
+        
 class EfferenceKernelStack(nn.Module):
     def __init__(self, d_model=128, device="cpu", seed=42):
         super().__init__()
@@ -172,8 +191,10 @@ class KernelLLM(nn.Module):
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         self.pos_emb = nn.Embedding(D, d_model)
         self.kernel  = EfferenceKernelStack(d_model)
-        self.grille  = CardanGrilleLayer(max_len=D)   # ← added
+        self.grille  = CardanGrilleLayer(max_len=D)
+        self.monad1  = FineAlterableMonad(d_model)
         self.blocks  = nn.Sequential(*[Block(d_model, n_heads) for _ in range(n_layers)])
+        self.monad2  = FineAlterableMonad(d_model)
         self.ln      = nn.LayerNorm(d_model)
         self.dnn     = nn.Sequential(
             nn.Linear(d_model, 2 * d_model), nn.GELU(),
@@ -183,27 +204,29 @@ class KernelLLM(nn.Module):
         )
         self.head = nn.Linear(d_model, vocab_size)
 
-    def forward(self, idx):
+    def forward(self, idx, monad_strength=1.0):
         B, T = idx.shape
         if T > D:
             idx = idx[:, -D:]
             T = D
         pos = torch.arange(T, device=idx.device).unsqueeze(0)
-        x   = self.tok_emb(idx) + self.pos_emb(pos)
+        x = self.tok_emb(idx) + self.pos_emb(pos)
 
-        # Sliding context window → efference features
-        window_size   = min(32, T)
+        window_size = min(32, T)
         context_tokens = idx[:, -window_size:]
-        emb   = self.tok_emb(context_tokens).mean(dim=1)
-        rho   = torch.sigmoid(emb[:, 0])
+        emb = self.tok_emb(context_tokens).mean(dim=1)
+        rho = torch.sigmoid(emb[:, 0])
         theta = torch.sigmoid(emb[:, 1])
         sigma = torch.sigmoid(emb[:, 2])
         x = x + self.kernel.efference_features(rho, theta, sigma).unsqueeze(1)
 
-        x = self.grille(x)   # ← Cardan grille masks positions here
-
-        x = self.blocks(x)
+        y = self.grille(x)
+        x = self.monad1(x, strength=0.1) -self.grille(x)
+        x = self.blocks(y)
+        x = self.monad2(x, strength=0.9) -self.grille(x)
         x = self.dnn(x)
+        x = self.grille(x)
+
         x = self.ln(x)
         return self.head(x)
 
