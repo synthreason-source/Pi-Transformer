@@ -47,7 +47,7 @@ class TrigramTokenizer:
             if tri in self.stoi:
                 tokens.append(self.stoi[tri])
         if len(tokens) == 0:
-            tokens = [random.randint(0, self.vocab_size - 1)]
+            tokens = [0]
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
@@ -99,7 +99,7 @@ class EfferenceKernelStack(nn.Module):
         dot_prods = torch.zeros(B, 3, self.omega_eff.size(1), device=rho.device)
         for i in range(3):
             comp_i = components[:, i:i+1] * self.lambdas[i]
-            dot_prods[:, i-1] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
+            dot_prods[:, i] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
         
         proj = dot_prods.sum(dim=1) + self.bias_eff  # Stack → sum iterations
         return torch.exp(proj)
@@ -123,7 +123,7 @@ class Block(nn.Module):
         mask = torch.triu(torch.ones(T, T), diagonal=1).bool()
         attn_out, _ = self.attn(x, x, x, attn_mask=mask)
         x = self.ln1(x + attn_out)
-        x = self.ln2(x + self.ff(x))
+        x = self.ln2(x + self.ff(x) + attn_out)
         return x
 
 # ============================
