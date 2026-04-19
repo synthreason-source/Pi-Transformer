@@ -14,7 +14,7 @@ D = 2048
 # ============================
 # 1. SEEDING
 # ============================
-def set_seed(seed=42):
+def set_seed(seed=41):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -33,7 +33,7 @@ class TrigramTokenizer:
         trigrams = []
         for i in range(len(words) - 2):
             trigrams.append(" ".join(words[i:i+3]))
-        vocab = sorted(set(trigrams))
+        vocab = list(set(trigrams))
         random.shuffle(vocab)
         self.stoi = {t: i for i, t in enumerate(vocab)}
         self.itos = {i: t for t, i in self.stoi.items()}
@@ -47,7 +47,7 @@ class TrigramTokenizer:
             if tri in self.stoi:
                 tokens.append(self.stoi[tri])
         if len(tokens) == 0:
-            tokens = [0]
+            tokens = [random.randint(0, self.vocab_size - 1)]
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
@@ -87,16 +87,22 @@ class EfferenceKernelStack(nn.Module):
         self.lambdas = nn.Parameter(torch.tensor([8.0, 4.0, 4.0]))
         g = torch.Generator(device=device)
         g.manual_seed(seed)
-        self.omega_eff = nn.Parameter(torch.randn(3, d_model, 1, generator=g, device=device))
-        self.bias_eff = nn.Parameter(torch.randn(3, d_model, generator=g, device=device))
+        self.omega_eff = nn.Parameter(torch.randn(3, d_model, generator=g, device=device))
+        self.bias_eff = nn.Parameter(torch.randn(d_model, generator=g, device=device))
 
     def efference_features(self, rho, theta, sigma):
+        B = rho.size(0)
         rho_eff = rho * torch.cos(theta)
-        x = torch.stack([rho_eff, theta, sigma], dim=1).unsqueeze(-1)
-        proj = torch.einsum("bci,oid->bcd", x, self.omega_eff)
-        proj = proj + self.bias_eff.unsqueeze(0)
-        return torch.cos(proj).mean(dim=1)
-
+        components = torch.stack([rho_eff, theta, sigma], dim=1)  # [B, 3]
+        
+        # Lambda dot iterations
+        dot_prods = torch.zeros(B, 3, self.omega_eff.size(1), device=rho.device)
+        for i in range(3):
+            comp_i = components[:, i:i+1] * self.lambdas[i]
+            dot_prods[:, i] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
+        
+        proj = dot_prods.sum(dim=1) + self.bias_eff  # Stack → sum iterations
+        return torch.exp(proj)
 # ============================
 # 5. TRANSFORMER BLOCK
 # ============================
@@ -122,9 +128,6 @@ class Block(nn.Module):
 
 # ============================
 # 6. FULL MODEL
-# ============================
-# ============================
-# 6. FULL MODEL (with DNN)
 # ============================
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=4):
@@ -154,14 +157,16 @@ class KernelLLM(nn.Module):
             T = D
         pos = torch.arange(T, device=idx.device).unsqueeze(0)
         x = self.tok_emb(idx) + self.pos_emb(pos)
-        rho = torch.rand(B, device=idx.device)
-        theta = torch.rand(B, device=idx.device)
-        sigma = torch.rand(B, device=idx.device)
+        emb = self.tok_emb(idx).mean(dim=1)  # [B, d_model]
+        rho   = torch.sigmoid(emb[:, 0])
+        theta = torch.sigmoid(emb[:, 1])
+        sigma = torch.sigmoid(emb[:, 2])
         kernel_feat = self.kernel.efference_features(rho, theta, sigma)
         x = x + kernel_feat.unsqueeze(1)
         x = self.blocks(x)
-        x = self.ln(x)
-        x = self.dnn(x)              # <-- DNN added here
+
+        x = self.dnn(x) # <-- DNN added here
+        x = self.ln(x) 
         return self.head(x)
 
 # ============================
