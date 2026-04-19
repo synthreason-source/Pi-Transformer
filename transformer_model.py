@@ -35,7 +35,7 @@ class TrigramTokenizer:
             trigrams.append(" ".join(words[i:i+3]))
 
         vocab = sorted(set(trigrams))
-
+        random.shuffle(vocab)
         self.stoi = {t: i for i, t in enumerate(vocab)}
         self.itos = {i: t for t, i in self.stoi.items()}
 
