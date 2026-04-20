@@ -22,8 +22,21 @@ PUNCT_SET = {",", ".", "!", "?", ";", ":"}
 ORBIT_SYMBOLS = {0: "â—‹", 1: "â—”", 2: "â—‘", 3: "â—•"}
 PHASE_COLORS = {"INPUT": "\033[94m", "FWD": "\033[93m", "REV": "\033[96m", "AND": "\033[92m", "EMIT": "\033[97m"}
 RESET = "\033[0m"
-
-
+def maj_gate(x: torch.Tensor, y: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    """
+    Maj(x, y, z) = (x & y) ^ (x & z) ^ (y & z)
+    Analog version: threshold each signal to {0,1} via sign,
+    compute majority vote mask, then use it to blend the continuous signals.
+    Returns a tensor the same shape as x/y/z.
+    """
+    bx = (x > 0).float()
+    by = (y > 0).float()
+    bz = (z > 0).float()
+    # Boolean majority: 1 when at least 2 of 3 are positive
+    maj_mask = (bx * by) + (bx * bz) + (by * bz)  # counts 0,1,2,3
+    maj_mask = (maj_mask >= 2).float()               # 1 where majority positive
+    # Blend: dominant pair contributes fully, minority is gated
+    return maj_mask * (x + y + z) / 3.0 + (1.0 - maj_mask) * (x + y + z).clamp(min=0) / 3.0
 def load_text_corpus(file_path: str) -> str:
     p = Path(file_path)
     if not p.exists():
@@ -727,13 +740,19 @@ class SpaghettiMixer:
               _activator: "SequentialLayerActivator | None" = None) -> torch.Tensor:
         if not self._strands:
             return torch.zeros(C, device=self.device)
-        acc = torch.zeros(C, device=self.device)
         spag_gate = _activator.gate(7) if _activator is not None else 1.0
-        for s in self._strands:
-            sig = s.signal
-            if sig.shape[0] != C:
-                sig = torch.zeros(C, device=self.device)
-            acc = acc + s.sign * s.weight * sig * spag_gate
+        weighted = [s.sign * s.weight * (s.signal if s.signal.shape[0] == C
+                    else torch.zeros(C, device=self.device)) * spag_gate
+                    for s in self._strands]
+        if len(weighted) >= 3:
+            # Majority-gate the first three strands, then sum the rest
+            acc = maj_gate(weighted[0], weighted[1], weighted[2])
+            for sig in weighted[3:]:
+                acc = acc + sig
+        elif len(weighted) == 2:
+            acc = weighted[0] + weighted[1]
+        else:
+            acc = weighted[0]
         return layer_norm_array(acc) / max(SPAGHETTI_MIXER_TEMP, 1e-6)
 
 
@@ -811,7 +830,8 @@ class SpaghettiRouter:
         outputs: List[torch.Tensor] = [m.blend(C, _activator=_activator) for m in self._mixers]
         for tangle in self._tangles:
             outputs = tangle.apply(outputs)
-        combined = torch.stack(outputs, dim=0).sum(dim=0)
+        # Apply Maj gate instead of plain sum
+        combined = maj_gate(outputs[0], outputs[1], outputs[2])
         return layer_norm_array(combined)
 
 
