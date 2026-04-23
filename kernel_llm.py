@@ -319,7 +319,7 @@ if __name__ == "__main__":
 
     if mode == "t":
         model, tokenizer = train_model(
-            text_path="singlekb.txt",
+            text_path=input("Filename: "),
             model_path="model.pt",
             tok_path="tokenizer.pkl",
             steps=10,
