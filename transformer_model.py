@@ -2430,15 +2430,31 @@ class ContingentExtringentProbability:
             theta_stream=NanowireStream("ChromaticPhase", chromatic_theta_trend),
             sigma_stream=NanowireStream("BloomGlow", glow_sigma_trend))
 
+    def _pack_state(self, logits, c_rho, c_theta, c_sigma):
+        logp = torch.log(logits.clamp(min=1e-12)) if logits.ndim == 1 else logits
+        C = logp.shape[-1]
+        if c_rho is None:
+            c_rho = torch.zeros_like(logp)
+        if c_theta is None:
+            c_theta = torch.zeros_like(logp)
+        if c_sigma is None:
+            c_sigma = torch.zeros_like(logp)
+        return torch.cat([logp, c_rho, c_theta, c_sigma], dim=-1), C
+
+    def _unpack_state(self, state, C):
+        return state[:C], state[C:2*C], state[2*C:3*C], state[3*C:4*C]
+
     def govern_next_probs(self, logits, c_rho=None, c_theta=None, c_sigma=None):
-        x = c_rho * torch.cos(c_theta); y = c_rho * torch.sin(c_theta)
-        ring_dist = torch.abs((y**2 / 0.96) + (x**2 / 0.64) - 1.0)
-        core_suppression = torch.tanh(-10.0 * (y**2 / x**2))
-        personality_inversion_mask = -20.0 * core_suppression - 5.0 * ring_dist
+        state, C = self._pack_state(logits, c_rho, c_theta, c_sigma)
+        logp, c_rho, c_theta, c_sigma = self._unpack_state(state, C)
         if c_rho is not None and c_theta is not None:
-            logits = personality_inversion_mask + logits
+            x = c_rho * torch.cos(c_theta)
+            y = c_rho * torch.sin(c_theta)
+            ring_dist = torch.abs((y**2 / 0.96) + (x**2 / 0.64) - 1.0)
+            core_suppression = torch.tanh(-10.0 * (y**2 / (x**2 + 1e-12)))
+            logp = logp - 20.0 * core_suppression - 5.0 * ring_dist
         dyn_temp = self.coupling_factor * (1.0 - self.intermediate_max_prob) + 1.0
-        m_gov    = FineAlterableMonad(logits)
+        m_gov = FineAlterableMonad(logp)
         if c_rho is not None and c_theta is not None and c_sigma is not None:
             m_gov = self.canvas.paint(m_gov, c_rho, c_theta, c_sigma)
             m_gov = m_gov >> (lambda l: self.dnn.temp_scaler.scale(l, dyn_temp, c_rho))
@@ -3155,8 +3171,10 @@ def train_fitted_line(walker, corpus_tokens, batch_size=64, epochs=200,
     for epoch in range(epochs):
         epoch_loss = 0.0
         for feat_b, gold_b in loader:
-            loss = model.loss(feat_b, gold_b)
             opt.zero_grad(); loss.backward()
+            logp, c_rho, c_theta, c_sigma = self._unpack_state(probs, epoch)
+            loss = model.loss(c_rho, logp)
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step(); epoch_loss += loss.item()
         if epoch % 20 == 0 or epoch == epochs - 1:
