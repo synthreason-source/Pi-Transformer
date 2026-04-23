@@ -273,7 +273,7 @@ def train_model(
         V = tokenizer.vocab_size
         t = min(step, T - 1)
         probs = F.softmax(logits[0, t, :], dim=-1)              # [V]
-        logp, c_rho, c_theta, c_sigma = model._unpack_state(probs, V // 4)
+        logp, c_rho, c_theta, c_sigma = model._unpack_state(probs, step+1)
         gold = data[0, t + 1].unsqueeze(0)                      # [1]
         loss = model.loss(c_rho.unsqueeze(0), gold)             # [1, V//4], [1]
 
