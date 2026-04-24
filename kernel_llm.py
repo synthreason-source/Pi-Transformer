@@ -132,39 +132,27 @@ class Block(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
         self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
-        self.state_proj = nn.Linear(d_model, 4 * d_model)  # Add here ✓
         self.ff = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
-            nn.ReLU(), 
+            nn.ReLU(),
             nn.Linear(4 * d_model, d_model),
         )
         self.ln1 = nn.LayerNorm(d_model)
         self.ln2 = nn.LayerNorm(d_model)
 
-    def _unpack_state(self, state, d_model):
-        chunks = torch.chunk(state.squeeze(1), 4, dim=-1)
-        scaled = [chunks[0], chunks[1]*2, chunks[2], chunks[3]]
-        return [s.unsqueeze(1) for s in scaled]
+    def forward(self, x):
+        T = x.size(1)
+        mask = torch.triu(
+            torch.ones(T, T, device=x.device, dtype=torch.bool),
+            diagonal=1
+        )
 
-    def forward(self, x):  # x: [B,T,d_model]
-        B, T, d_model = x.shape
-        
-        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-        
-        # Kernel state
-        pooled = x.mean(dim=1, keepdim=True).repeat(1, T, 1)
-        state = self.state_proj(pooled)  # [B,T,4*d_model]
-        logp, c_rho, c_theta, c_sigma = self._unpack_state(state, d_model)
-        
-        # Q/K/V ✓
-        Q, K, V = logp.squeeze(1), c_rho.squeeze(1), c_theta.squeeze(1)
-        
-        attn_out, _ = self.attn(Q, K, V, attn_mask=mask, need_weights=False)
+        attn_out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
         x = self.ln1(x + attn_out)
-        
+
         ff_out = self.ff(x)
         x = self.ln2(x + ff_out)
-        return self.ln2(x + ff_out)  # Or just: return x + ff_out ✓
+        return x
 
 
 # ============================
@@ -238,7 +226,6 @@ def generate(model, idx, max_new_tokens=100, temperature=1.0):
         idx_cond = idx[:, -D:]
         logits = model(idx_cond)
         logits = logits[:, -1, :] / max(temperature, 1e-6)
-        
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, 1)
         idx = torch.cat([idx, next_token], dim=1)
@@ -336,7 +323,7 @@ if __name__ == "__main__":
             model_path="model.pt",
             tok_path="tokenizer.pkl",
             steps=10,
-            lr=1e-3,
+            lr=1e-5,
             device=device
         )
     else:
