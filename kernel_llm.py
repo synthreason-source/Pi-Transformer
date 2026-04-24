@@ -4,13 +4,12 @@ import torch.nn.functional as F
 import random
 import numpy as np
 import pickle
+from pathlib import Path
 
 max_new_tokens = 200
 D = 2048
 
-# ============================
-# 1. SEEDING
-# ============================
+
 def set_seed(seed=41):
     random.seed(seed)
     np.random.seed(seed)
@@ -20,34 +19,25 @@ def set_seed(seed=41):
     torch.backends.cudnn.benchmark = False
 
 
-# ============================
-# 2. TRIGRAM TOKENIZER
-# ============================
 class TrigramTokenizer:
     def __init__(self, text):
         words = text.lower().split()
-        trigrams = []
-        for i in range(len(words) - 2):
-            trigrams.append(" ".join(words[i:i+3]))
-
-        vocab = list(set(trigrams))
+        self.trigrams = [" ".join(words[i:i+3]) for i in range(max(0, len(words)-2))]
+        vocab = sorted(set(self.trigrams))
         random.shuffle(vocab)
-
         self.stoi = {t: i for i, t in enumerate(vocab)}
         self.itos = {i: t for t, i in self.stoi.items()}
         self.vocab_size = len(vocab)
 
     def encode(self, text):
         words = text.lower().split()
-        tokens = []
-        for i in range(len(words) - 2):
-            tri = " ".join(words[i:i+3])
-            if tri in self.stoi:
-                tokens.append(self.stoi[tri])
-
+        tokens = [
+            self.stoi[" ".join(words[i:i+3])]
+            for i in range(max(0, len(words)-2))
+            if " ".join(words[i:i+3]) in self.stoi
+        ]
         if len(tokens) == 0:
-            tokens = [hash(text) % self.vocab_size]
-
+            tokens = [abs(hash(text)) % max(self.vocab_size, 1)] if self.vocab_size > 0 else [0]
         return torch.tensor(tokens, dtype=torch.long)
 
     def decode(self, tokens):
@@ -69,9 +59,6 @@ def load_tokenizer(path="tokenizer.pkl"):
         return pickle.load(f)
 
 
-# ============================
-# 3. LOAD TEXT DATASET/MODEL
-# ============================
 def load_text(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
@@ -90,44 +77,27 @@ def load_model(model, path="model.pt", device="cpu"):
     return model
 
 
-# ============================
-# 4. KERNEL MODULE
-# ============================
 class EfferenceKernelStack(nn.Module):
     def __init__(self, d_model=128, device="cpu", seed=42):
         super().__init__()
         self.lambdas = nn.Parameter(torch.tensor([8.0, 4.0, 4.0], device=device))
-
         g = torch.Generator(device=device)
         g.manual_seed(seed)
-
-        self.omega_eff = nn.Parameter(
-            torch.randn(3, d_model, generator=g, device=device)
-        )
-        self.bias_eff = nn.Parameter(
-            torch.randn(d_model, generator=g, device=device)
-        )
+        self.omega_eff = nn.Parameter(torch.randn(3, d_model, generator=g, device=device))
+        self.bias_eff = nn.Parameter(torch.randn(d_model, generator=g, device=device))
 
     def efference_features(self, rho, theta, sigma):
         B = rho.size(0)
         rho_eff = rho * torch.cos(theta)
         components = torch.stack([rho_eff, theta, sigma], dim=1)
-
         dot_prods = torch.zeros(B, 3, self.omega_eff.size(1), device=rho.device)
-
         for i in range(3):
             comp_i = components[:, i:i+1] * self.lambdas[i]
-            dot_prods[:, i] = torch.sum(
-                comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1
-            )
-
+            dot_prods[:, i] = torch.sum(comp_i.unsqueeze(-1) * self.omega_eff[i], dim=1)
         proj = dot_prods.sum(dim=1) + self.bias_eff
-        return torch.exp(proj)
+        return torch.exp(proj.clamp(max=20))
 
 
-# ============================
-# 5. TRANSFORMER BLOCK
-# ============================
 class Block(nn.Module):
     def __init__(self, d_model, n_heads):
         super().__init__()
@@ -142,33 +112,23 @@ class Block(nn.Module):
 
     def forward(self, x):
         T = x.size(1)
-        mask = torch.triu(
-            torch.ones(T, T, device=x.device, dtype=torch.bool),
-            diagonal=1
-        )
-
+        mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
         attn_out, _ = self.attn(x, x, x, attn_mask=mask, need_weights=False)
         x = self.ln1(x + attn_out)
-
         ff_out = self.ff(x)
         x = self.ln2(x + ff_out)
         return x
 
 
-# ============================
-# 6. FULL MODEL
-# ============================
 class KernelLLM(nn.Module):
     def __init__(self, vocab_size, d_model=128, n_layers=4, n_heads=4, device="cpu"):
         super().__init__()
-        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.d_model = d_model
+        self.tok_emb = nn.Embedding(max(vocab_size, 1), d_model)
         self.pos_emb = nn.Embedding(D, d_model)
         self.kernel = EfferenceKernelStack(d_model=d_model, device=device)
-        self.blocks = nn.Sequential(*[
-            Block(d_model, n_heads) for _ in range(n_layers)
-        ])
+        self.blocks = nn.Sequential(*[Block(d_model, n_heads) for _ in range(n_layers)])
         self.ln = nn.LayerNorm(d_model)
-
         self.dnn = nn.Sequential(
             nn.Linear(d_model, 2 * d_model),
             nn.GELU(),
@@ -177,177 +137,159 @@ class KernelLLM(nn.Module):
             nn.Linear(2 * d_model, d_model),
             nn.LayerNorm(d_model),
         )
-
-        self.head = nn.Linear(d_model, vocab_size)
+        self.head = nn.Linear(d_model, max(vocab_size, 1))
+        # State projection: maps d_model -> 4 state slices of d_model each
+        self.state_proj = nn.Linear(d_model, 4 * d_model)
 
     def forward(self, idx):
         B, T = idx.shape
-
         if T > D:
             idx = idx[:, -D:]
             T = D
-
-        pos = torch.arange(T, device=idx.device).unsqueeze(0)
         tok = self.tok_emb(idx)
-        x = tok + self.pos_emb(pos)
-
+        pos = self.pos_emb(torch.arange(T, device=idx.device).unsqueeze(0).expand(B, -1))
+        x = tok + pos
         emb = tok.mean(dim=1)
-        rho = torch.sigmoid(emb[:, 0])
-        theta = torch.sigmoid(emb[:, 1])
-        sigma = torch.sigmoid(emb[:, 2])
-
+        rho   = torch.sigmoid(emb[:, 0:1])
+        theta = torch.sigmoid(emb[:, 1:2])
+        sigma = torch.sigmoid(emb[:, 2:3])
         kernel_feat = self.kernel.efference_features(rho, theta, sigma)
         x = x + kernel_feat.unsqueeze(1)
-
         x = self.blocks(x)
         x = self.dnn(x)
         x = self.ln(x)
-
-        return self.head(x)  # [B, T, V]
-
-    def _unpack_state(self, state, C):
-        return state[:C], state[C:2*C], state[2*C:3*C], state[3*C:4*C]
-
-    def loss(self, features: torch.Tensor, gold_indices: torch.Tensor) -> torch.Tensor:
-        probs = F.softmax(features, dim=-1)          # [B, V]
-        C = features.size(-1)
-        targets = F.one_hot(gold_indices.long().clamp(0, C - 1), C).float()  # [B, V]
-        return F.binary_cross_entropy(probs, targets)
+        logits = self.head(x)
+        # Build flat state tensor: shape (B, 4*d_model) -> flatten to (4*d_model*B,)
+        state_vec = self.state_proj(x.mean(dim=1))   # (B, 4*d_model)
+        state = state_vec.reshape(-1)                 # flat: (B*4*d_model,)
+        return logits, state
 
 
-# ============================
-# 8. GENERATION
-# ============================
+def _unpack_state(state, C):
+    return state[:C], state[C:2*C], state[2*C:3*C], state[3*C:4*C]
+
+
+def manhattan_distance(pred_logits, target_ids):
+    V = pred_logits.size(-1)
+    probs = F.softmax(pred_logits, dim=-1)
+    targets = F.one_hot(target_ids.clamp(0, V - 1), V).float()
+    return torch.abs(probs - targets).sum(dim=-1).mean()
+
+
+def trigram_coverage(tokenizer, text):
+    words = text.lower().split()
+    tris = [" ".join(words[i:i+3]) for i in range(max(0, len(words)-2))]
+    if not tris:
+        return 0.0
+    covered = sum(1 for tri in tris if tri in tokenizer.stoi)
+    return covered / len(tris)
+
+
+def make_batch(data, seq_len):
+    if data.numel() <= seq_len + 1:
+        return data[:-1].unsqueeze(0), data[1:].unsqueeze(0)
+    start = random.randint(0, data.numel() - seq_len - 1)
+    x = data[start:start+seq_len].unsqueeze(0)
+    y = data[start+1:start+seq_len+1].unsqueeze(0)
+    return x, y
+
+
 @torch.no_grad()
 def generate(model, idx, max_new_tokens=100, temperature=1.0):
     model.eval()
-
     for _ in range(max_new_tokens):
         idx_cond = idx[:, -D:]
-        logits = model(idx_cond)
+        logits, _ = model(idx_cond)
         logits = logits[:, -1, :] / max(temperature, 1e-6)
         probs = F.softmax(logits, dim=-1)
         next_token = torch.multinomial(probs, 1)
         idx = torch.cat([idx, next_token], dim=1)
-
     return idx
 
 
-# ============================
-# 8. TRAIN
-# ============================
-def train_model(
-    text_path="singlekb.txt",
-    model_path="model.pt",
-    tok_path="tokenizer.pkl",
-    steps=300,
-    lr=1e-3,
-    device="cpu"
-):
+def train_model(text_path="singlekb.txt", model_path="model.pt", tok_path="tokenizer.pkl",
+                steps=300, lr=1e-3, device="cpu", seq_len=64):
     text = load_text(text_path)
     tokenizer = TrigramTokenizer(text)
-    data = tokenizer.encode(text).unsqueeze(0).to(device)
-
+    data = tokenizer.encode(text).to(device)
     if data.numel() < 2:
         raise ValueError("Not enough tokens to train.")
+    if tokenizer.vocab_size == 0:
+        raise ValueError("Tokenizer vocabulary is empty.")
 
     model = KernelLLM(
-        vocab_size=tokenizer.vocab_size,
-        d_model=128,
-        n_layers=4,
-        n_heads=4,
-        device=device
+        vocab_size=tokenizer.vocab_size, d_model=128,
+        n_layers=4, n_heads=4, device=device
     ).to(device)
-
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-
-    print("training...")
+    C = model.d_model  # state slice size
+    print(f"training on {data.numel()} tokens | vocab={tokenizer.vocab_size} | coverage={trigram_coverage(tokenizer, text):.4f}")
 
     for step in range(steps):
         model.train()
         optimizer.zero_grad()
+        x, y = make_batch(data, seq_len)
+        x, y = x.to(device), y.to(device)
 
-        logits = model(data)
-
-        T = min(logits.size(1), data.size(1)) - 1
-        V = tokenizer.vocab_size
-        t = min(step, T - 1)
-        probs = F.softmax(logits[0, t, :], dim=-1)              # [V]
-        logp, c_rho, c_theta, c_sigma = model._unpack_state(probs, step+1)
-        gold = data[0, t + 1].unsqueeze(0)                      # [1]
-        loss = model.loss(c_rho.unsqueeze(0), gold)             # [1, V//4], [1]
-
-        loss.backward()
+        logits, state = model(x)
+        # Unpack state: loss_state used as auxiliary scalar, _1 as soft targets
+        loss_state, _1, _2, _3 = _unpack_state(state, C)
+        # CE loss on logits vs real targets
+        loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
+        # Manhattan distance: logits vs state-derived soft signal (_1 mapped to token indices)
+        state_target = (_1.detach().abs() * (tokenizer.vocab_size - 1)).long().clamp(0, tokenizer.vocab_size - 1)
+        # Pad/trim state_target to match logits batch*seq dimension
+        BT = logits.size(0) * logits.size(1)
+        state_target = state_target[:BT] if state_target.numel() >= BT else state_target.repeat(BT // state_target.numel() + 1)[:BT]
+        md = manhattan_distance(logits.reshape(-1, logits.size(-1)), state_target)
+        total_loss = loss + 0.71 * md
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
         if step % 50 == 0 or step == steps - 1:
-            print(f"step {step} | loss {loss.item():.6f}")
+            print(f"step {step} | ce {loss.item():.6f} | manhattan {md.item():.6f} | total {total_loss.item():.6f}")
 
     save_model(model, model_path)
     save_tokenizer(tokenizer, tok_path)
     return model, tokenizer
 
 
-# ============================
-# 9. LOAD
-# ============================
 def load_trained_model(model_path="model.pt", tok_path="tokenizer.pkl", device="cpu"):
     tokenizer = load_tokenizer(tok_path)
-
     model = KernelLLM(
-        vocab_size=tokenizer.vocab_size,
-        d_model=128,
-        n_layers=4,
-        n_heads=4,
-        device=device
+        vocab_size=tokenizer.vocab_size, d_model=128,
+        n_layers=4, n_heads=4, device=device
     ).to(device)
-
     model = load_model(model, model_path, device=device)
     return model, tokenizer
 
 
-# ============================
-# 10. MAIN
-# ============================
 if __name__ == "__main__":
     set_seed(42)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"using device: {device}")
-
     mode = input("train or load? (t/l): ").strip().lower()
-
     if mode == "t":
         model, tokenizer = train_model(
             text_path=input("Filename: "),
             model_path="model.pt",
             tok_path="tokenizer.pkl",
             steps=10,
-            lr=1e-5,
-            device=device
+            lr=1e-3,
+            device=device,
+            seq_len=128,
         )
     else:
         model, tokenizer = load_trained_model(
-            model_path="model.pt",
-            tok_path="tokenizer.pkl",
-            device=device
+            model_path="model.pt", tok_path="tokenizer.pkl", device=device
         )
-
     while True:
         seed_text = input("USER: ").strip()
-
         if seed_text.lower() in {"quit", "exit", "q"}:
             break
-
         prompt = tokenizer.encode(seed_text).unsqueeze(0).to(device)
-
-        generated = generate(
-            model,
-            prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=1.0,
-        )
-
+        generated = generate(model, prompt, max_new_tokens=max_new_tokens, temperature=1.0)
         print("\n--- GENERATED TEXT ---\n")
         print(tokenizer.decode(generated[0].detach().cpu().tolist()))
         print()
