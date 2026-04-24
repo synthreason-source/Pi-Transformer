@@ -5,6 +5,7 @@ import random
 import numpy as np
 import pickle
 from pathlib import Path
+import math
 
 max_new_tokens = 200
 D = 2048
@@ -138,7 +139,6 @@ class KernelLLM(nn.Module):
             nn.LayerNorm(d_model),
         )
         self.head = nn.Linear(d_model, max(vocab_size, 1))
-        # State projection: maps d_model -> 4 state slices of d_model each
         self.state_proj = nn.Linear(d_model, 4 * d_model)
 
     def forward(self, idx):
@@ -159,14 +159,46 @@ class KernelLLM(nn.Module):
         x = self.dnn(x)
         x = self.ln(x)
         logits = self.head(x)
-        # Build flat state tensor: shape (B, 4*d_model) -> flatten to (4*d_model*B,)
-        state_vec = self.state_proj(x.mean(dim=1))   # (B, 4*d_model)
-        state = state_vec.reshape(-1)                 # flat: (B*4*d_model,)
-        return logits, state
+        # Build 2D state: (B, 4, d_model) — four 2D-addressable slices
+        state_vec = self.state_proj(x.mean(dim=1))        # (B, 4*d_model)
+        state_2d = state_vec.reshape(B, 4, self.d_model)  # (B, 4, d_model)
+        return logits, state_2d
 
 
-def _unpack_state(state, C):
-    return state[:C], state[C:2*C], state[2*C:3*C], state[3*C:4*C]
+def _spherical_order(C):
+    """
+    Return indices for a flat slice of length C in spherical (expanding ring) order.
+    Reshapes C -> (H, W) grid, then yields flat indices ordered by radius from centre,
+    breaking ties by polar angle phi. This is the 2D spherical iteration.
+    """
+    H = W = int(math.isqrt(C))
+    # If C is not a perfect square, trim to nearest square
+    H = W = max(1, H)
+    while H * W > C:
+        W -= 1
+    cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
+    coords = []
+    for i in range(H):
+        for j in range(W):
+            r   = math.sqrt((i - cy)**2 + (j - cx)**2)
+            phi = math.atan2(i - cy, j - cx)
+            coords.append((r, phi, i * W + j))
+    coords.sort(key=lambda x: (x[0], x[1]))
+    return [c[2] for c in coords], H, W
+
+
+def _unpack_state_2d(state_2d, C):
+    """
+    Unpack (B, 4, d_model) state using spherical iteration order per slice.
+    Returns four slices, each (B, n_valid) where n_valid = H*W <= C,
+    with elements reordered outward from the centre of the 2D grid.
+    """
+    sph_idx, H, W = _spherical_order(C)
+    sph_idx_t = torch.tensor(sph_idx, dtype=torch.long, device=state_2d.device)
+    # state_2d: (B, 4, C) — index each slice spherically
+    s = state_2d[:, :, :H*W]              # (B, 4, H*W)
+    s_sph = s[:, :, sph_idx_t]            # (B, 4, H*W) reordered spherically
+    return s_sph[:, 0, :], s_sph[:, 1, :], s_sph[:, 2, :], s_sph[:, 3, :]
 
 
 def manhattan_distance(pred_logits, target_ids):
@@ -222,7 +254,7 @@ def train_model(text_path="singlekb.txt", model_path="model.pt", tok_path="token
         n_layers=4, n_heads=4, device=device
     ).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    C = model.d_model  # state slice size
+    C = model.d_model
     print(f"training on {data.numel()} tokens | vocab={tokenizer.vocab_size} | coverage={trigram_coverage(tokenizer, text):.4f}")
 
     for step in range(steps):
@@ -231,18 +263,22 @@ def train_model(text_path="singlekb.txt", model_path="model.pt", tok_path="token
         x, y = make_batch(data, seq_len)
         x, y = x.to(device), y.to(device)
 
-        logits, state = model(x)
-        # Unpack state: loss_state used as auxiliary scalar, _1 as soft targets
-        loss_state, _1, _2, _3 = _unpack_state(state, C)
+        logits, state_2d = model(x)
+        # Unpack state spherically: each slice is (B, H*W), ordered centre-out
+        loss_state, _1, _2, _3 = _unpack_state_2d(state_2d, C)
+
         # CE loss on logits vs real targets
         loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1))
-        # Manhattan distance: logits vs state-derived soft signal (_1 mapped to token indices)
+
+        # Manhattan: map _1 (centre-first spherical values) -> token indices
         state_target = (_1.detach().abs() * (tokenizer.vocab_size - 1)).long().clamp(0, tokenizer.vocab_size - 1)
-        # Pad/trim state_target to match logits batch*seq dimension
         BT = logits.size(0) * logits.size(1)
-        state_target = state_target[:BT] if state_target.numel() >= BT else state_target.repeat(BT // state_target.numel() + 1)[:BT]
-        md = manhattan_distance(logits.reshape(-1, logits.size(-1)), state_target)
-        total_loss = loss + 0.71 * md
+        st_flat = state_target.reshape(-1)
+        st_flat = st_flat[:BT] if st_flat.numel() >= BT else st_flat.repeat(BT // st_flat.numel() + 1)[:BT]
+        md = manhattan_distance(logits.reshape(-1, logits.size(-1)), st_flat)
+
+        # _2 from spherical slice used as auxiliary loss weight (mean of ring values)
+        total_loss = loss + 0.71 * _2.mean()
         total_loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
