@@ -1547,7 +1547,7 @@ def _smoke_test():
     print("\n  All checks passed ✓")
     tokenizer = WordTokenizer(vocab_size=20000)  # FIXED: match model.vocab_size
     tokenizer.build_vocab(
-    load_text("xaa.txt")
+    load_text(input("Filename: "))
     )
     
     run_text_gui_words(model, tokenizer, device)
