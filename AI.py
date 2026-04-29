@@ -12,6 +12,7 @@ Fixes applied vs paste.txt:
   • generate_sample() reloads proper tokenizer
   • WordTokenizer build_vocab bug fixed (idx*_ → idx)
   • seq_len padded inputs clamped to max_seq_len in forward
+  • N_LAYERS and N_HEADS are now fake generators using %
 """
 
 from __future__ import annotations
@@ -29,21 +30,47 @@ import requests
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL CONFIG — change these in one place only
 # ─────────────────────────────────────────────────────────────────────────────
-VOCAB       = 10_000
-D_MODEL     = 64
-N_LAYERS    = 4
-N_HEADS     = 4
-MAX_SEQ_LEN = 128      # ← single source of truth for pos_emb size
-KB_LEN = 100
-SEQ_LEN     = 64       # training window (must be < MAX_SEQ_LEN)
-CARDAN_K    = 64
-DROPOUT     = 0.1
-EPOCHS      = 10
-LR          = 6e-4
-BATCH_GPU   = 32
-BATCH_CPU   = 8
-CHECKPOINT  = "v18_geo.pt"
-TOKENIZER_F = "v18_tokenizer.json"
+VOCAB           = 10_000
+D_MODEL         = 64
+MAX_SEQ_LEN     = 128      # ← single source of truth for pos_emb size
+KB_LEN          = 10
+SEQ_LEN         = 64       # training window (must be < MAX_SEQ_LEN)
+CARDAN_K        = 64
+DROPOUT         = 0.1
+EPOCHS          = 1
+LR              = 6e-4
+BATCH_GPU       = 32
+BATCH_CPU       = 8
+CHECKPOINT      = "v18_geo.pt"
+TOKENIZER_F     = "v18_tokenizer.json"
+
+# ── Fake generator bases ──────────────────────────────────────────────────────
+_N_LAYERS_BASE  = 4
+_N_HEADS_BASE   = 4
+
+def _n_layers_gen():
+    """Infinite generator: cycles through valid layer counts using %."""
+    _valid = [2, 3, 4, 5, 6, 7, 8]   # reasonable transformer depths
+    i = 0
+    while True:
+        yield _valid[(_N_LAYERS_BASE + i) % len(_valid)]
+        i += 1
+
+def _n_heads_gen():
+    """Infinite generator: cycles through head counts that divide D_MODEL evenly using %."""
+    _valid = [h for h in range(1, D_MODEL + 1) if D_MODEL % h == 0]
+    # e.g. for D_MODEL=64: [1,2,4,8,16,32,64]
+    i = 0
+    while True:
+        yield _valid[(_N_HEADS_BASE + i) % len(_valid)]
+        i += 1
+
+_layers_gen = _n_layers_gen()
+_heads_gen  = _n_heads_gen()
+
+N_LAYERS = next(_layers_gen)   # initial value: 4
+N_HEADS  = next(_heads_gen)    # initial value: 4
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRANSMUTABLE GEOMETRIC OPERATOR
@@ -60,8 +87,8 @@ class TransmutableGeoOp(nn.Module):
                  weight_tensor: Optional[torch.Tensor] = None,
                  extra_params: Optional[Dict[str, Any]] = None):
         super().__init__()
-        self.op_name     = name
-        self.func        = func
+        self.op_name      = name
+        self.func         = func
         self.extra_params = extra_params or {}
         _r = torch.tensor(float(rho))
         _t = torch.tensor(float(theta))
@@ -110,53 +137,53 @@ class TransmutableGeoOp(nn.Module):
 def _build_registry() -> Dict[str, TransmutableGeoOp]:
     reg = {}
     # Math ops
-    reg["tanh"]         = TransmutableGeoOp("tanh",      torch.tanh,             rho=0.1,  sigma=0.5)
-    reg["tanh_full"]    = TransmutableGeoOp("tanh_full",  torch.tanh,             rho=1.0,  sigma=0.0)
-    reg["exp"]          = TransmutableGeoOp("exp",        torch.exp,              rho=1.0,  sigma=0.0)
-    reg["cos"]          = TransmutableGeoOp("cos",        torch.cos,              theta=math.pi/4, sigma=0.0)
-    reg["sin"]          = TransmutableGeoOp("sin",        torch.sin,              theta=math.pi/4, sigma=0.0)
-    reg["arctan"]       = TransmutableGeoOp("arctan",     torch.arctan,           rho=1.0,  sigma=0.3)
-    reg["atan2"]        = TransmutableGeoOp("atan2",      lambda x,y: torch.atan2(x,y), rho=1.0, sigma=0.0, learnable=False)
-    reg["sqrt"]         = TransmutableGeoOp("sqrt",       torch.sqrt,             rho=1.0,  sigma=0.0)
-    reg["log"]          = TransmutableGeoOp("log",        lambda x: torch.log(x.clamp(min=1e-8)), rho=1.0, sigma=0.0, learnable=False)
-    reg["abs"]          = TransmutableGeoOp("abs",        torch.abs,              rho=1.0,  sigma=0.0)
-    reg["relu"]         = TransmutableGeoOp("relu",       F.relu,                 rho=1.0,  sigma=0.0)
-    reg["gelu"]         = TransmutableGeoOp("gelu",       F.gelu,                 rho=1.0,  sigma=0.2)
-    reg["softmax"]      = TransmutableGeoOp("softmax",    lambda x: torch.softmax(x, dim=-1), rho=1.0, sigma=0.35, learnable=False)
-    reg["mean"]         = TransmutableGeoOp("mean",       lambda x: x.mean(),    rho=1.0,  sigma=0.0, learnable=False)
-    reg["std"]          = TransmutableGeoOp("std",        lambda x: x.std(),     rho=1.0,  sigma=0.0, learnable=False)
-    reg["norm_1d"]      = TransmutableGeoOp("norm_1d",    lambda x: x.norm(dim=-1, keepdim=True), rho=1.0, sigma=0.0, learnable=False)
-    reg["clamp_signal"] = TransmutableGeoOp("clamp_sig",  lambda x: x.clamp(-20., 20.), rho=1.0, sigma=0.0, learnable=False)
-    reg["clamp_unit"]   = TransmutableGeoOp("clamp_unit", lambda x: x.clamp(-0.9999, 0.9999), rho=1.0, sigma=0.0, learnable=False)
-    reg["triu"]         = TransmutableGeoOp("triu",       lambda x: torch.triu(x, diagonal=1), rho=1.0, sigma=0.0, learnable=False)
-    reg["topk"]         = TransmutableGeoOp("topk",       lambda x,k: torch.topk(x,k), rho=1.0, sigma=0.0, learnable=False)
-    reg["argsort"]      = TransmutableGeoOp("argsort",    lambda x: torch.argsort(x, descending=True), rho=1.0, sigma=0.0, learnable=False)
-    reg["multinomial"]  = TransmutableGeoOp("multinomial",lambda x: torch.multinomial(x, 1), rho=1.0, sigma=0.0, learnable=False)
+    reg["tanh"]          = TransmutableGeoOp("tanh",       torch.tanh,             rho=0.1,  sigma=0.5)
+    reg["tanh_full"]     = TransmutableGeoOp("tanh_full",   torch.tanh,             rho=1.0,  sigma=0.0)
+    reg["exp"]           = TransmutableGeoOp("exp",         torch.exp,              rho=1.0,  sigma=0.0)
+    reg["cos"]           = TransmutableGeoOp("cos",         torch.cos,              theta=math.pi/4, sigma=0.0)
+    reg["sin"]           = TransmutableGeoOp("sin",         torch.sin,              theta=math.pi/4, sigma=0.0)
+    reg["arctan"]        = TransmutableGeoOp("arctan",      torch.arctan,           rho=1.0,  sigma=0.3)
+    reg["atan2"]         = TransmutableGeoOp("atan2",       lambda x,y: torch.atan2(x,y), rho=1.0, sigma=0.0, learnable=False)
+    reg["sqrt"]          = TransmutableGeoOp("sqrt",        torch.sqrt,             rho=1.0,  sigma=0.0)
+    reg["log"]           = TransmutableGeoOp("log",         lambda x: torch.log(x.clamp(min=1e-8)), rho=1.0, sigma=0.0, learnable=False)
+    reg["abs"]           = TransmutableGeoOp("abs",         torch.abs,              rho=1.0,  sigma=0.0)
+    reg["relu"]          = TransmutableGeoOp("relu",        F.relu,                 rho=1.0,  sigma=0.0)
+    reg["gelu"]          = TransmutableGeoOp("gelu",        F.gelu,                 rho=1.0,  sigma=0.2)
+    reg["softmax"]       = TransmutableGeoOp("softmax",     lambda x: torch.softmax(x, dim=-1), rho=1.0, sigma=0.35, learnable=False)
+    reg["mean"]          = TransmutableGeoOp("mean",        lambda x: x.mean(),    rho=1.0,  sigma=0.0, learnable=False)
+    reg["std"]           = TransmutableGeoOp("std",         lambda x: x.std(),     rho=1.0,  sigma=0.0, learnable=False)
+    reg["norm_1d"]       = TransmutableGeoOp("norm_1d",     lambda x: x.norm(dim=-1, keepdim=True), rho=1.0, sigma=0.0, learnable=False)
+    reg["clamp_signal"]  = TransmutableGeoOp("clamp_sig",   lambda x: x.clamp(-20., 20.), rho=1.0, sigma=0.0, learnable=False)
+    reg["clamp_unit"]    = TransmutableGeoOp("clamp_unit",  lambda x: x.clamp(-0.9999, 0.9999), rho=1.0, sigma=0.0, learnable=False)
+    reg["triu"]          = TransmutableGeoOp("triu",        lambda x: torch.triu(x, diagonal=1), rho=1.0, sigma=0.0, learnable=False)
+    reg["topk"]          = TransmutableGeoOp("topk",        lambda x,k: torch.topk(x,k), rho=1.0, sigma=0.0, learnable=False)
+    reg["argsort"]       = TransmutableGeoOp("argsort",     lambda x: torch.argsort(x, descending=True), rho=1.0, sigma=0.0, learnable=False)
+    reg["multinomial"]   = TransmutableGeoOp("multinomial", lambda x: torch.multinomial(x, 1), rho=1.0, sigma=0.0, learnable=False)
     # Weight ops
-    reg["gamma_blend"]    = TransmutableGeoOp("gamma_blend",  lambda x: x, rho=0.82,  sigma=0.15, weight_tensor=nn.Parameter(torch.tensor(0.82)))
-    reg["lambda_scale"]   = TransmutableGeoOp("lambda_scale", lambda x: x, rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor([8.0,4.0,4.0])))
-    reg["coupling_mob"]   = TransmutableGeoOp("coupling_mob", lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
-    reg["alpha_mirror"]   = TransmutableGeoOp("alpha_mirror", lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
-    reg["ripple_decay"]   = TransmutableGeoOp("ripple_decay", torch.exp,   rho=-0.9,  sigma=0.0)
-    reg["logit_bonus"]    = TransmutableGeoOp("logit_bonus",  torch.add,   rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(8.0)))
-    reg["ripple_scale"]   = TransmutableGeoOp("ripple_scale", lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
-    reg["theb_gamma_in"]  = TransmutableGeoOp("theb_in",      lambda x: x, rho=0.12,  sigma=0.12, weight_tensor=nn.Parameter(torch.tensor(0.12)))
-    reg["theb_gamma_ker"] = TransmutableGeoOp("theb_ker",     lambda x: x, rho=0.10,  sigma=0.10, weight_tensor=nn.Parameter(torch.tensor(0.10)))
-    reg["theb_gamma_rip"] = TransmutableGeoOp("theb_rip",     lambda x: x, rho=0.15,  sigma=0.15, weight_tensor=nn.Parameter(torch.tensor(0.15)))
-    reg["theb_gamma_out"] = TransmutableGeoOp("theb_out",     lambda x: x, rho=0.12,  sigma=0.12, weight_tensor=nn.Parameter(torch.tensor(0.12)))
-    reg["rff_scale"]      = TransmutableGeoOp("rff_scale",    lambda x: x, rho=1.0,   sigma=0.0)
-    reg["poly_jaggy"]     = TransmutableGeoOp("jaggy",        lambda x: x, rho=0.45,  sigma=0.2,  weight_tensor=nn.Parameter(torch.tensor(0.45)))
-    reg["sawtooth_period"]= TransmutableGeoOp("saw_period",   lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
-    reg["midpoint_scale"] = TransmutableGeoOp("midpoint",     lambda x: x, rho=0.9,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.9)))
-    reg["hyp_scale"]      = TransmutableGeoOp("hyp_scale",    lambda x: x, rho=0.9,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.9)))
-    reg["bolyai_disk"]    = TransmutableGeoOp("disk_scale",   lambda x: x, rho=0.18,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.18)))
-    reg["sigma_curvature"]= TransmutableGeoOp("sigma_curv",   lambda x: x, rho=2.0,   sigma=0.5,  weight_tensor=nn.Parameter(torch.tensor(2.0)))
-    reg["ripple_nudge"]   = TransmutableGeoOp("rip_nudge",    lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
-    reg["efference_nudge"]= TransmutableGeoOp("eff_nudge",    lambda x: x, rho=0.05,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.05)))
-    reg["cardan_weight"]  = TransmutableGeoOp("cardan_w",     lambda x: x, rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(8.0)))
-    reg["mob_coup_ab"]    = TransmutableGeoOp("mob_ab",       lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
-    reg["mob_coup_bc"]    = TransmutableGeoOp("mob_bc",       lambda x: x, rho=0.28,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.28)))
-    reg["mob_coup_ca"]    = TransmutableGeoOp("mob_ca",       lambda x: x, rho=0.21,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.21)))
+    reg["gamma_blend"]     = TransmutableGeoOp("gamma_blend",  lambda x: x, rho=0.82,  sigma=0.15, weight_tensor=nn.Parameter(torch.tensor(0.82)))
+    reg["lambda_scale"]    = TransmutableGeoOp("lambda_scale", lambda x: x, rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor([8.0,4.0,4.0])))
+    reg["coupling_mob"]    = TransmutableGeoOp("coupling_mob", lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
+    reg["alpha_mirror"]    = TransmutableGeoOp("alpha_mirror", lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
+    reg["ripple_decay"]    = TransmutableGeoOp("ripple_decay", torch.exp,   rho=-0.9,  sigma=0.0)
+    reg["logit_bonus"]     = TransmutableGeoOp("logit_bonus",  torch.add,   rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(8.0)))
+    reg["ripple_scale"]    = TransmutableGeoOp("ripple_scale", lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
+    reg["theb_gamma_in"]   = TransmutableGeoOp("theb_in",      lambda x: x, rho=0.12,  sigma=0.12, weight_tensor=nn.Parameter(torch.tensor(0.12)))
+    reg["theb_gamma_ker"]  = TransmutableGeoOp("theb_ker",     lambda x: x, rho=0.10,  sigma=0.10, weight_tensor=nn.Parameter(torch.tensor(0.10)))
+    reg["theb_gamma_rip"]  = TransmutableGeoOp("theb_rip",     lambda x: x, rho=0.15,  sigma=0.15, weight_tensor=nn.Parameter(torch.tensor(0.15)))
+    reg["theb_gamma_out"]  = TransmutableGeoOp("theb_out",     lambda x: x, rho=0.12,  sigma=0.12, weight_tensor=nn.Parameter(torch.tensor(0.12)))
+    reg["rff_scale"]       = TransmutableGeoOp("rff_scale",    lambda x: x, rho=1.0,   sigma=0.0)
+    reg["poly_jaggy"]      = TransmutableGeoOp("jaggy",        lambda x: x, rho=0.45,  sigma=0.2,  weight_tensor=nn.Parameter(torch.tensor(0.45)))
+    reg["sawtooth_period"] = TransmutableGeoOp("saw_period",   lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
+    reg["midpoint_scale"]  = TransmutableGeoOp("midpoint",     lambda x: x, rho=0.9,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.9)))
+    reg["hyp_scale"]       = TransmutableGeoOp("hyp_scale",    lambda x: x, rho=0.9,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.9)))
+    reg["bolyai_disk"]     = TransmutableGeoOp("disk_scale",   lambda x: x, rho=0.18,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.18)))
+    reg["sigma_curvature"] = TransmutableGeoOp("sigma_curv",   lambda x: x, rho=2.0,   sigma=0.5,  weight_tensor=nn.Parameter(torch.tensor(2.0)))
+    reg["ripple_nudge"]    = TransmutableGeoOp("rip_nudge",    lambda x: x, rho=0.1,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.1)))
+    reg["efference_nudge"] = TransmutableGeoOp("eff_nudge",    lambda x: x, rho=0.05,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.05)))
+    reg["cardan_weight"]   = TransmutableGeoOp("cardan_w",     lambda x: x, rho=8.0,   sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(8.0)))
+    reg["mob_coup_ab"]     = TransmutableGeoOp("mob_ab",       lambda x: x, rho=0.35,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.35)))
+    reg["mob_coup_bc"]     = TransmutableGeoOp("mob_bc",       lambda x: x, rho=0.28,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.28)))
+    reg["mob_coup_ca"]     = TransmutableGeoOp("mob_ca",       lambda x: x, rho=0.21,  sigma=0.0,  weight_tensor=nn.Parameter(torch.tensor(0.21)))
     return reg
 
 GEO = _build_registry()
@@ -488,7 +515,7 @@ class SpaghettiMixer(nn.Module):
 class CardanAperture(nn.Module):
     def __init__(self, vocab_size: int, aperture_k: int = 64, logit_weight: float = 8.0):
         super().__init__()
-        self.V         = vocab_size
+        self.V          = vocab_size
         self.aperture_k = min(aperture_k, vocab_size)
         self.logit_geo  = TransmutableGeoOp("cardan_local", lambda x: x, rho=logit_weight, sigma=0.,
                                              weight_tensor=nn.Parameter(torch.tensor(logit_weight)))
@@ -527,8 +554,8 @@ class CardanAperture(nn.Module):
 class MirroredInstructionHead(nn.Module):
     def __init__(self, d_model: int, alpha: float = 0.35, learnable_alpha: bool = False):
         super().__init__()
-        self.proj_fwd = nn.Linear(d_model, d_model, bias=False)
-        self.proj_mir = nn.Linear(d_model, d_model, bias=False)
+        self.proj_fwd  = nn.Linear(d_model, d_model, bias=False)
+        self.proj_mir  = nn.Linear(d_model, d_model, bias=False)
         self.alpha_geo = TransmutableGeoOp("alpha_local", lambda x: x, rho=alpha, sigma=0.,
                                            learnable=learnable_alpha,
                                            weight_tensor=nn.Parameter(torch.tensor(alpha)))
@@ -629,12 +656,12 @@ class V18Block(nn.Module):
     def __init__(self, d_model=D_MODEL, spaghetti_coup=0.35,
                  ripple_decay=0.50, ripple_scale=0.50, n_rff=32):
         super().__init__()
-        self.d_model    = d_model
-        self.bolyai     = BolyaiEmbedding(d_model)
-        self.efference  = EfferenceKernel(d_model)
-        self.rff        = RandomFourierFeatures(rff_dim=n_rff)
-        self.aniso      = AnisoDirKernel()
-        self.ripple     = RippleShift(ripple_decay, ripple_scale, thebault_gamma=0.15)
+        self.d_model     = d_model
+        self.bolyai      = BolyaiEmbedding(d_model)
+        self.efference   = EfferenceKernel(d_model)
+        self.rff         = RandomFourierFeatures(rff_dim=n_rff)
+        self.aniso       = AnisoDirKernel()
+        self.ripple      = RippleShift(ripple_decay, ripple_scale, thebault_gamma=0.15)
         self.theb_input  = MiniThebault(gamma_op=GEO["theb_gamma_in"],  dim=-1)
         self.theb_kernel = MiniThebault(gamma_op=GEO["theb_gamma_ker"], dim=-1)
         self.theb_ripple = MiniThebault(gamma_op=GEO["theb_gamma_rip"], dim=-1)
@@ -781,6 +808,7 @@ class V18Model(nn.Module):
     """
     Full V18-GEO language model.
     All math/weight ops routed through TransmutableGeoOp (GEO registry).
+    n_layers and n_heads are sourced from the module-level fake generators.
     """
     def __init__(self, vocab_size: int = VOCAB, d_model: int = D_MODEL,
                  n_layers: int = N_LAYERS, n_heads: int = N_HEADS,
@@ -791,7 +819,7 @@ class V18Model(nn.Module):
         self.vocab_size  = vocab_size
         self.max_seq_len = max_seq_len
         self.tok_emb     = nn.Embedding(vocab_size, d_model)
-        self.pos_emb     = nn.Embedding(max_seq_len, d_model)   # ← shape [max_seq_len, d_model]
+        self.pos_emb     = nn.Embedding(max_seq_len, d_model)
         self.drop        = nn.Dropout(dropout)
         self.layers      = nn.ModuleList([
             V18TransformerLayer(d_model=d_model, n_heads=n_heads, ffn_mult=4,
@@ -824,8 +852,7 @@ class V18Model(nn.Module):
     def forward(self, input_ids: torch.Tensor,
                 instruction_ids=None, temperature=1., return_probs=False):
         B, T = input_ids.shape
-        # Clamp T to max_seq_len (prevents pos_emb out-of-range)
-        T   = min(T, self.max_seq_len)
+        T         = min(T, self.max_seq_len)
         input_ids = input_ids[:, :T]
         pos = torch.arange(T, device=input_ids.device).unsqueeze(0).expand(B, -1)
         x   = self.drop(self.tok_emb(input_ids) + self.pos_emb(pos))
@@ -843,15 +870,14 @@ class V18Model(nn.Module):
         self.eval()
         ids = prompt_ids.clone()
         for step in range(max_new_tokens):
-            # Keep only last max_seq_len tokens
-            ctx       = ids[:, -self.max_seq_len:]
-            probs     = self.forward(ctx, instruction_ids=instruction_ids,
-                                     temperature=temperature, return_probs=True)
-            next_p    = probs[0, -1]
-            next_p    = GEO["relu"](next_p).clamp(min=1e-12)
-            next_p    = next_p / next_p.sum()
-            next_id   = GEO["multinomial"](next_p)        # (1,)
-            ids       = torch.cat([ids, next_id.unsqueeze(0)], dim=1)
+            ctx     = ids[:, -self.max_seq_len:]
+            probs   = self.forward(ctx, instruction_ids=instruction_ids,
+                                   temperature=temperature, return_probs=True)
+            next_p  = probs[0, -1]
+            next_p  = GEO["relu"](next_p).clamp(min=1e-12)
+            next_p  = next_p / next_p.sum()
+            next_id = GEO["multinomial"](next_p)        # (1,)
+            ids     = torch.cat([ids, next_id.unsqueeze(0)], dim=1)
             self.set_orbit(step)
         return ids
 
@@ -865,7 +891,7 @@ def _get_data() -> str:
         return f.read()
 
 
-class Dataset(Dataset):
+class TextDataset(Dataset):
     """Sliding-window token dataset with shared tokenizer."""
     def __init__(self, tokens: torch.Tensor, seq_len: int = SEQ_LEN):
         self.tokens  = tokens
@@ -875,14 +901,14 @@ class Dataset(Dataset):
         return max(1, len(self.tokens) - self.seq_len - 1)
 
     def __getitem__(self, idx):
-        chunk  = self.tokens[idx : idx + self.seq_len + 1]
+        chunk = self.tokens[idx : idx + self.seq_len + 1]
         return chunk[:-1], chunk[1:]
 
 
 def build_datasets(seq_len: int = SEQ_LEN):
     """Download, tokenize, split 90/10 train/val. Returns (train_ds, val_ds, tokenizer)."""
-    raw   = _get_data()
-    tok   = WordTokenizer(vocab_size=VOCAB)
+    raw = _get_data()
+    tok = WordTokenizer(vocab_size=VOCAB)
     tok.build_vocab([raw])
     tok.save(TOKENIZER_F)
     print(f"Vocabulary built: {len(tok.trigram2id):,} trigrams saved to {TOKENIZER_F}")
@@ -890,9 +916,9 @@ def build_datasets(seq_len: int = SEQ_LEN):
     tokens = tok.encode(raw)
     print(f"Dataset: {len(tokens):,} tokens")
 
-    split     = int(0.9 * len(tokens))
-    train_ds  = Dataset(tokens[:split],  seq_len=seq_len)
-    val_ds    = Dataset(tokens[split:],  seq_len=seq_len)
+    split    = int(0.9 * len(tokens))
+    train_ds = TextDataset(tokens[:split],  seq_len=seq_len)
+    val_ds   = TextDataset(tokens[split:],  seq_len=seq_len)
     print(f"Train: {len(train_ds):,} windows  |  Val: {len(val_ds):,} windows")
     return train_ds, val_ds, tok
 
@@ -908,9 +934,13 @@ def collate_fn(batch):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def train():
+    global N_LAYERS, N_HEADS
+    N_LAYERS = next(_layers_gen)
+    N_HEADS  = next(_heads_gen)
+
     device     = "cuda" if torch.cuda.is_available() else "cpu"
     batch_size = BATCH_GPU if device == "cuda" else BATCH_CPU
-    print(f"Device: {device}  |  Batch: {batch_size}")
+    print(f"Device: {device}  |  Batch: {batch_size}  |  N_LAYERS: {N_LAYERS}  |  N_HEADS: {N_HEADS}")
 
     train_ds, val_ds, tok = build_datasets(seq_len=SEQ_LEN)
     train_dl = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
@@ -918,13 +948,12 @@ def train():
     val_dl   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False,
                           collate_fn=collate_fn, num_workers=0)
 
-    # Model — ALL dims use global constants (no mismatch possible)
     model = V18Model(
         vocab_size   = VOCAB,
         d_model      = D_MODEL,
         n_layers     = N_LAYERS,
         n_heads      = N_HEADS,
-        max_seq_len  = MAX_SEQ_LEN,  # ← checkpoint will have pos_emb [128, D_MODEL]
+        max_seq_len  = MAX_SEQ_LEN,
         cardan_k     = CARDAN_K,
         dropout      = DROPOUT,
     ).to(device)
@@ -959,24 +988,55 @@ def train():
         model.eval()
         v_loss, v_steps = 0., 0
         with torch.no_grad():
-            for inputs, targets in val_dl:
+            for i, (inputs, targets) in enumerate(val_dl):
                 inputs, targets = inputs.to(device), targets.to(device)
                 logits = model(inputs)
                 v_loss  += criterion(logits.transpose(1, 2), targets).item()
                 v_steps += 1
                 if i == KB_LEN:
                     break
-        avg_t = t_loss/max(t_steps,1)
-        avg_v = v_loss/max(v_steps,1)
+        avg_t = t_loss / max(t_steps, 1)
+        avg_v = v_loss / max(v_steps, 1)
         print(f"Epoch {epoch+1}/{EPOCHS}  train={avg_t:.4f}  val={avg_v:.4f}")
 
         if avg_v < best_val:
             best_val = avg_v
             torch.save(model.state_dict(), CHECKPOINT)
+            # Save architecture metadata so generation never has to guess n_heads
+            torch.save({"n_layers": N_LAYERS, "n_heads": N_HEADS},
+                       CHECKPOINT + ".meta")
             print(f"  ✓ Saved best model → {CHECKPOINT}")
 
     print(f"\nTraining complete. Best val loss: {best_val:.4f}")
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CHECKPOINT INTROSPECTION HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _dims_from_checkpoint(state: dict) -> tuple:
+    """
+    Recover (vocab_size, d_model, max_seq_len, n_layers, n_heads) purely from
+    the state_dict so generation always builds an architecture that matches the
+    saved weights, regardless of what the generators are currently pointing at.
+    """
+    v_size   = state["tok_emb.weight"].shape[0]
+    d_size   = state["tok_emb.weight"].shape[1]
+    s_len    = state["pos_emb.weight"].shape[0]
+    # Count layers by finding the highest index under "layers."
+    layer_indices = [int(k.split(".")[1]) for k in state if k.startswith("layers.")]
+    n_layers = max(layer_indices) + 1 if layer_indices else _N_LAYERS_BASE
+    # Recover n_heads: in_proj_weight shape is [3*d, d]; that alone cannot tell
+    # us n_heads.  We store it in a sidecar .meta file written at save time.
+    meta_path = CHECKPOINT + ".meta"
+    if os.path.exists(meta_path):
+        meta    = torch.load(meta_path, map_location="cpu")
+        n_heads = meta["n_heads"]
+    else:
+        # Fallback: use the current generator value if no sidecar exists
+        n_heads = N_HEADS
+    return v_size, d_size, s_len, n_layers, n_heads
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GENERATION
@@ -996,14 +1056,14 @@ def generate_sample(prompt: str = "To be or not to be",
     tok = WordTokenizer.load(TOKENIZER_F)
     print(f"Loaded tokenizer: {len(tok.trigram2id):,} trigrams")
 
-    # Auto-detect checkpoint dims so load always matches
+    # Auto-detect ALL dims from checkpoint — generator state is irrelevant here
     state  = torch.load(CHECKPOINT, map_location=device)
-    v_size = state["tok_emb.weight"].shape[0]
-    d_size = state["tok_emb.weight"].shape[1]
-    s_len  = state["pos_emb.weight"].shape[0]
-    print(f"Checkpoint: vocab={v_size}, d_model={d_size}, max_seq_len={s_len}")
+    v_size, d_size, s_len, ck_layers, ck_heads = _dims_from_checkpoint(state)
+    print(f"Checkpoint: vocab={v_size}, d_model={d_size}, max_seq_len={s_len}, "
+          f"n_layers={ck_layers}, n_heads={ck_heads}")
 
     model = V18Model(vocab_size=v_size, d_model=d_size,
+                     n_layers=ck_layers, n_heads=ck_heads,
                      max_seq_len=s_len).to(device)
     model.load_state_dict(state)
     model.eval()
@@ -1030,10 +1090,12 @@ def run_gui():
         return
     tok    = WordTokenizer.load(TOKENIZER_F)
     state  = torch.load(CHECKPOINT, map_location=device)
-    v_size = state["tok_emb.weight"].shape[0]
-    d_size = state["tok_emb.weight"].shape[1]
-    s_len  = state["pos_emb.weight"].shape[0]
-    model  = V18Model(vocab_size=v_size, d_model=d_size, max_seq_len=s_len).to(device)
+    v_size, d_size, s_len, ck_layers, ck_heads = _dims_from_checkpoint(state)
+    print(f"Checkpoint: vocab={v_size}, d_model={d_size}, max_seq_len={s_len}, "
+          f"n_layers={ck_layers}, n_heads={ck_heads}")
+    model  = V18Model(vocab_size=v_size, d_model=d_size,
+                      n_layers=ck_layers, n_heads=ck_heads,
+                      max_seq_len=s_len).to(device)
     model.load_state_dict(state)
     model.eval()
     model.build_cardan()
