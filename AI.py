@@ -860,7 +860,7 @@ class V18Model(nn.Module):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_data() -> str:
-    with open(input("Filename"), encoding="utf-8") as f:
+    with open(input("Filename: "), encoding="utf-8") as f:
         return f.read()
 
 
@@ -1053,12 +1053,13 @@ def run_gui():
 # ─────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    choice = input("(t) Train   (g) Generate sample   (i) Interactive GUI\n>>> ").strip().lower()
-    if choice == "t":
-        train()
-    elif choice == "g":
-        generate_sample()
-    elif choice == "i":
-        run_gui()
-    else:
-        print("Unknown choice. Run again and enter t / g / i")
+    while True:
+        choice = input("(t) Train   (g) Generate sample   (i) Interactive GUI\n>>> ").strip().lower()
+        if choice == "t":
+            train()
+        elif choice == "g":
+            generate_sample()
+        elif choice == "i":
+            run_gui()
+        else:
+            print("Unknown choice. Run again and enter t / g / i")
