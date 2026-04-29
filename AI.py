@@ -34,7 +34,7 @@ D_MODEL     = 64
 N_LAYERS    = 4
 N_HEADS     = 4
 MAX_SEQ_LEN = 128      # ← single source of truth for pos_emb size
-KB_LEN = 1000
+KB_LEN = 100
 SEQ_LEN     = 64       # training window (must be < MAX_SEQ_LEN)
 CARDAN_K    = 64
 DROPOUT     = 0.1
@@ -952,7 +952,7 @@ def train():
             scheduler.step()
             t_loss  += loss.item()
             t_steps += 1
-            if i % KB_LEN == 0:
+            if i == KB_LEN:
                 print(f"Step {i}/{len(train_dl)}  loss={loss.item():.4f}")
                 break
         # ── val ──
@@ -964,7 +964,7 @@ def train():
                 logits = model(inputs)
                 v_loss  += criterion(logits.transpose(1, 2), targets).item()
                 v_steps += 1
-                if i % KB_LEN == 0:
+                if i == KB_LEN:
                     break
         avg_t = t_loss/max(t_steps,1)
         avg_v = v_loss/max(v_steps,1)
