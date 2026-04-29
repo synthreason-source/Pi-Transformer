@@ -29,7 +29,7 @@ import requests
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL CONFIG — change these in one place only
 # ─────────────────────────────────────────────────────────────────────────────
-VOCAB       = 10_000
+VOCAB       = 10
 D_MODEL     = 64
 N_LAYERS    = 4
 N_HEADS     = 4
@@ -37,11 +37,11 @@ MAX_SEQ_LEN = 128      # ← single source of truth for pos_emb size
 SEQ_LEN     = 64       # training window (must be < MAX_SEQ_LEN)
 CARDAN_K    = 64
 DROPOUT     = 0.1
-EPOCHS      = 10
+EPOCHS      = 1
 LR          = 6e-4
 BATCH_GPU   = 32
 BATCH_CPU   = 8
-CHECKPOINT  = "v18_geo_tinyshakespeare.pt"
+CHECKPOINT  = "v18_geo.pt"
 TOKENIZER_F = "v18_tokenizer.json"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -953,7 +953,6 @@ def train():
             t_steps += 1
             if i % 50 == 0:
                 print(f"  Epoch {epoch+1} step {i}/{len(train_dl)}  loss={loss.item():.4f}")
-                break
         # ── val ──
         model.eval()
         v_loss, v_steps = 0., 0
@@ -965,7 +964,6 @@ def train():
                 v_steps += 1
                 if i % 50 == 0:
                     print(f"  Epoch {epoch+1} step {i}/{len(train_dl)}  loss={loss.item():.4f}")
-                    break
         avg_t = t_loss/max(t_steps,1)
         avg_v = v_loss/max(v_steps,1)
         print(f"Epoch {epoch+1}/{EPOCHS}  train={avg_t:.4f}  val={avg_v:.4f}")
