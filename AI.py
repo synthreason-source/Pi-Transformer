@@ -182,35 +182,70 @@ class VectorMagnetEncoding(nn.Module):
 # ═══════════════════════════════════════════════════════════════
 #  PART 6: MINI‑KERNEL HEAD (per‑index latent kernels)
 # ═══════════════════════════════════════════════════════════════
-
 class MiniKernelHead(nn.Module):
     """
-    Per‑sample mini‑kernel that modulates token embeddings.
+    Per‑sample multi‑kernel that modulates token embeddings.
     For each sequence (index) in a batch, it looks at a small
-    window of that sequence's embeddings and outputs a
-    [B, d_model] modulation vector.
+    window of that sequence's embeddings and outputs modulation
+    for multiple kernels, each with its own entropy bandgap constraint.
     """
-    def __init__(self, d_model: int, kernel_size: int = 4):
+    def __init__(self, d_model: int, kernel_size: int = 4, num_kernels: int = 4):
         super().__init__()
         self.d_model = d_model
         self.kernel_size = kernel_size
+        self.num_kernels = num_kernels
+        self.kernel_dim = d_model // num_kernels  # must divide evenly
+        assert d_model % num_kernels == 0, "d_model must be divisible by num_kernels"
+        
         self.proj = nn.Sequential(
             nn.Linear(kernel_size * d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
         self.gate = nn.Linear(kernel_size * d_model, d_model)
-
+        # Learnable bandgap for each kernel (entropy upper bound)
+        # Initialized to allow moderate entropy (adjust as needed)
+        self.bandgap = nn.Parameter(torch.ones(num_kernels) * 1.0)
+    
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: [B, K, d_model] — kernel context per sample.
-        returns: [B, d_model] modulation per sample.
+        returns: [B, d_model] modulation per sample (constrained by bandgaps).
         """
         B, K, D = x.shape
         flat = x.reshape(B, K * D)
-        gate = torch.sigmoid(self.gate(flat))
-        mod  = self.proj(flat)
-        return gate * mod
+        gate = torch.sigmoid(self.gate(flat))  # [B, D]
+        mod_raw = self.proj(flat)  # [B, D]
+        
+        # Reshape to multiple kernels: [B, num_kernels, kernel_dim]
+        mod_raw = mod_raw.view(B, self.num_kernels, self.kernel_dim)
+        gate = gate.view(B, self.num_kernels, self.kernel_dim)
+        
+        # Apply entropy constraint per kernel
+        constrained_kernels = []
+        for i in range(self.num_kernels):
+            kernel_raw = mod_raw[:, i, :]  # [B, kernel_dim]
+            kernel_gate = gate[:, i, :]    # [B, kernel_dim]
+            
+            # Calculate entropy for this kernel (treating output as logits)
+            kernel_probs = F.softmax(kernel_raw, dim=-1)
+            kernel_log_probs = F.log_softmax(kernel_raw, dim=-1)
+            entropy = -torch.sum(kernel_probs * kernel_log_probs, dim=-1)  # [B]
+            
+            # Get bandgap for this kernel
+            bandgap_i = self.bandgap[i]  # scalar
+            
+            # If entropy exceeds bandgap, apply exponential scaling penalty
+            excess = torch.clamp(entropy - bandgap_i, min=0.0)
+            scale = torch.exp(-excess)  # [B] - scales from 1.0 (no excess) toward 0.0
+            
+            # Apply scaling and gating
+            kernel_constrained = kernel_raw * scale.unsqueeze(-1) * kernel_gate
+            constrained_kernels.append(kernel_constrained)
+        
+        # Concatenate kernels back to [B, D]
+        mod = torch.cat(constrained_kernels, dim=-1)
+        return mod
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -321,14 +356,19 @@ class V18Model(nn.Module):
     ):
         device = x.device
         B, T = x.shape
+        if use_minikernels and kernel_ctx is None:
+            pos = torch.arange(5, device=device).unsqueeze(0).expand(B, -1)
+            emb = self.tok(x) + self.pos(pos)
+            K = min(4, T)
+            kernel_ctx = emb[:, :K, :].detach()
+        logits = self(x, kernel_ctx=kernel_ctx if use_minikernels else None)
+
+        probs = torch.softmax(logits[:, -1], dim=-1)
         for _ in range(steps):
-            if _ % 5 and use_minikernels and kernel_ctx is None:
-                pos = torch.arange(5, device=device).unsqueeze(0).expand(B, -1)
-                emb = self.tok(x) + self.pos(pos)
-                K = min(4, T)
-                kernel_ctx = emb[:, :K, :].detach()
             logits = self(x, kernel_ctx=kernel_ctx if use_minikernels else None)
-            probs = torch.softmax(logits[:, -1], dim=-1)
+            if _ % 50 == 0:
+                probs = torch.softmax(logits[:, -1], dim=-1)
+
             nxt = torch.multinomial(probs, 1)
             x = torch.cat([x, nxt], dim=1)
 
