@@ -14,14 +14,14 @@ import torch.nn.functional as F
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
-VOCAB       = 1000000
+VOCAB       = 1000
 D_MODEL     = 64
 MAX_SEQ_LEN = 512
 SEQ_LEN     = 16
 DROPOUT     = 0.9
 LR          = 6e-4
 EPOCHS      = 2
-KB_LEN      = -1
+KB_LEN      = 9999
 CHECKPOINT  = "v18.pt"
 TOKENIZER_F = "v18_tokenizer.json"
 
@@ -76,7 +76,7 @@ def all_constants():
 def score_ast(expr, traces, ignore_name=None):
     return 0.0   # dummy
 
-def robust_ast_search(traces_A, traces_B, min_accuracy=0.01, max_candidates=50):
+def robust_ast_search(traces_A, traces_B, min_accuracy=0.11, max_candidates=150):
     return []    # dummy
 
 
@@ -103,7 +103,7 @@ class NALULike(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  PART 5: VECTOR MAGNET ENCODING (unchanged core)
+#  PART 5: VECTOR MAGNET ENCODING (modified for vertical waves, horizontal lines, AOE)
 # ═══════════════════════════════════════════════════════════════
 
 class VectorMagnetEncoding(nn.Module):
@@ -131,39 +131,59 @@ class VectorMagnetEncoding(nn.Module):
         self.magnets = nn.Parameter(torch.cat([mags_low, mags_mid, mags_high], dim=0))
         self.axes = nn.Parameter(torch.cat([axes_low, axes_mid, axes_high], dim=0))
 
-        self.proj = nn.Linear(2 * self.n_vecs, d_model)
+        # FIXED: expect 3 * n_vecs inputs (vertical wave, horizontal lines, radial depth)
+        self.proj = nn.Linear(3 * self.n_vecs, d_model)
 
     def forward(self, pos_ids: torch.Tensor) -> torch.Tensor:
         pos = pos_ids.float() + self.shift
         B, T = pos.shape
 
-        # 1. Build 2D magnet‑axis activation map (bx, by)
+        # 1. Build 2D magnet‑axis activation map (bx, by) with vertical waves & horizontal lines
         feats = []
         for i in range(self.n_vecs):
             w = self.magnets[i]
             a = self.axes[i]
-            x = pos * w + self.phase + (i * 0.91)
+            base = pos * w + self.phase + (i * 0.11)          # [B, T]
 
-            bx = torch.sin(x) * a
-            by = torch.cos(x) * (1.0 - 0.1 * a)
+            # vertical waves: slow variation over stack index i
+            vertical_phase = i * 0.15
+            vert_wave = torch.sin(base + vertical_phase)      # [B, T]
 
-            feats.append(-bx)
-            feats.append(by)
+            # horizontal lines: high‑frequency sinusoid quantized into bands
+            horiz = torch.sin(base * 3.0)                     # [B, T]
+            horiz_lines = torch.round(horiz * 3.0) / 3.0      # snap into bands
 
-        # Shape: [B, T, 2*n_vecs]
+            # radial shell index for AOE‑like depth cue
+            r_shell = torch.full_like(base, float(i))
+            r_shell = (r_shell / self.n_vecs) * 2 - 1.0       # normalize to [-1, 1]
+
+            feats.append(vert_wave * a)                       # x‑like: vertical wave
+            feats.append(horiz_lines * (1.0 - 0.1 * a))       # y‑like: horizontal lines
+            feats.append(r_shell)                             # z‑like: radial depth
+
+        # Shape: [B, T, 3*n_vecs]
         feats = torch.stack(feats, dim=-1)
+
+        # Defensive shape check – helps catch configuration mismatches early
+        expected_dim = 3 * self.n_vecs
+        actual_dim = feats.shape[-1]
+        if actual_dim != expected_dim:
+            raise RuntimeError(
+                f"VectorMagnetEncoding feature dimension mismatch: "
+                f"expected {expected_dim} (3 * n_vecs where n_vecs={self.n_vecs}), "
+                f"got {actual_dim}. Check that n_low, n_mid, n_high are consistent "
+                f"between where the module is instantiated and used."
+            )
 
         # 2. fold into 3D‑like “x,y,z” coordinates (conceptually)
         n_3d = (feats.shape[-1] // 3) * 3
-        xyz = feats[..., :n_3d].reshape(B, T, -1, 3)  # [..., stacks, 3]
+        xyz = feats[..., :n_3d].reshape(B, T, -1, 3)          # [..., stacks, 3]
 
-        # 3. cubic cage mask: 1 inside, 0 outside
-        max_feat = xyz.abs().max(dim=-1, keepdim=True)[0]
-        xyz_norm = xyz / (max_feat + 1e-6)
-
-        box_margin = 10.90
-        inside = (xyz_norm.abs() <= 1 + box_margin).float()
-        smooth_mask_per_point = inside.min(dim=-1, keepdim=True)[0]  # [..., stacks, 1]
+        # 3. radial AOE mask: smooth falloff from center (replaces cube cage)
+        r = torch.norm(xyz, dim=-1, keepdim=True)            # [B, T, stacks, 1]
+        radius = self.cage_size
+        sharpness = 4.0
+        smooth_mask_per_point = torch.exp(- (r / radius) ** sharpness)  # [B,T,stacks,1]
 
         # 4. reshape back to 2D latent vector and apply mask
         mask_3d = smooth_mask_per_point.expand_as(xyz)
@@ -173,7 +193,6 @@ class VectorMagnetEncoding(nn.Module):
             ones = torch.ones(B, T, feats.shape[-1] - n_3d, device=feats.device)
             mask_flat = torch.cat([mask_flat, ones], dim=-1)
 
-        feats = torch.roll(feats, shifts=int(self.shift.item()) if self.shift.numel() == 1 else 1, dims=-1)
         feats = feats * mask_flat
 
         return self.proj(feats) * self.scale / math.sqrt(self.d_model)
