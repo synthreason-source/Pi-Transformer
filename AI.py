@@ -14,14 +14,14 @@ import torch.nn.functional as F
 # ═══════════════════════════════════════════════════════════════
 #  CONFIG
 # ═══════════════════════════════════════════════════════════════
-VOCAB       = 1000
+VOCAB       = 1000000
 D_MODEL     = 64
 MAX_SEQ_LEN = 512
 SEQ_LEN     = 16
 DROPOUT     = 0.9
 LR          = 6e-4
 EPOCHS      = 2
-KB_LEN      = 9999
+KB_LEN      = -1
 CHECKPOINT  = "v18.pt"
 TOKENIZER_F = "v18_tokenizer.json"
 
