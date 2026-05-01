@@ -544,7 +544,7 @@ def gui():
             K = min(4, T)
             k_ctx = emb[:, :K, :].detach()
 
-        out = m.generate(ids, 1000, use_minikernels=True, kernel_ctx=k_ctx)
+        out = m.generate(ids, 280, use_minikernels=True, kernel_ctx=k_ctx)
         print(tok.decode(out[0].cpu()))
 
 
