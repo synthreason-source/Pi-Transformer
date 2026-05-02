@@ -8,7 +8,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-VOCAB_SIZE = 5000
+VOCAB_SIZE = 500000000
 SEQ_LEN = 16
 EMBED_DIM = 128
 HIDDEN_DIM = 256
