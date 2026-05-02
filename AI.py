@@ -177,16 +177,55 @@ def load_all(device: str = "cpu"):
     model.load_state_dict(ckpt["model_state"])
     model.eval()
     return model, tokenizer
+def ranked_generate(
+    model: SimpleLM,
+    tokenizer: Tokenizer,
+    prompt: str,
+    length_weight: float = 0.35,
+    n_samples: int = 5,
+    max_new_tokens: int = 30,
+    device: str = "cpu",
+) -> str:
+    start_ids = tokenizer.encode(prompt)
+    if not start_ids:
+        start_ids = [tokenizer.t2i["<unk>"]]
 
+    completions = []
+    prompt_len = len(prompt.split())
 
+    for _ in range(n_samples):
+        out_ids = model.generate(
+            start_ids,
+            max_new_tokens=max_new_tokens,
+            device=device,
+        )
+        completion = tokenizer.decode(out_ids)
+        completions.append((completion, prompt_len, completion))
+
+    def score_pair(completion: str, ref_len: int) -> float:
+        c_len = len(completion.split())
+        if ref_len == 0 and c_len == 0:
+            return 1.0
+        ls = 1.0 - abs(c_len - ref_len) / max(c_len, ref_len, 1)
+        return ls
+
+    scored = [(score_pair(c, prompt_len), c) for c in [comp for comp, _, _ in completions]]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    _, best = scored[0]
+    return best
 def train(text: str):
     sentences = split_sentences(text)
-    if sentences:
-        text = " ".join(cosine_length_sort_sentences(sentences))
+    if not sentences:
+        raise ValueError("No sentences found.")
+
+    # Keep orig text for tokenizer
+    orig_text = " ".join(sentences)
+    # Cosine‑sorted text for training
+    sorted_text = " ".join(cosine_length_sort_sentences(sentences))
 
     tokenizer = Tokenizer()
-    tokenizer.build([text])
-    token_ids = tokenizer.encode(text)
+    tokenizer.build([orig_text])                # build vocab on original
+    token_ids = tokenizer.encode(sorted_text)   # train on sorted
 
     if len(token_ids) <= SEQ_LEN:
         raise ValueError("Text too short for training.")
@@ -223,18 +262,6 @@ def train(text: str):
     print(f"saved tokenizer -> {TOKENIZER_FILE}")
 
 
-def generate_once(prompt: str, max_new_tokens: int = 30):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model, tokenizer = load_all(device=device)
-
-    start_ids = tokenizer.encode(prompt)
-    if not start_ids:
-        start_ids = [tokenizer.t2i["<unk>"]]
-
-    out_ids = model.generate(start_ids, max_new_tokens=max_new_tokens, device=device)
-    print(tokenizer.decode(out_ids))
-
-
 def generate_loop(max_new_tokens: int = 300):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tokenizer = load_all(device=device)
@@ -245,28 +272,27 @@ def generate_loop(max_new_tokens: int = 300):
         if prompt.lower() in ("q"):
             break
 
-        start_ids = tokenizer.encode(prompt)
-        if not start_ids:
-            start_ids = [tokenizer.t2i["<unk>"]]
-
-        out_ids = model.generate(start_ids, max_new_tokens=max_new_tokens, device=device)
-        print(tokenizer.decode(out_ids))
+        completion = ranked_generate(
+            model,
+            tokenizer,
+            prompt,
+            n_samples=5,
+            max_new_tokens=max_new_tokens,
+            device=device,
+        )
+        print(completion)
         print()
 
 
 if __name__ == "__main__":
     while True:
-        c = input("(t)rain (g)en-once (i)nteractive (l)oad-test (q)uit > ").strip().lower()
+        c = input("(t)rain (i)nteractive (l)oad-test (q)uit > ").strip().lower()
 
         if c == "t":
             path = input("File: ").strip()
             with open(path, "r", encoding="utf-8") as f:
                 text = f.read()
             train(text)
-
-        elif c == "g":
-            prompt = input("prompt: ").strip()
-            generate_once(prompt)
 
         elif c == "i":
             generate_loop()
