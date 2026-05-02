@@ -210,7 +210,7 @@ def ranked_generate(
         return ls
 
     scored = [(score_pair(c, prompt_len), c) for c in [comp for comp, _, _ in completions]]
-    scored.sort(key=lambda x: x[0], reverse=True)
+    scored.sort(key=lambda x: x[0], reverse=False)
     _, best = scored[0]
     return best
 def train(text: str):
