@@ -474,7 +474,7 @@ with gr.Blocks(title="π → BASE-26 → NLTK Trigram Generator", css=CSS) as de
         seed_input = gr.Textbox(
             label="Seed phrase",
             placeholder='e.g. "hello world", "quantum", ""',
-            value="hello world",
+            value="Is there inherent order in nature or is it all chaos and chance?",
             scale=3,
         )
         corpus_upload = gr.File(
