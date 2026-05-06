@@ -41,7 +41,7 @@ DATASET_PATH   = "pi_dataset.txt"
 
 # ── PUBLIC-DOMAIN CORPUS ──────────────────────────────────────────────────────
 # Multiple genres; all pre-1928 or clearly public domain.
-file = open("xaa.txt", "r")
+file = open("xaa.txt", "r", encoding = "utf-8")
 
 # Read the entire content of the file
 CORPUS = file.read()
