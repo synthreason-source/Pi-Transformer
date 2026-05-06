@@ -1,3 +1,6 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
 """
 π → BASE-26 → NLTK TRIGRAM LLM → NATURAL TEXT
 ═══════════════════════════════════════════════
@@ -7,7 +10,8 @@
   4. Pi entropy   — base-26 stream of π replaces all random sampling
   5. Triangle     — vertices A / B / C at 0 / ⅓ / ⅔ of the stream seed
                     three independently-reproducible texts
-  6. Dataset      — words found live in the stream + generated paragraphs
+  6. Seed text    — user‑provided phrase offsets the triangle and seeds the trigram context
+  7. Dataset      — words found live in the stream + generated paragraphs
                     all written to pi_dataset.txt
 """
 
@@ -25,8 +29,15 @@ if hasattr(sys, "set_int_max_str_digits"):
     sys.set_int_max_str_digits(300_000)
 
 # ── ANSI ──────────────────────────────────────────────────────────────────────
-R="\033[0m"; B="\033[1m"; DM="\033[2m"
-CY="\033[96m"; GR="\033[92m"; YL="\033[93m"; RD="\033[91m"; MG="\033[95m"
+R = "\033[0m"   # reset
+B = "\033[1m"   # bold
+DM = "\033[2m"  # dim
+CY = "\033[96m" # cyan
+GR = "\033[92m" # green
+YL = "\033[93m" # yellow
+RD = "\033[91m" # red
+MG = "\033[95m" # magenta
+
 def c(code, t): return f"{code}{t}{R}"
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
@@ -40,14 +51,52 @@ WORD_FIND_MIN  = 4        # minimum word length to report from stream
 DATASET_PATH   = "pi_dataset.txt"
 
 # ── PUBLIC-DOMAIN CORPUS ──────────────────────────────────────────────────────
-# Multiple genres; all pre-1928 or clearly public domain.
-file = open("xaa.txt", "r", encoding = "utf-8")
+# Try to read an external file; if it doesn't exist, fall back to an embedded
+# public‑domain excerpt (the opening of Alice's Adventures in Wonderland).
+def _load_corpus():
+    try:
+        with open("xaa.txt", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        # Embedded fallback – public domain
+        return (
+            "Alice was beginning to get very tired of sitting by her sister on the bank, "
+            "and of having nothing to do: once or twice she had peeped into the book her "
+            "sister was reading, but it had no pictures or conversations in it, \"and what "
+            "is the use of a book,\" thought Alice \"without pictures or conversation?\"\n\n"
+            "So she was considering in her own mind (as well as she could, for the hot "
+            "day made her feel very sleepy and stupid), whether the pleasure of making "
+            "a daisy-chain would be worth the trouble of getting up and picking the "
+            "daisies, when suddenly a White Rabbit with pink eyes ran close by her.\n\n"
+            "There was nothing so very remarkable in that; nor did Alice think it so "
+            "very much out of the way to hear the Rabbit say to itself, \"Oh dear! Oh "
+            "dear! I shall be late!\" (when she thought it over afterwards, it occurred "
+            "to her that she ought to have wondered at this, but at the time it all "
+            "seemed quite natural); but when the Rabbit actually took a watch out of "
+            "its waistcoat-pocket, and looked at it, and then hurried on, Alice started "
+            "to her feet, for it flashed across her mind that she had never before "
+            "seen a rabbit with either a waistcoat-pocket, or a watch to take out of it, "
+            "and burning with curiosity, she ran across the field after it, and fortunately "
+            "was just in time to see it pop down a large rabbit-hole under the hedge.\n\n"
+            "In another moment down went Alice after it, never once considering how in "
+            "the world she was to get out again.\n\n"
+            "The rabbit-hole went straight on like a tunnel for some way, and then "
+            "dipped suddenly down, so suddenly that Alice had not a moment to think "
+            "about stopping herself before she found herself falling down a very deep well.\n\n"
+            "Either the well was very deep, or she fell very slowly, for she had plenty "
+            "of time as she went down to look about her and to wonder what was going "
+            "to happen next. First, she tried to look down and make out what she was "
+            "coming to, but it was too dark to see anything; then she looked at the "
+            "sides of the well, and noticed that they were filled with cupboards and "
+            "book-shelves; here and there she saw maps and pictures hung upon pegs. "
+            "She took down a jar from one of the shelves as she passed; it was labelled "
+            "\"ORANGE MARMALADE\", but to her great disappointment it was empty: she did "
+            "not like to drop the jar for fear of killing somebody, so managed to put "
+            "it into one of the cupboards as she fell past it."
+        )
 
-# Read the entire content of the file
-CORPUS = file.read()
+CORPUS = _load_corpus()
 
-# Close the file
-file.close()
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. NLTK SETUP
 # ═════════════════════════════════════════════════════════════════════════════
@@ -58,8 +107,8 @@ def build_nltk_model(corpus: str):
     tokens    = tokenizer.tokenize(corpus.lower())
 
     # Build trigram (context = prev 2 words → next word)
-    pad = ["<s>", "<s>"]
-    padded = pad + tokens + ["</s>"]
+    pad = ["", ""]
+    padded = pad + tokens + [""]
     trigrams = list(ngrams(padded, NGRAM_N))
 
     # ConditionalFreqDist: context (w1,w2) → FreqDist over w3
@@ -84,6 +133,24 @@ def load_nltk_words():
         print(f"  nltk words failed ({e}), using corpus vocab")
         return set()
 
+
+# ── SEED HELPERS ─────────────────────────────────────────────────────────────
+def seed_to_offset(seed: str, stream_len: int) -> int:
+    """Deterministically map a seed string to an integer in [0, stream_len)."""
+    h = 0
+    for ch in seed.lower():
+        if ch.isalpha():
+            h = (h * 31 + (ord(ch) - ord('a') + 1)) % stream_len
+    return h
+
+def seed_context(seed: str, default=("", "")):
+    """Return a two‑word tuple to prime the trigram model."""
+    toks = [w for w in re.findall(r"[a-z]+", seed.lower()) if w]
+    if len(toks) >= 2:
+        return (toks[0], toks[1])
+    if len(toks) == 1:
+        return (toks[0], default[1])
+    return default
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 2. π BASE-26 STREAM
@@ -118,7 +185,7 @@ def build_pi_stream(n_decimal: int = PI_PREC, length: int = PI_STREAM_LEN):
 
 class PiSampler:
     """
-    Wraps the pre-computed base-26 stream and exposes sample().
+    Wraps the pre‑computed base-26 stream and exposes sample().
     Call seek(pos) to jump to a triangle vertex before generation.
     """
     def __init__(self, stream: list):
@@ -154,18 +221,22 @@ class PiSampler:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# 4. TRIANGLE REFERENCE
+# 4. TRIANGLE REFERENCE (with seed‑driven offset)
 # ═════════════════════════════════════════════════════════════════════════════
 
 class Triangle:
     """
-    Three vertices evenly spaced across the π stream.
-    Each vertex is a starting position for PiSampler → different text.
+    Three vertices evenly spaced across the π stream, optionally shifted
+    by a seed‑derived offset so the whole triangle moves together.
     """
-    def __init__(self, stream_len: int):
-        self.A = 0
-        self.B = stream_len // 3
-        self.C = 2 * stream_len // 3
+    def __init__(self, stream_len: int, seed: str = ""):
+        offset = seed_to_offset(seed, stream_len) if seed else 0
+        base_a = offset
+        base_b = (offset + stream_len // 3) % stream_len
+        base_c = (offset + 2 * stream_len // 3) % stream_len
+        self.A = base_a
+        self.B = base_b
+        self.C = base_c
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
     def zone(self, pos: int) -> str:
@@ -183,7 +254,7 @@ class Triangle:
 
 def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
     """
-    Walk the pre-computed base-26 stream, convert digits → letters,
+    Walk the pre‑computed base-26 stream, convert digits → letters,
     and detect English words in real time (ending-at-current-position).
     Returns the letter string and word catalogue.
     """
@@ -199,9 +270,9 @@ def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
     row       = []
     COLS      = 60
 
-    print(c(B, "\n🔍  Streaming π base-26 — words surface in real time:\n"))
-    print(c(DM, f"  {'POS':>6}  {'WORD':<16} {'LEN':>3}  ZONE  ENERGY  CONTEXT"))
-    print(c(DM, "  " + "─" * 66))
+    #print(c(B, "\n🔍  Streaming π base-26 — words surface in real time:\n"))
+    #print(c(DM, f"  {'POS':>6}  {'WORD':<16} {'LEN':>3}  ZONE  ENERGY  CONTEXT"))
+    #print(c(DM, "  " + "─" * 66))
 
     for pos, digit in enumerate(stream):
         ch = chr(ord('a') + digit)
@@ -231,6 +302,11 @@ def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
             ctx    = buf_str[lo:buf_len].upper()
             rel    = start_buf - lo
             ctx_hi = ctx[:rel] + c(GR+B, f"[{ctx[rel:rel+length]}]") + ctx[rel+length:]
+            # Avoid f‑string nesting by building parts separately
+            global_start_str = c(CY, f'{global_start:>6}')
+            candidate_str    = c(YL, f'{candidate:<16}')
+            #print(f"{global_start_str}  {candidate_str} {len(candidate):>3}  {zone}  {energy:5.2f}  {ctx_hi}")
+
     return "".join(all_chars), word_cat
 
 
@@ -239,26 +315,24 @@ def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
 #    NLTK trigram model + PiSampler → reproducible natural sentences
 # ═════════════════════════════════════════════════════════════════════════════
 
-def generate_text(cpd, sampler: PiSampler, n_words: int = GEN_WORDS) -> str:
+def generate_text(cpd, sampler: PiSampler,
+                  n_words: int = GEN_WORDS,
+                  init_context: tuple = ("", "")) -> str:
     """
     Generate natural text using the NLTK trigram CPD.
-    Word choices are driven entirely by PiSampler (no random).
+    The first trigram state is taken from `init_context`; thereafter
+    the model proceeds as usual.
     """
-    context = ("<s>", "<s>")
+    context = init_context
     words_out = []
 
     for _ in range(n_words):
         dist = cpd[context]
         if not dist.samples():
-            context = ("<s>", "<s>")
+            context = ("", "")
             dist    = cpd[context]
 
         word = sampler.sample(dist)
-
-        if word in ("</s>", "<s>"):
-            context = ("<s>", "<s>")
-            words_out.append(".")
-            continue
 
         words_out.append(word)
         context = (context[1], word)
@@ -266,7 +340,7 @@ def generate_text(cpd, sampler: PiSampler, n_words: int = GEN_WORDS) -> str:
     # ── tidy into sentences ──
     text = " ".join(words_out)
     # Capitalise after full stop
-    text = re.sub(r"\. (\w)", lambda m: ". " + m.group(1).upper(), text)
+    text = re.sub(r"\\. (\\w)", lambda m: ". " + m.group(1).upper(), text)
     return text[0].upper() + text[1:] if text else text
 
 
@@ -295,74 +369,72 @@ def write_dataset(stream_text: str, word_cat: dict,
 # ═════════════════════════════════════════════════════════════════════════════
 
 def main():
-    print(f"\n{c(B,'═'*66)}")
-    print(f"  {c(B+CY,'π → BASE-26 → NLTK TRIGRAM LLM → NATURAL TEXT')}")
-    print(f"{c(B,'═'*66)}\n")
+    # 👇  USER‑DEFINED SEED – change this to any phrase you like
 
-    # ── NLTK word list (dictionary for stream scanning) ──
-    print(c(B, "📖  Loading NLTK word list…"), flush=True)
-    dictionary = load_nltk_words()
+    while True:
 
-    # ── NLTK language model from embedded corpus ──
-    print(c(B, "\n📚  Building NLTK trigram model from corpus…"), flush=True)
-    cpd, corpus_tokens, vocab = build_nltk_model(CORPUS)
-    print(f"  {c(DM,'corpus')}  {len(corpus_tokens):,} tokens  "
-          f"|  vocab {len(vocab):,}  "
-          f"|  contexts {len(cpd.conditions()):,}")
+        SEED_PHRASE = input("USER: ")   # ← try "", "hello world", etc.
 
-    # ── π base-26 stream ──
-    print(c(B, "\n🔢  Computing π stream…"), flush=True)
-    stream   = build_pi_stream()
-    triangle = Triangle(len(stream))
 
-    print(f"  {c(B,'△  Triangle vertices')}")
-    for name, pos in triangle.vertices.items():
-        print(f"     {c(CY,name)} = position {pos:>6}  (zone {triangle.zone(pos)})")
+        print(f"BASE-26 → NLTK TRIGRAM LLM → NATURAL TEXT'")
 
-    # ── real-time word finding ──
-    stream_text, word_cat = find_words_in_stream(stream, dictionary, triangle)
+        print(c(B, "📖  Loading NLTK word list…"), flush=True)
+        dictionary = load_nltk_words()
 
-    # ── generate natural text from each triangle vertex ──
-    print(c(B, "\n✨  Generating natural text from each triangle vertex:\n"))
-    sampler     = PiSampler(stream)
-    generations = {}
+        #print(c(B, "\n📚  Building NLTK trigram model from corpus…"), flush=True)
+        cpd, corpus_tokens, vocab = build_nltk_model(CORPUS)
+        
 
-    for vertex, start_pos in triangle.vertices.items():
-        sampler.seek(start_pos)
-        text = generate_text(cpd, sampler, n_words=GEN_WORDS)
-        generations[vertex] = text
+        #print(c(B, "\n🔢  Computing π stream…"), flush=True)
+        stream   = build_pi_stream()
+        triangle = Triangle(len(stream), seed=SEED_PHRASE)
 
-        zone = triangle.zone(start_pos)
-        print(f"  {c(B+YL, f'Vertex {vertex}')}  "
-              f"{c(DM, f'stream pos {start_pos}  zone {zone}')}\n")
-        # wrap at 72 chars
-        words_in_text = text.split()
-        line, lines = [], []
-        for w in words_in_text:
-            line.append(w)
-            if sum(len(x)+1 for x in line) > 72:
+        # Print triangle vertices info
+        msg = f'△  Triangle vertices (seed="{SEED_PHRASE}")'
+        #print(f"  {c(B, msg)}")
+        #for name, pos in triangle.vertices.items():
+            #print(f"     {c(CY,name)} = position {pos:>6}  (zone {triangle.zone(pos)})")
+
+        stream_text, word_cat = find_words_in_stream(stream, dictionary, triangle)
+
+        print(c(B, "\n✨  Generating natural text from each triangle vertex:\n"))
+        sampler     = PiSampler(stream)
+        generations = {}
+
+        ctx = seed_context(SEED_PHRASE)
+
+        for vertex, start_pos in triangle.vertices.items():
+            sampler.seek(start_pos)
+            text = generate_text(cpd, sampler, n_words=GEN_WORDS, init_context=ctx)
+            generations[vertex] = text
+
+            zone = triangle.zone(start_pos)
+            #print(f"  {c(B+YL, f'Vertex {vertex}')}  "
+                  #f"{c(DM, f'stream pos {start_pos}  zone {zone}')}\n")
+            words_in_text = text.split()
+            line, lines = [], []
+            for w in words_in_text:
+                line.append(w)
+                if sum(len(x)+1 for x in line) > 72:
+                    lines.append(" ".join(line))
+                    line = []
+            if line:
                 lines.append(" ".join(line))
-                line = []
-        if line:
-            lines.append(" ".join(line))
-        for ln in lines:
-            print(f"    {ln}")
-        print()
+            for ln in lines:
+                print(f"    {ln}")
+            print()
 
-    # ── write dataset ──
-    print(c(B, "💾  Writing dataset…"), flush=True)
-    write_dataset(stream_text, word_cat, triangle, generations, DATASET_PATH)
+        print(c(B, "💾  Writing dataset…"), flush=True)
+        write_dataset(stream_text, word_cat, triangle, generations, DATASET_PATH)
 
-    # ── summary ──
-    by_len = defaultdict(list)
-    for w in word_cat:
-        by_len[len(w)].append(w)
-    tri_hits = [w for w, ps in word_cat.items()
-                if len({triangle.zone(p) for p in ps}) >= 2]
-    longest  = max(word_cat, key=lambda w: len(w)) if word_cat else "—"
+        by_len = defaultdict(list)
+        for w in word_cat:
+            by_len[len(w)].append(w)
+        tri_hits = [w for w, ps in word_cat.items()
+                    if len({triangle.zone(p) for p in ps}) >= 2]
+        longest  = max(word_cat, key=lambda w: len(w)) if word_cat else "—"
 
-
-    print(f"\n{c(B,'═'*66)}\n")
+        #print(f"\n{c(B,'═'*66)}\n")
 
 
 if __name__ == "__main__":
