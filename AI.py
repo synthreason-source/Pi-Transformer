@@ -41,94 +41,13 @@ DATASET_PATH   = "pi_dataset.txt"
 
 # ── PUBLIC-DOMAIN CORPUS ──────────────────────────────────────────────────────
 # Multiple genres; all pre-1928 or clearly public domain.
-CORPUS = """
-Alice was beginning to get very tired of sitting by her sister on the bank and of having nothing
-to do once or twice she had peeped into the book her sister was reading but it had no pictures or
-conversations in it and what is the use of a book without pictures or conversations so she was
-considering in her own mind whether the pleasure of making a daisy chain would be worth the trouble
-of getting up and picking the daisies when suddenly a white rabbit with pink eyes ran close by her
-there was nothing so very remarkable in that nor did Alice think it so very much out of the way to
-hear the rabbit say to itself oh dear oh dear I shall be too late but when the rabbit actually took
-a watch out of its waistcoat pocket and looked at it and then hurried on Alice started to her feet
-for it flashed across her mind that she had never before seen a rabbit with either a waistcoat pocket
-or a watch to take out of it and burning with curiosity she ran across the field after it.
-Call me Ishmael some years ago never mind how long precisely having little money in my purse and
-nothing particular to interest me on shore I thought I would sail about a little and see the watery
-part of the world it is a way I have of driving off the spleen and regulating the circulation
-whenever I find myself growing grim about the mouth whenever it is a damp drizzly November in my
-soul whenever I find myself involuntarily pausing before coffin warehouses and bringing up the rear
-of every funeral I meet and especially whenever my hypos get such an upper hand of me that it
-requires a strong moral principle to prevent me from deliberately stepping into the street and
-methodically knocking peoples hats off then I account it high time to get to sea as soon as I can
-this is my substitute for pistol and ball with a philosophical flourish Cato throws himself upon
-his sword I quietly take to the ship there is nothing surprising in this if they only knew it
-almost all men in their degree some time or other cherish very nearly the same feelings towards
-the ocean with me.
-It is a truth universally acknowledged that a single man in possession of a good fortune must be
-in want of a wife however little known the feelings or views of such a man may be on his first
-entering a neighbourhood this truth is so well fixed in the minds of the surrounding families
-that he is considered as the rightful property of some one or other of their daughters my dear
-Mr Bennet said his lady to him one day have you heard that Netherfield Park is let at last
-Mr Bennet replied that he had not but Mrs Bennet was not so easily silenced and insisted on his
-listening to what she had to say a single man of large fortune four or five thousand a year what
-a fine thing for our girls do you not think so my dear replied Mr Bennet how so can it affect them
-my dear you must know that I am thinking of his marrying one of them.
-Marley was dead to begin with there is no doubt whatever about that the register of his burial was
-signed by the clergyman the clerk the undertaker and the chief mourner Scrooge signed it and
-Scrooges name was good upon Change for anything he chose to put his hand to old Marley was as dead
-as a door nail mind I do not mean to say that I know of my own knowledge what there is particularly
-dead about a door nail I might have been inclined myself to regard a coffin nail as the deadest
-piece of ironmongery in the trade but the wisdom of our ancestors is in the simile and my unhallowed
-hands shall not disturb it or the countrys done for you will therefore permit me to repeat
-emphatically that Marley was as dead as a door nail.
-The old man was thin and gaunt with deep wrinkles in the back of his neck the brown blotches of
-the benevolent skin cancer the sun brings from its reflection on the tropic sea were on his cheeks
-the blotches ran well down the sides of his face and his hands had the deep creased scars from
-handling heavy fish on the cords but none of these scars were fresh they were as old as erosions
-in a fishless desert everything about him was old except his eyes and they were the same color as
-the sea and were cheerful and undefeated the old man was thin and gaunt with deep wrinkles in the
-back of his neck he looked at the old man sleeping in the chair and at the brown sacks that held
-his gear the wind was steady and the sea was calm and beautiful in the early morning light.
-Whether I shall turn out to be the hero of my own life or whether that station will be held by
-anybody else these pages must show to begin my life with the beginning of my life I record that
-I was born as I have been informed and believe on a Friday at twelve o clock at night it was
-remarked that the clock began to strike and I began to cry simultaneously both of which events
-I am informed took place in the same moment of time whether I had any knowledge of it at the
-time is a matter of no consequence since I was not there to observe it and indeed I am far from
-sure that I should have been able to form any opinion upon the subject even if I had been present.
-The sea was calm and the morning air was fresh and the light fell golden on the ancient stones
-of the harbor and the boats moved gently on the quiet water and the birds called in the distance
-and the sound of the waves was soft and regular like breathing and the world seemed at peace
-with itself as if the long night of troubles had finally passed and a new day was beginning with
-all the promise of clear skies and steady winds and good fortune for those who sailed the deep.
-In the forests of the night the great creatures moved silently through the dark spaces between
-the trees where no light fell and the only sound was the soft press of heavy feet on the ancient
-earth and the breathing of large bodies and the occasional snap of a branch and the world was
-old and dark and full of things that had no names and the night stretched out endlessly in all
-directions without a single star to give hope or direction to the wandering traveler who might
-find himself alone in such a place far from any road or house or fire.
-The winter was long and cold and the snow lay deep across the fields and the road was lost under
-the white and the trees were black against the pale sky and the wind moved through the bare
-branches with a sound like distant voices and the house was warm inside with the fire burning
-and the smell of bread and the sound of quiet conversation and the evening coming down outside
-like a dark curtain drawn across the world to keep in the warmth and the light and the company
-of those who had gathered there against the cold and the dark and the silence of the winter.
-She had been told many times that the city was dangerous and that a young woman alone should not
-walk through its streets at night but she had never believed it and she walked now quickly along
-the wet pavement with her coat pulled close and her head down and the lights of the shops
-reflecting in the puddles and the sound of traffic all around her and the feeling of being
-utterly alone in the midst of all these people who passed her without looking up as if she were
-not there at all or were perhaps a ghost of some former self walking the same streets she had
-walked a hundred times before in a different life when things had been simpler and the world had
-seemed a more reasonable and comprehensible place to live in.
-The storm came in from the west with great clouds piling up on the horizon and the light turning
-yellow and strange before the darkness arrived and the rain began to fall in heavy drops that
-rattled on the leaves and the wind came suddenly and bent the long grass flat and the trees
-swayed and creaked and the thunder rolled across the sky from one end to the other and the
-lightning showed everything in a cold white light for an instant before the darkness returned
-and the rain fell harder and the river began to rise and the fields were full of running water.
-"""
+file = open("xaa.txt", "r")
 
+# Read the entire content of the file
+CORPUS = file.read()
+
+# Close the file
+file.close()
 # ═════════════════════════════════════════════════════════════════════════════
 # 1. NLTK SETUP
 # ═════════════════════════════════════════════════════════════════════════════
