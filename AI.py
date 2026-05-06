@@ -134,14 +134,20 @@ def seed_context(seed: str, default=("", "")):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def build_pi_stream(n_decimal=PI_PREC, length=PI_STREAM_LEN):
-    mp.dps  = n_decimal + 50
-    pi_str  = mp.nstr(mpi, n_decimal, strip_zeros=False).replace(".", "")
-    D       = 10 ** (len(pi_str) - 1)
-    frac    = int(pi_str[1:])
-    stream  = []
+    # Extra guard digits ensure floor() sees the true value, not a rounded one.
+    mp.dps = n_decimal + 60
+
+    # Exact integer arithmetic from here on:
+    #   D    = 10^n_decimal  (Python int — infinite precision)
+    #   frac = floor(π × D) − 3×D  →  the fractional digits of π as an integer
+    # No string conversion, no rounding, no floats in the loop.
+    D    = 10 ** n_decimal
+    frac = int(mp.floor(mpi * D)) - 3 * D
+
+    stream = []
     for _ in range(length):
         frac *= 26
-        stream.append(frac // D)
+        stream.append(frac // D)   # pure Python integer division — exact
         frac  = frac % D
     return stream
 
