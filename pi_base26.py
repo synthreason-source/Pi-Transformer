@@ -88,7 +88,7 @@ def stream_and_find_words():
         for length in range(MIN_LEN, min(MAX_LEN, buf_len) + 1):
             start_idx = buf_len - length
             word = buf_str[start_idx:]
-            if word in DICTIONARY and len(word) > 7:
+            if word in DICTIONARY and len(word) > 4:
                 global_start = pos - length          # position in the infinite stream
                 key = (word, global_start)
                 if key in found:
