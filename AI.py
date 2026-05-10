@@ -5,17 +5,17 @@
 π → BASE-26 → NLTK TRIGRAM LLM → NATURAL TEXT
 ═══════════════════════════════════════════════
   1. Corpus       — embedded public-domain prose, tokenised with NLTK
-  2. Word list    — nltk.corpus.words
+  2. Word list    — nltk.corpus.words when available, else corpus vocab
   3. LLM          — nltk ConditionalProbDist trigram model with Lidstone smoothing
   4. Pi entropy   — base-26 stream of π replaces all random sampling
-  5. Triangle     — vertices A / B / C at 0 / ⅓ / ⅔ of the stream seed
-                    three independently-reproducible texts
+  5. Bent triangle— vertices A / B / C mapped on a circle, then skewed by ±13°
   6. Seed text    — user-provided phrase offsets the triangle and seeds the trigram context
-  7. Dataset      — words found live in the stream + generated paragraphs
-                    all written to pi_dataset.txt
+  7. Dataset      — stream hits + generated paragraphs written to pi_dataset.txt
 """
 
-import sys, os, time
+import sys
+import os
+import time
 from collections import defaultdict, deque, Counter
 from mpmath import mp, pi as mpi
 
@@ -33,13 +33,10 @@ if hasattr(sys, "set_int_max_str_digits"):
 R  = "\033[0m"
 B  = "\033[1m"
 DM = "\033[2m"
-CY = "\033[96m"
 GR = "\033[92m"
-YL = "\033[93m"
-RD = "\033[91m"
-MG = "\033[95m"
 
-def c(code, t): return f"{code}{t}{R}"
+def c(code, t):
+    return f"{code}{t}{R}"
 
 PI_PREC           = 15_000
 PI_STREAM_LEN     = 12_000
@@ -50,7 +47,7 @@ GEN_WORDS         = 120
 WORD_FIND_MIN     = 4
 DATASET_PATH      = "pi_dataset.txt"
 CONTEXT_WINDOW    = 2
-SEED_OFFSET       = 0
+BEND_DEGREES      = 13.0
 
 def _embedded_corpus():
     return (
@@ -97,14 +94,13 @@ def _load_corpus(uploaded_file=None):
                 text = f.read()
             if text.strip():
                 return text
-        except Exception as e:
-            print(f"  Upload read failed ({e}), falling back.")
+        except Exception:
+            pass
     try:
         with open("xaa.txt", "r", encoding="utf-8") as f:
             return f.read()
     except FileNotFoundError:
-        pass
-    return _embedded_corpus()
+        return _embedded_corpus()
 
 def _alpha_lower_chars(text: str):
     for ch in text:
@@ -127,42 +123,36 @@ def _tokenise_alpha(text: str):
         tokens.append("".join(current))
     return tokens
 
-def _capitalise_after_period(words: list) -> str:
-    text = " ".join(words)
+def _capitalise_after_period(words_list):
+    text = " ".join([w for w in words_list if w])
     if not text:
         return text
     chars = list(text)
-    i = 0
-    while i < len(chars) - 2:
+    if 'a' <= chars[0] <= 'z':
+        chars[0] = chars[0].upper()
+    for i in range(len(chars) - 2):
         if chars[i] == '.' and chars[i + 1] == ' ':
             j = i + 2
             if j < len(chars) and 'a' <= chars[j] <= 'z':
                 chars[j] = chars[j].upper()
-        i += 1
-    result = "".join(chars)
-    return result[0].upper() + result[1:] if result else result
+    return "".join(chars)
 
 def build_nltk_model(corpus: str):
     tokenizer = RegexpTokenizer(r"[a-z]+")
     tokens = tokenizer.tokenize(corpus.lower())
-    padded = ["", ""] + tokens + [""]
+    padded = [""] * (NGRAM_N - 1) + tokens + [""]
     trigrams_ = list(ngrams(padded, NGRAM_N))
     cfd = ConditionalFreqDist((tuple(tg[:-1]), tg[-1]) for tg in trigrams_)
     cpd = ConditionalProbDist(cfd, LidstoneProbDist, LIDSTONE_GAMMA)
-    vocab = set(tokens)
-    return cpd, tokens, vocab
+    return cpd, tokens, set(tokens)
 
-def load_nltk_words():
+def load_nltk_words(fallback_vocab=None):
+    fallback_vocab = set(fallback_vocab or [])
     try:
-        word_set = set(
-            w.lower() for w in nltk_words.words()
-            if w.isalpha() and WORD_FIND_MIN <= len(w) <= 15
-        )
-        print(f"  {c(DM,'nltk.corpus.words')}  {len(word_set):,} words")
-        return word_set
-    except Exception as e:
-        print(f"  nltk words failed ({e}), using corpus vocab")
-        return set()
+        word_set = {w.lower() for w in nltk_words.words() if w.isalpha() and WORD_FIND_MIN <= len(w) <= 15}
+        return word_set | fallback_vocab
+    except Exception:
+        return fallback_vocab
 
 def seed_to_offset(seed: str, stream_len: int) -> int:
     h = 0
@@ -182,8 +172,6 @@ def seed_context(seed: str, default=("", ""), window=2):
     return tuple(default[:window]) if default else tuple("" for _ in range(window))
 
 def build_pi_stream(n_decimal: int = PI_PREC, length: int = PI_STREAM_LEN):
-    print(f"  Computing π to {n_decimal} decimal digits…", end=" ", flush=True)
-    t0 = time.time()
     mp.dps = n_decimal + 60
     D = 10 ** n_decimal
     frac = int(mp.floor(mpi * D)) - 3 * D
@@ -192,20 +180,25 @@ def build_pi_stream(n_decimal: int = PI_PREC, length: int = PI_STREAM_LEN):
         frac *= 26
         stream.append(frac // D)
         frac = frac % D
-    print(f"done ({time.time()-t0:.1f}s)  {length:,} base-26 digits")
     return stream
 
 class PiSampler:
-    def __init__(self, stream: list, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0):
+    def __init__(self, stream, temperature=1.0, top_k=0, top_p=1.0, min_p=0.0,
+                 repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0):
         self.stream = stream
         self.pos = 0
         self.temperature = max(1e-6, float(temperature))
         self.top_k = int(top_k)
         self.top_p = float(top_p)
         self.min_p = float(min_p)
+        self.repetition_penalty = max(1.0, float(repetition_penalty))
+        self.presence_penalty = max(0.0, float(presence_penalty))
+        self.frequency_penalty = max(0.0, float(frequency_penalty))
+        self.history = Counter()
 
     def seek(self, pos: int):
         self.pos = pos % len(self.stream)
+        self.history.clear()
 
     def _next_unit(self) -> float:
         val = 0
@@ -219,7 +212,15 @@ class PiSampler:
         samples = sorted(prob_dist.samples())
         if not samples:
             return ""
-        probs = [max(0.0, float(prob_dist.prob(s))) for s in samples]
+        probs = []
+        for s in samples:
+            p = max(0.0, float(prob_dist.prob(s)))
+            count = self.history[s]
+            if count > 0:
+                p /= self.repetition_penalty ** count
+                p /= (1.0 + self.presence_penalty)
+                p /= (1.0 + self.frequency_penalty * count)
+            probs.append(p)
         if self.temperature != 1.0:
             probs = [p ** (1.0 / self.temperature) for p in probs]
         total = sum(probs) or 1.0
@@ -243,29 +244,45 @@ class PiSampler:
         total = sum(p for _, p in ranked) or 1.0
         u = self._next_unit()
         cumulative = 0.0
+        chosen = ranked[-1][0]
         for s, p in ranked:
             cumulative += p / total
             if u < cumulative:
-                return s
-        return ranked[-1][0]
+                chosen = s
+                break
+        if chosen:
+            self.history[chosen] += 1
+        return chosen
+import time
 
 class Triangle:
-    def __init__(self, stream_len: int, seed: str = "", offset_extra: int = 0):
-        offset = (seed_to_offset(seed, stream_len) + int(offset_extra)) % stream_len if seed else int(offset_extra) % stream_len
-        self.A = offset
-        self.B = (offset + stream_len // 3) % stream_len
-        self.C = (offset + 2 * stream_len // 3) % stream_len
+    def __init__(self, stream_len: int, seed: str = "", offset_extra: int = 0, bend_degrees: float = 13.0):
+        base_offset = (seed_to_offset(seed, stream_len) + int(offset_extra)) % stream_len
+        
+        # Dynamic: Add a drift of 0-360 degrees based on the current second
+        # This makes the triangle "rotate" dynamically every time you run it
+        drift = (time.time() % 60) / 60 * 360.0
+        bend = float(bend_degrees) + drift
+
+        # Stream-space bend (changes indices directly)
+        bend_shift = int(round((bend / 360.0) * stream_len))
+
+        self.A = (base_offset + bend_shift) % stream_len
+        self.B = (base_offset + stream_len // 3 + bend_shift) % stream_len
+        self.C = (base_offset + 2 * stream_len // 3 + bend_shift) % stream_len
+
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
+        self.angles = {v: (pos / stream_len) * 360.0 for v, pos in self.vertices.items()}
+        self.sorted_positions = sorted(self.vertices.values())
+        self.total_bend = bend
 
     def zone(self, pos: int) -> str:
-        if pos < self.B: return "α"
-        if pos < self.C: return "β"
+        _, b1, b2 = self.sorted_positions
+        if pos < b1: return "α"
+        if pos < b2: return "β"
         return "γ"
 
-    def energy(self, pos: int) -> float:
-        return sum(1 / (abs(pos - v) + 1) for v in self.vertices.values())
-
-def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
+def find_words_in_stream(stream, dictionary):
     prefixes = set()
     for w in dictionary:
         for i in range(1, len(w) + 1):
@@ -281,11 +298,8 @@ def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
         buf_str = "".join(buf)
         buf_len = len(buf_str)
         for length in range(WORD_FIND_MIN, min(15, buf_len) + 1):
-            start_buf = buf_len - length
-            candidate = buf_str[start_buf:]
-            if candidate not in prefixes:
-                continue
-            if candidate not in dictionary:
+            candidate = buf_str[buf_len - length:]
+            if candidate not in prefixes or candidate not in dictionary:
                 continue
             global_start = pos - length + 1
             if seen_at.get(global_start, 0) >= length:
@@ -294,7 +308,7 @@ def find_words_in_stream(stream: list, dictionary: set, triangle: Triangle):
             word_cat[candidate].append(global_start)
     return "".join(all_chars), word_cat
 
-def generate_text(cpd, sampler: PiSampler, n_words: int = GEN_WORDS, init_context: tuple = ("", ""), context_window: int = 2) -> str:
+def generate_text(cpd, sampler: PiSampler, n_words: int = GEN_WORDS, init_context=("", ""), context_window: int = 2) -> str:
     context_window = max(1, int(context_window))
     init = list(init_context)[-context_window:]
     if len(init) < context_window:
@@ -309,49 +323,68 @@ def generate_text(cpd, sampler: PiSampler, n_words: int = GEN_WORDS, init_contex
             context.extend([""] * context_window)
             dist = cpd[tuple(context)]
         word = sampler.sample(dist)
-        words_out.append(word)
-        context.append(word)
+        if word:
+            words_out.append(word)
+            context.append(word)
     return _capitalise_after_period(words_out)
 
 def write_dataset(stream_text: str, word_cat: dict, triangle: Triangle, generations: dict, path: str):
-    lines = ["=== NLTK-GENERATED NATURAL TEXT ==="]
+    lines = ["=== PI BASE-26 STREAM (first 500 chars) ===", stream_text[:500], "", "=== TRIANGLE VERTICES ==="]
+    for vertex in ("A", "B", "C"):
+        lines.append(f"{vertex}: pos={triangle.vertices[vertex]} angle={triangle.angles[vertex]:.2f}°")
+    lines.append("")
+    lines.append("=== WORDS FOUND IN STREAM ===")
+    for word in sorted(word_cat, key=lambda w: (-len(w), w))[:500]:
+        zones = sorted({triangle.zone(p) for p in word_cat[word]})
+        positions = ", ".join(str(p) for p in word_cat[word][:12])
+        lines.append(f"{word:<16} zones={''.join(zones)} hits={len(word_cat[word]):<3} pos=[{positions}]")
+    lines.append("")
+    lines.append("=== NLTK-GENERATED NATURAL TEXT ===")
     for vertex, text in generations.items():
         lines.append(f"\n-- Vertex {vertex} --")
-        for i in range(0, len(text), 80):
-            lines.append(text[i:i+80])
-    lines.append("")
+        words = text.split()
+        line = []
+        for w in words:
+            line.append(w)
+            if sum(len(x) + 1 for x in line) > 80:
+                lines.append(" ".join(line))
+                line = []
+        if line:
+            lines.append(" ".join(line))
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
-    kb = os.path.getsize(path) / 1024
-    print(f"  {c(GR,'✓')}  {c(B, path)}  ({kb:.1f} KB,  {len(lines)} lines)")
 
 def gradio_run(seed_phrase, uploaded_corpus, temperature, top_k, top_p, min_p,
                repetition_penalty, presence_penalty, frequency_penalty,
-               digits_per_sample, gen_words, gamma, context_window, seed_offset):
+               digits_per_sample, gen_words, gamma, context_window, seed_offset, bend_degrees):
     global DIGITS_PER_SAMPLE, GEN_WORDS, LIDSTONE_GAMMA
     DIGITS_PER_SAMPLE = int(digits_per_sample)
     GEN_WORDS = int(gen_words)
     LIDSTONE_GAMMA = float(gamma)
     try:
         corpus = _load_corpus(uploaded_corpus)
-        dictionary = load_nltk_words()
-        cpd, _, _ = build_nltk_model(corpus)
+        cpd, tokens, vocab = build_nltk_model(corpus)
+        dictionary = load_nltk_words(vocab)
         stream = build_pi_stream()
-        triangle = Triangle(len(stream), seed=seed_phrase, offset_extra=seed_offset)
-        stream_text, word_cat = find_words_in_stream(stream, dictionary, triangle)
-        sampler = PiSampler(stream, temperature=temperature, top_k=top_k, top_p=top_p, min_p=min_p)
+        triangle = Triangle(len(stream), seed=seed_phrase, offset_extra=seed_offset, bend_degrees=bend_degrees)
+        stream_text, word_cat = find_words_in_stream(stream, dictionary)
         ctx = seed_context(seed_phrase, window=int(context_window))
         generations = {}
         for vertex, start_pos in triangle.vertices.items():
-            sampler.seek(start_pos)
-            generations[vertex] = generate_text(
-                cpd, sampler,
-                n_words=GEN_WORDS,
-                init_context=ctx,
-                context_window=int(context_window),
+            sampler = PiSampler(
+                stream,
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                min_p=min_p,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
             )
+            sampler.seek(start_pos)
+            generations[vertex] = generate_text(cpd, sampler, n_words=GEN_WORDS, init_context=ctx, context_window=int(context_window))
         write_dataset(stream_text, word_cat, triangle, generations, DATASET_PATH)
-        out = [f'BASE-26 → NLTK TRIGRAM LLM  |  seed: "{seed_phrase}"\n']
+        out = [f'BASE-26 → NLTK TRIGRAM LLM  |  seed: "{seed_phrase}"', f"Bend: {bend_degrees:.2f}°", f"Vertices: A={triangle.A}, B={triangle.B}, C={triangle.C}", ""]
         for vertex, text in generations.items():
             out.append(f"── Vertex {vertex} ──")
             words = text.split()
@@ -370,89 +403,41 @@ def gradio_run(seed_phrase, uploaded_corpus, temperature, top_k, top_p, min_p,
         out.append(f"Words found in stream : {len(word_cat):,}")
         out.append(f"Longest               : {longest}")
         out.append(f"Cross-zone hits       : {len(tri_hits)}")
-        out.append(f"\nDataset written → {DATASET_PATH}")
+        out.append(f"Dataset written → {DATASET_PATH}")
         return "\n".join(out), DATASET_PATH
     except Exception as e:
         import traceback
         return f"ERROR: {e}\n\n{traceback.format_exc()}", None
 
 CSS = "#output-box textarea { font-family: monospace; font-size: 13px; }"
-
 with gr.Blocks(title="π → BASE-26 → NLTK Trigram Generator", css=CSS) as demo:
     gr.Markdown("## π → BASE-26 → NLTK Trigram Generator")
-    gr.Markdown(
-        "Enter a seed phrase and hit **Generate**. "
-        "Three texts are produced from triangle vertices in the π base-26 stream.\n\n"
-        "Optionally upload a `.txt` corpus — otherwise falls back to `xaa.txt` "
-        "or the embedded *Alice* excerpt."
-    )
-
+    gr.Markdown("Enter a seed phrase and hit **Generate**. Three texts are produced from bent triangle vertices in the π base-26 stream.")
     with gr.Row():
-        seed_input = gr.Textbox(
-            label="Seed phrase",
-            placeholder='e.g. "hello world", "quantum", ""',
-            value="Is there inherent order in nature or is it all chaos and chance?",
-            scale=3,
-        )
-        corpus_upload = gr.File(
-            label="Corpus (optional)",
-            file_types=[".txt", ".md", ".text"],
-            type="filepath",
-            scale=1,
-        )
-
+        seed_input = gr.Textbox(label="Seed phrase", value="Is there inherent order in nature or is it all chaos and chance?", scale=3)
+        corpus_upload = gr.File(label="Corpus (optional)", file_types=[".txt", ".md", ".text"], type="filepath", scale=1)
     with gr.Row():
         temperature = gr.Slider(0.1, 12.5, value=2.5, step=0.05, label="Temperature")
         top_k = gr.Slider(0, 1100, value=100, step=1, label="Top-k")
-        top_p = gr.Slider(0.0, 11.0, value=1.0, step=0.01, label="Top-p")
-        min_p = gr.Slider(0.0, 11.0, value=0.52, step=0.01, label="Min-p")
-
+        top_p = gr.Slider(0.0, 1.0, value=1.0, step=0.01, label="Top-p")
+        min_p = gr.Slider(0.0, 1.0, value=0.52, step=0.01, label="Min-p")
     with gr.Row():
-        repetition_penalty = gr.Slider(1.0, 13.0, value=1.0, step=0.01, label="Repetition penalty")
-        presence_penalty = gr.Slider(0.0, 12.0, value=1.21, step=0.01, label="Presence penalty")
-        frequency_penalty = gr.Slider(0.0, 12.0, value=0.0, step=0.01, label="Frequency penalty")
+        repetition_penalty = gr.Slider(1.0, 3.0, value=1.08, step=0.01, label="Repetition penalty")
+        presence_penalty = gr.Slider(0.0, 3.0, value=0.20, step=0.01, label="Presence penalty")
+        frequency_penalty = gr.Slider(0.0, 3.0, value=0.06, step=0.01, label="Frequency penalty")
         digits_per_sample = gr.Slider(1, 16, value=3, step=1, label="π digits per sample")
-
     with gr.Row():
         gen_words = gr.Slider(10, 1500, value=120, step=1, label="Generated words")
-        gamma = gr.Slider(0.001, 11.0, value=0.994, step=0.1, label="Lidstone γ")
+        gamma = gr.Slider(0.001, 11.0, value=0.994, step=0.001, label="Lidstone γ")
         context_window = gr.Slider(2, 18, value=2, step=1, label="Context window")
         seed_offset = gr.Slider(0, PI_STREAM_LEN - 1, value=11999, step=1, label="Seed offset")
-
+    with gr.Row():
+        bend_degrees = gr.Slider(0.0, 45.0, value=13.0, step=0.1, label="Bend (degrees)")
     run_btn = gr.Button("▶  Generate", variant="primary")
-
-    output_text = gr.Textbox(
-        label="Output",
-        lines=28,
-        elem_id="output-box",
-        interactive=False,
-    )
+    output_text = gr.Textbox(label="Output", lines=28, elem_id="output-box", interactive=False)
     dataset_file = gr.File(label="💾  Download pi_dataset.txt")
-
-    run_btn.click(
-        fn=gradio_run,
-        inputs=[
-            seed_input, corpus_upload,
-            temperature, top_k, top_p, min_p,
-            repetition_penalty, presence_penalty, frequency_penalty,
-            digits_per_sample, gen_words, gamma, context_window, seed_offset
-        ],
-        outputs=[output_text, dataset_file],
-    )
-
-    seed_input.submit(
-        fn=gradio_run,
-        inputs=[
-            seed_input, corpus_upload,
-            temperature, top_k, top_p, min_p,
-            repetition_penalty, presence_penalty, frequency_penalty,
-            digits_per_sample, gen_words, gamma, context_window, seed_offset
-        ],
-        outputs=[output_text, dataset_file],
-    )
+    run_btn.click(fn=gradio_run, inputs=[seed_input, corpus_upload, temperature, top_k, top_p, min_p, repetition_penalty, presence_penalty, frequency_penalty, digits_per_sample, gen_words, gamma, context_window, seed_offset, bend_degrees], outputs=[output_text, dataset_file])
+    seed_input.submit(fn=gradio_run, inputs=[seed_input, corpus_upload, temperature, top_k, top_p, min_p, repetition_penalty, presence_penalty, frequency_penalty, digits_per_sample, gen_words, gamma, context_window, seed_offset, bend_degrees], outputs=[output_text, dataset_file])
 
 if __name__ == "__main__":
-    try:
-        demo.launch()
-    except KeyboardInterrupt:
-        print(f"\n{c(GR,'✅  Stopped.')}  Partial results saved to {DATASET_PATH}")
+    demo.launch()
