@@ -8,18 +8,19 @@
 PURE TERMINAL VERSION
 NO GRADIO
 
-NEW SEARCH MODE
----------------
-Searches for TWO target phrases simultaneously.
-
-Example:
-    Search #1: rabbit hole
-    Search #2: white rabbit
-
-The seed phrase is COMPLETELY IGNORED during search.
-
-The brute-force engine searches bend + offset space
-until BOTH targets appear in generated text.
+PROMPT-SEEDED SEARCH MODE
+-------------------------
+1. User enters a prompt
+2. Prompt becomes:
+   - trigram seed context
+   - search target
+   - beginning of generated text
+3. Prompt is converted into ordered word pairs
+4. Brute-force search scans:
+   - bend_degrees
+   - stream offsets
+5. Generated text must contain ALL prompt pairs
+6. Exact + fuzzy matching supported
 
 FEATURES
 --------
@@ -28,12 +29,13 @@ FEATURES
 3. π base-26 entropy stream
 4. Deterministic sampling
 5. Bent-triangle vertex mapping
-6. Dual prompt brute-force search
+6. Prompt-aligned generation
 7. Exact + fuzzy matching
 8. Dataset export
 """
 
 import sys
+import re
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
 
@@ -41,7 +43,7 @@ from mpmath import mp, pi as mpi
 
 import nltk
 from nltk.util import ngrams
-from nltk.tokenize import RegexpTokenizer
+from nltk.tokenize import RegexpTokenizer, word_tokenize
 from nltk.probability import (
     ConditionalFreqDist,
     ConditionalProbDist,
@@ -69,7 +71,7 @@ LIDSTONE_GAMMA = 0.1
 
 GEN_WORDS = 160
 
-WORD_FIND_MIN = 4
+WORD_FIND_MIN = 2
 
 DATASET_PATH = "pi_dataset.txt"
 
@@ -115,6 +117,17 @@ def tokenise_alpha(text):
     return tokenizer.tokenize(text.lower())
 
 
+def extract_word_pairs(prompt):
+
+    words = [
+        w.lower()
+        for w in word_tokenize(prompt)
+        if w.isalpha()
+    ]
+
+    return list(ngrams(words, 2))
+
+
 def capitalise_text(words):
 
     if not words:
@@ -132,7 +145,15 @@ def capitalise_text(words):
         if chars[i] == "." and chars[i + 1] == " ":
             chars[i + 2] = chars[i + 2].upper()
 
-    return "".join(chars)
+    txt = "".join(chars)
+
+    txt = re.sub(
+        r'([.!?])\s*([A-Z])',
+        r'\1\n\n\2',
+        txt
+    )
+
+    return txt
 
 
 # ============================================================
@@ -240,10 +261,13 @@ class PiSampler:
     ):
 
         self.stream = stream
+
         self.pos = 0
 
         self.temperature = temperature
+
         self.top_k = top_k
+
         self.top_p = top_p
 
         self.repetition_penalty = repetition_penalty
@@ -402,15 +426,31 @@ class Triangle:
 def generate_text(
     cpd,
     sampler,
+    prompt="",
     n_words=GEN_WORDS,
 ):
 
+    seed_words = tokenise_alpha(prompt)
+
+    if len(seed_words) >= CONTEXT_WINDOW:
+
+        init = seed_words[-CONTEXT_WINDOW:]
+
+    else:
+
+        init = (
+            ["<s>"] * (
+                CONTEXT_WINDOW - len(seed_words)
+            )
+            + seed_words
+        )
+
     context = deque(
-        ["<s>"] * CONTEXT_WINDOW,
+        init,
         maxlen=CONTEXT_WINDOW,
     )
 
-    words = []
+    words = list(seed_words)
 
     for _ in range(n_words):
 
@@ -517,29 +557,78 @@ def fuzzy_score(target, text):
 
 
 # ============================================================
-# DUAL SEARCH
+# PAIR MATCHING
 # ============================================================
 
-def brute_force_dual_search(
-    target1,
-    target2,
+def all_pairs_match(
+    pairs,
+    text,
+    fuzzy_threshold=0.72,
+):
+
+    lower_text = text.lower()
+
+    for pair in pairs:
+
+        pair_str = " ".join(pair)
+
+        exact = pair_str in lower_text
+
+        if exact:
+            continue
+
+        score = fuzzy_score(
+            pair_str,
+            text
+        )
+
+        if score < fuzzy_threshold:
+            return False, pair
+
+    return True, None
+
+
+# ============================================================
+# PROMPT SEARCH
+# ============================================================
+
+def brute_force_prompt_search(
+    prompt,
     cpd,
     stream,
     vertex="A",
     max_solutions=10,
 ):
 
-    print("\nSearching...\n")
+    pairs = extract_word_pairs(prompt)
+
+    if not pairs:
+
+        print(
+            "No valid word pairs extracted."
+        )
+
+        return []
+
+    print(
+        "\nSearching bend+offset space..."
+    )
+
+    print(f"\nPrompt:\n{prompt}\n")
 
     found = []
 
-    for bend_x10 in range(0, 451, 10):
+    for bend_x10 in range(0, 451, 5):
 
         bend = bend_x10 / 10.0
 
         print(f"bend = {bend:.1f}")
 
-        for offset in range(0, PI_STREAM_LEN):
+        for offset in range(
+            0,
+            PI_STREAM_LEN,
+            5,
+        ):
 
             triangle = Triangle(
                 PI_STREAM_LEN,
@@ -556,55 +645,46 @@ def brute_force_dual_search(
             text = generate_text(
                 cpd,
                 sampler,
+                prompt=prompt,
                 n_words=GEN_WORDS,
             )
 
-            lower = text.lower()
+            matches_all, failed_pair = (
+                all_pairs_match(
+                    pairs,
+                    text,
+                )
+            )
 
-            exact1 = target1.lower() in lower
-            exact2 = target2.lower() in lower
-
-            score1 = fuzzy_score(target1, text)
-            score2 = fuzzy_score(target2, text)
-
-            good1 = exact1 or score1 > 0.88
-            good2 = exact2 or score2 > 0.88
-
-            if good1 and good2:
+            if matches_all:
 
                 found.append(
                     {
+                        "prompt": prompt,
                         "bend": bend,
                         "offset": offset,
-                        "score1": score1,
-                        "score2": score2,
-                        "exact1": exact1,
-                        "exact2": exact2,
+                        "vertex": vertex,
                         "text": text,
                     }
                 )
 
                 print("\nFOUND MATCH")
+
                 print(
                     f"bend={bend:.1f} "
                     f"offset={offset}"
                 )
 
-                print(
-                    f"target1 score={score1:.3f} "
-                    f"exact={exact1}"
-                )
+                print("\nGenerated:\n")
 
-                print(
-                    f"target2 score={score2:.3f} "
-                    f"exact={exact2}"
-                )
-
-                print()
                 print(text)
+
                 print()
 
-                if len(found) >= max_solutions:
+                if (
+                    len(found)
+                    >= max_solutions
+                ):
                     return found
 
     return found
@@ -655,26 +735,18 @@ def main():
     while True:
 
         print("\n==========================")
-        print("DUAL SEARCH")
+        print("PROMPT-ALIGNED SEARCH")
         print("==========================")
 
-        target1 = input(
-            "\nSearch target #1:\n> "
+        prompt = input(
+            "\nEnter prompt:\n> "
         ).strip()
 
-        if not target1:
+        if not prompt:
             continue
 
-        target2 = input(
-            "\nSearch target #2:\n> "
-        ).strip()
-
-        if not target2:
-            continue
-
-        results = brute_force_dual_search(
-            target1=target1,
-            target2=target2,
+        results = brute_force_prompt_search(
+            prompt=prompt,
             cpd=cpd,
             stream=stream,
             vertex="A",
@@ -695,24 +767,19 @@ def main():
                 print(
                     f"[{i}] "
                     f"bend={r['bend']:.1f} "
-                    f"offset={r['offset']}"
+                    f"offset={r['offset']} "
+                    f"vertex={r['vertex']}"
                 )
 
-                print(
-                    f"target1 "
-                    f"score={r['score1']:.3f} "
-                    f"exact={r['exact1']}"
-                )
+                print("\nGenerated response:\n")
 
-                print(
-                    f"target2 "
-                    f"score={r['score2']:.3f} "
-                    f"exact={r['exact2']}"
-                )
-
-                print()
                 print(r["text"])
-                print()
+
+                print(
+                    "\n"
+                    + "=" * 50
+                    + "\n"
+                )
 
         again = input(
             "\nSearch again? (y/n): "
