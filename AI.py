@@ -646,48 +646,48 @@ def main():
         stream,
         dictionary,
     )
+    while True:
+        seed_phrase = input(
+            "\nSeed phrase:\n> "
+        ).strip()
+        target = input(
+            "\nSearch target "
+            "(ENTER to skip):\n> "
+        ).strip()
 
-    seed_phrase = input(
-        "\nSeed phrase:\n> "
-    ).strip()
-    target = input(
-        "\nSearch target "
-        "(ENTER to skip):\n> "
-    ).strip()
+        if target:
 
-    if target:
+            results = brute_force_search(
+                target_text=target,
+                cpd=cpd,
+                stream=stream,
+                seed_phrase=seed_phrase,
+                vertex="A",
+            )
 
-        results = brute_force_search(
-            target_text=target,
-            cpd=cpd,
-            stream=stream,
-            seed_phrase=seed_phrase,
-            vertex="A",
-        )
+            print("\n====================")
+            print("SEARCH RESULTS")
+            print("====================\n")
 
-        print("\n====================")
-        print("SEARCH RESULTS")
-        print("====================\n")
+            if not results:
 
-        if not results:
+                print("No matches found.")
 
-            print("No matches found.")
+            else:
 
-        else:
+                for i, r in enumerate(results, 1):
 
-            for i, r in enumerate(results, 1):
+                    print(
+                        f"[{i}] "
+                        f"bend={r['bend']:.1f} "
+                        f"offset={r['offset']} "
+                        f"score={r['score']:.3f} "
+                        f"exact={r['exact']}"
+                    )
 
-                print(
-                    f"[{i}] "
-                    f"bend={r['bend']:.1f} "
-                    f"offset={r['offset']} "
-                    f"score={r['score']:.3f} "
-                    f"exact={r['exact']}"
-                )
+                    print(r["text"])
 
-                print(r["text"])
-
-                print()
+                    print()
 
 
 if __name__ == "__main__":
