@@ -781,13 +781,5 @@ def main():
                     + "\n"
                 )
 
-        again = input(
-            "\nSearch again? (y/n): "
-        ).strip().lower()
-
-        if again != "y":
-            break
-
-
 if __name__ == "__main__":
     main()
