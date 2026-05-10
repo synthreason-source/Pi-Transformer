@@ -8,6 +8,19 @@
 PURE TERMINAL VERSION
 NO GRADIO
 
+NEW SEARCH MODE
+---------------
+Searches for TWO target phrases simultaneously.
+
+Example:
+    Search #1: rabbit hole
+    Search #2: white rabbit
+
+The seed phrase is COMPLETELY IGNORED during search.
+
+The brute-force engine searches bend + offset space
+until BOTH targets appear in generated text.
+
 FEATURES
 --------
 1. Embedded / external corpus
@@ -15,9 +28,9 @@ FEATURES
 3. π base-26 entropy stream
 4. Deterministic sampling
 5. Bent-triangle vertex mapping
-6. Prompt brute-force search
-7. Dataset export
-8. Exact + fuzzy prompt matching
+6. Dual prompt brute-force search
+7. Exact + fuzzy matching
+8. Dataset export
 """
 
 import sys
@@ -54,7 +67,7 @@ CONTEXT_WINDOW = NGRAM_N - 1
 
 LIDSTONE_GAMMA = 0.1
 
-GEN_WORDS = 120
+GEN_WORDS = 160
 
 WORD_FIND_MIN = 4
 
@@ -96,7 +109,9 @@ time as she went down to look about her and wonder what was going to happen next
 # ============================================================
 
 def tokenise_alpha(text):
+
     tokenizer = RegexpTokenizer(r"[a-z]+")
+
     return tokenizer.tokenize(text.lower())
 
 
@@ -341,36 +356,16 @@ class PiSampler:
 # TRIANGLE
 # ============================================================
 
-def seed_to_offset(seed, stream_len):
-
-    h = 0
-
-    for ch in seed.lower():
-
-        if "a" <= ch <= "z":
-
-            h = (
-                h * 31
-                + (ord(ch) - 96)
-            ) % stream_len
-
-    return h
-
-
 class Triangle:
 
     def __init__(
         self,
         stream_len,
-        seed="",
         offset_extra=0,
         bend_degrees=13.0,
     ):
 
-        base = (
-            seed_to_offset(seed, stream_len)
-            + offset_extra
-        ) % stream_len
+        base = offset_extra % stream_len
 
         bend_shift = int(
             round(
@@ -408,14 +403,10 @@ def generate_text(
     cpd,
     sampler,
     n_words=GEN_WORDS,
-    init_context=None,
 ):
 
-    if init_context is None:
-        init_context = ["<s>"] * CONTEXT_WINDOW
-
     context = deque(
-        init_context[-CONTEXT_WINDOW:],
+        ["<s>"] * CONTEXT_WINDOW,
         maxlen=CONTEXT_WINDOW,
     )
 
@@ -513,14 +504,27 @@ def find_words(stream, dictionary):
 
 
 # ============================================================
-# BRUTE FORCE SEARCH
+# FUZZY SCORE
 # ============================================================
 
-def brute_force_search(
-    target_text,
+def fuzzy_score(target, text):
+
+    return SequenceMatcher(
+        None,
+        target.lower(),
+        text.lower()
+    ).quick_ratio()
+
+
+# ============================================================
+# DUAL SEARCH
+# ============================================================
+
+def brute_force_dual_search(
+    target1,
+    target2,
     cpd,
     stream,
-    seed_phrase,
     vertex="A",
     max_solutions=10,
 ):
@@ -535,11 +539,10 @@ def brute_force_search(
 
         print(f"bend = {bend:.1f}")
 
-        for offset in range(0, PI_STREAM_LEN, 1):
+        for offset in range(0, PI_STREAM_LEN):
 
             triangle = Triangle(
                 PI_STREAM_LEN,
-                seed=seed_phrase,
                 offset_extra=offset,
                 bend_degrees=bend,
             )
@@ -550,60 +553,62 @@ def brute_force_search(
 
             sampler.seek(start)
 
-            ctx = (
-                seed_phrase.lower()
-                .split()[:2]
-            )
-
             text = generate_text(
                 cpd,
                 sampler,
                 n_words=GEN_WORDS,
-                init_context=ctx,
             )
 
-            exact = (
-                target_text.lower()
-                in text.lower()
-            )
+            lower = text.lower()
 
-            score = SequenceMatcher(
-                None,
-                target_text.lower(),
-                text.lower()
-            ).quick_ratio()
+            exact1 = target1.lower() in lower
+            exact2 = target2.lower() in lower
 
-            if exact or score > 0.88:
+            score1 = fuzzy_score(target1, text)
+            score2 = fuzzy_score(target2, text)
+
+            good1 = exact1 or score1 > 0.88
+            good2 = exact2 or score2 > 0.88
+
+            if good1 and good2:
 
                 found.append(
                     {
                         "bend": bend,
                         "offset": offset,
-                        "score": score,
-                        "exact": exact,
+                        "score1": score1,
+                        "score2": score2,
+                        "exact1": exact1,
+                        "exact2": exact2,
                         "text": text,
                     }
                 )
 
-                print(
-                    f"\nFOUND "
-                    f"score={score:.3f} "
-                    f"exact={exact}"
-                )
-
+                print("\nFOUND MATCH")
                 print(
                     f"bend={bend:.1f} "
                     f"offset={offset}"
                 )
 
-                print(text)
+                print(
+                    f"target1 score={score1:.3f} "
+                    f"exact={exact1}"
+                )
 
+                print(
+                    f"target2 score={score2:.3f} "
+                    f"exact={exact2}"
+                )
+
+                print()
+                print(text)
                 print()
 
                 if len(found) >= max_solutions:
                     return found
 
     return found
+
 
 # ============================================================
 # MAIN
@@ -646,48 +651,75 @@ def main():
         stream,
         dictionary,
     )
+
     while True:
-        seed_phrase = input(
-            "\nSeed phrase:\n> "
+
+        print("\n==========================")
+        print("DUAL SEARCH")
+        print("==========================")
+
+        target1 = input(
+            "\nSearch target #1:\n> "
         ).strip()
-        target = input(
-            "\nSearch target "
-            "(ENTER to skip):\n> "
+
+        if not target1:
+            continue
+
+        target2 = input(
+            "\nSearch target #2:\n> "
         ).strip()
 
-        if target:
+        if not target2:
+            continue
 
-            results = brute_force_search(
-                target_text=target,
-                cpd=cpd,
-                stream=stream,
-                seed_phrase=seed_phrase,
-                vertex="A",
-            )
+        results = brute_force_dual_search(
+            target1=target1,
+            target2=target2,
+            cpd=cpd,
+            stream=stream,
+            vertex="A",
+        )
 
-            print("\n====================")
-            print("SEARCH RESULTS")
-            print("====================\n")
+        print("\n====================")
+        print("SEARCH RESULTS")
+        print("====================\n")
 
-            if not results:
+        if not results:
 
-                print("No matches found.")
+            print("No matches found.")
 
-            else:
+        else:
 
-                for i, r in enumerate(results, 1):
+            for i, r in enumerate(results, 1):
 
-                    print(
-                        f"[{i}] "
-                        f"bend={r['bend']:.1f} "
-                        f"offset={r['offset']} "
-                        f"score={r['score']:.3f} "
-                        f"exact={r['exact']}"
-                    )
+                print(
+                    f"[{i}] "
+                    f"bend={r['bend']:.1f} "
+                    f"offset={r['offset']}"
+                )
 
-                    print(r["text"])
+                print(
+                    f"target1 "
+                    f"score={r['score1']:.3f} "
+                    f"exact={r['exact1']}"
+                )
 
-                    print()
+                print(
+                    f"target2 "
+                    f"score={r['score2']:.3f} "
+                    f"exact={r['exact2']}"
+                )
+
+                print()
+                print(r["text"])
+                print()
+
+        again = input(
+            "\nSearch again? (y/n): "
+        ).strip().lower()
+
+        if again != "y":
+            break
 
 
 if __name__ == "__main__":
