@@ -248,9 +248,7 @@ def build_pi_stream(
 # ============================================================
 # PI SAMPLER
 # ============================================================
-
 class PiSampler:
-
     def __init__(
         self,
         stream,
@@ -259,120 +257,128 @@ class PiSampler:
         top_p=1.0,
         repetition_penalty=1.08,
     ):
-
         self.stream = stream
-
         self.pos = 0
-
         self.temperature = temperature
-
         self.top_k = top_k
-
         self.top_p = top_p
-
         self.repetition_penalty = repetition_penalty
-
         self.history = Counter()
 
     def seek(self, pos):
-
         self.pos = pos % len(self.stream)
-
         self.history.clear()
 
     def next_unit(self):
-
         val = 0
-
         base = 26 ** DIGITS_PER_SAMPLE
-
         for _ in range(DIGITS_PER_SAMPLE):
-
             val = (
                 val * 26
                 + self.stream[self.pos % len(self.stream)]
             )
-
             self.pos += 1
-
         return val / base
 
+    def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
+        """XOR fusion: Creates mutually exclusive probability regions"""
+        xor_scores = []
+        
+        # Generate 3 orthogonal streams for XOR logic
+        u_a_norm = u_a  # Primary stream
+        u_b_norm = u_b  # Anti-correlation stream  
+        u_c_norm = u_c  # Selector stream
+        
+        for rank, (word, base_p) in enumerate(scored):
+            idx = rank / max(1, len(scored) - 1)
+            
+            # XOR regions: A∧¬B∧¬C | ¬A∧B∧¬C | ¬A∧¬B∧C
+            region_a = (1.0 - abs(idx - u_a_norm)) * (1.0 - u_b_norm) * (1.0 - u_c_norm)
+            region_b = u_b_norm * (1.0 - abs(idx - u_a_norm)) * (1.0 - u_c_norm)
+            region_c = u_c_norm * (1.0 - u_a_norm) * (1.0 - u_b_norm)
+            
+            # XOR fusion: exclusive dominance
+            xor_blend = max(region_a, region_b, region_c)
+            
+            # Sharpness boost based on stream orthogonality
+            orthogonality = 1.0 - abs(u_a_norm - u_b_norm) * abs(u_b_norm - u_c_norm)
+            final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
+            
+            xor_scores.append((word, final_p))
+        
+        return xor_scores
+
     def sample(self, dist):
-
         samples = list(dist.samples())
-
         if not samples:
             return "</s>"
 
-        scored = []
-
+        # Base scoring with repetition penalty
+        base_scored = []
         for s in samples:
-
             p = max(1e-12, float(dist.prob(s)))
-
             count = self.history[s]
-
             if count > 0:
-                p /= (
-                    self.repetition_penalty ** count
-                )
+                p /= (self.repetition_penalty ** count)
+            base_scored.append((s, p))
 
-            scored.append((s, p))
-
+        # Temperature scaling
         scored = [
             (s, p ** (1.0 / self.temperature))
-            for s, p in scored
+            for s, p in base_scored
         ]
 
+        # Normalize
         total = sum(p for _, p in scored)
-
         scored = [
             (s, p / total)
             for s, p in scored
         ]
 
-        scored.sort(
-            key=lambda x: x[1],
-            reverse=True
-        )
-
+        scored.sort(key=lambda x: x[1], reverse=True)
         scored = scored[:self.top_k]
 
+        # Top-p filtering
         kept = []
-
         accum = 0.0
-
         for s, p in scored:
-
             kept.append((s, p))
-
             accum += p
-
             if accum >= self.top_p:
                 break
-
         scored = kept
 
-        total = sum(p for _, p in scored)
+        # Generate 3 orthogonal π streams for XOR
+        u_a = self.next_unit()  # Primary selection stream
+        u_b = self.next_unit()  # Region exclusion stream
+        u_c = self.next_unit()  # Final discriminator
 
-        u = self.next_unit()
+        # XOR FUSION: Mutually exclusive probability regions
+        xor_scored = self._xor_probability_fusion(scored, u_a, u_b, u_c)
 
-        cumulative = 0.0
-
-        for s, p in scored:
-
-            cumulative += p / total
-
-            if u < cumulative:
-
-                self.history[s] += 1
-
-                return s
-
-        chosen = scored[-1][0]
+        # Renormalize XOR scores
+        xor_total = sum(p for _, p in xor_scored)
+        if xor_total <= 0:
+            chosen = scored[-1][0] if scored else "</s>"
+        else:
+            xor_scored = [
+                (w, p / xor_total) for w, p in xor_scored
+            ]
+            
+            # XOR final selection using orthogonal draw
+            xor_draw = (u_a * (1-u_b) * (1-u_c) + 
+                       u_b * (1-u_a) * (1-u_c) + 
+                       u_c * (1-u_a) * (1-u_b)) / 1.5
+            
+            cumulative = 0.0
+            chosen = xor_scored[-1][0]
+            for word, p in xor_scored:
+                cumulative += p
+                if xor_draw < cumulative:
+                    chosen = word
+                    break
 
         self.history[chosen] += 1
-
         return chosen
 
 
@@ -751,35 +757,6 @@ def main():
             stream=stream,
             vertex="A",
         )
-
-        print("\n====================")
-        print("SEARCH RESULTS")
-        print("====================\n")
-
-        if not results:
-
-            print("No matches found.")
-
-        else:
-
-            for i, r in enumerate(results, 1):
-
-                print(
-                    f"[{i}] "
-                    f"bend={r['bend']:.1f} "
-                    f"offset={r['offset']} "
-                    f"vertex={r['vertex']}"
-                )
-
-                print("\nGenerated response:\n")
-
-                print(r["text"])
-
-                print(
-                    "\n"
-                    + "=" * 50
-                    + "\n"
-                )
 
 if __name__ == "__main__":
     main()
