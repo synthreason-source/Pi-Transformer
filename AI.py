@@ -97,8 +97,8 @@ class EnhancedTextProcessor(nn.Module):
         self.vectorizer = TfidfVectorizer(
             max_features=max_features,
             ngram_range=(1, 3),
-            min_df=2,
-            max_df=0.95,
+            min_df=1,
+            max_df=1,
             lowercase=True,
             token_pattern=r'\b[a-zA-Z0-9]+\b',
             stop_words=None
@@ -138,13 +138,7 @@ class EnhancedTextProcessor(nn.Module):
         self.register_parameter('question_weight', nn.Parameter(torch.tensor(0.3)))
         
         self.geometric_terms = {
-            'compass': 0, 'circle': 1, 'intersection': 2, 'construction': 3,
-            'midpoint': 4, 'perpendicular': 5, 'radius': 6, 'center': 7,
-            'arc': 8, 'point': 9, 'line': 10, 'geometry': 11,
-            'mohr': 12, 'theorem': 13, 'euclidean': 14,
-            'straightedge': 15, 'triangle': 16, 'square': 17, 'polygon': 18,
-            'angle': 19, 'bisector': 20, 'chord': 21, 'diameter': 22,
-            'tangent': 23, 'secant': 24, 'vertex': 25, 'edge': 26
+            
         }
         
         self.question_patterns = {
@@ -187,29 +181,8 @@ class EnhancedTextProcessor(nn.Module):
 # ============================================================
 
 def embedded_corpus():
-    return """
-Alice was beginning to get very tired of sitting by her sister on the bank,
-and of having nothing to do. Once or twice she had peeped into the book her
-sister was reading, but it had no pictures or conversations in it.
-
-So she was considering in her own mind whether the pleasure of making a
-daisy chain would be worth the trouble of getting up and picking the daisies.
-
-Suddenly a White Rabbit with pink eyes ran close by her.
-
-There was nothing so very remarkable in that, nor did Alice think it so very
-much out of the way to hear the Rabbit say to itself, "Oh dear! Oh dear!
-I shall be late!"
-
-When the Rabbit actually took a watch out of its waistcoat pocket and looked
-at it and hurried on, Alice started to her feet.
-
-The rabbit hole went straight on like a tunnel for some way and then dipped
-suddenly down.
-
-Either the well was very deep or she fell very slowly, for she had plenty of
-time as she went down to look about her and wonder what was going to happen next.
-"""
+    with open(input("Enter skill.md: "), "r", encoding="utf-8") as f:
+        return f.read()
 
 def tokenise_alpha(text):
     tokenizer = RegexpTokenizer(r"[a-z]+")
@@ -473,13 +446,10 @@ def main():
     text_processor = EnhancedTextProcessor(device=device).to(device)
     
     # Fit with Alice corpus + geometric training data
-    training_docs = [embedded_corpus()] + [
-        "geometry compass circle construction triangle vertex",
-        "mohr mascheroni theorem compass only euclidean construction",
-        "circle intersection midpoint perpendicular bisector radius",
-        "straightedge triangle square polygon angle theorem"
+    instructions = [embedded_corpus()] + [
+       input("Enter instructions: ")
     ]
-    text_processor.fit_vectorizer(training_docs)
+    text_processor.fit_vectorizer(instructions)
     
     print("✅ PyTorch Geometric Processor ready!")
     print(f"📊 Geometric terms: {len(text_processor.geometric_terms)}")
