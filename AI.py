@@ -5,7 +5,7 @@
 π → BASE-26 → NLTK TRIGRAM GENERATOR
 ════════════════════════════════════
 
-TERMINAL + GRADIO VERSION
+PURE TERMINAL VERSION + GRADIO DEMO
 
 PROMPT-SEEDED SEARCH MODE
 -------------------------
@@ -24,7 +24,7 @@ PROMPT-SEEDED SEARCH MODE
 FEATURES
 --------
 1. Embedded / external corpus
-2. NLTK trigram / 4-gram language model
+2. NLTK trigram language model
 3. π base-26 entropy stream
 4. Deterministic sampling
 5. Bent-triangle vertex mapping
@@ -48,7 +48,7 @@ from mpmath import mp, pi as mpi
 
 import nltk
 from nltk.util import ngrams
-from nltk.tokenize import word_tokenize
+from nltk.tokenize import RegexpTokenizer, word_tokenize
 from nltk.probability import (
     ConditionalFreqDist,
     ConditionalProbDist,
@@ -59,7 +59,7 @@ from nltk.corpus import words as nltk_words
 import gradio as gr
 from datasets import load_dataset
 
-
+nltk.download('punkt_tab')
 # ============================================================
 # CONFIG
 # ============================================================
@@ -83,6 +83,7 @@ WORD_FIND_MIN = 4
 
 DATASET_PATH = "pi_dataset.txt"
 
+# Seashell resonance config
 SEASHELL_ENABLE = True
 SEASHELL_STRENGTH = 4.35
 SEASHELL_DECAY = 0.985
@@ -126,22 +127,31 @@ time as she went down to look about her and wonder what was going to happen next
 # ============================================================
 
 def tokenise_alpha(text):
-    return text.lower().split()
+
+    tokenizer = RegexpTokenizer(r"[a-z]+")
+
+    return tokenizer.tokenize(text.lower())
 
 
 def extract_word_pairs(prompt):
+
     words = [
         w.lower()
         for w in word_tokenize(prompt)
         if w.isalpha()
     ]
+
     return list(ngrams(words, 2))
 
 
 def capitalise_text(words):
+
     if not words:
         return ""
-    return " ".join(words)
+
+    txt = " ".join(words)
+
+    return txt
 
 
 # ============================================================
@@ -149,6 +159,7 @@ def capitalise_text(words):
 # ============================================================
 
 def build_model(corpus):
+
     tokens = tokenise_alpha(corpus)
 
     padded = (
@@ -157,16 +168,17 @@ def build_model(corpus):
         + ["</s>"]
     )
 
-    ngrams_ = list(ngrams(padded, NGRAM_N))
+    trigrams_ = list(ngrams(padded, NGRAM_N))
 
     cfd = ConditionalFreqDist(
         (tuple(tg[:-1]), tg[-1])
-        for tg in ngrams_
+        for tg in trigrams_
     )
 
     vocab = set(tokens) | {"</s>"}
 
     for ctx in list(cfd.conditions()):
+
         if len(cfd[ctx]) == 0:
             cfd[ctx]["</s>"] += 1
 
@@ -187,14 +199,19 @@ def build_model(corpus):
 # ============================================================
 
 def load_dictionary(vocab):
+
     try:
+
         words = {
             w.lower()
             for w in nltk_words.words()
             if w.isalpha()
         }
+
         return words | set(vocab)
+
     except Exception:
+
         return set(vocab)
 
 
@@ -202,15 +219,25 @@ def load_dictionary(vocab):
 # PI STREAM
 # ============================================================
 
-def build_pi_stream(decimals=PI_PREC, length=PI_STREAM_LEN):
+def build_pi_stream(
+    decimals=PI_PREC,
+    length=PI_STREAM_LEN,
+):
+
     mp.dps = decimals + 50
+
     D = 10 ** decimals
+
     frac = int(mp.floor(mpi * D)) - 3 * D
 
     stream = []
+
     for _ in range(length):
+
         frac *= 26
+
         stream.append(frac // D)
+
         frac %= D
 
     return stream
@@ -221,6 +248,11 @@ def build_pi_stream(decimals=PI_PREC, length=PI_STREAM_LEN):
 # ============================================================
 
 class SeashellResonator:
+    """
+    Simulates seashell-like cavity coloration by boosting/attenuating
+    ranked candidate probabilities with a few decaying resonant peaks.
+    """
+
     def __init__(
         self,
         sampler,
@@ -278,6 +310,7 @@ class SeashellResonator:
 
         for rank in range(n_items):
             idx = rank / max(1, n_items - 1)
+
             response = 0.0
 
             for center, phase, spread in zip(self.centers, self.phases, self.spreads):
@@ -295,6 +328,7 @@ class SeashellResonator:
                 response += gauss * (0.55 + 0.45 * ripple)
 
             response /= max(1, self.peaks)
+
             gain = self.floor + (1.0 - self.floor) + live_strength * response
             gains.append(max(self.floor, gain))
 
@@ -384,6 +418,7 @@ class PiSampler:
         return val / base
 
     def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
+        """XOR fusion: Creates mutually exclusive probability regions"""
         xor_scores = []
 
         u_a_norm = u_a
@@ -398,6 +433,7 @@ class PiSampler:
             region_c = u_c_norm * (1.0 - u_a_norm) * (1.0 - u_b_norm)
 
             xor_blend = max(region_a, region_b, region_c)
+
             orthogonality = 1.0 - abs(u_a_norm - u_b_norm) * abs(u_b_norm - u_c_norm)
             final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
 
@@ -454,7 +490,9 @@ class PiSampler:
         if xor_total <= 0:
             chosen = scored[-1][0] if scored else "</s>"
         else:
-            xor_scored = [(w, p / xor_total) for w, p in xor_scored]
+            xor_scored = [
+                (w, p / xor_total) for w, p in xor_scored
+            ]
 
             xor_draw = (
                 u_a * (1 - u_b) * (1 - u_c) +
@@ -479,13 +517,16 @@ class PiSampler:
 # ============================================================
 
 class Triangle:
+
     def __init__(
         self,
         stream_len,
         offset_extra=0,
         bend_degrees=13.0,
     ):
+
         base = offset_extra % stream_len
+
         bend_shift = int(
             round(
                 (bend_degrees / 360.0)
@@ -494,11 +535,13 @@ class Triangle:
         )
 
         self.A = base % stream_len
+
         self.B = (
             base
             + stream_len // 3
             + bend_shift
         ) % stream_len
+
         self.C = (
             base
             + 2 * stream_len // 3
@@ -522,11 +565,15 @@ def generate_text(
     prompt="",
     n_words=GEN_WORDS,
 ):
+
     seed_words = tokenise_alpha(prompt)
 
     if len(seed_words) >= CONTEXT_WINDOW:
+
         init = seed_words[-CONTEXT_WINDOW:]
+
     else:
+
         init = (
             ["<s>"] * (
                 CONTEXT_WINDOW - len(seed_words)
@@ -542,27 +589,43 @@ def generate_text(
     words = list(seed_words)
 
     for _ in range(n_words):
+
         ctx = tuple(context)
 
         try:
+
             dist = cpd[ctx]
+
             samples = list(dist.samples())
+
         except Exception:
+
             samples = []
 
         if not samples:
+
             context.clear()
-            context.extend(["<s>"] * CONTEXT_WINDOW)
+
+            context.extend(
+                ["<s>"] * CONTEXT_WINDOW
+            )
+
             continue
 
         word = sampler.sample(dist)
 
         if word in ("</s>", ""):
+
             context.clear()
-            context.extend(["<s>"] * CONTEXT_WINDOW)
+
+            context.extend(
+                ["<s>"] * CONTEXT_WINDOW
+            )
+
             continue
 
         words.append(word)
+
         context.append(word)
 
     return capitalise_text(words)
@@ -573,32 +636,42 @@ def generate_text(
 # ============================================================
 
 def find_words(stream, dictionary):
+
     prefixes = set()
 
     for w in dictionary:
+
         for i in range(1, len(w) + 1):
             prefixes.add(w[:i])
 
     buf = deque(maxlen=35)
+
     all_chars = []
+
     found = defaultdict(list)
 
     for pos, digit in enumerate(stream):
+
         ch = chr(ord("a") + digit)
+
         buf.append(ch)
+
         all_chars.append(ch)
+
         s = "".join(buf)
 
         for length in range(
             WORD_FIND_MIN,
             min(16, len(s)) + 1,
         ):
+
             cand = s[-length:]
 
             if cand not in prefixes:
                 continue
 
             if cand in dictionary:
+
                 found[cand].append(
                     pos - length + 1
                 )
@@ -611,6 +684,7 @@ def find_words(stream, dictionary):
 # ============================================================
 
 def fuzzy_score(target, text):
+
     return SequenceMatcher(
         None,
         target.lower(),
@@ -627,16 +701,22 @@ def all_pairs_match(
     text,
     fuzzy_threshold=0.72,
 ):
+
     lower_text = text.lower()
 
     for pair in pairs:
+
         pair_str = " ".join(pair)
+
         exact = pair_str in lower_text
 
         if exact:
             continue
 
-        score = fuzzy_score(pair_str, text)
+        score = fuzzy_score(
+            pair_str,
+            text
+        )
 
         if score < fuzzy_threshold:
             return False, pair
@@ -645,7 +725,7 @@ def all_pairs_match(
 
 
 # ============================================================
-# CORPUS LOADING
+# DATASET HELPERS
 # ============================================================
 
 def dataset_rows_to_text(ds, max_rows=5000):
@@ -654,7 +734,7 @@ def dataset_rows_to_text(ds, max_rows=5000):
 
     for row in ds:
         parts = []
-        for k, v in row.items():
+        for v in row.values():
             if isinstance(v, str):
                 parts.append(v)
             elif isinstance(v, (int, float, bool)):
@@ -663,9 +743,11 @@ def dataset_rows_to_text(ds, max_rows=5000):
                 parts.append(" ".join(str(x) for x in v))
             elif isinstance(v, dict):
                 parts.append(" ".join(f"{a}:{b}" for a, b in v.items()))
+
         row_text = " ".join(parts).strip()
         if row_text:
             texts.append(row_text)
+
         count += 1
         if count >= max_rows:
             break
@@ -685,10 +767,10 @@ def load_corpus_from_source(
         return embedded_corpus(), "embedded"
 
     if source_mode == "file":
-        if uploaded_file is None:
+        if not uploaded_file:
             raise ValueError("No file uploaded.")
-        file_path = uploaded_file if isinstance(uploaded_file, str) else uploaded_file.name
 
+        file_path = uploaded_file if isinstance(uploaded_file, str) else uploaded_file.name
         ext = os.path.splitext(file_path)[1].lower()
 
         if ext in [".txt", ".md", ".py", ".log", ".text"]:
@@ -701,6 +783,8 @@ def load_corpus_from_source(
             ds = load_dataset("csv", data_files=file_path, split="train")
         elif ext == ".parquet":
             ds = load_dataset("parquet", data_files=file_path, split="train")
+        elif ext == ".txt":
+            ds = load_dataset("text", data_files=file_path, split="train")
         else:
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 return f.read(), f"file:{os.path.basename(file_path)}"
@@ -756,25 +840,38 @@ def brute_force_prompt_search(
     stream,
     vertex="A",
     max_solutions=10,
-    gen_words=GEN_WORDS,
 ):
+
     pairs = extract_word_pairs(prompt)
 
     if not pairs:
-        return [{
-            "error": "No valid word pairs extracted."
-        }]
+
+        print(
+            "No valid word pairs extracted."
+        )
+
+        return []
+
+    print(
+        "\nSearching bend+offset space..."
+    )
+
+    print(f"\nPrompt:\n{prompt}\n")
 
     found = []
 
     for bend_x10 in range(0, 451, 5):
+
         bend = bend_x10 / 10.0
+
+        print(f"bend = {bend:.1f}")
 
         for offset in range(
             0,
             PI_STREAM_LEN,
             5,
         ):
+
             triangle = Triangle(
                 PI_STREAM_LEN,
                 offset_extra=offset,
@@ -784,21 +881,25 @@ def brute_force_prompt_search(
             start = triangle.vertices[vertex]
 
             sampler = PiSampler(stream)
+
             sampler.seek(start)
 
             text = generate_text(
                 cpd,
                 sampler,
                 prompt=prompt,
-                n_words=gen_words,
+                n_words=GEN_WORDS,
             )
 
-            matches_all, failed_pair = all_pairs_match(
-                pairs,
-                text,
+            matches_all, failed_pair = (
+                all_pairs_match(
+                    pairs,
+                    text,
+                )
             )
 
             if matches_all:
+
                 found.append(
                     {
                         "prompt": prompt,
@@ -809,17 +910,33 @@ def brute_force_prompt_search(
                     }
                 )
 
-                if len(found) >= max_solutions:
+                print("\nFOUND MATCH")
+
+                print(
+                    f"bend={bend:.1f} "
+                    f"offset={offset}"
+                )
+
+                print("\nGenerated:\n")
+
+                print(text)
+
+                print()
+
+                if (
+                    len(found)
+                    >= max_solutions
+                ):
                     return found
 
     return found
 
 
 # ============================================================
-# APP LOGIC
+# UI RUNNER
 # ============================================================
 
-def run_search(
+def run_search_ui(
     prompt,
     source_mode,
     uploaded_file,
@@ -829,10 +946,9 @@ def run_search(
     hf_text_field,
     vertex,
     max_solutions,
-    gen_words,
 ):
     try:
-        corpus, corpus_label = load_corpus_from_source(
+        corpus, source_label = load_corpus_from_source(
             source_mode=source_mode,
             uploaded_file=uploaded_file,
             hf_dataset_name=hf_dataset_name,
@@ -844,7 +960,7 @@ def run_search(
         cpd, vocab = build_model(corpus)
         dictionary = load_dictionary(vocab)
         stream = build_pi_stream()
-        _, found_words = find_words(stream, dictionary)
+        stream_text, found_words = find_words(stream, dictionary)
 
         results = brute_force_prompt_search(
             prompt=prompt,
@@ -852,75 +968,86 @@ def run_search(
             stream=stream,
             vertex=vertex,
             max_solutions=int(max_solutions),
-            gen_words=int(gen_words),
         )
 
-        if results and "error" in results[0]:
+        if not results:
             return (
-                f"Corpus source: {corpus_label}\n"
+                f"Source: {source_label}\n"
                 f"Corpus chars: {len(corpus)}\n"
                 f"Vocab size: {len(vocab)}\n"
-                f"Found π words: {len(found_words)}\n\n"
-                f"Error: {results[0]['error']}",
+                f"Pi words found: {len(found_words)}\n"
+                f"Matches: 0",
                 []
             )
 
-        summary_lines = [
-            f"Corpus source: {corpus_label}",
-            f"Corpus chars: {len(corpus)}",
-            f"Vocab size: {len(vocab)}",
-            f"Found π words: {len(found_words)}",
-            f"Matches found: {len(results)}",
-        ]
+        formatted = []
+        for r in results:
+            formatted.append({
+                "prompt": r["prompt"],
+                "bend": r["bend"],
+                "offset": r["offset"],
+                "vertex": r["vertex"],
+                "text": r["text"],
+            })
 
-        display = []
-        for i, r in enumerate(results, 1):
-            block = (
-                f"[{i}] bend={r['bend']:.1f} offset={r['offset']} vertex={r['vertex']}\n\n"
-                f"{r['text']}"
-            )
-            display.append(block)
+        summary = (
+            f"Source: {source_label}\n"
+            f"Corpus chars: {len(corpus)}\n"
+            f"Vocab size: {len(vocab)}\n"
+            f"Pi words found: {len(found_words)}\n"
+            f"Matches: {len(results)}"
+        )
 
-        return "\n".join(summary_lines), display
+        return summary, formatted
 
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}", []
 
 
 # ============================================================
-# TERMINAL MAIN
+# MAIN
 # ============================================================
 
-def terminal_main():
+def main():
+
     filename = input(
-        "Corpus filename (ENTER for embedded corpus): "
+        "Corpus filename "
+        "(ENTER for embedded corpus): "
     ).strip()
 
     if filename:
+
         with open(
             filename,
             "r",
             encoding="utf-8",
         ) as f:
+
             corpus = f.read()
+
     else:
+
         corpus = embedded_corpus()
 
     print("\nBuilding trigram model...")
+
     cpd, vocab = build_model(corpus)
 
     dictionary = load_dictionary(vocab)
 
     print("Building pi stream...")
+
     stream = build_pi_stream()
 
     print("Finding words in stream...")
+
     stream_text, found_words = find_words(
         stream,
         dictionary,
     )
 
     while True:
+
         print("\n==========================")
         print("PROMPT-ALIGNED SEARCH")
         print("==========================")
@@ -938,17 +1065,6 @@ def terminal_main():
             stream=stream,
             vertex="A",
         )
-
-        if not results:
-            print("\nNo matches found.\n")
-            continue
-
-        for r in results:
-            print("\nFOUND MATCH")
-            print(f"bend={r['bend']:.1f} offset={r['offset']}")
-            print("\nGenerated:\n")
-            print(r["text"])
-            print()
 
 
 # ============================================================
@@ -968,7 +1084,7 @@ Use an embedded corpus, upload a file, or load a Hugging Face dataset with optio
         with gr.Row():
             prompt = gr.Textbox(
                 label="Prompt",
-                placeholder="Enter a prompt",
+                placeholder="Enter prompt",
                 lines=3,
             )
             source_mode = gr.Radio(
@@ -978,23 +1094,46 @@ Use an embedded corpus, upload a file, or load a Hugging Face dataset with optio
             )
 
         with gr.Row():
-            uploaded_file = gr.File(label="Upload corpus file", file_count="single", type="filepath")
-            hf_dataset_name = gr.Textbox(label="HF dataset name", placeholder="e.g. ag_news")
-            hf_config_name = gr.Textbox(label="HF config name", placeholder="optional config/subset")
-            hf_split = gr.Textbox(label="HF split", value="train")
-            hf_text_field = gr.Textbox(label="HF text field", placeholder="optional text column")
+            uploaded_file = gr.File(
+                label="Upload corpus file",
+                file_count="single",
+                type="filepath"
+            )
 
         with gr.Row():
-            vertex = gr.Dropdown(choices=["A", "B", "C"], value="A", label="Triangle vertex")
-            max_solutions = gr.Slider(1, 20, value=5, step=1, label="Max solutions")
-            gen_words = gr.Slider(50, 3000, value=1600, step=50, label="Generated words")
+            hf_dataset_name = gr.Textbox(
+                label="HF dataset name",
+                placeholder="e.g. ag_news"
+            )
+            hf_config_name = gr.Textbox(
+                label="HF config name",
+                placeholder="optional"
+            )
+            hf_split = gr.Textbox(
+                label="HF split",
+                value="train"
+            )
+            hf_text_field = gr.Textbox(
+                label="HF text field",
+                placeholder="optional"
+            )
+
+        with gr.Row():
+            vertex = gr.Dropdown(
+                choices=["A", "B", "C"],
+                value="A",
+                label="Triangle vertex",
+            )
+            max_solutions = gr.Slider(
+                1, 20, value=5, step=1, label="Max solutions"
+            )
 
         run_btn = gr.Button("Run search")
-        summary = gr.Textbox(label="Summary", lines=8)
-        outputs = gr.JSON(label="Matches")
+        summary = gr.Textbox(label="Summary", lines=6)
+        results = gr.JSON(label="Matches")
 
         run_btn.click(
-            fn=run_search,
+            fn=run_search_ui,
             inputs=[
                 prompt,
                 source_mode,
@@ -1005,9 +1144,8 @@ Use an embedded corpus, upload a file, or load a Hugging Face dataset with optio
                 hf_text_field,
                 vertex,
                 max_solutions,
-                gen_words,
             ],
-            outputs=[summary, outputs],
+            outputs=[summary, results],
         )
 
     return demo
@@ -1018,9 +1156,10 @@ Use an embedded corpus, upload a file, or load a Hugging Face dataset with optio
 # ============================================================
 
 if __name__ == "__main__":
-    mode = os.environ.get("APP_MODE", "gradio").lower()
-    if mode == "terminal":
-        terminal_main()
-    else:
+    mode = os.environ.get("APP_MODE", "terminal").lower()
+
+    if mode == "gradio":
         demo = build_demo()
         demo.launch()
+    else:
+        main()
