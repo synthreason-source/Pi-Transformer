@@ -33,15 +33,11 @@ FEATURES
 7. Exact + fuzzy matching
 8. Dataset export
 9. Seashell-style resonant probability coloration
-10. Optional Gradio demo
-11. File upload
-12. Hugging Face dataset support with config
 """
 
 import sys
 import re
 import math
-import os
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
 
@@ -56,9 +52,6 @@ from nltk.probability import (
     LidstoneProbDist,
 )
 from nltk.corpus import words as nltk_words
-
-import gradio as gr
-from datasets import load_dataset
 
 
 # ============================================================
@@ -724,112 +717,6 @@ def all_pairs_match(
 
 
 # ============================================================
-# CORPUS LOADING HELPERS
-# ============================================================
-
-def dataset_rows_to_text(ds, max_rows=5000):
-    texts = []
-    count = 0
-
-    for row in ds:
-        parts = []
-        for v in row.values():
-            if isinstance(v, str):
-                parts.append(v)
-            elif isinstance(v, (int, float, bool)):
-                parts.append(str(v))
-            elif isinstance(v, list):
-                parts.append(" ".join(str(x) for x in v))
-            elif isinstance(v, dict):
-                parts.append(" ".join(f"{a}:{b}" for a, b in v.items()))
-
-        row_text = " ".join(parts).strip()
-        if row_text:
-            texts.append(row_text)
-
-        count += 1
-        if count >= max_rows:
-            break
-
-    return "\n".join(texts)
-
-
-def load_corpus_from_source(
-    source_mode,
-    uploaded_file=None,
-    hf_dataset_name="",
-    hf_config_name="",
-    hf_split="train",
-    hf_text_field="",
-):
-    if source_mode == "embedded":
-        return embedded_corpus(), "embedded"
-
-    if source_mode == "file":
-        if not uploaded_file:
-            raise ValueError("No file uploaded.")
-
-        file_path = uploaded_file if isinstance(uploaded_file, str) else uploaded_file.name
-        ext = os.path.splitext(file_path)[1].lower()
-
-        if ext in [".txt", ".md", ".py", ".log", ".text"]:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read(), f"file:{os.path.basename(file_path)}"
-
-        if ext == ".json":
-            ds = load_dataset("json", data_files=file_path, split="train")
-        elif ext == ".csv":
-            ds = load_dataset("csv", data_files=file_path, split="train")
-        elif ext == ".parquet":
-            ds = load_dataset("parquet", data_files=file_path, split="train")
-        elif ext == ".txt":
-            ds = load_dataset("text", data_files=file_path, split="train")
-        else:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                return f.read(), f"file:{os.path.basename(file_path)}"
-
-        if hf_text_field and hf_text_field in ds.column_names:
-            text = "\n".join(str(x) for x in ds[hf_text_field] if x is not None)
-        else:
-            text = dataset_rows_to_text(ds)
-
-        return text, f"dataset-file:{os.path.basename(file_path)}"
-
-    if source_mode == "huggingface":
-        if not hf_dataset_name.strip():
-            raise ValueError("Hugging Face dataset name is required.")
-
-        if hf_config_name.strip():
-            ds = load_dataset(
-                hf_dataset_name.strip(),
-                hf_config_name.strip(),
-                split=hf_split.strip() or "train",
-            )
-        else:
-            ds = load_dataset(
-                hf_dataset_name.strip(),
-                split=hf_split.strip() or "train",
-            )
-
-        if hf_text_field.strip():
-            field = hf_text_field.strip()
-            if field not in ds.column_names:
-                raise ValueError(f"Field '{field}' not found. Available: {ds.column_names}")
-            text = "\n".join(str(x) for x in ds[field] if x is not None)
-        else:
-            text = dataset_rows_to_text(ds)
-
-        label = hf_dataset_name.strip()
-        if hf_config_name.strip():
-            label += f"/{hf_config_name.strip()}"
-        label += f":{hf_split.strip() or 'train'}"
-
-        return text, label
-
-    raise ValueError(f"Unknown source mode: {source_mode}")
-
-
-# ============================================================
 # PROMPT SEARCH
 # ============================================================
 
@@ -932,144 +819,6 @@ def brute_force_prompt_search(
 
 
 # ============================================================
-# GRADIO WRAPPER
-# ============================================================
-
-def run_search_ui(
-    prompt,
-    source_mode,
-    uploaded_file,
-    hf_dataset_name,
-    hf_config_name,
-    hf_split,
-    hf_text_field,
-    vertex,
-    max_solutions,
-):
-    try:
-        corpus, source_label = load_corpus_from_source(
-            source_mode=source_mode,
-            uploaded_file=uploaded_file,
-            hf_dataset_name=hf_dataset_name,
-            hf_config_name=hf_config_name,
-            hf_split=hf_split,
-            hf_text_field=hf_text_field,
-        )
-
-        cpd, vocab = build_model(corpus)
-        dictionary = load_dictionary(vocab)
-        stream = build_pi_stream()
-        stream_text, found_words = find_words(
-            stream,
-            dictionary,
-        )
-
-        results = brute_force_prompt_search(
-            prompt=prompt,
-            cpd=cpd,
-            stream=stream,
-            vertex=vertex,
-            max_solutions=int(max_solutions),
-        )
-
-        summary = (
-            f"Source: {source_label}\n"
-            f"Corpus chars: {len(corpus)}\n"
-            f"Vocab size: {len(vocab)}\n"
-            f"Found π words: {len(found_words)}\n"
-            f"Matches found: {len(results)}"
-        )
-
-        return summary, results
-
-    except Exception as e:
-        return f"Error: {type(e).__name__}: {e}", []
-
-
-def build_demo():
-    with gr.Blocks(title="Pi Base-26 NLTK Generator") as demo:
-        gr.Markdown(
-            """
-# π → BASE-26 → NLTK Generator
-
-This demo keeps the core search logic and variables unchanged, while adding:
-- embedded corpus mode,
-- file upload corpus mode,
-- Hugging Face dataset loading with optional config and split.
-"""
-        )
-
-        with gr.Row():
-            prompt = gr.Textbox(
-                label="Prompt",
-                placeholder="Enter prompt",
-                lines=3,
-            )
-            source_mode = gr.Radio(
-                choices=["embedded", "file", "huggingface"],
-                value="embedded",
-                label="Corpus source",
-            )
-
-        with gr.Row():
-            uploaded_file = gr.File(
-                label="Upload corpus file",
-                file_count="single",
-                type="filepath"
-            )
-
-        with gr.Row():
-            hf_dataset_name = gr.Textbox(
-                label="HF dataset name",
-                placeholder="e.g. ag_news"
-            )
-            hf_config_name = gr.Textbox(
-                label="HF config name",
-                placeholder="optional config"
-            )
-            hf_split = gr.Textbox(
-                label="HF split",
-                value="train"
-            )
-            hf_text_field = gr.Textbox(
-                label="HF text field",
-                placeholder="optional text field"
-            )
-
-        with gr.Row():
-            vertex = gr.Dropdown(
-                choices=["A", "B", "C"],
-                value="A",
-                label="Triangle vertex",
-            )
-            max_solutions = gr.Slider(
-                1, 20, value=10, step=1, label="Max solutions"
-            )
-
-        run_btn = gr.Button("Run search")
-        summary = gr.Textbox(label="Summary", lines=6)
-        results = gr.JSON(label="Matches")
-
-        run_btn.click(
-            fn=run_search_ui,
-            inputs=[
-                prompt,
-                source_mode,
-                uploaded_file,
-                hf_dataset_name,
-                hf_config_name,
-                hf_split,
-                hf_text_field,
-                vertex,
-                max_solutions,
-            ],
-            outputs=[summary, results],
-        )
-
-    return demo
-
-
-# ============================================================
 # MAIN
 # ============================================================
 
@@ -1131,14 +880,5 @@ def main():
             vertex="A",
         )
 
-
-# ============================================================
-# ENTRYPOINT
-# ============================================================
-
 if __name__ == "__main__":
-    if mode == "gradio":
-        demo = build_demo()
-        demo.launch()
-    else:
-        main()
+    main()
