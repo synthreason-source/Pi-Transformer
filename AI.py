@@ -32,10 +32,12 @@ FEATURES
 6. Prompt-aligned generation
 7. Exact + fuzzy matching
 8. Dataset export
+9. Seashell-style resonant probability coloration
 """
 
 import sys
 import re
+import math
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
 
@@ -64,16 +66,24 @@ PI_STREAM_LEN = 12000
 
 DIGITS_PER_SAMPLE = 3
 
-NGRAM_N = 3
+NGRAM_N = 4
 CONTEXT_WINDOW = NGRAM_N - 1
 
 LIDSTONE_GAMMA = 0.1
 
-GEN_WORDS = 160
+GEN_WORDS = 1600
 
-WORD_FIND_MIN = 2
+WORD_FIND_MIN = 4
 
 DATASET_PATH = "pi_dataset.txt"
+
+# Seashell resonance config
+SEASHELL_ENABLE = True
+SEASHELL_STRENGTH = 4.35
+SEASHELL_DECAY = 0.985
+SEASHELL_PEAKS = 4
+SEASHELL_WIDTH = 0.16
+SEASHELL_FLOOR = 0.35
 
 
 # ============================================================
@@ -112,10 +122,7 @@ time as she went down to look about her and wonder what was going to happen next
 
 def tokenise_alpha(text):
 
-    tokenizer = RegexpTokenizer(r"[a-z]+")
-
-    return tokenizer.tokenize(text.lower())
-
+    return text.lower().split()
 
 def extract_word_pairs(prompt):
 
@@ -134,24 +141,6 @@ def capitalise_text(words):
         return ""
 
     txt = " ".join(words)
-
-    chars = list(txt)
-
-    if chars:
-        chars[0] = chars[0].upper()
-
-    for i in range(len(chars) - 2):
-
-        if chars[i] == "." and chars[i + 1] == " ":
-            chars[i + 2] = chars[i + 2].upper()
-
-    txt = "".join(chars)
-
-    txt = re.sub(
-        r'([.!?])\s*([A-Z])',
-        r'\1\n\n\2',
-        txt
-    )
 
     return txt
 
@@ -246,8 +235,128 @@ def build_pi_stream(
 
 
 # ============================================================
+# SEASHELL RESONATOR
+# ============================================================
+
+class SeashellResonator:
+    """
+    Simulates seashell-like cavity coloration by boosting/attenuating
+    ranked candidate probabilities with a few decaying resonant peaks.
+    """
+
+    def __init__(
+        self,
+        sampler,
+        strength=SEASHELL_STRENGTH,
+        decay=SEASHELL_DECAY,
+        peaks=SEASHELL_PEAKS,
+        width=SEASHELL_WIDTH,
+        floor=SEASHELL_FLOOR,
+    ):
+        self.sampler = sampler
+        self.base_strength = max(0.0, float(strength))
+        self.decay = min(0.9999, max(0.0, float(decay)))
+        self.peaks = max(1, int(peaks))
+        self.width = max(0.02, float(width))
+        self.floor = max(1e-6, float(floor))
+        self.energy = 1.0
+        self.step_index = 0
+        self.centers = []
+        self.phases = []
+        self.spreads = []
+        self._seed_from_stream()
+
+    def _seed_from_stream(self):
+        self.centers = []
+        self.phases = []
+        self.spreads = []
+
+        for _ in range(self.peaks):
+            c = self.sampler.next_unit()
+            ph = 2.0 * math.pi * self.sampler.next_unit()
+            spread = self.width * (0.65 + 0.7 * self.sampler.next_unit())
+            self.centers.append(c)
+            self.phases.append(ph)
+            self.spreads.append(spread)
+
+    def reset(self):
+        self.energy = 1.0
+        self.step_index = 0
+        self._seed_from_stream()
+
+    def _wrapped_distance(self, a, b):
+        d = abs(a - b)
+        return min(d, 1.0 - d)
+
+    def gains(self, n_items):
+        if n_items <= 0:
+            return []
+
+        gains = []
+        t = self.step_index
+        live_strength = self.base_strength * self.energy
+
+        drift = 0.017 * math.sin(0.11 * t)
+        shimmer = 0.09 * math.sin(0.19 * t + 1.7)
+
+        for rank in range(n_items):
+            idx = rank / max(1, n_items - 1)
+
+            response = 0.0
+
+            for center, phase, spread in zip(self.centers, self.phases, self.spreads):
+                moving_center = (center + drift * math.sin(phase + 0.07 * t)) % 1.0
+                d = self._wrapped_distance(idx, moving_center)
+
+                gauss = math.exp(-(d * d) / max(1e-9, 2.0 * spread * spread))
+
+                ripple = 0.5 + 0.5 * math.cos(
+                    (d / max(1e-9, spread)) * math.pi * (1.5 + shimmer)
+                    + phase
+                    + 0.13 * t
+                )
+
+                response += gauss * (0.55 + 0.45 * ripple)
+
+            response /= max(1, self.peaks)
+
+            gain = self.floor + (1.0 - self.floor) + live_strength * response
+            gains.append(max(self.floor, gain))
+
+        total = sum(gains)
+        if total > 0:
+            gains = [g / total for g in gains]
+
+        return gains
+
+    def apply(self, scored):
+        if not scored:
+            return scored
+
+        g = self.gains(len(scored))
+
+        weighted = []
+        for (word, p), gain in zip(scored, g):
+            weighted.append((word, p * gain))
+
+        total = sum(p for _, p in weighted)
+        if total > 0:
+            weighted = [(w, p / total) for w, p in weighted]
+
+        self.energy *= self.decay
+        self.step_index += 1
+
+        if self.energy < 0.08:
+            self.energy = 1.0
+            self._seed_from_stream()
+
+        return weighted
+
+
+# ============================================================
 # PI SAMPLER
 # ============================================================
+
 class PiSampler:
     def __init__(
         self,
@@ -256,6 +365,12 @@ class PiSampler:
         top_k=100,
         top_p=1.0,
         repetition_penalty=1.08,
+        seashell_enable=SEASHELL_ENABLE,
+        seashell_strength=SEASHELL_STRENGTH,
+        seashell_decay=SEASHELL_DECAY,
+        seashell_peaks=SEASHELL_PEAKS,
+        seashell_width=SEASHELL_WIDTH,
+        seashell_floor=SEASHELL_FLOOR,
     ):
         self.stream = stream
         self.pos = 0
@@ -264,10 +379,23 @@ class PiSampler:
         self.top_p = top_p
         self.repetition_penalty = repetition_penalty
         self.history = Counter()
+        self.seashell = None
+
+        if seashell_enable:
+            self.seashell = SeashellResonator(
+                sampler=self,
+                strength=seashell_strength,
+                decay=seashell_decay,
+                peaks=seashell_peaks,
+                width=seashell_width,
+                floor=seashell_floor,
+            )
 
     def seek(self, pos):
         self.pos = pos % len(self.stream)
         self.history.clear()
+        if self.seashell is not None:
+            self.seashell.reset()
 
     def next_unit(self):
         val = 0
@@ -283,29 +411,25 @@ class PiSampler:
     def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
         """XOR fusion: Creates mutually exclusive probability regions"""
         xor_scores = []
-        
-        # Generate 3 orthogonal streams for XOR logic
-        u_a_norm = u_a  # Primary stream
-        u_b_norm = u_b  # Anti-correlation stream  
-        u_c_norm = u_c  # Selector stream
-        
+
+        u_a_norm = u_a
+        u_b_norm = u_b
+        u_c_norm = u_c
+
         for rank, (word, base_p) in enumerate(scored):
             idx = rank / max(1, len(scored) - 1)
-            
-            # XOR regions: A∧¬B∧¬C | ¬A∧B∧¬C | ¬A∧¬B∧C
+
             region_a = (1.0 - abs(idx - u_a_norm)) * (1.0 - u_b_norm) * (1.0 - u_c_norm)
             region_b = u_b_norm * (1.0 - abs(idx - u_a_norm)) * (1.0 - u_c_norm)
             region_c = u_c_norm * (1.0 - u_a_norm) * (1.0 - u_b_norm)
-            
-            # XOR fusion: exclusive dominance
+
             xor_blend = max(region_a, region_b, region_c)
-            
-            # Sharpness boost based on stream orthogonality
+
             orthogonality = 1.0 - abs(u_a_norm - u_b_norm) * abs(u_b_norm - u_c_norm)
             final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
-            
+
             xor_scores.append((word, final_p))
-        
+
         return xor_scores
 
     def sample(self, dist):
@@ -313,7 +437,6 @@ class PiSampler:
         if not samples:
             return "</s>"
 
-        # Base scoring with repetition penalty
         base_scored = []
         for s in samples:
             p = max(1e-12, float(dist.prob(s)))
@@ -322,13 +445,11 @@ class PiSampler:
                 p /= (self.repetition_penalty ** count)
             base_scored.append((s, p))
 
-        # Temperature scaling
         scored = [
             (s, p ** (1.0 / self.temperature))
             for s, p in base_scored
         ]
 
-        # Normalize
         total = sum(p for _, p in scored)
         scored = [
             (s, p / total)
@@ -338,7 +459,6 @@ class PiSampler:
         scored.sort(key=lambda x: x[1], reverse=True)
         scored = scored[:self.top_k]
 
-        # Top-p filtering
         kept = []
         accum = 0.0
         for s, p in scored:
@@ -348,15 +468,16 @@ class PiSampler:
                 break
         scored = kept
 
-        # Generate 3 orthogonal π streams for XOR
-        u_a = self.next_unit()  # Primary selection stream
-        u_b = self.next_unit()  # Region exclusion stream
-        u_c = self.next_unit()  # Final discriminator
+        # Apply seashell cavity coloration before XOR selection.
+        if self.seashell is not None:
+            scored = self.seashell.apply(scored)
 
-        # XOR FUSION: Mutually exclusive probability regions
+        u_a = self.next_unit()
+        u_b = self.next_unit()
+        u_c = self.next_unit()
+
         xor_scored = self._xor_probability_fusion(scored, u_a, u_b, u_c)
 
-        # Renormalize XOR scores
         xor_total = sum(p for _, p in xor_scored)
         if xor_total <= 0:
             chosen = scored[-1][0] if scored else "</s>"
@@ -364,12 +485,13 @@ class PiSampler:
             xor_scored = [
                 (w, p / xor_total) for w, p in xor_scored
             ]
-            
-            # XOR final selection using orthogonal draw
-            xor_draw = (u_a * (1-u_b) * (1-u_c) + 
-                       u_b * (1-u_a) * (1-u_c) + 
-                       u_c * (1-u_a) * (1-u_b)) / 1.5
-            
+
+            xor_draw = (
+                u_a * (1 - u_b) * (1 - u_c) +
+                u_b * (1 - u_a) * (1 - u_c) +
+                u_c * (1 - u_a) * (1 - u_b)
+            ) / 1.5
+
             cumulative = 0.0
             chosen = xor_scored[-1][0]
             for word, p in xor_scored:
