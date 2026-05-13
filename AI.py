@@ -5,7 +5,8 @@
 π → BASE-26 → NLTK TRIGRAM GENERATOR
 ════════════════════════════════════
 
-PURE TERMINAL VERSION + GRADIO DEMO
+PURE TERMINAL VERSION
+NO GRADIO
 
 PROMPT-SEEDED SEARCH MODE
 -------------------------
@@ -32,7 +33,7 @@ FEATURES
 7. Exact + fuzzy matching
 8. Dataset export
 9. Seashell-style resonant probability coloration
-10. Gradio demo
+10. Optional Gradio demo
 11. File upload
 12. Hugging Face dataset support with config
 """
@@ -59,7 +60,7 @@ from nltk.corpus import words as nltk_words
 import gradio as gr
 from datasets import load_dataset
 
-nltk.download('punkt_tab')
+
 # ============================================================
 # CONFIG
 # ============================================================
@@ -128,10 +129,7 @@ time as she went down to look about her and wonder what was going to happen next
 
 def tokenise_alpha(text):
 
-    tokenizer = RegexpTokenizer(r"[a-z]+")
-
-    return tokenizer.tokenize(text.lower())
-
+    return text.lower().split()
 
 def extract_word_pairs(prompt):
 
@@ -477,6 +475,7 @@ class PiSampler:
                 break
         scored = kept
 
+        # Apply seashell cavity coloration before XOR selection.
         if self.seashell is not None:
             scored = self.seashell.apply(scored)
 
@@ -725,7 +724,7 @@ def all_pairs_match(
 
 
 # ============================================================
-# DATASET HELPERS
+# CORPUS LOADING HELPERS
 # ============================================================
 
 def dataset_rows_to_text(ds, max_rows=5000):
@@ -933,7 +932,7 @@ def brute_force_prompt_search(
 
 
 # ============================================================
-# UI RUNNER
+# GRADIO WRAPPER
 # ============================================================
 
 def run_search_ui(
@@ -960,7 +959,10 @@ def run_search_ui(
         cpd, vocab = build_model(corpus)
         dictionary = load_dictionary(vocab)
         stream = build_pi_stream()
-        stream_text, found_words = find_words(stream, dictionary)
+        stream_text, found_words = find_words(
+            stream,
+            dictionary,
+        )
 
         results = brute_force_prompt_search(
             prompt=prompt,
@@ -970,38 +972,101 @@ def run_search_ui(
             max_solutions=int(max_solutions),
         )
 
-        if not results:
-            return (
-                f"Source: {source_label}\n"
-                f"Corpus chars: {len(corpus)}\n"
-                f"Vocab size: {len(vocab)}\n"
-                f"Pi words found: {len(found_words)}\n"
-                f"Matches: 0",
-                []
-            )
-
-        formatted = []
-        for r in results:
-            formatted.append({
-                "prompt": r["prompt"],
-                "bend": r["bend"],
-                "offset": r["offset"],
-                "vertex": r["vertex"],
-                "text": r["text"],
-            })
-
         summary = (
             f"Source: {source_label}\n"
             f"Corpus chars: {len(corpus)}\n"
             f"Vocab size: {len(vocab)}\n"
-            f"Pi words found: {len(found_words)}\n"
-            f"Matches: {len(results)}"
+            f"Found π words: {len(found_words)}\n"
+            f"Matches found: {len(results)}"
         )
 
-        return summary, formatted
+        return summary, results
 
     except Exception as e:
         return f"Error: {type(e).__name__}: {e}", []
+
+
+def build_demo():
+    with gr.Blocks(title="Pi Base-26 NLTK Generator") as demo:
+        gr.Markdown(
+            """
+# π → BASE-26 → NLTK Generator
+
+This demo keeps the core search logic and variables unchanged, while adding:
+- embedded corpus mode,
+- file upload corpus mode,
+- Hugging Face dataset loading with optional config and split.
+"""
+        )
+
+        with gr.Row():
+            prompt = gr.Textbox(
+                label="Prompt",
+                placeholder="Enter prompt",
+                lines=3,
+            )
+            source_mode = gr.Radio(
+                choices=["embedded", "file", "huggingface"],
+                value="embedded",
+                label="Corpus source",
+            )
+
+        with gr.Row():
+            uploaded_file = gr.File(
+                label="Upload corpus file",
+                file_count="single",
+                type="filepath"
+            )
+
+        with gr.Row():
+            hf_dataset_name = gr.Textbox(
+                label="HF dataset name",
+                placeholder="e.g. ag_news"
+            )
+            hf_config_name = gr.Textbox(
+                label="HF config name",
+                placeholder="optional config"
+            )
+            hf_split = gr.Textbox(
+                label="HF split",
+                value="train"
+            )
+            hf_text_field = gr.Textbox(
+                label="HF text field",
+                placeholder="optional text field"
+            )
+
+        with gr.Row():
+            vertex = gr.Dropdown(
+                choices=["A", "B", "C"],
+                value="A",
+                label="Triangle vertex",
+            )
+            max_solutions = gr.Slider(
+                1, 20, value=10, step=1, label="Max solutions"
+            )
+
+        run_btn = gr.Button("Run search")
+        summary = gr.Textbox(label="Summary", lines=6)
+        results = gr.JSON(label="Matches")
+
+        run_btn.click(
+            fn=run_search_ui,
+            inputs=[
+                prompt,
+                source_mode,
+                uploaded_file,
+                hf_dataset_name,
+                hf_config_name,
+                hf_split,
+                hf_text_field,
+                vertex,
+                max_solutions,
+            ],
+            outputs=[summary, results],
+        )
+
+    return demo
 
 
 # ============================================================
@@ -1068,95 +1133,14 @@ def main():
 
 
 # ============================================================
-# GRADIO DEMO
-# ============================================================
-
-def build_demo():
-    with gr.Blocks(title="Pi Base-26 NLTK Generator") as demo:
-        gr.Markdown(
-            """
-# π → BASE-26 → NLTK Generator
-
-Use an embedded corpus, upload a file, or load a Hugging Face dataset with optional config and split.
-"""
-        )
-
-        with gr.Row():
-            prompt = gr.Textbox(
-                label="Prompt",
-                placeholder="Enter prompt",
-                lines=3,
-            )
-            source_mode = gr.Radio(
-                choices=["embedded", "file", "huggingface"],
-                value="embedded",
-                label="Corpus source",
-            )
-
-        with gr.Row():
-            uploaded_file = gr.File(
-                label="Upload corpus file",
-                file_count="single",
-                type="filepath"
-            )
-
-        with gr.Row():
-            hf_dataset_name = gr.Textbox(
-                label="HF dataset name",
-                placeholder="e.g. ag_news"
-            )
-            hf_config_name = gr.Textbox(
-                label="HF config name",
-                placeholder="optional"
-            )
-            hf_split = gr.Textbox(
-                label="HF split",
-                value="train"
-            )
-            hf_text_field = gr.Textbox(
-                label="HF text field",
-                placeholder="optional"
-            )
-
-        with gr.Row():
-            vertex = gr.Dropdown(
-                choices=["A", "B", "C"],
-                value="A",
-                label="Triangle vertex",
-            )
-            max_solutions = gr.Slider(
-                1, 20, value=5, step=1, label="Max solutions"
-            )
-
-        run_btn = gr.Button("Run search")
-        summary = gr.Textbox(label="Summary", lines=6)
-        results = gr.JSON(label="Matches")
-
-        run_btn.click(
-            fn=run_search_ui,
-            inputs=[
-                prompt,
-                source_mode,
-                uploaded_file,
-                hf_dataset_name,
-                hf_config_name,
-                hf_split,
-                hf_text_field,
-                vertex,
-                max_solutions,
-            ],
-            outputs=[summary, results],
-        )
-
-    return demo
-
-
-# ============================================================
 # ENTRYPOINT
 # ============================================================
 
 if __name__ == "__main__":
+    mode = os.environ.get("APP_MODE", "terminal").lower()
 
+    if mode == "gradio":
         demo = build_demo()
         demo.launch()
-   
+    else:
+        main()
