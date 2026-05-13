@@ -1137,8 +1137,6 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
-    mode = os.environ.get("APP_MODE", "terminal").lower()
-
     if mode == "gradio":
         demo = build_demo()
         demo.launch()
