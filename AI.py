@@ -5,93 +5,110 @@
 π → BASE-26 → NLTK TRIGRAM GENERATOR
 ════════════════════════════════════
 
-PURE TERMINAL VERSION
-NO GRADIO
+GRADIO VERSION (Hugging Face Spaces ready)
 
-PROMPT-SEEDED SEARCH MODE
--------------------------
-1. User enters a prompt
-2. Prompt becomes:
-   - trigram seed context
-   - search target
-   - beginning of generated text
-3. Prompt is converted into ordered word pairs
-4. Brute-force search scans:
-   - bend_degrees
-   - stream offsets
-5. Generated text must contain ALL prompt pairs
-6. Exact + fuzzy matching supported
-
-FEATURES
+Features
 --------
-1. Embedded / external corpus
-2. NLTK trigram language model
-3. π base-26 entropy stream
-4. Deterministic sampling
-5. Bent-triangle vertex mapping
-6. Prompt-aligned generation
-7. Exact + fuzzy matching
-8. Dataset export
-9. Seashell-style resonant probability coloration
+- File upload OR pasted corpus OR embedded fallback
+- All knobs exposed: precision, stream length, n-gram order,
+  Lidstone gamma, generation length, sampling temperature,
+  top-k / top-p, repetition penalty, seashell resonator,
+  triangle bend / offset / vertex, fuzzy threshold.
+- Two modes:
+    1. Single generate (one bend/offset/vertex)
+    2. Brute-force prompt-aligned search
+- Live status log
+- Downloadable dataset export
 """
 
+import os
 import sys
+import io
 import re
 import math
+import json
+import tempfile
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
 
+import gradio as gr
 from mpmath import mp, pi as mpi
 
 import nltk
 from nltk.util import ngrams
-from nltk.tokenize import RegexpTokenizer, word_tokenize
+from nltk.tokenize import word_tokenize
 from nltk.probability import (
     ConditionalFreqDist,
     ConditionalProbDist,
     LidstoneProbDist,
 )
-from nltk.corpus import words as nltk_words
+
+# Make NLTK download silently into a writable dir (HF Spaces friendly).
+NLTK_DATA_DIR = os.environ.get("NLTK_DATA", "/tmp/nltk_data")
+os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+if NLTK_DATA_DIR not in nltk.data.path:
+    nltk.data.path.insert(0, NLTK_DATA_DIR)
+
+def _ensure_nltk():
+    for pkg, path in [
+        ("punkt", "tokenizers/punkt"),
+        ("punkt_tab", "tokenizers/punkt_tab"),
+        ("words", "corpora/words"),
+    ]:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            try:
+                nltk.download(pkg, download_dir=NLTK_DATA_DIR, quiet=True)
+            except Exception:
+                pass
+
+_ensure_nltk()
+
+from nltk.corpus import words as nltk_words  # noqa: E402
 
 
 # ============================================================
-# CONFIG
+# CONFIG DEFAULTS
 # ============================================================
 
 if hasattr(sys, "set_int_max_str_digits"):
     sys.set_int_max_str_digits(300_000)
 
-PI_PREC = 15000
-PI_STREAM_LEN = 12000
-
-DIGITS_PER_SAMPLE = 3
-
-NGRAM_N = 4
-CONTEXT_WINDOW = NGRAM_N - 1
-
-LIDSTONE_GAMMA = 0.1
-
-GEN_WORDS = 1600
-
-WORD_FIND_MIN = 4
-
-DATASET_PATH = "pi_dataset.txt"
-
-# Seashell resonance config
-SEASHELL_ENABLE = True
-SEASHELL_STRENGTH = 4.35
-SEASHELL_DECAY = 0.985
-SEASHELL_PEAKS = 4
-SEASHELL_WIDTH = 0.16
-SEASHELL_FLOOR = 0.35
+DEFAULTS = dict(
+    PI_PREC=15000,
+    PI_STREAM_LEN=12000,
+    DIGITS_PER_SAMPLE=3,
+    NGRAM_N=2,
+    LIDSTONE_GAMMA=0.1,
+    GEN_WORDS=400,
+    WORD_FIND_MIN=2,
+    TEMPERATURE=4.8,
+    TOP_K=488,
+    TOP_P=1.0,
+    REP_PENALTY=1.08,
+    SEASHELL_ENABLE=True,
+    SEASHELL_STRENGTH=4.35,
+    SEASHELL_DECAY=0.985,
+    SEASHELL_PEAKS=4,
+    SEASHELL_WIDTH=0.16,
+    SEASHELL_FLOOR=0.35,
+    BEND_DEGREES=13.0,
+    OFFSET=0,
+    VERTEX="A",
+    FUZZY_THRESHOLD=0.72,
+    MAX_SOLUTIONS=5,
+    BEND_STEP=0.5,
+    OFFSET_STEP=50,
+    BEND_MAX=45.0,
+)
 
 
 # ============================================================
 # EMBEDDED CORPUS
 # ============================================================
 
-def embedded_corpus():
-    return """
+EMBEDDED_CORPUS = """
 Alice was beginning to get very tired of sitting by her sister on the bank,
 and of having nothing to do. Once or twice she had peeped into the book her
 sister was reading, but it had no pictures or conversations in it.
@@ -120,66 +137,81 @@ time as she went down to look about her and wonder what was going to happen next
 # TOKEN HELPERS
 # ============================================================
 
-def tokenise_alpha(text):
+_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
+def tokenise_alpha(text):
+    """Lowercase, strip punctuation, keep only alphabetic word tokens.
+    Used for BOTH corpus and prompt so they share a vocabulary."""
+    if text is None:
+        return []
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="ignore")
+    elif not isinstance(text, str):
+        text = str(text)
     return text.lower().split()
 
+
 def extract_word_pairs(prompt):
-
-    words = [
-        w.lower()
-        for w in word_tokenize(prompt)
-        if w.isalpha()
-    ]
-
+    try:
+        words = [w.lower() for w in word_tokenize(prompt) if w.isalpha()]
+    except Exception:
+        words = [w.lower() for w in re.findall(r"[A-Za-z]+", prompt)]
     return list(ngrams(words, 2))
 
 
 def capitalise_text(words):
-
     if not words:
         return ""
-
-    txt = " ".join(words)
-
-    return txt
+    return " ".join(words)
 
 
 # ============================================================
 # MODEL
 # ============================================================
 
-def build_model(corpus):
+def build_model(corpus, ngram_n, lidstone_gamma):
+    # Defensive coercion — Gradio sliders can return floats; corpus could in
+    # theory arrive as bytes or as something with __str__ if upstream caching
+    # mishandles it. Make this function robust to all of those.
+    if isinstance(corpus, bytes):
+        corpus = corpus.decode("utf-8", errors="ignore")
+    elif not isinstance(corpus, str):
+        corpus = str(corpus) if corpus is not None else ""
+
+    ngram_n = int(ngram_n)
+    if ngram_n < 2:
+        ngram_n = 2
+    lidstone_gamma = float(lidstone_gamma)
 
     tokens = tokenise_alpha(corpus)
+    if not isinstance(tokens, list):
+        tokens = list(tokens)
 
-    padded = (
-        ["<s>"] * (NGRAM_N - 1)
-        + tokens
-        + ["</s>"]
-    )
+    if not tokens:
+        raise ValueError(
+            "Corpus produced zero tokens after tokenisation. "
+            "Upload a non-empty text corpus or paste some text."
+        )
 
-    trigrams_ = list(ngrams(padded, NGRAM_N))
+    padded = ["<s>"] * (ngram_n - 1) + tokens + ["</s>"]
+
+    trigrams_ = list(ngrams(padded, ngram_n))
 
     cfd = ConditionalFreqDist(
-        (tuple(tg[:-1]), tg[-1])
-        for tg in trigrams_
+        (tuple(tg[:-1]), tg[-1]) for tg in trigrams_
     )
 
     vocab = set(tokens) | {"</s>"}
 
     for ctx in list(cfd.conditions()):
-
         if len(cfd[ctx]) == 0:
             cfd[ctx]["</s>"] += 1
 
     cpd = ConditionalProbDist(
         cfd,
         lambda fd: LidstoneProbDist(
-            fd,
-            gamma=LIDSTONE_GAMMA,
-            bins=max(1, len(vocab))
-        )
+            fd, gamma=lidstone_gamma, bins=max(1, len(vocab))
+        ),
     )
 
     return cpd, vocab
@@ -190,19 +222,10 @@ def build_model(corpus):
 # ============================================================
 
 def load_dictionary(vocab):
-
     try:
-
-        words = {
-            w.lower()
-            for w in nltk_words.words()
-            if w.isalpha()
-        }
-
+        words = {w.lower() for w in nltk_words.words() if w.isalpha()}
         return words | set(vocab)
-
     except Exception:
-
         return set(vocab)
 
 
@@ -210,27 +233,18 @@ def load_dictionary(vocab):
 # PI STREAM
 # ============================================================
 
-def build_pi_stream(
-    decimals=PI_PREC,
-    length=PI_STREAM_LEN,
-):
-
+def build_pi_stream(decimals, length):
+    decimals = int(decimals)
+    length = int(length)
     mp.dps = decimals + 50
-
     D = 10 ** decimals
-
     frac = int(mp.floor(mpi * D)) - 3 * D
 
     stream = []
-
     for _ in range(length):
-
         frac *= 26
-
         stream.append(frac // D)
-
         frac %= D
-
     return stream
 
 
@@ -239,20 +253,7 @@ def build_pi_stream(
 # ============================================================
 
 class SeashellResonator:
-    """
-    Simulates seashell-like cavity coloration by boosting/attenuating
-    ranked candidate probabilities with a few decaying resonant peaks.
-    """
-
-    def __init__(
-        self,
-        sampler,
-        strength=SEASHELL_STRENGTH,
-        decay=SEASHELL_DECAY,
-        peaks=SEASHELL_PEAKS,
-        width=SEASHELL_WIDTH,
-        floor=SEASHELL_FLOOR,
-    ):
+    def __init__(self, sampler, strength, decay, peaks, width, floor):
         self.sampler = sampler
         self.base_strength = max(0.0, float(strength))
         self.decay = min(0.9999, max(0.0, float(decay)))
@@ -270,7 +271,6 @@ class SeashellResonator:
         self.centers = []
         self.phases = []
         self.spreads = []
-
         for _ in range(self.peaks):
             c = self.sampler.next_unit()
             ph = 2.0 * math.pi * self.sampler.next_unit()
@@ -301,32 +301,25 @@ class SeashellResonator:
 
         for rank in range(n_items):
             idx = rank / max(1, n_items - 1)
-
             response = 0.0
-
             for center, phase, spread in zip(self.centers, self.phases, self.spreads):
                 moving_center = (center + drift * math.sin(phase + 0.07 * t)) % 1.0
                 d = self._wrapped_distance(idx, moving_center)
-
                 gauss = math.exp(-(d * d) / max(1e-9, 2.0 * spread * spread))
-
                 ripple = 0.5 + 0.5 * math.cos(
                     (d / max(1e-9, spread)) * math.pi * (1.5 + shimmer)
                     + phase
                     + 0.13 * t
                 )
-
                 response += gauss * (0.55 + 0.45 * ripple)
 
             response /= max(1, self.peaks)
-
             gain = self.floor + (1.0 - self.floor) + live_strength * response
             gains.append(max(self.floor, gain))
 
         total = sum(gains)
         if total > 0:
             gains = [g / total for g in gains]
-
         return gains
 
     def apply(self, scored):
@@ -334,10 +327,7 @@ class SeashellResonator:
             return scored
 
         g = self.gains(len(scored))
-
-        weighted = []
-        for (word, p), gain in zip(scored, g):
-            weighted.append((word, p * gain))
+        weighted = [(w, p * gain) for (w, p), gain in zip(scored, g)]
 
         total = sum(p for _, p in weighted)
         if total > 0:
@@ -361,23 +351,25 @@ class PiSampler:
     def __init__(
         self,
         stream,
-        temperature=2.5,
-        top_k=100,
-        top_p=1.0,
-        repetition_penalty=1.08,
-        seashell_enable=SEASHELL_ENABLE,
-        seashell_strength=SEASHELL_STRENGTH,
-        seashell_decay=SEASHELL_DECAY,
-        seashell_peaks=SEASHELL_PEAKS,
-        seashell_width=SEASHELL_WIDTH,
-        seashell_floor=SEASHELL_FLOOR,
+        digits_per_sample,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        seashell_enable,
+        seashell_strength,
+        seashell_decay,
+        seashell_peaks,
+        seashell_width,
+        seashell_floor,
     ):
         self.stream = stream
+        self.digits_per_sample = digits_per_sample
         self.pos = 0
-        self.temperature = temperature
-        self.top_k = top_k
-        self.top_p = top_p
-        self.repetition_penalty = repetition_penalty
+        self.temperature = max(1e-3, float(temperature))
+        self.top_k = max(1, int(top_k))
+        self.top_p = max(1e-3, min(1.0, float(top_p)))
+        self.repetition_penalty = max(1.0, float(repetition_penalty))
         self.history = Counter()
         self.seashell = None
 
@@ -399,37 +391,23 @@ class PiSampler:
 
     def next_unit(self):
         val = 0
-        base = 26 ** DIGITS_PER_SAMPLE
-        for _ in range(DIGITS_PER_SAMPLE):
-            val = (
-                val * 26
-                + self.stream[self.pos % len(self.stream)]
-            )
+        base = 26 ** self.digits_per_sample
+        for _ in range(self.digits_per_sample):
+            val = val * 26 + self.stream[self.pos % len(self.stream)]
             self.pos += 1
         return val / base
 
     def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
-        """XOR fusion: Creates mutually exclusive probability regions"""
         xor_scores = []
-
-        u_a_norm = u_a
-        u_b_norm = u_b
-        u_c_norm = u_c
-
         for rank, (word, base_p) in enumerate(scored):
             idx = rank / max(1, len(scored) - 1)
-
-            region_a = (1.0 - abs(idx - u_a_norm)) * (1.0 - u_b_norm) * (1.0 - u_c_norm)
-            region_b = u_b_norm * (1.0 - abs(idx - u_a_norm)) * (1.0 - u_c_norm)
-            region_c = u_c_norm * (1.0 - u_a_norm) * (1.0 - u_b_norm)
-
+            region_a = (1.0 - abs(idx - u_a)) * (1.0 - u_b) * (1.0 - u_c)
+            region_b = u_b * (1.0 - abs(idx - u_a)) * (1.0 - u_c)
+            region_c = u_c * (1.0 - u_a) * (1.0 - u_b)
             xor_blend = max(region_a, region_b, region_c)
-
-            orthogonality = 1.0 - abs(u_a_norm - u_b_norm) * abs(u_b_norm - u_c_norm)
+            orthogonality = 1.0 - abs(u_a - u_b) * abs(u_b - u_c)
             final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
-
             xor_scores.append((word, final_p))
-
         return xor_scores
 
     def sample(self, dist):
@@ -442,22 +420,15 @@ class PiSampler:
             p = max(1e-12, float(dist.prob(s)))
             count = self.history[s]
             if count > 0:
-                p /= (self.repetition_penalty ** count)
+                p /= self.repetition_penalty ** count
             base_scored.append((s, p))
 
-        scored = [
-            (s, p ** (1.0 / self.temperature))
-            for s, p in base_scored
-        ]
-
+        scored = [(s, p ** (1.0 / self.temperature)) for s, p in base_scored]
         total = sum(p for _, p in scored)
-        scored = [
-            (s, p / total)
-            for s, p in scored
-        ]
+        scored = [(s, p / total) for s, p in scored]
 
         scored.sort(key=lambda x: x[1], reverse=True)
-        scored = scored[:self.top_k]
+        scored = scored[: self.top_k]
 
         kept = []
         accum = 0.0
@@ -468,7 +439,6 @@ class PiSampler:
                 break
         scored = kept
 
-        # Apply seashell cavity coloration before XOR selection.
         if self.seashell is not None:
             scored = self.seashell.apply(scored)
 
@@ -477,19 +447,16 @@ class PiSampler:
         u_c = self.next_unit()
 
         xor_scored = self._xor_probability_fusion(scored, u_a, u_b, u_c)
-
         xor_total = sum(p for _, p in xor_scored)
+
         if xor_total <= 0:
             chosen = scored[-1][0] if scored else "</s>"
         else:
-            xor_scored = [
-                (w, p / xor_total) for w, p in xor_scored
-            ]
-
+            xor_scored = [(w, p / xor_total) for w, p in xor_scored]
             xor_draw = (
-                u_a * (1 - u_b) * (1 - u_c) +
-                u_b * (1 - u_a) * (1 - u_c) +
-                u_c * (1 - u_a) * (1 - u_b)
+                u_a * (1 - u_b) * (1 - u_c)
+                + u_b * (1 - u_a) * (1 - u_c)
+                + u_c * (1 - u_a) * (1 - u_b)
             ) / 1.5
 
             cumulative = 0.0
@@ -509,115 +476,90 @@ class PiSampler:
 # ============================================================
 
 class Triangle:
-
-    def __init__(
-        self,
-        stream_len,
-        offset_extra=0,
-        bend_degrees=13.0,
-    ):
-
+    def __init__(self, stream_len, offset_extra=0, bend_degrees=13.0):
         base = offset_extra % stream_len
-
-        bend_shift = int(
-            round(
-                (bend_degrees / 360.0)
-                * stream_len
-            )
-        )
+        bend_shift = int(round((bend_degrees / 360.0) * stream_len))
 
         self.A = base % stream_len
+        self.B = (base + stream_len // 3 + bend_shift) % stream_len
+        self.C = (base + 2 * stream_len // 3 + bend_shift) % stream_len
 
-        self.B = (
-            base
-            + stream_len // 3
-            + bend_shift
-        ) % stream_len
-
-        self.C = (
-            base
-            + 2 * stream_len // 3
-            + bend_shift
-        ) % stream_len
-
-        self.vertices = {
-            "A": self.A,
-            "B": self.B,
-            "C": self.C,
-        }
+        self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
 
 # ============================================================
 # GENERATION
 # ============================================================
 
-def generate_text(
-    cpd,
-    sampler,
-    prompt="",
-    n_words=GEN_WORDS,
-):
+def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
+    """Generate n_words tokens, seeded by `prompt`.
 
+    Prompt handling:
+      * Tokenised the same way as the corpus.
+      * Tokens are echoed in the output verbatim (so the user sees their prompt
+        at the start), even if they're out-of-vocab.
+      * Only in-vocab tokens are used to seed the trigram context. Out-of-vocab
+        tokens are skipped from the context so the model still has a chance to
+        continue.
+      * When the full (n-1)-gram context has no continuations, we back off to
+        shorter suffixes, then finally to '<s>' padding.
+    """
+    context_window = ngram_n - 1
     seed_words = tokenise_alpha(prompt)
 
-    if len(seed_words) >= CONTEXT_WINDOW:
-
-        init = seed_words[-CONTEXT_WINDOW:]
-
+    # In-vocab subset for trigram seeding.
+    if vocab is not None:
+        seed_in_vocab = [w for w in seed_words if w in vocab]
     else:
+        seed_in_vocab = list(seed_words)
 
-        init = (
-            ["<s>"] * (
-                CONTEXT_WINDOW - len(seed_words)
-            )
-            + seed_words
-        )
+    if len(seed_in_vocab) >= context_window:
+        init = seed_in_vocab[-context_window:]
+    else:
+        init = ["<s>"] * (context_window - len(seed_in_vocab)) + seed_in_vocab
 
-    context = deque(
-        init,
-        maxlen=CONTEXT_WINDOW,
-    )
+    context = deque(init, maxlen=context_window)
+    words = list(seed_words)  # echo the user's prompt verbatim in output
 
-    words = list(seed_words)
+    def _dist_for(ctx_tuple):
+        """Return a usable dist for `ctx_tuple`, backing off to shorter
+        suffixes (padded with <s>) if the full context has no continuations."""
+        # try full context, then progressively shorter suffixes
+        for cut in range(len(ctx_tuple) + 1):
+            trial = ("<s>",) * cut + ctx_tuple[cut:]
+            try:
+                d = cpd[trial]
+                if list(d.samples()):
+                    return d
+            except Exception:
+                continue
+        # final fallback: all-<s> start-of-sentence
+        try:
+            d = cpd[("<s>",) * context_window]
+            if list(d.samples()):
+                return d
+        except Exception:
+            pass
+        return None
 
     for _ in range(n_words):
-
         ctx = tuple(context)
+        dist = _dist_for(ctx)
 
-        try:
-
-            dist = cpd[ctx]
-
-            samples = list(dist.samples())
-
-        except Exception:
-
-            samples = []
-
-        if not samples:
-
+        if dist is None:
+            # nothing in the model can continue — reset and try again next step
             context.clear()
-
-            context.extend(
-                ["<s>"] * CONTEXT_WINDOW
-            )
-
+            context.extend(["<s>"] * context_window)
             continue
 
         word = sampler.sample(dist)
 
         if word in ("</s>", ""):
-
             context.clear()
-
-            context.extend(
-                ["<s>"] * CONTEXT_WINDOW
-            )
-
+            context.extend(["<s>"] * context_window)
             continue
 
         words.append(word)
-
         context.append(word)
 
     return capitalise_text(words)
@@ -627,258 +569,491 @@ def generate_text(
 # FIND WORDS
 # ============================================================
 
-def find_words(stream, dictionary):
-
+def find_words(stream, dictionary, word_find_min):
     prefixes = set()
-
     for w in dictionary:
-
         for i in range(1, len(w) + 1):
             prefixes.add(w[:i])
 
     buf = deque(maxlen=35)
-
     all_chars = []
-
     found = defaultdict(list)
 
     for pos, digit in enumerate(stream):
-
         ch = chr(ord("a") + digit)
-
         buf.append(ch)
-
         all_chars.append(ch)
-
         s = "".join(buf)
-
-        for length in range(
-            WORD_FIND_MIN,
-            min(16, len(s)) + 1,
-        ):
-
+        for length in range(word_find_min, min(16, len(s)) + 1):
             cand = s[-length:]
-
             if cand not in prefixes:
                 continue
-
             if cand in dictionary:
-
-                found[cand].append(
-                    pos - length + 1
-                )
+                found[cand].append(pos - length + 1)
 
     return "".join(all_chars), found
 
 
 # ============================================================
-# FUZZY SCORE
+# FUZZY / PAIR MATCHING
 # ============================================================
 
 def fuzzy_score(target, text):
-
-    return SequenceMatcher(
-        None,
-        target.lower(),
-        text.lower()
-    ).quick_ratio()
+    return SequenceMatcher(None, target.lower(), text.lower()).quick_ratio()
 
 
-# ============================================================
-# PAIR MATCHING
-# ============================================================
-
-def all_pairs_match(
-    pairs,
-    text,
-    fuzzy_threshold=0.72,
-):
-
+def all_pairs_match(pairs, text, fuzzy_threshold):
     lower_text = text.lower()
-
     for pair in pairs:
-
         pair_str = " ".join(pair)
-
-        exact = pair_str in lower_text
-
-        if exact:
+        if pair_str in lower_text:
             continue
-
-        score = fuzzy_score(
-            pair_str,
-            text
-        )
-
-        if score < fuzzy_threshold:
+        if fuzzy_score(pair_str, text) < fuzzy_threshold:
             return False, pair
-
     return True, None
 
 
 # ============================================================
-# PROMPT SEARCH
+# GRADIO STATE / PIPELINE
 # ============================================================
 
-def brute_force_prompt_search(
-    prompt,
-    cpd,
-    stream,
-    vertex="A",
-    max_solutions=10,
-):
+# Cache for compiled corpus + pi stream so we don't rebuild every call.
+_CACHE = {"key": None, "cpd": None, "vocab": None, "stream": None}
 
-    pairs = extract_word_pairs(prompt)
 
-    if not pairs:
-
-        print(
-            "No valid word pairs extracted."
-        )
-
-        return []
-
-    print(
-        "\nSearching bend+offset space..."
+def _cache_key(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len):
+    return (
+        hash(corpus),
+        int(ngram_n),
+        float(lidstone_gamma),
+        int(pi_prec),
+        int(pi_stream_len),
     )
 
-    print(f"\nPrompt:\n{prompt}\n")
+
+def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
+    key = _cache_key(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len)
+    if _CACHE["key"] == key and _CACHE["cpd"] is not None:
+        log.append("✓ Using cached model + π stream.")
+        return _CACHE["cpd"], _CACHE["vocab"], _CACHE["stream"]
+
+    log.append("Building trigram model...")
+    cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
+
+    log.append(f"Building π stream ({pi_prec} dps → {pi_stream_len} symbols)...")
+    stream = build_pi_stream(pi_prec, pi_stream_len)
+
+    _CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream)
+    log.append("✓ Cached.")
+    return cpd, vocab, stream
+
+
+def resolve_corpus(file_obj, pasted_corpus):
+    """Priority: uploaded file > pasted text > embedded fallback."""
+    if file_obj is not None:
+        path = file_obj.name if hasattr(file_obj, "name") else file_obj
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                txt = f.read()
+            if txt.strip():
+                return txt, f"file: {os.path.basename(path)}"
+        except Exception as e:
+            return EMBEDDED_CORPUS, f"file read failed ({e}); using embedded"
+
+    if pasted_corpus and pasted_corpus.strip():
+        return pasted_corpus, "pasted text"
+
+    return EMBEDDED_CORPUS, "embedded fallback"
+
+
+def run_single(
+    file_obj,
+    pasted_corpus,
+    prompt,
+    pi_prec,
+    pi_stream_len,
+    ngram_n,
+    lidstone_gamma,
+    gen_words,
+    temperature,
+    top_k,
+    top_p,
+    rep_penalty,
+    seashell_enable,
+    seashell_strength,
+    seashell_decay,
+    seashell_peaks,
+    seashell_width,
+    seashell_floor,
+    bend_degrees,
+    offset,
+    vertex,
+):
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f"Corpus source: {source} ({len(corpus)} chars).")
+
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
+    )
+
+    triangle = Triangle(
+        int(pi_stream_len),
+        offset_extra=int(offset),
+        bend_degrees=float(bend_degrees),
+    )
+    start = triangle.vertices[vertex]
+    log.append(
+        f"Triangle: A={triangle.A} B={triangle.B} C={triangle.C} "
+        f"→ vertex {vertex} = {start}"
+    )
+
+    sampler = PiSampler(
+        stream,
+        digits_per_sample=DEFAULTS["DIGITS_PER_SAMPLE"],
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=rep_penalty,
+        seashell_enable=seashell_enable,
+        seashell_strength=seashell_strength,
+        seashell_decay=seashell_decay,
+        seashell_peaks=seashell_peaks,
+        seashell_width=seashell_width,
+        seashell_floor=seashell_floor,
+    )
+    sampler.seek(start)
+
+    log.append(f"Generating {int(gen_words)} words...")
+    text = generate_text(
+        cpd, sampler, prompt=prompt or "", n_words=int(gen_words),
+        ngram_n=int(ngram_n), vocab=vocab,
+    )
+
+    seed_tokens = tokenise_alpha(prompt or "")
+    oov = [w for w in seed_tokens if w not in vocab]
+    if oov:
+        log.append(f"⚠ {len(oov)} prompt token(s) not in corpus vocab: {oov}")
+    log.append(f"✓ Done. {len(text.split())} tokens output.")
+
+    # Write a downloadable copy.
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".txt", prefix="pi_gen_", mode="w", encoding="utf-8"
+    )
+    tmp.write(text)
+    tmp.close()
+
+    return text, "\n".join(log), tmp.name
+
+
+def run_search(
+    file_obj,
+    pasted_corpus,
+    prompt,
+    pi_prec,
+    pi_stream_len,
+    ngram_n,
+    lidstone_gamma,
+    gen_words,
+    temperature,
+    top_k,
+    top_p,
+    rep_penalty,
+    seashell_enable,
+    seashell_strength,
+    seashell_decay,
+    seashell_peaks,
+    seashell_width,
+    seashell_floor,
+    vertex,
+    bend_max,
+    bend_step,
+    offset_step,
+    fuzzy_threshold,
+    max_solutions,
+    progress=gr.Progress(track_tqdm=False),
+):
+    log = []
+    if not prompt or not prompt.strip():
+        return "", "Prompt is empty — search needs word pairs.", None
+
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f"Corpus source: {source} ({len(corpus)} chars).")
+
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
+    )
+
+    pairs = extract_word_pairs(prompt)
+    if not pairs:
+        return "", "No valid word pairs extracted from prompt.", None
+    log.append(f"Prompt yields {len(pairs)} word pairs.")
+
+    # Enumerate (bend, offset) grid.
+    bend_values = []
+    b = 0.0
+    while b <= float(bend_max) + 1e-9:
+        bend_values.append(round(b, 4))
+        b += float(bend_step)
+
+    offset_values = list(range(0, int(pi_stream_len), max(1, int(offset_step))))
+    total = len(bend_values) * len(offset_values)
+    log.append(
+        f"Search grid: {len(bend_values)} bends × "
+        f"{len(offset_values)} offsets = {total} candidates."
+    )
 
     found = []
-
-    for bend_x10 in range(0, 451, 5):
-
-        bend = bend_x10 / 10.0
-
-        print(f"bend = {bend:.1f}")
-
-        for offset in range(
-            0,
-            PI_STREAM_LEN,
-            5,
-        ):
+    counter = 0
+    for bend in bend_values:
+        for offset in offset_values:
+            counter += 1
+            progress(counter / max(1, total), desc=f"bend={bend} offset={offset}")
 
             triangle = Triangle(
-                PI_STREAM_LEN,
+                int(pi_stream_len),
                 offset_extra=offset,
                 bend_degrees=bend,
             )
-
             start = triangle.vertices[vertex]
 
-            sampler = PiSampler(stream)
-
+            sampler = PiSampler(
+                stream,
+                digits_per_sample=DEFAULTS["DIGITS_PER_SAMPLE"],
+                temperature=temperature,
+                top_k=top_k,
+                top_p=top_p,
+                repetition_penalty=rep_penalty,
+                seashell_enable=seashell_enable,
+                seashell_strength=seashell_strength,
+                seashell_decay=seashell_decay,
+                seashell_peaks=seashell_peaks,
+                seashell_width=seashell_width,
+                seashell_floor=seashell_floor,
+            )
             sampler.seek(start)
 
             text = generate_text(
-                cpd,
-                sampler,
-                prompt=prompt,
-                n_words=GEN_WORDS,
+                cpd, sampler,
+                prompt=prompt, n_words=int(gen_words),
+                ngram_n=int(ngram_n), vocab=vocab,
             )
 
-            matches_all, failed_pair = (
-                all_pairs_match(
-                    pairs,
-                    text,
-                )
+            matches, _failed = all_pairs_match(
+                pairs, text, fuzzy_threshold=float(fuzzy_threshold)
             )
 
-            if matches_all:
+            if matches:
+                found.append({
+                    "prompt": prompt,
+                    "bend": bend,
+                    "offset": offset,
+                    "vertex": vertex,
+                    "text": text,
+                })
+                log.append(f"✓ MATCH bend={bend} offset={offset}")
+                if len(found) >= int(max_solutions):
+                    break
+        if len(found) >= int(max_solutions):
+            break
 
-                found.append(
-                    {
-                        "prompt": prompt,
-                        "bend": bend,
-                        "offset": offset,
-                        "vertex": vertex,
-                        "text": text,
-                    }
-                )
+    if not found:
+        log.append("No matches found in the searched grid.")
+        return "", "\n".join(log), None
 
-                print("\nFOUND MATCH")
+    # Render results
+    parts = []
+    for i, r in enumerate(found, 1):
+        parts.append(
+            f"=== MATCH {i} ===\n"
+            f"bend = {r['bend']}   offset = {r['offset']}   vertex = {r['vertex']}\n\n"
+            f"{r['text']}\n"
+        )
+    rendered = "\n".join(parts)
 
-                print(
-                    f"bend={bend:.1f} "
-                    f"offset={offset}"
-                )
-
-                print("\nGenerated:\n")
-
-                print(text)
-
-                print()
-
-                if (
-                    len(found)
-                    >= max_solutions
-                ):
-                    return found
-
-    return found
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-def main():
-
-    filename = input(
-        "Corpus filename "
-        "(ENTER for embedded corpus): "
-    ).strip()
-
-    if filename:
-
-        with open(
-            filename,
-            "r",
-            encoding="utf-8",
-        ) as f:
-
-            corpus = f.read()
-
-    else:
-
-        corpus = embedded_corpus()
-
-    print("\nBuilding trigram model...")
-
-    cpd, vocab = build_model(corpus)
-
-    dictionary = load_dictionary(vocab)
-
-    print("Building pi stream...")
-
-    stream = build_pi_stream()
-
-    print("Finding words in stream...")
-
-    stream_text, found_words = find_words(
-        stream,
-        dictionary,
+    # JSONL export
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".jsonl", prefix="pi_search_",
+        mode="w", encoding="utf-8"
     )
+    for r in found:
+        tmp.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp.close()
 
-    while True:
+    return rendered, "\n".join(log), tmp.name
 
-        print("\n==========================")
-        print("PROMPT-ALIGNED SEARCH")
-        print("==========================")
 
-        prompt = input(
-            "\nEnter prompt:\n> "
-        ).strip()
+# ============================================================
+# UI
+# ============================================================
 
-        if not prompt:
-            continue
+DESCRIPTION = """
+# π → base-26 → NLTK trigram generator
 
-        results = brute_force_prompt_search(
-            prompt=prompt,
-            cpd=cpd,
-            stream=stream,
-            vertex="A",
+A deterministic text generator seeded by the base-26 expansion of π, sampled via
+a bent-triangle vertex map, scored through an NLTK trigram language model with
+optional **seashell cavity resonance** coloration and **XOR probability fusion**.
+
+- **Single Generate** — pick one bend/offset/vertex and produce text.
+- **Prompt-Aligned Search** — brute-force the (bend × offset) grid until the
+  generated text contains all word pairs from your prompt (exact or fuzzy).
+
+Upload your own corpus, paste one in, or use the embedded *Alice* fragment.
+"""
+
+
+def build_ui():
+    with gr.Blocks(title="π → base-26 → trigram", theme=gr.themes.Soft()) as demo:
+        gr.Markdown(DESCRIPTION)
+
+        with gr.Row():
+            with gr.Column(scale=1):
+                gr.Markdown("### Corpus")
+                file_in = gr.File(
+                    label="Upload corpus (.txt)",
+                    file_types=[".txt", ".md"],
+                    type="filepath",
+                )
+                pasted = gr.Textbox(
+                    label="…or paste corpus here",
+                    lines=6,
+                    placeholder="(optional) paste corpus text — used if no file uploaded",
+                )
+
+                gr.Markdown("### Prompt")
+                prompt_in = gr.Textbox(
+                    label="Prompt",
+                    lines=3,
+                    value="alice rabbit hole",
+                    placeholder="Words that must appear as ordered pairs in output",
+                )
+
+            with gr.Column(scale=1):
+                gr.Markdown("### π stream & model")
+                with gr.Row():
+                    pi_prec = gr.Slider(500, 30000, value=DEFAULTS["PI_PREC"],
+                                        step=500, label="π precision (dps)")
+                    pi_stream_len = gr.Slider(500, 30000, value=DEFAULTS["PI_STREAM_LEN"],
+                                              step=500, label="π stream length")
+                with gr.Row():
+                    ngram_n = gr.Slider(2, 6, value=DEFAULTS["NGRAM_N"], step=1,
+                                        label="n-gram order (n)")
+                    lidstone_gamma = gr.Slider(0.001, 1.0,
+                                               value=DEFAULTS["LIDSTONE_GAMMA"],
+                                               step=0.001, label="Lidstone γ")
+                gen_words = gr.Slider(50, 5000, value=DEFAULTS["GEN_WORDS"],
+                                      step=50, label="Generated words")
+
+                gr.Markdown("### Sampling")
+                with gr.Row():
+                    temperature = gr.Slider(0.1, 5.0, value=DEFAULTS["TEMPERATURE"],
+                                            step=0.05, label="Temperature")
+                    rep_penalty = gr.Slider(1.0, 2.0, value=DEFAULTS["REP_PENALTY"],
+                                            step=0.01, label="Repetition penalty")
+                with gr.Row():
+                    top_k = gr.Slider(1, 500, value=DEFAULTS["TOP_K"],
+                                      step=1, label="top-k")
+                    top_p = gr.Slider(0.05, 1.0, value=DEFAULTS["TOP_P"],
+                                      step=0.01, label="top-p")
+
+        with gr.Accordion("Seashell resonator", open=False):
+            seashell_enable = gr.Checkbox(value=DEFAULTS["SEASHELL_ENABLE"],
+                                          label="Enable seashell coloration")
+            with gr.Row():
+                seashell_strength = gr.Slider(0.0, 10.0,
+                                              value=DEFAULTS["SEASHELL_STRENGTH"],
+                                              step=0.05, label="Strength")
+                seashell_decay = gr.Slider(0.5, 0.9999,
+                                           value=DEFAULTS["SEASHELL_DECAY"],
+                                           step=0.0005, label="Decay")
+            with gr.Row():
+                seashell_peaks = gr.Slider(1, 12, value=DEFAULTS["SEASHELL_PEAKS"],
+                                           step=1, label="Peaks")
+                seashell_width = gr.Slider(0.02, 0.6, value=DEFAULTS["SEASHELL_WIDTH"],
+                                           step=0.01, label="Width")
+                seashell_floor = gr.Slider(0.0, 1.0, value=DEFAULTS["SEASHELL_FLOOR"],
+                                           step=0.01, label="Floor")
+
+        with gr.Accordion("Triangle (single-generate)", open=True):
+            with gr.Row():
+                bend_degrees = gr.Slider(0.0, 90.0,
+                                         value=DEFAULTS["BEND_DEGREES"],
+                                         step=0.1, label="Bend (degrees)")
+                offset = gr.Slider(0, 30000, value=DEFAULTS["OFFSET"],
+                                   step=1, label="Offset")
+                vertex = gr.Radio(["A", "B", "C"], value=DEFAULTS["VERTEX"],
+                                  label="Vertex")
+
+        with gr.Accordion("Search grid (prompt-aligned)", open=False):
+            with gr.Row():
+                bend_max = gr.Slider(1.0, 90.0, value=DEFAULTS["BEND_MAX"],
+                                     step=0.5, label="Bend max (°)")
+                bend_step = gr.Slider(0.1, 5.0, value=DEFAULTS["BEND_STEP"],
+                                      step=0.1, label="Bend step (°)")
+                offset_step = gr.Slider(1, 1000, value=DEFAULTS["OFFSET_STEP"],
+                                        step=1, label="Offset step")
+            with gr.Row():
+                fuzzy_threshold = gr.Slider(0.0, 1.0,
+                                            value=DEFAULTS["FUZZY_THRESHOLD"],
+                                            step=0.01, label="Fuzzy threshold")
+                max_solutions = gr.Slider(1, 25, value=DEFAULTS["MAX_SOLUTIONS"],
+                                          step=1, label="Max solutions")
+
+        with gr.Row():
+            btn_single = gr.Button("▶ Single Generate", variant="primary")
+            btn_search = gr.Button("🔍 Prompt-Aligned Search", variant="secondary")
+
+        with gr.Row():
+            out_text = gr.Textbox(label="Generated text",
+                                  lines=18)
+        with gr.Row():
+            out_log = gr.Textbox(label="Log", lines=8)
+            out_file = gr.File(label="Download output")
+
+        # Wire up.
+        single_inputs = [
+            file_in, pasted, prompt_in,
+            pi_prec, pi_stream_len, ngram_n, lidstone_gamma, gen_words,
+            temperature, top_k, top_p, rep_penalty,
+            seashell_enable, seashell_strength, seashell_decay,
+            seashell_peaks, seashell_width, seashell_floor,
+            bend_degrees, offset, vertex,
+        ]
+        btn_single.click(
+            run_single,
+            inputs=single_inputs,
+            outputs=[out_text, out_log, out_file],
         )
 
+        search_inputs = [
+            file_in, pasted, prompt_in,
+            pi_prec, pi_stream_len, ngram_n, lidstone_gamma, gen_words,
+            temperature, top_k, top_p, rep_penalty,
+            seashell_enable, seashell_strength, seashell_decay,
+            seashell_peaks, seashell_width, seashell_floor,
+            vertex,
+            bend_max, bend_step, offset_step,
+            fuzzy_threshold, max_solutions,
+        ]
+        btn_search.click(
+            run_search,
+            inputs=search_inputs,
+            outputs=[out_text, out_log, out_file],
+        )
+
+        gr.Markdown(
+            "**Tip:** the model+stream are cached, so re-running with the same "
+            "corpus / π settings is fast. Changing precision, stream length, "
+            "n-gram order, or Lidstone γ triggers a rebuild."
+        )
+
+    return demo
+
+
 if __name__ == "__main__":
-    main()
+    demo = build_ui()
+    demo.queue(max_size=8).launch(
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
+        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
+        show_error=True,
+    )
