@@ -27,6 +27,9 @@ import io
 import re
 import math
 import json
+import gzip
+import pickle
+import hashlib
 import tempfile
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
@@ -83,8 +86,8 @@ DEFAULTS = dict(
     LIDSTONE_GAMMA=0.1,
     GEN_WORDS=400,
     WORD_FIND_MIN=2,
-    TEMPERATURE=4.8,
-    TOP_K=488,
+    TEMPERATURE=2.5,
+    TOP_K=100,
     TOP_P=1.0,
     REP_PENALTY=1.08,
     SEASHELL_ENABLE=True,
@@ -148,7 +151,7 @@ def tokenise_alpha(text):
         text = text.decode("utf-8", errors="ignore")
     elif not isinstance(text, str):
         text = str(text)
-    return text.lower().split()
+    return _WORD_RE.findall(text.lower())
 
 
 def extract_word_pairs(prompt):
@@ -168,6 +171,19 @@ def capitalise_text(words):
 # ============================================================
 # MODEL
 # ============================================================
+
+class _LidstoneFactory:
+    """Picklable replacement for `lambda fd: LidstoneProbDist(fd, gamma, bins)`.
+    Used by ConditionalProbDist so the whole CPD can be saved with pickle."""
+    __slots__ = ("gamma", "bins")
+
+    def __init__(self, gamma, bins):
+        self.gamma = float(gamma)
+        self.bins = max(1, int(bins))
+
+    def __call__(self, fd):
+        return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
+
 
 def build_model(corpus, ngram_n, lidstone_gamma):
     # Defensive coercion — Gradio sliders can return floats; corpus could in
@@ -209,9 +225,7 @@ def build_model(corpus, ngram_n, lidstone_gamma):
 
     cpd = ConditionalProbDist(
         cfd,
-        lambda fd: LidstoneProbDist(
-            fd, gamma=lidstone_gamma, bins=max(1, len(vocab))
-        ),
+        _LidstoneFactory(gamma=lidstone_gamma, bins=max(1, len(vocab))),
     )
 
     return cpd, vocab
@@ -633,8 +647,28 @@ def _cache_key(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len):
 
 def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     key = _cache_key(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len)
-    if _CACHE["key"] == key and _CACHE["cpd"] is not None:
+
+    cached_key = _CACHE["key"]
+    if cached_key == key and _CACHE["cpd"] is not None:
         log.append("✓ Using cached model + π stream.")
+        return _CACHE["cpd"], _CACHE["vocab"], _CACHE["stream"]
+
+    # Special-case: a loaded model is in the cache. Reuse it if the requested
+    # config (ngram_n, lidstone_gamma, pi_prec, pi_stream_len) matches what
+    # was loaded. We ignore the corpus content in this check — the user
+    # already supplied the model directly. Note: the actual stream length
+    # used for triangle math comes from the cached stream itself.
+    if (
+        isinstance(cached_key, tuple)
+        and len(cached_key) >= 6
+        and cached_key[0] == "LOADED"
+        and _CACHE["cpd"] is not None
+        and cached_key[2] == int(ngram_n)
+        and abs(cached_key[3] - float(lidstone_gamma)) < 1e-9
+        and cached_key[4] == int(pi_prec)
+        and cached_key[5] == int(pi_stream_len)
+    ):
+        log.append("✓ Using loaded model from file (no rebuild).")
         return _CACHE["cpd"], _CACHE["vocab"], _CACHE["stream"]
 
     log.append("Building trigram model...")
@@ -664,6 +698,218 @@ def resolve_corpus(file_obj, pasted_corpus):
         return pasted_corpus, "pasted text"
 
     return EMBEDDED_CORPUS, "embedded fallback"
+
+
+# ============================================================
+# SAVE / LOAD MODEL
+# ============================================================
+#
+# Format (gzipped pickle):
+#   {
+#     "magic":   "PI_TRIGRAM_MODEL_V1",
+#     "version": 1,
+#     "cpd":     ConditionalProbDist,
+#     "vocab":   set[str],
+#     "stream":  list[int],   # base-26 π digits
+#     "config":  {
+#         "ngram_n": int,
+#         "lidstone_gamma": float,
+#         "pi_prec": int,
+#         "pi_stream_len": int,
+#         "digits_per_sample": int,
+#         "corpus_sha256": str,
+#         "corpus_chars":  int,
+#         "vocab_size":    int,
+#     },
+#   }
+#
+# Pickle is used because nltk.ConditionalProbDist isn't naturally JSON-serializable.
+# Only load files from sources you trust — pickle can execute code on load.
+
+MODEL_MAGIC = "PI_TRIGRAM_MODEL_V1"
+MODEL_VERSION = 1
+
+
+def _corpus_fingerprint(corpus):
+    if isinstance(corpus, str):
+        b = corpus.encode("utf-8", errors="ignore")
+    elif isinstance(corpus, bytes):
+        b = corpus
+    else:
+        b = str(corpus).encode("utf-8", errors="ignore")
+    return hashlib.sha256(b).hexdigest()
+
+
+def save_model_to_path(
+    path,
+    cpd, vocab, stream,
+    ngram_n, lidstone_gamma, pi_prec, pi_stream_len,
+    corpus_text,
+):
+    payload = {
+        "magic": MODEL_MAGIC,
+        "version": MODEL_VERSION,
+        "cpd": cpd,
+        "vocab": set(vocab),
+        "stream": list(stream),
+        "config": {
+            "ngram_n": int(ngram_n),
+            "lidstone_gamma": float(lidstone_gamma),
+            "pi_prec": int(pi_prec),
+            "pi_stream_len": int(pi_stream_len),
+            "digits_per_sample": int(DEFAULTS["DIGITS_PER_SAMPLE"]),
+            "corpus_sha256": _corpus_fingerprint(corpus_text),
+            "corpus_chars": len(corpus_text) if corpus_text else 0,
+            "vocab_size": len(vocab),
+        },
+    }
+    with gzip.open(path, "wb") as f:
+        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+    return path
+
+
+def load_model_from_path(path):
+    """Return (cpd, vocab, stream, config, errors_list).
+    On failure, cpd is None and errors_list is populated."""
+    errors = []
+    try:
+        with gzip.open(path, "rb") as f:
+            payload = pickle.load(f)
+    except Exception as e:
+        # Try uncompressed pickle as a fallback.
+        try:
+            with open(path, "rb") as f:
+                payload = pickle.load(f)
+        except Exception as e2:
+            return None, None, None, None, [
+                f"Could not read file: {e}",
+                f"Uncompressed fallback also failed: {e2}",
+            ]
+
+    if not isinstance(payload, dict):
+        return None, None, None, None, [
+            "File does not contain a model dict."
+        ]
+    if payload.get("magic") != MODEL_MAGIC:
+        errors.append(
+            f"Magic header mismatch (got {payload.get('magic')!r}, "
+            f"expected {MODEL_MAGIC!r}). Proceeding cautiously."
+        )
+    if payload.get("version", 0) > MODEL_VERSION:
+        errors.append(
+            f"File version {payload.get('version')} is newer than "
+            f"supported version {MODEL_VERSION}."
+        )
+
+    cpd = payload.get("cpd")
+    vocab = payload.get("vocab")
+    stream = payload.get("stream")
+    config = payload.get("config", {})
+
+    if cpd is None or vocab is None or stream is None:
+        return None, None, None, None, errors + [
+            "Missing required fields (cpd/vocab/stream)."
+        ]
+
+    return cpd, set(vocab), list(stream), dict(config), errors
+
+
+def action_save_model(
+    file_obj, pasted_corpus,
+    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+):
+    """Build (or reuse cached) model with current corpus+config and write it
+    to a gzipped pickle that the user can download."""
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f"Corpus source: {source} ({len(corpus)} chars).")
+
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
+    )
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".pkl.gz", prefix="pi_trigram_model_"
+    )
+    tmp.close()
+    save_model_to_path(
+        tmp.name,
+        cpd, vocab, stream,
+        ngram_n, lidstone_gamma, pi_prec, pi_stream_len,
+        corpus,
+    )
+
+    size_kb = os.path.getsize(tmp.name) / 1024.0
+    log.append(
+        f"✓ Saved model to {os.path.basename(tmp.name)} ({size_kb:.1f} KB)."
+    )
+    log.append(
+        f"  config: ngram_n={int(ngram_n)} γ={float(lidstone_gamma)} "
+        f"π_prec={int(pi_prec)} stream_len={int(pi_stream_len)} "
+        f"vocab={len(vocab)}"
+    )
+    return tmp.name, "\n".join(log)
+
+
+def action_load_model(model_file):
+    """Load a saved model into the in-process cache and return updated
+    slider/log values so the UI reflects the loaded config."""
+    if model_file is None:
+        return (
+            "No file uploaded. Pick a .pkl.gz model file first.",
+            # leave slider values untouched
+            gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+
+    path = model_file.name if hasattr(model_file, "name") else model_file
+    cpd, vocab, stream, config, errors = load_model_from_path(path)
+
+    if cpd is None:
+        return (
+            "Failed to load model:\n" + "\n".join(errors),
+            gr.update(), gr.update(), gr.update(), gr.update(),
+        )
+
+    ngram_n = int(config.get("ngram_n", DEFAULTS["NGRAM_N"]))
+    lidstone_gamma = float(config.get("lidstone_gamma", DEFAULTS["LIDSTONE_GAMMA"]))
+    pi_prec = int(config.get("pi_prec", DEFAULTS["PI_PREC"]))
+    pi_stream_len = int(config.get("pi_stream_len", DEFAULTS["PI_STREAM_LEN"]))
+
+    # Install into the cache so generation uses it directly without rebuilding.
+    # Use a sentinel key that no recomputation will match, so any later
+    # corpus/config tweak by the user will rebuild cleanly.
+    _CACHE.update(
+        key=("LOADED", path, ngram_n, lidstone_gamma, pi_prec, pi_stream_len),
+        cpd=cpd, vocab=vocab, stream=stream,
+    )
+
+    lines = [
+        f"✓ Loaded model from {os.path.basename(path)}.",
+        f"  ngram_n={ngram_n}  γ={lidstone_gamma}",
+        f"  π_prec={pi_prec}  stream_len={pi_stream_len}",
+        f"  vocab={len(vocab)}  stream_len_actual={len(stream)}",
+    ]
+    if config.get("corpus_sha256"):
+        lines.append(
+            f"  corpus_sha256={config['corpus_sha256'][:16]}…  "
+            f"corpus_chars={config.get('corpus_chars', '?')}"
+        )
+    if errors:
+        lines.append("Warnings:")
+        for e in errors:
+            lines.append(f"  ! {e}")
+    lines.append(
+        "Slider values have been updated to match. You can now Generate/Search "
+        "without re-uploading the corpus."
+    )
+
+    return (
+        "\n".join(lines),
+        gr.update(value=pi_prec),
+        gr.update(value=pi_stream_len),
+        gr.update(value=ngram_n),
+        gr.update(value=lidstone_gamma),
+    )
 
 
 def run_single(
@@ -999,6 +1245,28 @@ def build_ui():
                 max_solutions = gr.Slider(1, 25, value=DEFAULTS["MAX_SOLUTIONS"],
                                           step=1, label="Max solutions")
 
+        with gr.Accordion("💾 Save / Load model", open=False):
+            gr.Markdown(
+                "Save the compiled trigram model + π stream + config as a "
+                "single `.pkl.gz` file. Loading restores it into the cache so "
+                "Generate/Search runs without rebuilding from the corpus.\n\n"
+                "⚠️ **Only load model files from sources you trust** — the "
+                "format is gzipped pickle, which can execute code on load."
+            )
+            with gr.Row():
+                btn_save_model = gr.Button("💾 Save model (download)",
+                                           variant="secondary")
+                save_model_file = gr.File(label="Saved model file",
+                                          interactive=False)
+            with gr.Row():
+                load_model_file = gr.File(
+                    label="Upload saved model (.pkl.gz)",
+                    file_types=[".gz", ".pkl"],
+                    type="filepath",
+                )
+                btn_load_model = gr.Button("📂 Load model", variant="secondary")
+            model_io_log = gr.Textbox(label="Model I/O log", lines=6)
+
         with gr.Row():
             btn_single = gr.Button("▶ Single Generate", variant="primary")
             btn_search = gr.Button("🔍 Prompt-Aligned Search", variant="secondary")
@@ -1010,7 +1278,19 @@ def build_ui():
             out_log = gr.Textbox(label="Log", lines=8)
             out_file = gr.File(label="Download output")
 
-        # Wire up.
+        # Wire up save/load.
+        btn_save_model.click(
+            action_save_model,
+            inputs=[file_in, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
+            outputs=[save_model_file, model_io_log],
+        )
+        btn_load_model.click(
+            action_load_model,
+            inputs=[load_model_file],
+            outputs=[model_io_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
+        )
+
+        # Wire up generation.
         single_inputs = [
             file_in, pasted, prompt_in,
             pi_prec, pi_stream_len, ngram_n, lidstone_gamma, gen_words,
@@ -1044,7 +1324,8 @@ def build_ui():
         gr.Markdown(
             "**Tip:** the model+stream are cached, so re-running with the same "
             "corpus / π settings is fast. Changing precision, stream length, "
-            "n-gram order, or Lidstone γ triggers a rebuild."
+            "n-gram order, or Lidstone γ triggers a rebuild. Use **Save / Load "
+            "model** above to skip the rebuild entirely on later sessions."
         )
 
     return demo
@@ -1053,7 +1334,6 @@ def build_ui():
 if __name__ == "__main__":
     demo = build_ui()
     demo.queue(max_size=8).launch(
-        server_name=os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0"),
-        server_port=int(os.environ.get("GRADIO_SERVER_PORT", "7860")),
+        server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
         show_error=True,
     )
