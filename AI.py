@@ -665,7 +665,10 @@ def save_hf_model(repo_id, token=None):
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
         tmp.close()
         save_model_to_path(tmp.name, cpd, vocab, stream, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], EMBEDDED_CORPUS)
-        upload_file(path_or_fileobj=tmp.name, path_in_repo='pi_model.pkl.gz', repo_id=repo_id, repo_type='model', token=token)
+        kwargs = dict(path_or_fileobj=tmp.name, path_in_repo='pi_model.pkl.gz', repo_id=repo_id, repo_type='model')
+        if token and token.strip():
+            kwargs['token'] = token.strip()
+        upload_file(**kwargs)
         return f'Saved full model to {repo_id}/pi_model.pkl.gz'
     except Exception as e:
         return f'Save failed: {e}'
@@ -674,7 +677,10 @@ def save_hf_model(repo_id, token=None):
 def load_hf_model_on_demand(repo_id, token=None):
     try:
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=repo_id, filename='pi_model.pkl.gz', repo_type='model', token=token, cache_dir=LOCAL_CACHE_DIR)
+        kwargs = dict(repo_id=repo_id, filename='pi_model.pkl.gz', repo_type='model', cache_dir=LOCAL_CACHE_DIR)
+        if token and token.strip():
+            kwargs['token'] = token.strip()
+        path = hf_hub_download(**kwargs)
         cpd, vocab, stream, config, errors = load_model_from_path(path)
         if cpd is None:
             return 'Load failed: ' + ' | '.join(errors)
