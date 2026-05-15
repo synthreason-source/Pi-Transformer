@@ -689,8 +689,8 @@ def load_hf_model_on_demand(repo_id, token=None):
         UI_STATE['version'] += 1
         HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
         if config:
-            return f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
-        return f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
+            return #f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
+        return #f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
     except Exception as e:
         return f'Load failed: {e}'
 
