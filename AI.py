@@ -657,13 +657,16 @@ def load_hf_model_on_demand(repo_id, token=None):
 def save_hf_model(repo_id, token=None):
     try:
         from huggingface_hub import HfApi, upload_file
-        HfApi(token=token)
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.json', prefix='model_state_', mode='w', encoding='utf-8')
-        payload = {'status': HF_CACHE.get('status'), 'repo': HF_REPO_ID}
-        tmp.write(json.dumps(payload, indent=2))
+        if CACHE.get('cpd') is None or CACHE.get('stream') is None or CACHE.get('vocab') is None:
+            corpus, _ = resolve_corpus(None, None)
+            cpd, vocab, stream = get_or_build(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], [])
+        else:
+            cpd, vocab, stream = CACHE['cpd'], CACHE['vocab'], CACHE['stream']
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
         tmp.close()
-        upload_file(path_or_fileobj=tmp.name, path_in_repo='model_state.json', repo_id=repo_id, repo_type='model', token=token)
-        return f'Saved state metadata to {repo_id}'
+        save_model_to_path(tmp.name, cpd, vocab, stream, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], EMBEDDED_CORPUS)
+        upload_file(path_or_fileobj=tmp.name, path_in_repo='pi_model.pkl.gz', repo_id=repo_id, repo_type='model', token=token)
+        return f'Saved full model to {repo_id}/pi_model.pkl.gz'
     except Exception as e:
         return f'Save failed: {e}'
 
@@ -671,13 +674,17 @@ def save_hf_model(repo_id, token=None):
 def load_hf_model_on_demand(repo_id, token=None):
     try:
         from huggingface_hub import hf_hub_download
-        path = hf_hub_download(repo_id=repo_id, filename='model_state.json', repo_type='model', token=token, cache_dir=LOCAL_CACHE_DIR)
-        with open(path, 'r', encoding='utf-8') as f:
-            payload = json.load(f)
-        HF_CACHE.update(loaded=False, tokenizer=None, model=None, status=f"Loaded metadata from {repo_id}: {payload}")
-        return f"Loaded metadata from {repo_id}: {payload}"
+        path = hf_hub_download(repo_id=repo_id, filename='pi_model.pkl.gz', repo_type='model', token=token, cache_dir=LOCAL_CACHE_DIR)
+        cpd, vocab, stream, config, errors = load_model_from_path(path)
+        if cpd is None:
+            return 'Load failed: ' + ' | '.join(errors)
+        CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
+        HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
+        if config:
+            return f'Loaded full model from {repo_id} with config {config}'
+        return f'Loaded full model from {repo_id}'
     except Exception as e:
-        return f"Load failed: {e}"
+        return f'Load failed: {e}'
 
 
 def run_generate(prompt, temperature, text_length):
@@ -736,7 +743,7 @@ def build_ui():
                 save_btn.click(save_model_ui, inputs=[filein, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma], outputs=[save_file, model_log])
                 load_btn.click(load_model_ui, inputs=[load_file], outputs=[model_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma])
             with gr.TabItem('Thinking-lite'):
-                gr.Markdown('Use the buttons below to load or save.')
+                gr.Markdown('This tab is lazy. Use the buttons below to load or save.')
                 hfstatus = gr.Textbox(label='Status', value='Idle', lines=2, interactive=False)
                 hf_repo = gr.Textbox(label='Hugging Face repo', value=HF_REPO_ID)
                 hf_token = gr.Textbox(label='HF token', type='password')
