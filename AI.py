@@ -151,7 +151,7 @@ def tokenise_alpha(text):
         text = text.decode("utf-8", errors="ignore")
     elif not isinstance(text, str):
         text = str(text)
-    return _WORD_RE.findall(text.lower())
+    return text.lower().split()
 
 
 def extract_word_pairs(prompt):
