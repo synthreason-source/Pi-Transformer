@@ -114,6 +114,7 @@ LOCAL_CACHE_DIR = os.path.join(NLTK_DATA_DIR, "hf_model_cache")
 os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 HF_CACHE = {"loaded": False, "tokenizer": None, "model": None, "status": "Idle"}
 CACHE = dict(key=None, cpd=None, vocab=None, stream=None)
+UI_STATE = {'version': 0}
 
 
 def tokenise_alpha(text):
@@ -685,18 +686,22 @@ def load_hf_model_on_demand(repo_id, token=None):
         if cpd is None:
             return 'Load failed: ' + ' | '.join(errors)
         CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
+        UI_STATE['version'] += 1
         HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
         if config:
-            return f'Loaded full model from {repo_id} with config {config}'
-        return f'Loaded full model from {repo_id}'
+            return f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
+        return f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
     except Exception as e:
         return f'Load failed: {e}'
 
 
 def run_generate(prompt, temperature, text_length):
-    corpus = EMBEDDED_CORPUS
-    cpd, vocab = build_model(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'])
-    stream = build_pi_stream(DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'])
+    if CACHE.get('cpd') is not None and CACHE.get('stream') is not None and CACHE.get('vocab') is not None:
+        cpd, vocab, stream = CACHE['cpd'], CACHE['vocab'], CACHE['stream']
+    else:
+        corpus = EMBEDDED_CORPUS
+        cpd, vocab = build_model(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'])
+        stream = build_pi_stream(DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'])
     sampler = PiSampler(stream, DEFAULTS['DIGITS_PER_SAMPLE'], temperature, DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], DEFAULTS['REP_PENALTY'], DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'], DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'], DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'])
     sampler.seek(0)
     text = generate_text(cpd, sampler, prompt or '', int(text_length), DEFAULTS['NGRAM_N'], vocab)
@@ -749,7 +754,7 @@ def build_ui():
                 save_btn.click(save_model_ui, inputs=[filein, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma], outputs=[save_file, model_log])
                 load_btn.click(load_model_ui, inputs=[load_file], outputs=[model_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma])
             with gr.TabItem('Thinking-lite'):
-                gr.Markdown('This tab is lazy. Use the buttons below to load or save.')
+                gr.Markdown('Use the buttons below to load or save.')
                 hfstatus = gr.Textbox(label='Status', value='Idle', lines=2, interactive=False)
                 hf_repo = gr.Textbox(label='Hugging Face repo', value=HF_REPO_ID)
                 hf_token = gr.Textbox(label='HF token', type='password')
