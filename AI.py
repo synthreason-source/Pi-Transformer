@@ -361,7 +361,8 @@ def _dist_for_ctx(cpd, context_window, ctxtuple):
         except Exception:
             continue
     try:
-        d = cpd[tuple(["<s>"] * context_window)]
+        trial = tuple(["<s>"] * context_window)
+        d = cpd[trial]
         if list(d.samples()):
             return d
     except Exception:
@@ -383,17 +384,17 @@ def _diag_context(prompt, ngram_n):
     return out
 
 
-def _semantic_bias_score(candidate, seed_words, pairs, diag_ctx):
+def _semantic_bias_score(candidate, seed_words, pairs, diag_flat):
     score = 0.0
     c = candidate.lower()
     for w in seed_words:
         if w in c:
-            score += 0.15
+            score += 0.1
     for a, b in pairs:
         if a in c and b in c:
-            score += 0.45
-        if a in diag_ctx or b in diag_ctx:
-            score += 0.2
+            score += 0.35
+        if a in diag_flat or b in diag_flat:
+            score += 0.15
     return score
 
 
@@ -402,6 +403,7 @@ def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
     seed_words = tokenise_alpha(prompt)
     pairs = extract_word_pairs(prompt)
     diag_ctx = _diag_context(prompt, ngram_n)
+    diag_flat = " ".join(" ".join(x) for x in diag_ctx)
     seed_in_vocab = [w for w in seed_words if vocab is None or w in vocab]
     if len(seed_in_vocab) >= context_window:
         init = seed_in_vocab[-context_window:]
@@ -414,44 +416,46 @@ def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
         dist = _dist_for_ctx(cpd, context_window, cand)
         if dist is None:
             continue
-        sample_words = list(dist.samples())[:10]
+        samples = list(dist.samples())[:12]
         score = len([w for w in cand if w != "<s>"]) * 0.05
-        score += sum(_semantic_bias_score(w, seed_words, pairs, " ".join(sum(diag_ctx, ()))) for w in sample_words)
+        score += sum(_semantic_bias_score(w, seed_words, pairs, diag_flat) for w in samples)
         if score > best_score:
             best_score = score
             best = cand
     context = deque(best, maxlen=context_window)
     words = list(seed_words)
-    diag_flat = " ".join(" ".join(x) for x in diag_ctx)
     for _ in range(n_words):
         dist = _dist_for_ctx(cpd, context_window, tuple(context))
         if dist is None:
-            context.clear(); context.extend(["<s>"] * context_window)
+            context.clear()
+            context.extend(["<s>"] * context_window)
             continue
         samples = list(dist.samples())
         if not samples:
-            context.clear(); context.extend(["<s>"] * context_window)
+            context.clear()
+            context.extend(["<s>"] * context_window)
             continue
         scored = []
         for w in samples:
             p = float(dist.prob(w))
             bonus = _semantic_bias_score(w, seed_words, pairs, diag_flat)
             if w in context:
-                bonus += 0.05
+                bonus += 0.03
             scored.append((w, p * (1.0 + bonus)))
         scored.sort(key=lambda x: x[1], reverse=True)
         total = sum(p for _, p in scored)
         if total > 0:
-            word = sampler.sample(type('D', (), {'samples': lambda self=None: [w for w,_ in scored], 'prob': lambda self, x: dict(scored).get(x, 0.0)})())
+            norm = [(w, p / total) for w, p in scored]
+            word = sampler.sample(type('D', (), {'samples': lambda self=None: [w for w, _ in norm], 'prob': lambda self, x: dict(norm).get(x, 0.0)})())
         else:
             word = sampler.sample(dist)
         if word == "</s>":
-            context.clear(); context.extend(["<s>"] * context_window)
+            context.clear()
+            context.extend(["<s>"] * context_window)
             continue
         words.append(word)
         context.append(word)
     return capitalise_text(words)
-
 
 def all_pairs_match(pairs, text, fuzzy_threshold):
     lower_text = text.lower()
@@ -764,7 +768,7 @@ def run_generate(file_obj, pasted_corpus, prompt, temperature, text_length):
     text = generate_text(cpd, sampler, prompt or '', int(text_length), DEFAULTS['NGRAM_N'], vocab)
     assoc_score, matched_pairs = collocation_association_score(text, prompt or '', min_freq=1, measure='pmi')
     exact_ok, failed_pair = all_pairs_match(pairs, text, fuzzy_threshold=DEFAULTS['FUZZY_THRESHOLD']) if pairs else (True, None)
-    log.append(f'Diag context applied: {len(tokenise_alpha(prompt or ''))} prompt tokens.')
+    log.append(f'Diag dot-product context applied from {len(tokenise_alpha(prompt or ""))} prompt tokens.')
     log.append(f'Assoc score: {assoc_score:.4f}')
     if matched_pairs:
         log.append(f'Matched pairs: {matched_pairs}')
@@ -772,7 +776,6 @@ def run_generate(file_obj, pasted_corpus, prompt, temperature, text_length):
         log.append(f'First missing pair: {failed_pair}')
     log.append(f'Generated {len(text.split())} tokens. exact_ok={exact_ok}')
     return text, ''.join(log)
-
 
 def build_ui():
     with gr.Blocks(title='Full features app') as demo:
