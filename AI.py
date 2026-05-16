@@ -351,45 +351,102 @@ class Triangle:
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
 
+def _dist_for_ctx(cpd, context_window, ctxtuple):
+    for cut in range(len(ctxtuple), 0, -1):
+        trial = ("<s>",) * (context_window - cut) + ctxtuple[-cut:]
+        try:
+            d = cpd[trial]
+            if list(d.samples()):
+                return d
+        except Exception:
+            continue
+    try:
+        d = cpd[tuple(["<s>"] * context_window)]
+        if list(d.samples()):
+            return d
+    except Exception:
+        pass
+    return None
+
+
+def _diag_context(prompt, ngram_n):
+    words = tokenise_alpha(prompt)
+    context_window = max(1, ngram_n - 1)
+    out = []
+    for i in range(len(words)):
+        seg = words[max(0, i - context_window + 1): i + 1]
+        if len(seg) < context_window:
+            seg = ["<s>"] * (context_window - len(seg)) + seg
+        out.append(tuple(seg))
+    if not out:
+        out.append(tuple(["<s>"] * context_window))
+    return out
+
+
+def _semantic_bias_score(candidate, seed_words, pairs, diag_ctx):
+    score = 0.0
+    c = candidate.lower()
+    for w in seed_words:
+        if w in c:
+            score += 0.15
+    for a, b in pairs:
+        if a in c and b in c:
+            score += 0.45
+        if a in diag_ctx or b in diag_ctx:
+            score += 0.2
+    return score
+
+
 def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
-    context_window = ngram_n - 1
+    context_window = max(1, ngram_n - 1)
     seed_words = tokenise_alpha(prompt)
-    if vocab is not None:
-        seed_in_vocab = [w for w in seed_words if w in vocab]
-    else:
-        seed_in_vocab = list(seed_words)
+    pairs = extract_word_pairs(prompt)
+    diag_ctx = _diag_context(prompt, ngram_n)
+    seed_in_vocab = [w for w in seed_words if vocab is None or w in vocab]
     if len(seed_in_vocab) >= context_window:
         init = seed_in_vocab[-context_window:]
     else:
         init = ["<s>"] * (context_window - len(seed_in_vocab)) + seed_in_vocab
-    context = deque(init, maxlen=context_window)
-    words = list(seed_words)
-    def dist_for_ctx(ctxtuple):
-        for cut in range(len(ctxtuple), 0, -1):
-            trial = ("<s>",) * (context_window - cut) + ctxtuple[-cut:]
-            try:
-                d = cpd[trial]
-                if list(d.samples()):
-                    return d
-            except Exception:
-                continue
-        try:
-            d = cpd[tuple(["<s>"] * context_window)]
-            if list(d.samples()):
-                return d
-        except Exception:
-            pass
-        return None
-    for _ in range(n_words):
-        dist = dist_for_ctx(tuple(context))
+    candidates = [tuple(init)] + diag_ctx
+    best = tuple(init)
+    best_score = -1e9
+    for cand in candidates:
+        dist = _dist_for_ctx(cpd, context_window, cand)
         if dist is None:
-            context.clear()
-            context.extend(["<s>"] * context_window)
             continue
-        word = sampler.sample(dist)
+        sample_words = list(dist.samples())[:10]
+        score = len([w for w in cand if w != "<s>"]) * 0.05
+        score += sum(_semantic_bias_score(w, seed_words, pairs, " ".join(sum(diag_ctx, ()))) for w in sample_words)
+        if score > best_score:
+            best_score = score
+            best = cand
+    context = deque(best, maxlen=context_window)
+    words = list(seed_words)
+    diag_flat = " ".join(" ".join(x) for x in diag_ctx)
+    for _ in range(n_words):
+        dist = _dist_for_ctx(cpd, context_window, tuple(context))
+        if dist is None:
+            context.clear(); context.extend(["<s>"] * context_window)
+            continue
+        samples = list(dist.samples())
+        if not samples:
+            context.clear(); context.extend(["<s>"] * context_window)
+            continue
+        scored = []
+        for w in samples:
+            p = float(dist.prob(w))
+            bonus = _semantic_bias_score(w, seed_words, pairs, diag_flat)
+            if w in context:
+                bonus += 0.05
+            scored.append((w, p * (1.0 + bonus)))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        total = sum(p for _, p in scored)
+        if total > 0:
+            word = sampler.sample(type('D', (), {'samples': lambda self=None: [w for w,_ in scored], 'prob': lambda self, x: dict(scored).get(x, 0.0)})())
+        else:
+            word = sampler.sample(dist)
         if word == "</s>":
-            context.clear()
-            context.extend(["<s>"] * context_window)
+            context.clear(); context.extend(["<s>"] * context_window)
             continue
         words.append(word)
         context.append(word)
@@ -689,23 +746,32 @@ def load_hf_model_on_demand(repo_id, token=None):
         UI_STATE['version'] += 1
         HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
         if config:
-            return f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
-        return f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
+            return #f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
+        return #f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
     except Exception as e:
         return f'Load failed: {e}'
 
 
-def run_generate(prompt, temperature, text_length):
-    if CACHE.get('cpd') is not None and CACHE.get('stream') is not None and CACHE.get('vocab') is not None:
-        cpd, vocab, stream = CACHE['cpd'], CACHE['vocab'], CACHE['stream']
-    else:
-        corpus = EMBEDDED_CORPUS
-        cpd, vocab = build_model(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'])
-        stream = build_pi_stream(DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'])
+def run_generate(file_obj, pasted_corpus, prompt, temperature, text_length):
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
+    cpd, vocab, stream = get_or_build(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], log)
+    pairs = extract_word_pairs(prompt or '')
+    log.append(f'Prompt pairs: {pairs[:6]}')
     sampler = PiSampler(stream, DEFAULTS['DIGITS_PER_SAMPLE'], temperature, DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], DEFAULTS['REP_PENALTY'], DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'], DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'], DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'])
     sampler.seek(0)
     text = generate_text(cpd, sampler, prompt or '', int(text_length), DEFAULTS['NGRAM_N'], vocab)
-    return text, f'Generated {len(text.split())} tokens.'
+    assoc_score, matched_pairs = collocation_association_score(text, prompt or '', min_freq=1, measure='pmi')
+    exact_ok, failed_pair = all_pairs_match(pairs, text, fuzzy_threshold=DEFAULTS['FUZZY_THRESHOLD']) if pairs else (True, None)
+    log.append(f'Diag context applied: {len(tokenise_alpha(prompt or ''))} prompt tokens.')
+    log.append(f'Assoc score: {assoc_score:.4f}')
+    if matched_pairs:
+        log.append(f'Matched pairs: {matched_pairs}')
+    if failed_pair:
+        log.append(f'First missing pair: {failed_pair}')
+    log.append(f'Generated {len(text.split())} tokens. exact_ok={exact_ok}')
+    return text, ''.join(log)
 
 
 def build_ui():
@@ -730,7 +796,7 @@ def build_ui():
                 outtext = gr.Textbox(label='Generated text', lines=18)
                 outlog = gr.Textbox(label='Log', lines=8)
                 outfile = gr.File(label='Download output')
-                btn.click(run_generate, inputs=[promptin, temperature, text_length], outputs=[outtext, outlog])
+                btn.click(run_generate, inputs=[filein, pasted, promptin, temperature, text_length], outputs=[outtext, outlog])
             with gr.TabItem('Search'):
                 gr.Markdown('Prompt-aligned search with collocations.')
                 search_prompt = gr.Textbox(label='Prompt', lines=3, value='alice rabbit hole')
