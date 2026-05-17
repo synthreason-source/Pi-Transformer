@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import os
@@ -81,6 +80,9 @@ DEFAULTS = dict(
     BEND_STEP=0.5,
     OFFSET_STEP=50,
     BEND_MAX=45.0,
+    # Insight penalty: penalise labels that encode conclusions (high-prob tokens).
+    # Applied as a soft preference before temperature scaling. 0.0 = off.
+    INSIGHT_PENALTY=1.5,
 )
 
 EMBEDDED_CORPUS = """
@@ -117,6 +119,40 @@ CACHE = dict(key=None, cpd=None, vocab=None, stream=None)
 UI_STATE = {'version': 0}
 
 
+# ---------------------------------------------------------------------------
+# Insight penalty — "Penalise labels that encode insights"
+# Tokens whose probability exceeds the distribution mean carry more
+# "conclusion mass".  We down-weight them proportionally so that the sampler
+# is pushed toward explicit, lower-interpretation alternatives.
+# This is applied as a soft preference (multiplicative adjustment) before
+# temperature scaling, not a hard removal from the candidate set.
+# ---------------------------------------------------------------------------
+
+def apply_insight_penalty(scored, strength):
+    """
+    Soft-penalise tokens that encode conclusions (those with above-mean
+    probability).  `strength` controls how aggressively over-probable tokens
+    are down-weighted; 0.0 disables the penalty entirely.
+
+    Returns a renormalised list of (word, adjusted_prob) pairs.
+    """
+    if not scored or strength <= 0.0:
+        return scored
+    mean_p = sum(p for _, p in scored) / len(scored)
+    if mean_p <= 0:
+        return scored
+    penalised = []
+    for word, p in scored:
+        excess = max(0.0, p - mean_p)
+        # Multiplicative downweight: higher excess → larger reduction.
+        p_adj = p / (1.0 + strength * excess / mean_p)
+        penalised.append((word, max(1e-12, p_adj)))
+    total = sum(p for _, p in penalised)
+    if total > 0:
+        penalised = [(w, p / total) for w, p in penalised]
+    return penalised
+
+
 def tokenise_alpha(text):
     if text is None:
         return []
@@ -141,9 +177,11 @@ def capitalise_text(words):
 
 class _LidstoneFactory:
     __slots__ = ("gamma", "bins")
+
     def __init__(self, gamma, bins):
         self.gamma = float(gamma)
         self.bins = max(1, int(bins))
+
     def __call__(self, fd):
         return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
 
@@ -159,15 +197,21 @@ def build_model(corpus, ngram_n, lidstone_gamma):
     lidstone_gamma = float(lidstone_gamma)
     tokens = tokenise_alpha(corpus)
     if not tokens:
-        raise ValueError("Corpus produced zero tokens after tokenisation. Upload a non-empty text corpus or paste some text.")
-    padded = ["<s>"] * (ngram_n - 1) + tokens + ["</s>"]
+        raise ValueError(
+            "Corpus produced zero tokens after tokenisation. "
+            "Upload a non-empty text corpus or paste some text."
+        )
+    padded = [""] * (ngram_n - 1) + tokens + [""]
     trigrams_ = list(ngrams(padded, ngram_n))
     cfd = ConditionalFreqDist((tuple(tg[:-1]), tg[-1]) for tg in trigrams_)
-    vocab = set(tokens) | {"</s>"}
+    vocab = set(tokens) | {""}
     for ctx in list(cfd.conditions()):
         if len(cfd[ctx]) == 0:
-            cfd[ctx]["</s>"] += 1
-    cpd = ConditionalProbDist(cfd, _LidstoneFactory(gamma=lidstone_gamma, bins=max(1, len(vocab))))
+            cfd[ctx][""] += 1
+    cpd = ConditionalProbDist(
+        cfd,
+        _LidstoneFactory(gamma=lidstone_gamma, bins=max(1, len(vocab))),
+    )
     return cpd, vocab
 
 
@@ -199,6 +243,7 @@ class SeashellResonator:
         self.phases = []
         self.spreads = []
         self._seed_from_stream()
+
     def _seed_from_stream(self):
         self.centers = []
         self.phases = []
@@ -210,13 +255,16 @@ class SeashellResonator:
             self.centers.append(c)
             self.phases.append(ph)
             self.spreads.append(spread)
+
     def reset(self):
         self.energy = 1.0
         self.step_index = 0
         self._seed_from_stream()
+
     def _wrapped_distance(self, a, b):
         d = abs(a - b)
         return min(d, 1.0 - d)
+
     def gains(self, n_items):
         if n_items <= 0:
             return []
@@ -232,7 +280,11 @@ class SeashellResonator:
                 moving_center = (center + drift * math.sin(phase + 0.07 * t)) % 1.0
                 d = self._wrapped_distance(idx, moving_center)
                 gauss = math.exp(-(d * d) / max(1e-9, 2.0 * spread * spread))
-                ripple = 0.5 + 0.5 * math.cos((d / max(1e-9, spread)) * math.pi * (1.5 + shimmer) + phase + 0.13 * t)
+                ripple = 0.5 + 0.5 * math.cos(
+                    (d / max(1e-9, spread)) * math.pi * (1.5 + shimmer)
+                    + phase
+                    + 0.13 * t
+                )
                 response += gauss * (0.55 + 0.45 * ripple)
             response /= max(1, self.peaks)
             gain = self.floor + (1.0 - self.floor) + live_strength * response
@@ -241,6 +293,7 @@ class SeashellResonator:
         if total > 0:
             gains = [g / total for g in gains]
         return gains
+
     def apply(self, scored):
         if not scored:
             return scored
@@ -258,7 +311,22 @@ class SeashellResonator:
 
 
 class PiSampler:
-    def __init__(self, stream, digits_per_sample, temperature, top_k, top_p, repetition_penalty, seashell_enable, seashell_strength, seashell_decay, seashell_peaks, seashell_width, seashell_floor):
+    def __init__(
+        self,
+        stream,
+        digits_per_sample,
+        temperature,
+        top_k,
+        top_p,
+        repetition_penalty,
+        seashell_enable,
+        seashell_strength,
+        seashell_decay,
+        seashell_peaks,
+        seashell_width,
+        seashell_floor,
+        insight_penalty=1.5,
+    ):
         self.stream = stream
         self.digits_per_sample = digits_per_sample
         self.pos = 0
@@ -266,15 +334,25 @@ class PiSampler:
         self.top_k = max(1, int(top_k))
         self.top_p = max(1e-3, min(1.0, float(top_p)))
         self.repetition_penalty = max(1.0, float(repetition_penalty))
+        self.insight_penalty = max(0.0, float(insight_penalty))
         self.history = Counter()
         self.seashell = None
         if seashell_enable:
-            self.seashell = SeashellResonator(self, seashell_strength, seashell_decay, seashell_peaks, seashell_width, seashell_floor)
+            self.seashell = SeashellResonator(
+                self,
+                seashell_strength,
+                seashell_decay,
+                seashell_peaks,
+                seashell_width,
+                seashell_floor,
+            )
+
     def seek(self, pos):
         self.pos = pos % len(self.stream)
         self.history.clear()
         if self.seashell is not None:
             self.seashell.reset()
+
     def next_unit(self):
         val = 0
         base = 26 ** self.digits_per_sample
@@ -282,6 +360,7 @@ class PiSampler:
             val = val * 26 + self.stream[self.pos % len(self.stream)]
             self.pos += 1
         return val / base
+
     def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
         xor_scores = []
         for rank, (word, base_p) in enumerate(scored):
@@ -294,10 +373,13 @@ class PiSampler:
             final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
             xor_scores.append((word, final_p))
         return xor_scores
+
     def sample(self, dist):
         samples = list(dist.samples())
         if not samples:
-            return "</s>"
+            return ""
+
+        # --- Step 1: base probabilities with repetition penalty ---
         base_scored = []
         for s in samples:
             p = max(1e-12, float(dist.prob(s)))
@@ -305,9 +387,18 @@ class PiSampler:
             if count > 0:
                 p /= self.repetition_penalty ** count
             base_scored.append((s, p))
+
+        # --- Step 2: insight penalty (soft preference, not hard constraint) ---
+        # Penalise tokens whose probability already encodes a conclusion,
+        # pushing the distribution toward explicit, lower-interpretation labels.
+        base_scored = apply_insight_penalty(base_scored, self.insight_penalty)
+
+        # --- Step 3: temperature scaling ---
         scored = [(s, p ** (1.0 / self.temperature)) for s, p in base_scored]
         total = sum(p for _, p in scored)
         scored = [(s, p / total) for s, p in scored]
+
+        # --- Step 4: top-K / top-P (nucleus) filtering ---
         scored.sort(key=lambda x: x[1], reverse=True)
         scored = scored[: self.top_k]
         kept = []
@@ -318,18 +409,26 @@ class PiSampler:
             if accum >= self.top_p:
                 break
         scored = kept
+
+        # --- Step 5: SeashellResonator spectral shaping ---
         if self.seashell is not None:
             scored = self.seashell.apply(scored)
+
+        # --- Step 6: XOR probability fusion via pi-stream samples ---
         u_a = self.next_unit()
         u_b = self.next_unit()
         u_c = self.next_unit()
         xor_scored = self._xor_probability_fusion(scored, u_a, u_b, u_c)
         xor_total = sum(p for _, p in xor_scored)
         if xor_total <= 0:
-            chosen = scored[-1][0] if scored else "</s>"
+            chosen = scored[-1][0] if scored else ""
         else:
             xor_scored = [(w, p / xor_total) for w, p in xor_scored]
-            xor_draw = (u_a * (1 - u_b) * (1 - u_c) + u_b * (1 - u_a) * (1 - u_c) + u_c * (1 - u_a) * (1 - u_b)) / 1.5
+            xor_draw = (
+                u_a * (1 - u_b) * (1 - u_c)
+                + u_b * (1 - u_a) * (1 - u_c)
+                + u_c * (1 - u_a) * (1 - u_b)
+            ) / 1.5
             cumulative = 0.0
             chosen = xor_scored[-1][0]
             for word, p in xor_scored:
@@ -337,6 +436,7 @@ class PiSampler:
                 if xor_draw < cumulative:
                     chosen = word
                     break
+
         self.history[chosen] += 1
         return chosen
 
@@ -351,111 +451,52 @@ class Triangle:
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
 
-def _dist_for_ctx(cpd, context_window, ctxtuple):
-    for cut in range(len(ctxtuple), 0, -1):
-        trial = ("<s>",) * (context_window - cut) + ctxtuple[-cut:]
-        try:
-            d = cpd[trial]
-            if list(d.samples()):
-                return d
-        except Exception:
-            continue
-    try:
-        trial = tuple(["<s>"] * context_window)
-        d = cpd[trial]
-        if list(d.samples()):
-            return d
-    except Exception:
-        pass
-    return None
-
-
-def _diag_context(prompt, ngram_n):
-    words = tokenise_alpha(prompt)
-    context_window = max(1, ngram_n - 1)
-    out = []
-    for i in range(len(words)):
-        seg = words[max(0, i - context_window + 1): i + 1]
-        if len(seg) < context_window:
-            seg = ["<s>"] * (context_window - len(seg)) + seg
-        out.append(tuple(seg))
-    if not out:
-        out.append(tuple(["<s>"] * context_window))
-    return out
-
-
-def _semantic_bias_score(candidate, seed_words, pairs, diag_flat):
-    score = 0.0
-    c = candidate.lower()
-    for w in seed_words:
-        if w in c:
-            score += 0.1
-    for a, b in pairs:
-        if a in c and b in c:
-            score += 0.35
-        if a in diag_flat or b in diag_flat:
-            score += 0.15
-    return score
-
-
 def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
-    context_window = max(1, ngram_n - 1)
+    context_window = ngram_n - 1
     seed_words = tokenise_alpha(prompt)
-    pairs = extract_word_pairs(prompt)
-    diag_ctx = _diag_context(prompt, ngram_n)
-    diag_flat = " ".join(" ".join(x) for x in diag_ctx)
-    seed_in_vocab = [w for w in seed_words if vocab is None or w in vocab]
+    if vocab is not None:
+        seed_in_vocab = [w for w in seed_words if w in vocab]
+    else:
+        seed_in_vocab = list(seed_words)
     if len(seed_in_vocab) >= context_window:
         init = seed_in_vocab[-context_window:]
     else:
-        init = ["<s>"] * (context_window - len(seed_in_vocab)) + seed_in_vocab
-    candidates = [tuple(init)] + diag_ctx
-    best = tuple(init)
-    best_score = -1e9
-    for cand in candidates:
-        dist = _dist_for_ctx(cpd, context_window, cand)
-        if dist is None:
-            continue
-        samples = list(dist.samples())[:12]
-        score = len([w for w in cand if w != "<s>"]) * 0.05
-        score += sum(_semantic_bias_score(w, seed_words, pairs, diag_flat) for w in samples)
-        if score > best_score:
-            best_score = score
-            best = cand
-    context = deque(best, maxlen=context_window)
+        init = [""] * (context_window - len(seed_in_vocab)) + seed_in_vocab
+    context = deque(init, maxlen=context_window)
     words = list(seed_words)
+
+    def dist_for_ctx(ctxtuple):
+        for cut in range(len(ctxtuple), 0, -1):
+            trial = ("",) * (context_window - cut) + ctxtuple[-cut:]
+            try:
+                d = cpd[trial]
+                if list(d.samples()):
+                    return d
+            except Exception:
+                continue
+        try:
+            d = cpd[tuple([""] * context_window)]
+            if list(d.samples()):
+                return d
+        except Exception:
+            pass
+        return None
+
     for _ in range(n_words):
-        dist = _dist_for_ctx(cpd, context_window, tuple(context))
+        dist = dist_for_ctx(tuple(context))
         if dist is None:
             context.clear()
-            context.extend(["<s>"] * context_window)
+            context.extend([""] * context_window)
             continue
-        samples = list(dist.samples())
-        if not samples:
+        word = sampler.sample(dist)
+        if word == "":
             context.clear()
-            context.extend(["<s>"] * context_window)
-            continue
-        scored = []
-        for w in samples:
-            p = float(dist.prob(w))
-            bonus = _semantic_bias_score(w, seed_words, pairs, diag_flat)
-            if w in context:
-                bonus += 0.03
-            scored.append((w, p * (1.0 + bonus)))
-        scored.sort(key=lambda x: x[1], reverse=True)
-        total = sum(p for _, p in scored)
-        if total > 0:
-            norm = [(w, p / total) for w, p in scored]
-            word = sampler.sample(type('D', (), {'samples': lambda self=None: [w for w, _ in norm], 'prob': lambda self, x: dict(norm).get(x, 0.0)})())
-        else:
-            word = sampler.sample(dist)
-        if word == "</s>":
-            context.clear()
-            context.extend(["<s>"] * context_window)
+            context.extend([""] * context_window)
             continue
         words.append(word)
         context.append(word)
     return capitalise_text(words)
+
 
 def all_pairs_match(pairs, text, fuzzy_threshold):
     lower_text = text.lower()
@@ -579,7 +620,10 @@ def load_model_from_path(path):
             with open(path, 'rb') as f:
                 payload = pickle.load(f)
         except Exception as e2:
-            return None, None, None, None, [f'Could not read file: {e}', f'Uncompressed fallback also failed: {e2}']
+            return None, None, None, None, [
+                f'Could not read file: {e}',
+                f'Uncompressed fallback also failed: {e2}',
+            ]
     if not isinstance(payload, dict):
         return None, None, None, None, ['File does not contain a model dict.']
     cpd = payload.get('cpd')
@@ -605,7 +649,35 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     return cpd, vocab, stream
 
 
-def run_single(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n, lidstone_gamma, gen_words, temperature, top_k, top_p, rep_penalty, seashell_enable, seashell_strength, seashell_decay, seashell_peaks, seashell_width, seashell_floor, bend_degrees, offset, vertex):
+def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
+                  seashell_enable, seashell_strength, seashell_decay,
+                  seashell_peaks, seashell_width, seashell_floor,
+                  insight_penalty):
+    return PiSampler(
+        stream,
+        digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=rep_penalty,
+        seashell_enable=seashell_enable,
+        seashell_strength=seashell_strength,
+        seashell_decay=seashell_decay,
+        seashell_peaks=seashell_peaks,
+        seashell_width=seashell_width,
+        seashell_floor=seashell_floor,
+        insight_penalty=insight_penalty,
+    )
+
+
+def run_single(
+    file_obj, pasted_corpus, prompt,
+    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+    gen_words, temperature, top_k, top_p, rep_penalty,
+    seashell_enable, seashell_strength, seashell_decay,
+    seashell_peaks, seashell_width, seashell_floor,
+    bend_degrees, offset, vertex, insight_penalty,
+):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
@@ -613,7 +685,12 @@ def run_single(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n,
     triangle = Triangle(int(pi_stream_len), offset_extra=int(offset), bend_degrees=float(bend_degrees))
     start = triangle.vertices[vertex]
     log.append(f'Triangle A={triangle.A} B={triangle.B} C={triangle.C} vertex={vertex} start={start}')
-    sampler = PiSampler(stream, digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'], temperature=temperature, top_k=top_k, top_p=top_p, repetition_penalty=rep_penalty, seashell_enable=seashell_enable, seashell_strength=seashell_strength, seashell_decay=seashell_decay, seashell_peaks=seashell_peaks, seashell_width=seashell_width, seashell_floor=seashell_floor)
+    sampler = _make_sampler(
+        stream, temperature, top_k, top_p, rep_penalty,
+        seashell_enable, seashell_strength, seashell_decay,
+        seashell_peaks, seashell_width, seashell_floor,
+        insight_penalty,
+    )
     sampler.seek(start)
     text = generate_text(cpd, sampler, prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
     oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
@@ -626,7 +703,16 @@ def run_single(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n,
     return text, '\n'.join(log), tmp.name
 
 
-def run_search(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n, lidstone_gamma, gen_words, temperature, rep_penalty, seashell_enable, seashell_strength, seashell_decay, seashell_peaks, seashell_width, seashell_floor, vertex, bend_max, bend_step, offset_step, fuzzy_threshold, max_solutions, progress=gr.Progress(track_tqdm=False)):
+def run_search(
+    file_obj, pasted_corpus, prompt,
+    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+    gen_words, temperature, rep_penalty,
+    seashell_enable, seashell_strength, seashell_decay,
+    seashell_peaks, seashell_width, seashell_floor,
+    vertex, bend_max, bend_step, offset_step,
+    fuzzy_threshold, max_solutions, insight_penalty,
+    progress=gr.Progress(track_tqdm=False),
+):
     log = []
     if not prompt or not prompt.strip():
         return '', 'Prompt is empty — search needs word pairs.', None
@@ -653,13 +739,27 @@ def run_search(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n,
             progress(counter / max(1, total), desc=f'bend={bend} offset={offset}')
             triangle = Triangle(int(pi_stream_len), offset_extra=offset, bend_degrees=bend)
             start = triangle.vertices[vertex]
-            sampler = PiSampler(stream, digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'], temperature=temperature, top_k=DEFAULTS['TOP_K'], top_p=DEFAULTS['TOP_P'], repetition_penalty=rep_penalty, seashell_enable=seashell_enable, seashell_strength=seashell_strength, seashell_decay=seashell_decay, seashell_peaks=seashell_peaks, seashell_width=seashell_width, seashell_floor=seashell_floor)
+            sampler = _make_sampler(
+                stream, temperature, DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
+                seashell_enable, seashell_strength, seashell_decay,
+                seashell_peaks, seashell_width, seashell_floor,
+                insight_penalty,
+            )
             sampler.seek(start)
             text = generate_text(cpd, sampler, prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
             exact_ok, _failed = all_pairs_match(pairs, text, fuzzy_threshold=float(fuzzy_threshold))
             assoc_score, matched_pairs = collocation_association_score(text, prompt, min_freq=1, measure='pmi')
             if exact_ok or assoc_score > 0:
-                scored_results.append({'prompt': prompt, 'bend': bend, 'offset': offset, 'vertex': vertex, 'text': text, 'assoc_score': assoc_score, 'matched_pairs': matched_pairs, 'exact_ok': exact_ok})
+                scored_results.append({
+                    'prompt': prompt,
+                    'bend': bend,
+                    'offset': offset,
+                    'vertex': vertex,
+                    'text': text,
+                    'assoc_score': assoc_score,
+                    'matched_pairs': matched_pairs,
+                    'exact_ok': exact_ok,
+                })
                 log.append(f'✓ candidate bend={bend} offset={offset} score={assoc_score:.4f}')
     if not scored_results:
         log.append('No matches found in the searched grid.')
@@ -668,7 +768,13 @@ def run_search(file_obj, pasted_corpus, prompt, pi_prec, pi_stream_len, ngram_n,
     top_results = scored_results[: int(max_solutions)]
     parts = []
     for i, r in enumerate(top_results, 1):
-        parts.append(f"=== MATCH {i} ===\n" f"bend = {r['bend']}   offset = {r['offset']}   vertex = {r['vertex']}\n" f"assoc_score = {r['assoc_score']:.4f}   exact_ok = {r['exact_ok']}\n" f"matched_pairs = {r['matched_pairs']}\n\n" f"{r['text']}\n")
+        parts.append(
+            f"=== MATCH {i} ===\n"
+            f"bend = {r['bend']} offset = {r['offset']} vertex = {r['vertex']}\n"
+            f"assoc_score = {r['assoc_score']:.4f} exact_ok = {r['exact_ok']}\n"
+            f"matched_pairs = {r['matched_pairs']}\n\n"
+            f"{r['text']}\n"
+        )
     rendered = '\n'.join(parts)
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jsonl', prefix='pi_search_', mode='w', encoding='utf-8')
     for r in top_results:
@@ -700,20 +806,13 @@ def load_model_ui(modelfile):
     log = [f'Loaded model from {os.path.basename(path)}.']
     if errors:
         log.extend([f'! {e}' for e in errors])
-    return '\n'.join(log), gr.update(value=config.get('pi_prec', DEFAULTS['PI_PREC'])), gr.update(value=config.get('pi_stream_len', DEFAULTS['PI_STREAM_LEN'])), gr.update(value=config.get('ngram_n', DEFAULTS['NGRAM_N'])), gr.update(value=config.get('lidstone_gamma', DEFAULTS['LIDSTONE_GAMMA']))
-
-
-def load_hf_model_on_demand(repo_id, token=None):
-    try:
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-        HF_CACHE['status'] = f'Loading {repo_id}…'
-        tok = AutoTokenizer.from_pretrained(repo_id, trust_remote_code=True, cache_dir=LOCAL_CACHE_DIR, token=token)
-        mdl = AutoModelForCausalLM.from_pretrained(repo_id, trust_remote_code=True, cache_dir=LOCAL_CACHE_DIR, token=token)
-        HF_CACHE.update(loaded=True, tokenizer=tok, model=mdl, status=f'Loaded {repo_id}')
-        return HF_CACHE['status']
-    except Exception as e:
-        HF_CACHE.update(loaded=False, tokenizer=None, model=None, status=f'Load failed: {e}')
-        return HF_CACHE['status']
+    return (
+        '\n'.join(log),
+        gr.update(value=config.get('pi_prec', DEFAULTS['PI_PREC'])),
+        gr.update(value=config.get('pi_stream_len', DEFAULTS['PI_STREAM_LEN'])),
+        gr.update(value=config.get('ngram_n', DEFAULTS['NGRAM_N'])),
+        gr.update(value=config.get('lidstone_gamma', DEFAULTS['LIDSTONE_GAMMA'])),
+    )
 
 
 def save_hf_model(repo_id, token=None):
@@ -721,13 +820,25 @@ def save_hf_model(repo_id, token=None):
         from huggingface_hub import HfApi, upload_file
         if CACHE.get('cpd') is None or CACHE.get('stream') is None or CACHE.get('vocab') is None:
             corpus, _ = resolve_corpus(None, None)
-            cpd, vocab, stream = get_or_build(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], [])
+            cpd, vocab, stream = get_or_build(
+                corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'],
+                DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], [],
+            )
         else:
             cpd, vocab, stream = CACHE['cpd'], CACHE['vocab'], CACHE['stream']
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
         tmp.close()
-        save_model_to_path(tmp.name, cpd, vocab, stream, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], EMBEDDED_CORPUS)
-        kwargs = dict(path_or_fileobj=tmp.name, path_in_repo='pi_model.pkl.gz', repo_id=repo_id, repo_type='model')
+        save_model_to_path(
+            tmp.name, cpd, vocab, stream,
+            DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'],
+            DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], EMBEDDED_CORPUS,
+        )
+        kwargs = dict(
+            path_or_fileobj=tmp.name,
+            path_in_repo='pi_model.pkl.gz',
+            repo_id=repo_id,
+            repo_type='model',
+        )
         if token and token.strip():
             kwargs['token'] = token.strip()
         upload_file(**kwargs)
@@ -739,7 +850,12 @@ def save_hf_model(repo_id, token=None):
 def load_hf_model_on_demand(repo_id, token=None):
     try:
         from huggingface_hub import hf_hub_download
-        kwargs = dict(repo_id=repo_id, filename='pi_model.pkl.gz', repo_type='model', cache_dir=LOCAL_CACHE_DIR)
+        kwargs = dict(
+            repo_id=repo_id,
+            filename='pi_model.pkl.gz',
+            repo_type='model',
+            cache_dir=LOCAL_CACHE_DIR,
+        )
         if token and token.strip():
             kwargs['token'] = token.strip()
         path = hf_hub_download(**kwargs)
@@ -749,38 +865,48 @@ def load_hf_model_on_demand(repo_id, token=None):
         CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
         UI_STATE['version'] += 1
         HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
-        if config:
-            return #f'Loaded full model from {repo_id} with config {config}. UI version={UI_STATE['version']}'
-        return #f'Loaded full model from {repo_id}. UI version={UI_STATE['version']}'
+        return f'Loaded full model from {repo_id}.'
     except Exception as e:
         return f'Load failed: {e}'
 
 
-def run_generate(file_obj, pasted_corpus, prompt, temperature, text_length):
+def run_generate(file_obj, pasted_corpus, prompt,
+                 pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+                 temperature, text_length, rep_penalty, insight_penalty):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'], DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], log)
-    pairs = extract_word_pairs(prompt or '')
-    log.append(f'Prompt pairs: {pairs[:6]}')
-    sampler = PiSampler(stream, DEFAULTS['DIGITS_PER_SAMPLE'], temperature, DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], DEFAULTS['REP_PENALTY'], DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'], DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'], DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'])
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
+    )
+    sampler = _make_sampler(
+        stream, temperature,
+        DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
+        DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'],
+        DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'],
+        DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'],
+        insight_penalty,
+    )
     sampler.seek(0)
-    text = generate_text(cpd, sampler, prompt or '', int(text_length), DEFAULTS['NGRAM_N'], vocab)
-    assoc_score, matched_pairs = collocation_association_score(text, prompt or '', min_freq=1, measure='pmi')
-    exact_ok, failed_pair = all_pairs_match(pairs, text, fuzzy_threshold=DEFAULTS['FUZZY_THRESHOLD']) if pairs else (True, None)
-    log.append(f'Diag dot-product context applied from {len(tokenise_alpha(prompt or ""))} prompt tokens.')
-    log.append(f'Assoc score: {assoc_score:.4f}')
-    if matched_pairs:
-        log.append(f'Matched pairs: {matched_pairs}')
-    if failed_pair:
-        log.append(f'First missing pair: {failed_pair}')
-    log.append(f'Generated {len(text.split())} tokens. exact_ok={exact_ok}')
-    return text, ''.join(log)
+    text = generate_text(
+        cpd, sampler, prompt or '', int(text_length),
+        int(ngram_n), vocab
+    )
+    oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
+    if oov:
+        log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
+    log.append(f'Generated {len(text.split())} tokens.')
+    return text, '\n'.join(log)
+
 
 def build_ui():
     with gr.Blocks(title='Full features app') as demo:
-        startup_status = gr.Markdown(f"### Loading model…\n\nCurrent status: `{HF_CACHE['status']}`")
+        gr.Markdown(f"### Loading model…\n\nCurrent status: `{HF_CACHE['status']}`")
         with gr.Tabs():
+
+            # ----------------------------------------------------------------
+            # Tab: Generate
+            # ----------------------------------------------------------------
             with gr.TabItem('Generate'):
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -795,11 +921,29 @@ def build_ui():
                         temperature = gr.Slider(0.1, 5.0, value=DEFAULTS['TEMPERATURE'], step=0.05, label='Temperature')
                         text_length = gr.Slider(1, 2000, value=DEFAULTS['GEN_WORDS'], step=1, label='Text length')
                         rep_penalty = gr.Slider(1.0, 2.0, value=DEFAULTS['REP_PENALTY'], step=0.01, label='Repetition penalty')
-                btn = gr.Button('Generate', variant='primary')
+                        insight_penalty_gen = gr.Slider(
+                            0.0, 5.0,
+                            value=DEFAULTS['INSIGHT_PENALTY'],
+                            step=0.05,
+                            label='Insight penalty — push away from conclusion-encoding labels',
+                        )
+                btn_gen = gr.Button('Generate', variant='primary')
                 outtext = gr.Textbox(label='Generated text', lines=18)
                 outlog = gr.Textbox(label='Log', lines=8)
                 outfile = gr.File(label='Download output')
-                btn.click(run_generate, inputs=[filein, pasted, promptin, temperature, text_length], outputs=[outtext, outlog])
+                btn_gen.click(
+                    run_generate,
+                    inputs=[
+                        filein, pasted, promptin,
+                        pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+                        temperature, text_length, rep_penalty, insight_penalty_gen,
+                    ],
+                    outputs=[outtext, outlog],
+                )
+
+            # ----------------------------------------------------------------
+            # Tab: Search
+            # ----------------------------------------------------------------
             with gr.TabItem('Search'):
                 gr.Markdown('Prompt-aligned search with collocations.')
                 search_prompt = gr.Textbox(label='Prompt', lines=3, value='alice rabbit hole')
@@ -808,11 +952,38 @@ def build_ui():
                 search_offset_step = gr.Slider(1, 1000, value=DEFAULTS['OFFSET_STEP'], step=1, label='Offset step')
                 search_fuzzy = gr.Slider(0.0, 1.0, value=DEFAULTS['FUZZY_THRESHOLD'], step=0.01, label='Fuzzy threshold')
                 search_max = gr.Slider(1, 25, value=DEFAULTS['MAX_SOLUTIONS'], step=1, label='Max solutions')
+                insight_penalty_search = gr.Slider(
+                    0.0, 5.0,
+                    value=DEFAULTS['INSIGHT_PENALTY'],
+                    step=0.05,
+                    label='Insight penalty — push away from conclusion-encoding labels',
+                )
                 search_btn = gr.Button('Run search', variant='primary')
                 search_out = gr.Textbox(label='Search result', lines=16)
                 search_log = gr.Textbox(label='Search log', lines=8)
                 search_file = gr.File(label='Search output')
-                search_btn.click(run_search, inputs=[filein, pasted, search_prompt, pi_prec, pi_stream_len, ngram_n, lidstone_gamma, text_length, temperature, rep_penalty, gr.Checkbox(value=DEFAULTS['SEASHELL_ENABLE'], visible=False), gr.Slider(visible=False, value=DEFAULTS['SEASHELL_STRENGTH']), gr.Slider(visible=False, value=DEFAULTS['SEASHELL_DECAY']), gr.Slider(visible=False, value=DEFAULTS['SEASHELL_PEAKS']), gr.Slider(visible=False, value=DEFAULTS['SEASHELL_WIDTH']), gr.Slider(visible=False, value=DEFAULTS['SEASHELL_FLOOR']), gr.Radio(choices=['A', 'B', 'C'], value=DEFAULTS['VERTEX'], visible=False), search_bend_max, search_bend_step, search_offset_step, search_fuzzy, search_max], outputs=[search_out, search_log, search_file])
+                search_btn.click(
+                    run_search,
+                    inputs=[
+                        filein, pasted, search_prompt,
+                        pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+                        text_length, temperature, rep_penalty,
+                        gr.Checkbox(value=DEFAULTS['SEASHELL_ENABLE'], visible=False),
+                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_STRENGTH']),
+                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_DECAY']),
+                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_PEAKS']),
+                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_WIDTH']),
+                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_FLOOR']),
+                        gr.Radio(choices=['A', 'B', 'C'], value=DEFAULTS['VERTEX'], visible=False),
+                        search_bend_max, search_bend_step, search_offset_step,
+                        search_fuzzy, search_max, insight_penalty_search,
+                    ],
+                    outputs=[search_out, search_log, search_file],
+                )
+
+            # ----------------------------------------------------------------
+            # Tab: Model I/O
+            # ----------------------------------------------------------------
             with gr.TabItem('Model I/O'):
                 gr.Markdown('Save/load compiled trigram model.')
                 save_btn = gr.Button('Save model', variant='primary')
@@ -820,8 +991,20 @@ def build_ui():
                 model_log = gr.Textbox(label='Model I/O log', lines=8)
                 load_file = gr.File(label='Load saved model .pkl.gz', file_types=['.gz', '.pkl'], type='filepath')
                 load_btn = gr.Button('Load model', variant='secondary')
-                save_btn.click(save_model_ui, inputs=[filein, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma], outputs=[save_file, model_log])
-                load_btn.click(load_model_ui, inputs=[load_file], outputs=[model_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma])
+                save_btn.click(
+                    save_model_ui,
+                    inputs=[filein, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
+                    outputs=[save_file, model_log],
+                )
+                load_btn.click(
+                    load_model_ui,
+                    inputs=[load_file],
+                    outputs=[model_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
+                )
+
+            # ----------------------------------------------------------------
+            # Tab: Thinking-lite
+            # ----------------------------------------------------------------
             with gr.TabItem('Thinking-lite'):
                 gr.Markdown('Use the buttons below to load or save.')
                 hfstatus = gr.Textbox(label='Status', value='Idle', lines=2, interactive=False)
@@ -835,10 +1018,13 @@ def build_ui():
                 hf_open_btn.click(lambda: 'Thinking-lite ready', inputs=None, outputs=[hfstatus])
                 hf_save_btn.click(save_hf_model, inputs=[hf_repo, hf_token], outputs=[hf_log])
                 hf_load_btn.click(load_hf_model_on_demand, inputs=[hf_repo, hf_token], outputs=[hf_log])
+
         gr.Markdown('Tip: model caches are reused until corpus or configuration changes.')
     return demo
 
 
 if __name__ == '__main__':
-    
-    build_ui().queue(max_size=8).launch(server_name=os.environ.get('GRADIO_SERVER_NAME', '127.0.0.1'), show_error=True)
+    build_ui().queue(max_size=8).launch(
+        server_name=os.environ.get('GRADIO_SERVER_NAME', '127.0.0.1'),
+        show_error=True,
+    )
