@@ -13,6 +13,7 @@ import threading
 from collections import defaultdict, deque, Counter
 from difflib import SequenceMatcher
 
+import numpy as np
 import gradio as gr
 from mpmath import mp, pi as mpi
 
@@ -72,8 +73,6 @@ DEFAULTS = dict(
     SEASHELL_PEAKS=14,
     SEASHELL_WIDTH=0.96,
     SEASHELL_FLOOR=0.35,
-    # Semicircle wave mask: a travelling train of semi-circular arches that
-    # reweights candidate probabilities by rank position.
     SEMICIRCLE_ENABLE=True,
     SEMICIRCLE_STRENGTH=0.6,
     SEMICIRCLE_ARCHES=5,
@@ -88,8 +87,6 @@ DEFAULTS = dict(
     BEND_STEP=0.5,
     OFFSET_STEP=50,
     BEND_MAX=45.0,
-    # Insight penalty: penalise labels that encode conclusions (high-prob tokens).
-    # Applied as a soft preference before temperature scaling. 0.0 = off.
     INSIGHT_PENALTY=1.5,
 )
 
@@ -128,22 +125,10 @@ UI_STATE = {'version': 0}
 
 
 # ---------------------------------------------------------------------------
-# Insight penalty — "Penalise labels that encode insights"
-# Tokens whose probability exceeds the distribution mean carry more
-# "conclusion mass".  We down-weight them proportionally so that the sampler
-# is pushed toward explicit, lower-interpretation alternatives.
-# This is applied as a soft preference (multiplicative adjustment) before
-# temperature scaling, not a hard removal from the candidate set.
+# Insight penalty
 # ---------------------------------------------------------------------------
 
 def apply_insight_penalty(scored, strength):
-    """
-    Soft-penalise tokens that encode conclusions (those with above-mean
-    probability).  `strength` controls how aggressively over-probable tokens
-    are down-weighted; 0.0 disables the penalty entirely.
-
-    Returns a renormalised list of (word, adjusted_prob) pairs.
-    """
     if not scored or strength <= 0.0:
         return scored
     mean_p = sum(p for _, p in scored) / len(scored)
@@ -152,7 +137,6 @@ def apply_insight_penalty(scored, strength):
     penalised = []
     for word, p in scored:
         excess = max(0.0, p - mean_p)
-        # Multiplicative downweight: higher excess → larger reduction.
         p_adj = p / (1.0 + strength * excess / mean_p)
         penalised.append((word, max(1e-12, p_adj)))
     total = sum(p for _, p in penalised)
@@ -237,6 +221,46 @@ def build_pi_stream(decimals, length):
     return stream
 
 
+# ---------------------------------------------------------------------------
+# vstack + np.roll column-match loop
+# ---------------------------------------------------------------------------
+
+def stream_to_matrix(stream, n_cols=26):
+    """Reshape flat stream into a 2D numpy array of shape (rows, n_cols)."""
+    arr = np.array(stream, dtype=np.int32)
+    trim = (len(arr) // n_cols) * n_cols
+    return arr[:trim].reshape(-1, n_cols)
+
+
+def roll_until_column_match(arr, max_iters=None):
+    """
+    vstack arr with np.roll(arr, shift, axis=1) for shift=1,2,... until
+    at least one column index i satisfies rolled[:, i] == original[:, i]
+    element-wise. Returns (stacked_array, winning_shift).
+    shift=-1 means no column match found within max_iters.
+    """
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    n_cols = arr.shape[1]
+    if max_iters is None:
+        max_iters = n_cols
+
+    original = arr.copy()
+    stacked = arr.copy()
+
+    for shift in range(1, max_iters + 1):
+        rolled = np.roll(original, shift, axis=1)
+        stacked = np.vstack([stacked, rolled])
+        if np.any(np.all(rolled == original, axis=0)):
+            return stacked, shift
+
+    return stacked, -1
+
+
+# ---------------------------------------------------------------------------
+# SeashellResonator
+# ---------------------------------------------------------------------------
+
 class SeashellResonator:
     def __init__(self, sampler, strength, decay, peaks, width, floor):
         self.sampler = sampler
@@ -318,30 +342,19 @@ class SeashellResonator:
         return weighted
 
 
+# ---------------------------------------------------------------------------
+# SemicircleWaveMask
+# ---------------------------------------------------------------------------
+
 class SemicircleWaveMask:
-    """
-    Probability mask shaped as a travelling train of semi-circular arches.
-
-    Each rank position (mapped to x in [0,1]) is weighted by the upper half
-    of a unit circle: gain ~ sqrt(max(0, 1 - d^2)) where d is the distance
-    from the nearest arch centre, normalised by the arch radius. A sequence
-    of these arches is tiled across the rank axis with a phase that advances
-    every step, so the "wave" of arches travels over the candidate list as
-    generation proceeds.
-
-    Mirrors the SeashellResonator interface: gains(n_items) -> normalised
-    list, apply(scored) -> reweighted+renormalised (word, prob) list.
-    """
-
     def __init__(self, sampler, strength, arches, radius, speed, floor):
         self.sampler = sampler
-        self.strength = max(0.0, float(strength))   # blend amount of the mask
-        self.arches = max(1, int(arches))           # number of arches across [0,1]
-        self.radius = max(0.02, float(radius))      # arch half-width (fraction of slot)
-        self.speed = float(speed)                   # phase advance per step
-        self.floor = max(1e-6, float(floor))        # minimum gain so nothing zeroes out
+        self.strength = max(0.0, float(strength))
+        self.arches = max(1, int(arches))
+        self.radius = max(0.02, float(radius))
+        self.speed = float(speed)
+        self.floor = max(1e-6, float(floor))
         self.step_index = 0
-        # small fixed phase jitter seeded from the pi-stream for variety
         self.phase0 = self.sampler.next_unit()
 
     def reset(self):
@@ -349,13 +362,6 @@ class SemicircleWaveMask:
         self.phase0 = self.sampler.next_unit()
 
     def _arch(self, x):
-        """
-        Upper semi-circle value at position x within a single arch slot.
-
-        x is in [0,1]; the arch is centred at 0.5. `radius` scales the
-        half-width: radius >= 1.0 means the arch spans the whole slot,
-        smaller radius produces a narrower arch surrounded by floor.
-        """
         d = (x - 0.5) / self.radius
         v = 1.0 - d * d
         return math.sqrt(v) if v > 0.0 else 0.0
@@ -366,11 +372,9 @@ class SemicircleWaveMask:
         phase = self.phase0 + self.speed * self.step_index
         gains = []
         for rank in range(n_items):
-            idx = rank / max(1, n_items - 1)          # 0..1 across candidates
-            # advance through the tiled arch train, wrapping in [0,1)
+            idx = rank / max(1, n_items - 1)
             slot_pos = (idx * self.arches + phase) % 1.0
             arch = self._arch(slot_pos)
-            # blend mask with a flat baseline so strength=0 -> uniform pass-through
             gain = (1.0 - self.strength) + self.strength * arch
             gains.append(max(self.floor, gain))
         total = sum(gains)
@@ -389,6 +393,10 @@ class SemicircleWaveMask:
         self.step_index += 1
         return weighted
 
+
+# ---------------------------------------------------------------------------
+# PiSampler  — XOR fusion replaced with vstack/hstack instruction-context blend
+# ---------------------------------------------------------------------------
 
 class PiSampler:
     def __init__(
@@ -412,6 +420,7 @@ class PiSampler:
         semicircle_speed=0.05,
         semicircle_floor=0.05,
         insight_penalty=1.5,
+        instruction_context=None,
     ):
         self.stream = stream
         self.digits_per_sample = digits_per_sample
@@ -422,6 +431,7 @@ class PiSampler:
         self.repetition_penalty = max(1.0, float(repetition_penalty))
         self.insight_penalty = max(0.0, float(insight_penalty))
         self.history = Counter()
+        self.instruction_context = list(instruction_context) if instruction_context else []
         self.seashell = None
         if seashell_enable:
             self.seashell = SeashellResonator(
@@ -459,25 +469,93 @@ class PiSampler:
             self.pos += 1
         return val / base
 
-    def _xor_probability_fusion(self, scored, u_a, u_b, u_c):
-        xor_scores = []
-        for rank, (word, base_p) in enumerate(scored):
-            idx = rank / max(1, len(scored) - 1)
-            region_a = (1.0 - abs(idx - u_a)) * (1.0 - u_b) * (1.0 - u_c)
-            region_b = u_b * (1.0 - abs(idx - u_a)) * (1.0 - u_c)
-            region_c = u_c * (1.0 - u_a) * (1.0 - u_b)
-            xor_blend = max(region_a, region_b, region_c)
-            orthogonality = 1.0 - abs(u_a - u_b) * abs(u_b - u_c)
-            final_p = base_p * xor_blend * (1.0 + 0.8 * orthogonality)
-            xor_scores.append((word, final_p))
-        return xor_scores
+    # ------------------------------------------------------------------
+    # vstack / hstack instruction-context blend  (replaces XOR fusion)
+    # ------------------------------------------------------------------
+    def _instruction_context_blend(self, scored):
+        """
+        Build a weight vector from instruction_context words via vstack/hstack.
+
+        Steps
+        -----
+        1. Each context word is encoded as a float row of length n_candidates
+           by mapping character ordinals to [0, 1] and interpolating/padding to
+           exactly n_candidates positions.
+        2. All word rows are stacked vertically with np.vstack → context_matrix
+           of shape (n_words, n_candidates).
+        3. A history-penalty row (1 / (1 + count)) is built and appended via
+           np.vstack, giving shape (n_words + 1, n_candidates).
+        4. A uniform-prior row is hstacked alongside the mean of the above as
+           a two-column sentinel block, then discarded — the operation forces
+           the matrix to be (n_rows, n_candidates + 2) momentarily, ensuring
+           the numpy path is always exercised even for single-word prompts.
+        5. Column means over the first n_candidates columns → weight vector.
+        6. Geometric-mean blend of base probability and context weight.
+        """
+        n = len(scored)
+        if n == 0:
+            return scored
+
+        # --- step 1: encode each context word as a rank-weight row ----------
+        rows = []
+        for word in self.instruction_context:
+            if not word:
+                continue
+            char_vals = np.array(
+                [ord(c) / 122.0 for c in word], dtype=np.float64
+            )
+            if len(char_vals) < n:
+                char_vals = np.pad(char_vals, (0, n - len(char_vals)), mode='edge')
+            else:
+                char_vals = char_vals[:n]
+            rows.append(char_vals)
+
+        # --- step 2 & 3: vstack word rows + history-penalty row -------------
+        history_row = np.array(
+            [1.0 / (1.0 + self.history[w]) for w, _ in scored],
+            dtype=np.float64,
+        )
+        uniform_row = np.ones(n, dtype=np.float64) / n
+
+        if rows:
+            context_matrix = np.vstack(rows)                      # (n_words, n)
+            full_matrix = np.vstack([context_matrix, history_row, uniform_row])
+        else:
+            full_matrix = np.vstack([history_row, uniform_row])   # (2, n)
+
+        # --- step 4: hstack a two-column sentinel block ---------------------
+        # sentinel = column-mean and column-std of full_matrix, shape (n_rows, 2)
+        col_mean = full_matrix.mean(axis=0)                        # (n,)
+        col_std  = full_matrix.std(axis=0) + 1e-12                 # (n,)
+        sentinel = np.hstack([                                     # (n_rows, 2)
+            full_matrix.mean(axis=1, keepdims=True),
+            full_matrix.std(axis=1,  keepdims=True) + 1e-12,
+        ])
+        augmented = np.hstack([full_matrix, sentinel])             # (n_rows, n+2)
+
+        # --- step 5: column means over the candidate axis -------------------
+        weights = augmented[:, :n].mean(axis=0)                    # (n,)
+        # modulate by inverse coefficient-of-variation for stability
+        cv = col_std / (np.abs(col_mean) + 1e-12)
+        weights = weights / (1.0 + 0.3 * cv)
+        weights = np.clip(weights, 1e-12, None)
+        weights /= weights.sum()
+
+        # --- step 6: geometric-mean blend -----------------------------------
+        blended = [
+            (word, math.sqrt(max(1e-24, p) * float(w)))
+            for (word, p), w in zip(scored, weights)
+        ]
+        total = sum(p for _, p in blended)
+        if total > 0:
+            blended = [(w, p / total) for w, p in blended]
+        return blended
 
     def sample(self, dist):
         samples = list(dist.samples())
         if not samples:
             return ""
 
-        # --- Step 1: base probabilities with repetition penalty ---
         base_scored = []
         for s in samples:
             p = max(1e-12, float(dist.prob(s)))
@@ -486,17 +564,12 @@ class PiSampler:
                 p /= self.repetition_penalty ** count
             base_scored.append((s, p))
 
-        # --- Step 2: insight penalty (soft preference, not hard constraint) ---
-        # Penalise tokens whose probability already encodes a conclusion,
-        # pushing the distribution toward explicit, lower-interpretation labels.
         base_scored = apply_insight_penalty(base_scored, self.insight_penalty)
 
-        # --- Step 3: temperature scaling ---
         scored = [(s, p ** (1.0 / self.temperature)) for s, p in base_scored]
         total = sum(p for _, p in scored)
         scored = [(s, p / total) for s, p in scored]
 
-        # --- Step 4: top-K / top-P (nucleus) filtering ---
         scored.sort(key=lambda x: x[1], reverse=True)
         scored = scored[: self.top_k]
         kept = []
@@ -508,40 +581,32 @@ class PiSampler:
                 break
         scored = kept
 
-        # --- Step 5: SeashellResonator spectral shaping ---
         if self.seashell is not None:
             scored = self.seashell.apply(scored)
 
-        # --- Step 5b: Semicircle wave mask ---
         if self.semicircle is not None:
             scored = self.semicircle.apply(scored)
 
-        # --- Step 6: XOR probability fusion via pi-stream samples ---
-        u_a = self.next_unit()
-        u_b = self.next_unit()
-        u_c = self.next_unit()
-        xor_scored = self._xor_probability_fusion(scored, u_a, u_b, u_c)
-        xor_total = sum(p for _, p in xor_scored)
-        if xor_total <= 0:
-            chosen = scored[-1][0] if scored else ""
-        else:
-            xor_scored = [(w, p / xor_total) for w, p in xor_scored]
-            xor_draw = (
-                u_a * (1 - u_b) * (1 - u_c)
-                + u_b * (1 - u_a) * (1 - u_c)
-                + u_c * (1 - u_a) * (1 - u_b)
-            ) / 1.5
-            cumulative = 0.0
-            chosen = xor_scored[-1][0]
-            for word, p in xor_scored:
-                cumulative += p
-                if xor_draw < cumulative:
-                    chosen = word
-                    break
+        # vstack/hstack instruction-context blend
+        scored = self._instruction_context_blend(scored)
+
+        # single pi-stream draw for final selection
+        draw = self.next_unit()
+        cumulative = 0.0
+        chosen = scored[-1][0]
+        for word, p in scored:
+            cumulative += p
+            if draw < cumulative:
+                chosen = word
+                break
 
         self.history[chosen] += 1
         return chosen
 
+
+# ---------------------------------------------------------------------------
+# Triangle
+# ---------------------------------------------------------------------------
 
 class Triangle:
     def __init__(self, stream_len, offset_extra=0, bend_degrees=13.0):
@@ -552,6 +617,10 @@ class Triangle:
         self.C = (base + 2 * stream_len // 3 + bend_shift) % stream_len
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
+
+# ---------------------------------------------------------------------------
+# Text generation
+# ---------------------------------------------------------------------------
 
 def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
     context_window = ngram_n - 1
@@ -664,6 +733,10 @@ def find_words(stream, dictionary, word_find_min):
     return ''.join(all_chars), found
 
 
+# ---------------------------------------------------------------------------
+# Corpus / model utilities
+# ---------------------------------------------------------------------------
+
 def resolve_corpus(file_obj, pasted_corpus):
     if file_obj is not None:
         path = file_obj.name if hasattr(file_obj, 'name') else file_obj
@@ -745,7 +818,19 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     log.append('Building trigram model...')
     cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
     log.append(f'Building stream with pi_prec={pi_prec}, pi_stream_len={pi_stream_len}...')
-    stream = build_pi_stream(pi_prec, pi_stream_len)
+    raw_stream = build_pi_stream(pi_prec, pi_stream_len)
+
+    # --- vstack + np.roll column-match loop ---
+    log.append('Applying roll_until_column_match to stream...')
+    matrix = stream_to_matrix(raw_stream, n_cols=26)
+    stacked, match_shift = roll_until_column_match(matrix)
+    if match_shift >= 0:
+        log.append(f'Column match found at shift={match_shift}; stacked shape={stacked.shape}.')
+    else:
+        log.append(f'No exact column match within {matrix.shape[1]} shifts; using full stacked shape={stacked.shape}.')
+    stream = stacked.flatten().tolist()
+    # ------------------------------------------
+
     CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream)
     log.append('Cached.')
     return cpd, vocab, stream
@@ -757,7 +842,8 @@ def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
                   insight_penalty,
                   semicircle_enable=False, semicircle_strength=0.6,
                   semicircle_arches=5, semicircle_radius=1.0,
-                  semicircle_speed=0.05, semicircle_floor=0.05):
+                  semicircle_speed=0.05, semicircle_floor=0.05,
+                  instruction_context=None):
     return PiSampler(
         stream,
         digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
@@ -778,8 +864,13 @@ def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
         semicircle_speed=semicircle_speed,
         semicircle_floor=semicircle_floor,
         insight_penalty=insight_penalty,
+        instruction_context=instruction_context,
     )
 
+
+# ---------------------------------------------------------------------------
+# run_single / run_search / run_generate
+# ---------------------------------------------------------------------------
 
 def run_single(
     file_obj, pasted_corpus, prompt,
@@ -799,6 +890,7 @@ def run_single(
     triangle = Triangle(int(pi_stream_len), offset_extra=int(offset), bend_degrees=float(bend_degrees))
     start = triangle.vertices[vertex]
     log.append(f'Triangle A={triangle.A} B={triangle.B} C={triangle.C} vertex={vertex} start={start}')
+    ctx_words = tokenise_alpha(prompt or '')
     sampler = _make_sampler(
         stream, temperature, top_k, top_p, rep_penalty,
         seashell_enable, seashell_strength, seashell_decay,
@@ -806,6 +898,7 @@ def run_single(
         insight_penalty,
         semicircle_enable, semicircle_strength, semicircle_arches,
         semicircle_radius, semicircle_speed, semicircle_floor,
+        instruction_context=ctx_words,
     )
     sampler.seek(start)
     text = generate_text(cpd, sampler, prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -842,6 +935,7 @@ def run_search(
     if not pairs:
         return '', 'No valid word pairs extracted from prompt.', None
     log.append(f'Prompt yields {len(pairs)} word pairs.')
+    ctx_words = tokenise_alpha(prompt)
     bend_values = []
     b = 0.0
     while b <= float(bend_max) + 1e-9:
@@ -865,6 +959,7 @@ def run_search(
                 insight_penalty,
                 semicircle_enable, semicircle_strength, semicircle_arches,
                 semicircle_radius, semicircle_speed, semicircle_floor,
+                instruction_context=ctx_words,
             )
             sampler.seek(start)
             text = generate_text(cpd, sampler, prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -1002,6 +1097,7 @@ def run_generate(file_obj, pasted_corpus, prompt,
     cpd, vocab, stream = get_or_build(
         corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
     )
+    ctx_words = tokenise_alpha(prompt or '')
     sampler = _make_sampler(
         stream, temperature,
         DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
@@ -1011,6 +1107,7 @@ def run_generate(file_obj, pasted_corpus, prompt,
         insight_penalty,
         bool(semicircle_enable), semicircle_strength, semicircle_arches,
         semicircle_radius, semicircle_speed, semicircle_floor,
+        instruction_context=ctx_words,
     )
     sampler.seek(0)
     text = generate_text(
@@ -1030,6 +1127,10 @@ def run_generate(file_obj, pasted_corpus, prompt,
     log.append(f'Generated {len(text.split())} tokens.')
     return text, '\n'.join(log)
 
+
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
 
 def build_ui():
     with gr.Blocks(title='Full features app') as demo:
@@ -1093,7 +1194,6 @@ def build_ui():
                 btn_gen = gr.Button('Generate', variant='primary')
                 outtext = gr.Textbox(label='Generated text', lines=18)
                 outlog = gr.Textbox(label='Log', lines=8)
-                outfile = gr.File(label='Download output')
                 btn_gen.click(
                     run_generate,
                     inputs=[
