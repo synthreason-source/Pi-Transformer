@@ -72,6 +72,14 @@ DEFAULTS = dict(
     SEASHELL_PEAKS=14,
     SEASHELL_WIDTH=0.96,
     SEASHELL_FLOOR=0.35,
+    # Semicircle wave mask: a travelling train of semi-circular arches that
+    # reweights candidate probabilities by rank position.
+    SEMICIRCLE_ENABLE=True,
+    SEMICIRCLE_STRENGTH=0.6,
+    SEMICIRCLE_ARCHES=5,
+    SEMICIRCLE_RADIUS=1.0,
+    SEMICIRCLE_SPEED=0.05,
+    SEMICIRCLE_FLOOR=0.05,
     BEND_DEGREES=13.0,
     OFFSET=0,
     VERTEX="A",
@@ -310,6 +318,78 @@ class SeashellResonator:
         return weighted
 
 
+class SemicircleWaveMask:
+    """
+    Probability mask shaped as a travelling train of semi-circular arches.
+
+    Each rank position (mapped to x in [0,1]) is weighted by the upper half
+    of a unit circle: gain ~ sqrt(max(0, 1 - d^2)) where d is the distance
+    from the nearest arch centre, normalised by the arch radius. A sequence
+    of these arches is tiled across the rank axis with a phase that advances
+    every step, so the "wave" of arches travels over the candidate list as
+    generation proceeds.
+
+    Mirrors the SeashellResonator interface: gains(n_items) -> normalised
+    list, apply(scored) -> reweighted+renormalised (word, prob) list.
+    """
+
+    def __init__(self, sampler, strength, arches, radius, speed, floor):
+        self.sampler = sampler
+        self.strength = max(0.0, float(strength))   # blend amount of the mask
+        self.arches = max(1, int(arches))           # number of arches across [0,1]
+        self.radius = max(0.02, float(radius))      # arch half-width (fraction of slot)
+        self.speed = float(speed)                   # phase advance per step
+        self.floor = max(1e-6, float(floor))        # minimum gain so nothing zeroes out
+        self.step_index = 0
+        # small fixed phase jitter seeded from the pi-stream for variety
+        self.phase0 = self.sampler.next_unit()
+
+    def reset(self):
+        self.step_index = 0
+        self.phase0 = self.sampler.next_unit()
+
+    def _arch(self, x):
+        """
+        Upper semi-circle value at position x within a single arch slot.
+
+        x is in [0,1]; the arch is centred at 0.5. `radius` scales the
+        half-width: radius >= 1.0 means the arch spans the whole slot,
+        smaller radius produces a narrower arch surrounded by floor.
+        """
+        d = (x - 0.5) / self.radius
+        v = 1.0 - d * d
+        return math.sqrt(v) if v > 0.0 else 0.0
+
+    def gains(self, n_items):
+        if n_items <= 0:
+            return []
+        phase = self.phase0 + self.speed * self.step_index
+        gains = []
+        for rank in range(n_items):
+            idx = rank / max(1, n_items - 1)          # 0..1 across candidates
+            # advance through the tiled arch train, wrapping in [0,1)
+            slot_pos = (idx * self.arches + phase) % 1.0
+            arch = self._arch(slot_pos)
+            # blend mask with a flat baseline so strength=0 -> uniform pass-through
+            gain = (1.0 - self.strength) + self.strength * arch
+            gains.append(max(self.floor, gain))
+        total = sum(gains)
+        if total > 0:
+            gains = [g / total for g in gains]
+        return gains
+
+    def apply(self, scored):
+        if not scored:
+            return scored
+        g = self.gains(len(scored))
+        weighted = [(w, p * gain) for (w, p), gain in zip(scored, g)]
+        total = sum(p for _, p in weighted)
+        if total > 0:
+            weighted = [(w, p / total) for w, p in weighted]
+        self.step_index += 1
+        return weighted
+
+
 class PiSampler:
     def __init__(
         self,
@@ -325,6 +405,12 @@ class PiSampler:
         seashell_peaks,
         seashell_width,
         seashell_floor,
+        semicircle_enable=False,
+        semicircle_strength=0.6,
+        semicircle_arches=5,
+        semicircle_radius=1.0,
+        semicircle_speed=0.05,
+        semicircle_floor=0.05,
         insight_penalty=1.5,
     ):
         self.stream = stream
@@ -346,12 +432,24 @@ class PiSampler:
                 seashell_width,
                 seashell_floor,
             )
+        self.semicircle = None
+        if semicircle_enable:
+            self.semicircle = SemicircleWaveMask(
+                self,
+                semicircle_strength,
+                semicircle_arches,
+                semicircle_radius,
+                semicircle_speed,
+                semicircle_floor,
+            )
 
     def seek(self, pos):
         self.pos = pos % len(self.stream)
         self.history.clear()
         if self.seashell is not None:
             self.seashell.reset()
+        if self.semicircle is not None:
+            self.semicircle.reset()
 
     def next_unit(self):
         val = 0
@@ -413,6 +511,10 @@ class PiSampler:
         # --- Step 5: SeashellResonator spectral shaping ---
         if self.seashell is not None:
             scored = self.seashell.apply(scored)
+
+        # --- Step 5b: Semicircle wave mask ---
+        if self.semicircle is not None:
+            scored = self.semicircle.apply(scored)
 
         # --- Step 6: XOR probability fusion via pi-stream samples ---
         u_a = self.next_unit()
@@ -652,7 +754,10 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
 def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
                   seashell_enable, seashell_strength, seashell_decay,
                   seashell_peaks, seashell_width, seashell_floor,
-                  insight_penalty):
+                  insight_penalty,
+                  semicircle_enable=False, semicircle_strength=0.6,
+                  semicircle_arches=5, semicircle_radius=1.0,
+                  semicircle_speed=0.05, semicircle_floor=0.05):
     return PiSampler(
         stream,
         digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
@@ -666,6 +771,12 @@ def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
         seashell_peaks=seashell_peaks,
         seashell_width=seashell_width,
         seashell_floor=seashell_floor,
+        semicircle_enable=semicircle_enable,
+        semicircle_strength=semicircle_strength,
+        semicircle_arches=semicircle_arches,
+        semicircle_radius=semicircle_radius,
+        semicircle_speed=semicircle_speed,
+        semicircle_floor=semicircle_floor,
         insight_penalty=insight_penalty,
     )
 
@@ -677,6 +788,9 @@ def run_single(
     seashell_enable, seashell_strength, seashell_decay,
     seashell_peaks, seashell_width, seashell_floor,
     bend_degrees, offset, vertex, insight_penalty,
+    semicircle_enable=False, semicircle_strength=0.6,
+    semicircle_arches=5, semicircle_radius=1.0,
+    semicircle_speed=0.05, semicircle_floor=0.05,
 ):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
@@ -690,6 +804,8 @@ def run_single(
         seashell_enable, seashell_strength, seashell_decay,
         seashell_peaks, seashell_width, seashell_floor,
         insight_penalty,
+        semicircle_enable, semicircle_strength, semicircle_arches,
+        semicircle_radius, semicircle_speed, semicircle_floor,
     )
     sampler.seek(start)
     text = generate_text(cpd, sampler, prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -711,6 +827,9 @@ def run_search(
     seashell_peaks, seashell_width, seashell_floor,
     vertex, bend_max, bend_step, offset_step,
     fuzzy_threshold, max_solutions, insight_penalty,
+    semicircle_enable=False, semicircle_strength=0.6,
+    semicircle_arches=5, semicircle_radius=1.0,
+    semicircle_speed=0.05, semicircle_floor=0.05,
     progress=gr.Progress(track_tqdm=False),
 ):
     log = []
@@ -744,6 +863,8 @@ def run_search(
                 seashell_enable, seashell_strength, seashell_decay,
                 seashell_peaks, seashell_width, seashell_floor,
                 insight_penalty,
+                semicircle_enable, semicircle_strength, semicircle_arches,
+                semicircle_radius, semicircle_speed, semicircle_floor,
             )
             sampler.seek(start)
             text = generate_text(cpd, sampler, prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -872,7 +993,9 @@ def load_hf_model_on_demand(repo_id, token=None):
 
 def run_generate(file_obj, pasted_corpus, prompt,
                  pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-                 temperature, text_length, rep_penalty, insight_penalty):
+                 temperature, text_length, rep_penalty, insight_penalty,
+                 semicircle_enable, semicircle_strength, semicircle_arches,
+                 semicircle_radius, semicircle_speed, semicircle_floor):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
@@ -886,6 +1009,8 @@ def run_generate(file_obj, pasted_corpus, prompt,
         DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'],
         DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'],
         insight_penalty,
+        bool(semicircle_enable), semicircle_strength, semicircle_arches,
+        semicircle_radius, semicircle_speed, semicircle_floor,
     )
     sampler.seek(0)
     text = generate_text(
@@ -895,6 +1020,13 @@ def run_generate(file_obj, pasted_corpus, prompt,
     oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
     if oov:
         log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
+    if semicircle_enable:
+        log.append(
+            f'Semicircle wave mask ON '
+            f'(strength={semicircle_strength}, arches={int(semicircle_arches)}, '
+            f'radius={semicircle_radius}, speed={semicircle_speed}, '
+            f'floor={semicircle_floor}).'
+        )
     log.append(f'Generated {len(text.split())} tokens.')
     return text, '\n'.join(log)
 
@@ -927,6 +1059,37 @@ def build_ui():
                             step=0.05,
                             label='Insight penalty — push away from conclusion-encoding labels',
                         )
+
+                with gr.Accordion('Semicircle wave mask', open=False):
+                    gr.Markdown(
+                        'Reweights candidate probabilities with a travelling '
+                        'train of semi-circular arches across the rank axis.'
+                    )
+                    semicircle_enable = gr.Checkbox(
+                        value=DEFAULTS['SEMICIRCLE_ENABLE'],
+                        label='Enable semicircle wave mask',
+                    )
+                    semicircle_strength = gr.Slider(
+                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_STRENGTH'], step=0.01,
+                        label='Strength — blend amount of the mask (0 = pass-through)',
+                    )
+                    semicircle_arches = gr.Slider(
+                        1, 30, value=DEFAULTS['SEMICIRCLE_ARCHES'], step=1,
+                        label='Arches — number of semi-circles tiled across candidates',
+                    )
+                    semicircle_radius = gr.Slider(
+                        0.05, 2.0, value=DEFAULTS['SEMICIRCLE_RADIUS'], step=0.05,
+                        label='Radius — arch width (>=1 fills the slot, smaller = narrower)',
+                    )
+                    semicircle_speed = gr.Slider(
+                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_SPEED'], step=0.005,
+                        label='Speed — phase advance per generation step (wave travel)',
+                    )
+                    semicircle_floor = gr.Slider(
+                        1e-3, 1.0, value=DEFAULTS['SEMICIRCLE_FLOOR'], step=0.005,
+                        label='Floor — minimum gain so no candidate is fully zeroed',
+                    )
+
                 btn_gen = gr.Button('Generate', variant='primary')
                 outtext = gr.Textbox(label='Generated text', lines=18)
                 outlog = gr.Textbox(label='Log', lines=8)
@@ -937,6 +1100,8 @@ def build_ui():
                         filein, pasted, promptin,
                         pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
                         temperature, text_length, rep_penalty, insight_penalty_gen,
+                        semicircle_enable, semicircle_strength, semicircle_arches,
+                        semicircle_radius, semicircle_speed, semicircle_floor,
                     ],
                     outputs=[outtext, outlog],
                 )
@@ -958,6 +1123,33 @@ def build_ui():
                     step=0.05,
                     label='Insight penalty — push away from conclusion-encoding labels',
                 )
+
+                with gr.Accordion('Semicircle wave mask', open=False):
+                    search_semicircle_enable = gr.Checkbox(
+                        value=DEFAULTS['SEMICIRCLE_ENABLE'],
+                        label='Enable semicircle wave mask',
+                    )
+                    search_semicircle_strength = gr.Slider(
+                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_STRENGTH'], step=0.01,
+                        label='Strength',
+                    )
+                    search_semicircle_arches = gr.Slider(
+                        1, 30, value=DEFAULTS['SEMICIRCLE_ARCHES'], step=1,
+                        label='Arches',
+                    )
+                    search_semicircle_radius = gr.Slider(
+                        0.05, 2.0, value=DEFAULTS['SEMICIRCLE_RADIUS'], step=0.05,
+                        label='Radius',
+                    )
+                    search_semicircle_speed = gr.Slider(
+                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_SPEED'], step=0.005,
+                        label='Speed',
+                    )
+                    search_semicircle_floor = gr.Slider(
+                        1e-3, 1.0, value=DEFAULTS['SEMICIRCLE_FLOOR'], step=0.005,
+                        label='Floor',
+                    )
+
                 search_btn = gr.Button('Run search', variant='primary')
                 search_out = gr.Textbox(label='Search result', lines=16)
                 search_log = gr.Textbox(label='Search log', lines=8)
@@ -977,6 +1169,9 @@ def build_ui():
                         gr.Radio(choices=['A', 'B', 'C'], value=DEFAULTS['VERTEX'], visible=False),
                         search_bend_max, search_bend_step, search_offset_step,
                         search_fuzzy, search_max, insight_penalty_search,
+                        search_semicircle_enable, search_semicircle_strength,
+                        search_semicircle_arches, search_semicircle_radius,
+                        search_semicircle_speed, search_semicircle_floor,
                     ],
                     outputs=[search_out, search_log, search_file],
                 )
