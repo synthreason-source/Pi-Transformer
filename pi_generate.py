@@ -120,7 +120,7 @@ HF_REPO_ID = "trainman999/Thinking-lite"
 LOCAL_CACHE_DIR = os.path.join(NLTK_DATA_DIR, "hf_model_cache")
 os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 HF_CACHE = {"loaded": False, "tokenizer": None, "model": None, "status": "Idle"}
-CACHE = dict(key=None, cpd=None, vocab=None, stream=None)
+CACHE = dict(key=None, cpd=None, vocab=None, stream=None, context_index=None)
 UI_STATE = {'version': 0}
 
 
@@ -219,6 +219,271 @@ def build_pi_stream(decimals, length):
         stream.append(frac // D)
         frac %= D
     return stream
+
+
+# ---------------------------------------------------------------------------
+# ContextZoneIndex — sorted/categorised data structures for attention
+# ---------------------------------------------------------------------------
+
+class ContextZoneIndex:
+    """
+    Pre-built, sorted data structures that the prompt can attend to.
+
+    Zones
+    -----
+    freq_zones   : dict[str, list[str]]
+        Words bucketed by corpus frequency tier:
+        "high"   >= FREQ_HIGH_THRESH  occurrences
+        "mid"    >= FREQ_MID_THRESH   occurrences
+        "low"    < FREQ_MID_THRESH    occurrences
+        Each list is sorted descending by frequency.
+
+    alpha_zones  : dict[str, list[str]]
+        Words bucketed by first letter (a–z), sorted alphabetically within
+        each bucket.
+
+    ngram_zones  : dict[tuple, list[str]]
+        For every bigram context tuple in the CPD, the sorted list of
+        successor words ordered by descending conditional probability.
+
+    prompt_zone  : dict[str, list[str]]
+        Dynamically populated per generation call: for each prompt word,
+        stores the words in the corpus vocab that share at least one
+        alphabetic trigram with it (loose semantic neighbourhood).
+
+    Attention gradient
+    ------------------
+    `zone_gradient(zone_words, candidates, sigma)` returns a weight vector
+    over `candidates` shaped as a Gaussian curve centred on the rank of the
+    highest-scored zone word inside `candidates`.  Words outside the attended
+    zone are masked toward a floor value, not zeroed — this is a soft mask.
+    """
+
+    FREQ_HIGH_THRESH = 10
+    FREQ_MID_THRESH  = 3
+
+    def __init__(self, vocab, cpd, token_freq):
+        self.vocab      = set(vocab)
+        self.token_freq = dict(token_freq)   # word → int count
+        self._build_freq_zones()
+        self._build_alpha_zones()
+        self._build_ngram_zones(cpd)
+        self._make_zone_specs()
+        self.prompt_zone = {}
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ZoneRetriever protocol — isomorphic retrieval syntax across all zones
+    #
+    # Every zone type is structurally identical:
+    #
+    #   key_fn(prompt_words)  →  [key₁, key₂, …]   (prompt → lookup keys)
+    #   data[key]             →  [word₁, word₂, …]  (sorted candidate list)
+    #   gradient params       →  (sigma, floor)      (attention curve shape)
+    #
+    # _ZONE_SPECS encodes this triple for each zone so that zone builders,
+    # zone selection, and gradient computation all go through one code path.
+    # ──────────────────────────────────────────────────────────────────────
+
+    # Each spec: (name, sigma, floor)
+    # key_fn and data are added dynamically in __init__ after the structures
+    # are built.  See _make_zone_specs().
+    _ZONE_SPEC_TEMPLATES = [
+        ("ngram_bigram",  0.25, 0.04),
+        ("ngram_unigram", 0.30, 0.04),
+        ("alpha",         0.40, 0.05),
+        ("freq",          0.50, 0.05),
+        ("trigram_char",  0.35, 0.04),
+    ]
+
+    # ── zone builders ─────────────────────────────────────────────────────
+
+    def _build_freq_zones(self):
+        pairs = sorted(
+            [(w, self.token_freq.get(w, 0)) for w in self.vocab if w],
+            key=lambda x: x[1], reverse=True,
+        )
+        high, mid, low = [], [], []
+        for w, c in pairs:
+            if c >= self.FREQ_HIGH_THRESH:
+                high.append(w)
+            elif c >= self.FREQ_MID_THRESH:
+                mid.append(w)
+            else:
+                low.append(w)
+        self.freq_zones = {"high": high, "mid": mid, "low": low}
+
+    def _build_alpha_zones(self):
+        zones = defaultdict(list)
+        for w in sorted(self.vocab):
+            if w and w[0].isalpha():
+                zones[w[0]].append(w)
+        self.alpha_zones = dict(zones)
+
+    def _build_ngram_zones(self, cpd):
+        zones = {}
+        try:
+            for ctx in cpd.conditions():
+                d = cpd[ctx]
+                ranked = sorted(
+                    [s for s in d.samples() if s],
+                    key=lambda s: d.prob(s), reverse=True,
+                )
+                if ranked:
+                    zones[ctx] = ranked
+        except Exception:
+            pass
+        self.ngram_zones = zones
+
+    # ── ZoneRetriever specs ───────────────────────────────────────────────
+
+    def _make_zone_specs(self):
+        """
+        Build self.zone_specs: a list of dicts, one per zone type.
+        Every spec has the same interface:
+            spec['name']    : str
+            spec['key_fn']  : prompt_words -> list of lookup keys
+            spec['data']    : dict mapping key -> sorted word list
+            spec['sigma']   : float  (Gaussian attention width)
+            spec['floor']   : float  (minimum attention weight)
+
+        This is the isomorphism: every zone is retrieved via the identical
+        pattern  data.get(key_fn(prompt)[i], [])  regardless of zone type.
+        The only things that differ are key_fn and data — not the retrieval
+        syntax.
+        """
+
+        def _char_trigrams(word):
+            return {word[i:i+3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
+
+        # --- ngram_bigram: key = (w_i, w_{i+1}) ---
+        def key_fn_bigram(prompt_words):
+            return [
+                (prompt_words[i], prompt_words[i + 1])
+                for i in range(len(prompt_words) - 1)
+            ]
+
+        # --- ngram_unigram: key = (w_i,) ---
+        def key_fn_unigram(prompt_words):
+            return [(w,) for w in prompt_words if w]
+
+        # --- alpha: key = first letter of each prompt word ---
+        def key_fn_alpha(prompt_words):
+            return [w[0] for w in prompt_words if w and w[0].isalpha()]
+
+        # --- freq: key = "high" | "mid" | "low" selected by prompt ---
+        high_set = set(self.freq_zones["high"])
+
+        def key_fn_freq(prompt_words):
+            if any(w in high_set for w in prompt_words):
+                return ["high"]
+            if all(self.token_freq.get(w, 0) < self.FREQ_MID_THRESH
+                   for w in prompt_words):
+                return ["low"]
+            return ["mid"]
+
+        # --- trigram_char: key = frozenset of char-trigrams of prompt ---
+        # Data is built on-the-fly as a single-key dict keyed by sentinel.
+        trig_index = defaultdict(set)
+        for v in self.vocab:
+            if v:
+                for tg in _char_trigrams(v):
+                    trig_index[tg].add(v)
+        self._trig_index = trig_index
+
+        def key_fn_trigram(prompt_words):
+            prompt_tgs = set()
+            for w in prompt_words:
+                prompt_tgs |= _char_trigrams(w)
+            # Use a single sentinel key "__trig__" that maps to neighbours
+            neighbours = set()
+            for tg in prompt_tgs:
+                neighbours |= trig_index.get(tg, set())
+            self._trig_data["__trig__"] = sorted(neighbours)
+            return ["__trig__"]
+
+        self._trig_data = {}
+
+        # Assemble specs — all five use the same retrieval interface
+        templates = {t[0]: (t[1], t[2]) for t in self._ZONE_SPEC_TEMPLATES}
+        self.zone_specs = [
+            dict(name="ngram_bigram",  key_fn=key_fn_bigram,   data=self.ngram_zones,  sigma=templates["ngram_bigram"][0],  floor=templates["ngram_bigram"][1]),
+            dict(name="ngram_unigram", key_fn=key_fn_unigram,  data=self.ngram_zones,  sigma=templates["ngram_unigram"][0], floor=templates["ngram_unigram"][1]),
+            dict(name="alpha",         key_fn=key_fn_alpha,    data=self.alpha_zones,  sigma=templates["alpha"][0],         floor=templates["alpha"][1]),
+            dict(name="freq",          key_fn=key_fn_freq,     data=self.freq_zones,   sigma=templates["freq"][0],          floor=templates["freq"][1]),
+            dict(name="trigram_char",  key_fn=key_fn_trigram,  data=self._trig_data,   sigma=templates["trigram_char"][0],  floor=templates["trigram_char"][1]),
+        ]
+
+    # ── prompt-driven zone selection (isomorphic across all zone types) ───
+
+    def select_zones_for_prompt(self, prompt_words):
+        """
+        Unified retrieval: for every zone spec, call key_fn(prompt_words)
+        to get the lookup keys, then retrieve data[key] for each key.
+        All five zone types use the identical retrieval syntax.
+
+        Returns a priority-ordered, deduped list of candidate words.
+        """
+        selected = []
+        seen = set()
+
+        def _add(words):
+            for w in words:
+                if w and w not in seen:
+                    seen.add(w)
+                    selected.append(w)
+
+        # Isomorphic retrieval loop — same syntax for every zone type
+        for spec in self.zone_specs:
+            keys = spec["key_fn"](prompt_words)   # prompt → lookup keys
+            for key in keys:
+                _add(spec["data"].get(key, []))    # data[key] → word list
+
+        return selected
+
+    # ── attention gradient ────────────────────────────────────────────────
+
+    @staticmethod
+    def zone_gradient(zone_set, candidates, sigma=0.35, floor=0.05):
+        """
+        Soft Gaussian attention mask over `candidates`.
+
+        Parameters
+        ----------
+        zone_set   : set of words that belong to the attended zone
+        candidates : list of (word, prob) in rank order (index 0 = highest prob)
+        sigma      : std-dev of the Gaussian window in normalised rank units
+        floor      : minimum weight so no candidate is fully zeroed
+
+        Returns a numpy weight vector of shape (len(candidates),) summing to 1.
+        """
+        n = len(candidates)
+        if n == 0:
+            return np.array([], dtype=np.float64)
+
+        indices = np.arange(n, dtype=np.float64)
+        norm_idx = indices / max(1, n - 1)   # [0, 1]
+
+        # Find the normalised rank centroid of zone members within candidates
+        zone_ranks = [
+            i / max(1, n - 1)
+            for i, (w, _) in enumerate(candidates)
+            if w in zone_set
+        ]
+        if zone_ranks:
+            centre = float(np.mean(zone_ranks))
+        else:
+            centre = 0.0   # default: attend toward high-probability end
+
+        gauss = np.exp(-0.5 * ((norm_idx - centre) / max(1e-6, sigma)) ** 2)
+        weights = floor + (1.0 - floor) * gauss
+        weights /= weights.sum()
+        return weights
+
+
+def build_context_index(vocab, cpd, corpus_tokens):
+    """Build a ContextZoneIndex from already-tokenised corpus data."""
+    freq = Counter(corpus_tokens)
+    return ContextZoneIndex(vocab, cpd, freq)
 
 
 # ---------------------------------------------------------------------------
@@ -470,85 +735,113 @@ class PiSampler:
         return val / base
 
     # ------------------------------------------------------------------
-    # vstack / hstack instruction-context blend  (replaces XOR fusion)
+    # Zone-attention blend
+    # The prompt selects which sorted/categorised data structure zones to
+    # attend to.  Within each attended zone, a Gaussian probability gradient
+    # masks away the non-attended parts of the candidate set.
     # ------------------------------------------------------------------
-    def _instruction_context_blend(self, scored):
-        """
-        Build a weight vector from instruction_context words via vstack/hstack.
 
-        Steps
-        -----
-        1. Each context word is encoded as a float row of length n_candidates
-           by mapping character ordinals to [0, 1] and interpolating/padding to
-           exactly n_candidates positions.
-        2. All word rows are stacked vertically with np.vstack → context_matrix
-           of shape (n_words, n_candidates).
-        3. A history-penalty row (1 / (1 + count)) is built and appended via
-           np.vstack, giving shape (n_words + 1, n_candidates).
-        4. A uniform-prior row is hstacked alongside the mean of the above as
-           a two-column sentinel block, then discarded — the operation forces
-           the matrix to be (n_rows, n_candidates + 2) momentarily, ensuring
-           the numpy path is always exercised even for single-word prompts.
-        5. Column means over the first n_candidates columns → weight vector.
-        6. Geometric-mean blend of base probability and context weight.
+    def set_context_index(self, context_index):
+        """Attach the pre-built ContextZoneIndex for this generation run."""
+        self._context_index = context_index
+
+    def _zone_attention_blend(self, scored):
+        """
+        Attention over sorted/categorised data structures.
+
+        Pipeline
+        --------
+        1. Use self.instruction_context (prompt words) to SELECT which zones
+           of the ContextZoneIndex to attend to — this returns an ordered
+           priority list of candidate words (zone_selection).
+
+        2. Build the zone membership set from zone_selection.
+
+        3. Compute a per-zone Gaussian attention gradient over the scored
+           candidates.  The gradient is a soft probability mask: candidates
+           whose words sit inside the attended zone get a high weight, those
+           outside get a floor weight.  Multiple zones are combined by
+           vstack-ing their gradient rows and taking a weighted column mean.
+
+        4. hstack a history-penalty column alongside the zone-gradient matrix
+           so recency is factored into the final weight at no extra cost.
+
+        5. Blend the resulting weight vector with the base probabilities via
+           geometric mean and renormalise.
         """
         n = len(scored)
         if n == 0:
             return scored
 
-        # --- step 1: encode each context word as a rank-weight row ----------
-        rows = []
-        for word in self.instruction_context:
-            if not word:
-                continue
-            char_vals = np.array(
-                [ord(c) / 122.0 for c in word], dtype=np.float64
-            )
-            if len(char_vals) < n:
-                char_vals = np.pad(char_vals, (0, n - len(char_vals)), mode='edge')
-            else:
-                char_vals = char_vals[:n]
-            rows.append(char_vals)
+        ctx = getattr(self, '_context_index', None)
+        prompt = self.instruction_context
 
-        # --- step 2 & 3: vstack word rows + history-penalty row -------------
-        history_row = np.array(
+        # ── step 1: prompt selects zones ──────────────────────────────────
+        if ctx is not None and prompt:
+            zone_selection = ctx.select_zones_for_prompt(prompt)
+        else:
+            zone_selection = [w for w, _ in scored]
+
+        zone_set = set(zone_selection)
+
+        # ── step 2: per-zone gradient rows ────────────────────────────────
+        # We compute one gradient row per distinct attended zone type so that
+        # the zones' signals can be independently weighted before combining.
+        gradient_rows = []
+
+        if ctx is not None and prompt:
+            # Isomorphic gradient loop — same retrieval syntax for all zone types.
+            # For each zone spec: retrieve words via data[key_fn(prompt)[i]],
+            # then compute a Gaussian attention gradient using the spec's sigma/floor.
+            for spec in ctx.zone_specs:
+                keys = spec["key_fn"](prompt)          # prompt → lookup keys
+                for key in keys:
+                    words = spec["data"].get(key, [])  # data[key] → word list
+                    if words:
+                        g = ContextZoneIndex.zone_gradient(
+                            set(words), scored,
+                            sigma=spec["sigma"],
+                            floor=spec["floor"],
+                        )
+                        gradient_rows.append(g)
+
+        # Fallback: uniform gradient if nothing was selected
+        if not gradient_rows:
+            gradient_rows.append(np.ones(n, dtype=np.float64) / n)
+
+        # ── step 3: vstack zone gradient rows ─────────────────────────────
+        zone_matrix = np.vstack(gradient_rows)        # (n_zones, n)
+
+        # ── step 4: hstack history-penalty column ─────────────────────────
+        history_col = np.array(
             [1.0 / (1.0 + self.history[w]) for w, _ in scored],
             dtype=np.float64,
-        )
-        uniform_row = np.ones(n, dtype=np.float64) / n
+        ).reshape(1, -1)                              # (1, n)
+        full_matrix = np.vstack([zone_matrix, history_col])  # (n_zones+1, n)
 
-        if rows:
-            context_matrix = np.vstack(rows)                      # (n_words, n)
-            full_matrix = np.vstack([context_matrix, history_row, uniform_row])
-        else:
-            full_matrix = np.vstack([history_row, uniform_row])   # (2, n)
+        # hstack a normalisation sentinel: each row's own L1 norm as a
+        # (n_rows, 1) column — this anchors the per-row scale before combining
+        row_norms = full_matrix.sum(axis=1, keepdims=True).clip(1e-12)
+        augmented = np.hstack([full_matrix, row_norms])       # (n_zones+1, n+1)
 
-        # --- step 4: hstack a two-column sentinel block ---------------------
-        # sentinel = column-mean and column-std of full_matrix, shape (n_rows, 2)
-        col_mean = full_matrix.mean(axis=0)                        # (n,)
-        col_std  = full_matrix.std(axis=0) + 1e-12                 # (n,)
-        sentinel = np.hstack([                                     # (n_rows, 2)
-            full_matrix.mean(axis=1, keepdims=True),
-            full_matrix.std(axis=1,  keepdims=True) + 1e-12,
-        ])
-        augmented = np.hstack([full_matrix, sentinel])             # (n_rows, n+2)
-
-        # --- step 5: column means over the candidate axis -------------------
-        weights = augmented[:, :n].mean(axis=0)                    # (n,)
-        # modulate by inverse coefficient-of-variation for stability
-        cv = col_std / (np.abs(col_mean) + 1e-12)
-        weights = weights / (1.0 + 0.3 * cv)
+        # ── step 5: weighted column mean over candidate axis ──────────────
+        # Weight each zone row by its mean gradient value (zones that are
+        # more focused/informative get higher weight)
+        row_weights = augmented[:, :n].mean(axis=1)           # (n_zones+1,)
+        row_weights = np.clip(row_weights, 1e-12, None)
+        row_weights /= row_weights.sum()
+        weights = (augmented[:, :n] * row_weights[:, None]).sum(axis=0)  # (n,)
         weights = np.clip(weights, 1e-12, None)
         weights /= weights.sum()
 
-        # --- step 6: geometric-mean blend -----------------------------------
+        # ── step 6: geometric-mean blend with base probabilities ──────────
         blended = [
             (word, math.sqrt(max(1e-24, p) * float(w)))
             for (word, p), w in zip(scored, weights)
         ]
         total = sum(p for _, p in blended)
         if total > 0:
-            blended = [(w, p / total) for w, p in blended]
+            blended = [(ww, pp / total) for ww, pp in blended]
         return blended
 
     def sample(self, dist):
@@ -587,8 +880,8 @@ class PiSampler:
         if self.semicircle is not None:
             scored = self.semicircle.apply(scored)
 
-        # vstack/hstack instruction-context blend
-        scored = self._instruction_context_blend(scored)
+        # zone-attention blend: prompt selects data structures, gradient masks non-attended
+        scored = self._zone_attention_blend(scored)
 
         # single pi-stream draw for final selection
         draw = self.next_unit()
@@ -815,6 +1108,7 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     if CACHE.get('key') == key and CACHE.get('cpd') is not None:
         log.append('Using cached model and stream.')
         return CACHE['cpd'], CACHE['vocab'], CACHE['stream']
+    CACHE['_corpus_text'] = corpus
     log.append('Building trigram model...')
     cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
     log.append(f'Building stream with pi_prec={pi_prec}, pi_stream_len={pi_stream_len}...')
@@ -831,7 +1125,19 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     stream = stacked.flatten().tolist()
     # ------------------------------------------
 
-    CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream)
+    log.append('Building context zone index...')
+    corpus_tokens = tokenise_alpha(
+        CACHE.get('_corpus_text', '')
+    )
+    context_index = build_context_index(vocab, cpd, corpus_tokens)
+    log.append(
+        f'Zone index: high={len(context_index.freq_zones["high"])} '
+        f'mid={len(context_index.freq_zones["mid"])} '
+        f'low={len(context_index.freq_zones["low"])} '
+        f'alpha_keys={len(context_index.alpha_zones)} '
+        f'ngram_keys={len(context_index.ngram_zones)}.'
+    )
+    CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream, context_index=context_index)
     log.append('Cached.')
     return cpd, vocab, stream
 
@@ -843,7 +1149,8 @@ def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
                   semicircle_enable=False, semicircle_strength=0.6,
                   semicircle_arches=5, semicircle_radius=1.0,
                   semicircle_speed=0.05, semicircle_floor=0.05,
-                  instruction_context=None):
+                  instruction_context=None,
+                  context_index=None):
     return PiSampler(
         stream,
         digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
@@ -866,6 +1173,8 @@ def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
         insight_penalty=insight_penalty,
         instruction_context=instruction_context,
     )
+    if context_index is not None:
+        sampler.set_context_index(context_index)
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +1208,7 @@ def run_single(
         semicircle_enable, semicircle_strength, semicircle_arches,
         semicircle_radius, semicircle_speed, semicircle_floor,
         instruction_context=ctx_words,
+        context_index=CACHE.get('context_index'),
     )
     sampler.seek(start)
     text = generate_text(cpd, sampler, prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -960,6 +1270,7 @@ def run_search(
                 semicircle_enable, semicircle_strength, semicircle_arches,
                 semicircle_radius, semicircle_speed, semicircle_floor,
                 instruction_context=ctx_words,
+                context_index=CACHE.get('context_index'),
             )
             sampler.seek(start)
             text = generate_text(cpd, sampler, prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
@@ -1063,14 +1374,45 @@ def save_hf_model(repo_id, token=None):
         return f'Save failed: {e}'
 
 
+def _hf_latest_commit_sha(repo_id, token=None):
+    """Return the latest commit sha for repo_id, or None on failure."""
+    try:
+        from huggingface_hub import list_repo_commits
+        kwargs = dict(repo_id=repo_id, repo_type='model')
+        if token and token.strip():
+            kwargs['token'] = token.strip()
+        commits = list(list_repo_commits(**kwargs))
+        return commits[0].commit_id if commits else None
+    except Exception:
+        return None
+
+
 def load_hf_model_on_demand(repo_id, token=None):
+    """
+    Resolves the latest commit on the HF repo before every download.
+    Uses force_download=True so huggingface_hub never serves a stale
+    cached blob when the remote file has been updated.
+    Skips the download only when the in-memory model already matches
+    the latest remote commit sha.
+    """
     try:
         from huggingface_hub import hf_hub_download
+        latest_sha = _hf_latest_commit_sha(repo_id, token)
+        already_loaded_sha = HF_CACHE.get('loaded_sha')
+        if (
+            HF_CACHE.get('loaded')
+            and latest_sha is not None
+            and latest_sha == already_loaded_sha
+            and CACHE.get('cpd') is not None
+        ):
+            return f'Model already up-to-date (sha={latest_sha[:7]})'
+
         kwargs = dict(
             repo_id=repo_id,
             filename='pi_model.pkl.gz',
             repo_type='model',
             cache_dir=LOCAL_CACHE_DIR,
+            force_download=True,
         )
         if token and token.strip():
             kwargs['token'] = token.strip()
@@ -1080,8 +1422,15 @@ def load_hf_model_on_demand(repo_id, token=None):
             return 'Load failed: ' + ' | '.join(errors)
         CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
         UI_STATE['version'] += 1
-        HF_CACHE.update(loaded=True, tokenizer=None, model=None, status=f'Loaded full model from {repo_id}')
-        return f'Loaded full model from {repo_id}.'
+        sha_tag = f' sha={latest_sha[:7]}' if latest_sha else ''
+        HF_CACHE.update(
+            loaded=True,
+            loaded_sha=latest_sha,
+            tokenizer=None,
+            model=None,
+            status=f'Loaded latest model from {repo_id}{sha_tag}',
+        )
+        return f'Loaded latest model from {repo_id}{sha_tag}.'
     except Exception as e:
         return f'Load failed: {e}'
 
@@ -1108,6 +1457,7 @@ def run_generate(file_obj, pasted_corpus, prompt,
         bool(semicircle_enable), semicircle_strength, semicircle_arches,
         semicircle_radius, semicircle_speed, semicircle_floor,
         instruction_context=ctx_words,
+        context_index=CACHE.get('context_index'),
     )
     sampler.seek(0)
     text = generate_text(
@@ -1134,7 +1484,7 @@ def run_generate(file_obj, pasted_corpus, prompt,
 
 def build_ui():
     with gr.Blocks(title='Full features app') as demo:
-        gr.Markdown(f"### Loading model…\n\nCurrent status: `{HF_CACHE['status']}`")
+        status_md = gr.Markdown("### Initialising…\n\nLoading latest model from Hugging Face…")
         with gr.Tabs():
 
             # ----------------------------------------------------------------
@@ -1315,6 +1665,17 @@ def build_ui():
                 hf_load_btn.click(load_hf_model_on_demand, inputs=[hf_repo, hf_token], outputs=[hf_log])
 
         gr.Markdown('Tip: model caches are reused until corpus or configuration changes.')
+
+        # ------------------------------------------------------------------
+        # Auto-load the latest model from HF every time the app starts
+        # ------------------------------------------------------------------
+        def _auto_load_on_startup():
+            msg = load_hf_model_on_demand(HF_REPO_ID)
+            status = HF_CACHE.get('status', 'Unknown')
+            return f"### Model status\n\n`{status}`\n\n_{msg}_"
+
+        demo.load(_auto_load_on_startup, inputs=None, outputs=[status_md])
+
     return demo
 
 
