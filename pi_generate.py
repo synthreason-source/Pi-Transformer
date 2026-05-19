@@ -63,10 +63,10 @@ DEFAULTS = dict(
     LIDSTONE_GAMMA=0.1,
     GEN_WORDS=400,
     WORD_FIND_MIN=2,
-    TEMPERATURE=2.5,
+    TEMPERATURE=4.3,
     TOP_K=100,
     TOP_P=1.0,
-    REP_PENALTY=1.08,
+    REP_PENALTY=1.13,
     SEASHELL_ENABLE=True,
     SEASHELL_STRENGTH=14.35,
     SEASHELL_DECAY=0.185,
@@ -87,7 +87,8 @@ DEFAULTS = dict(
     BEND_STEP=0.5,
     OFFSET_STEP=50,
     BEND_MAX=45.0,
-    INSIGHT_PENALTY=1.5,
+    INSIGHT_PENALTY=3.95,
+    CYCLES_N=32,
 )
 
 EMBEDDED_CORPUS = """
@@ -651,7 +652,7 @@ class SemicircleWaveMask:
         if not scored:
             return scored
         g = self.gains(len(scored))
-        weighted = [(w, p * gain) for (w, p), gain in zip(scored, g)]
+        weighted = [(w, -p * gain) for (w, p), gain in zip(scored, g)]
         total = sum(p for _, p in weighted)
         if total > 0:
             weighted = [(w, p / total) for w, p in weighted]
@@ -679,7 +680,7 @@ class PiSampler:
         seashell_width,
         seashell_floor,
         semicircle_enable=False,
-        semicircle_strength=0.6,
+        semicircle_strength=0.09,
         semicircle_arches=5,
         semicircle_radius=1.0,
         semicircle_speed=0.05,
@@ -883,11 +884,19 @@ class PiSampler:
         # zone-attention blend: prompt selects data structures, gradient masks non-attended
         scored = self._zone_attention_blend(scored)
 
+        # ── novelty filter: prefer words not yet emitted ────────────────────
+        unseen = [(w, p) for w, p in scored if self.history[w] == 0]
+        pool = unseen if unseen else scored   # fall back if all candidates seen
+        pool_total = sum(p for _, p in pool)
+        if pool_total > 0:
+            pool = [(w, p / pool_total) for w, p in pool]
+        # ─────────────────────────────────────────────────────────────────────
+
         # single pi-stream draw for final selection
         draw = self.next_unit()
         cumulative = 0.0
-        chosen = scored[-1][0]
-        for word, p in scored:
+        chosen = pool[-1][0]
+        for word, p in pool:
             cumulative += p
             if draw < cumulative:
                 chosen = word
@@ -960,6 +969,249 @@ def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
         words.append(word)
         context.append(word)
     return capitalise_text(words)
+
+
+# ---------------------------------------------------------------------------
+# Combinatorial cycles around generate_text
+#
+# Per-token, K cycles (K in [1,3]) walk a diagonal slice of the cartesian
+# product (zone_spec, prompt_bigram, pi_stream_offset). Each cycle produces
+# a full scored candidate list via _score_only (which mirrors PiSampler.sample
+# up to but not including the final draw). The K lists are merged by geometric
+# mean over the union vocab and a single pi-stream draw selects the winner.
+#
+# Scope: cheap. Diagonal walk keeps total cost O(K * sample-work) rather than
+# O(|zones| * |bigrams| * |offsets|).
+# ---------------------------------------------------------------------------
+
+def _score_only(sampler, dist):
+    """
+    Mirror PiSampler.sample() through every blend step but stop before the
+    final draw. Returns the scored list [(word, prob), ...].
+
+    Does not mutate sampler.history. Does not call sampler.next_unit().
+    Reads sampler.instruction_context and sampler._context_index.zone_specs
+    which the cycle wrapper has already temporarily mutated.
+    """
+    samples = list(dist.samples())
+    if not samples:
+        return []
+
+    base_scored = []
+    for s in samples:
+        p = max(1e-12, float(dist.prob(s)))
+        count = sampler.history[s]
+        if count > 0:
+            p /= sampler.repetition_penalty ** count
+        base_scored.append((s, p))
+
+    base_scored = apply_insight_penalty(base_scored, sampler.insight_penalty)
+
+    scored = [(s, p ** (1.0 / sampler.temperature)) for s, p in base_scored]
+    total = sum(p for _, p in scored)
+    if total > 0:
+        scored = [(s, p / total) for s, p in scored]
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    scored = scored[: sampler.top_k]
+
+    kept, accum = [], 0.0
+    for s, p in scored:
+        kept.append((s, p))
+        accum += p
+        if accum >= sampler.top_p:
+            break
+    scored = kept
+
+    if sampler.seashell is not None:
+        scored = sampler.seashell.apply(scored)
+    if sampler.semicircle is not None:
+        scored = sampler.semicircle.apply(scored)
+
+    scored = sampler._zone_attention_blend(scored)
+    return scored
+
+
+def _combine_scored_geometric(scored_lists, floor=1e-12):
+    """Geometric-mean combine of K [(word, prob)] lists over the union vocab."""
+    if not scored_lists:
+        return []
+
+    cycle_maps = [dict(sl) for sl in scored_lists]
+    union = set()
+    for d in cycle_maps:
+        union.update(d.keys())
+    if not union:
+        return []
+
+    K = len(cycle_maps)
+    combined = []
+    for w in union:
+        log_sum = 0.0
+        for d in cycle_maps:
+            log_sum += math.log(max(floor, d.get(w, floor)))
+        combined.append((w, math.exp(log_sum / K)))
+
+    total = sum(p for _, p in combined)
+    if total > 0:
+        combined = [(w, p / total) for w, p in combined]
+    combined.sort(key=lambda x: x[1], reverse=True)
+    return combined
+
+
+def generate_text_combo_cycles(
+    cpd, sampler, prompt, n_words, ngram_n,
+    vocab=None, context_index=None, n_cycles=3,
+):
+    """
+    generate_text + per-token combinatorial cycles over
+    (zone_spec, prompt_bigram, pi_stream_offset).
+
+    Pass n_cycles=1 and context_index=None to degenerate to the original
+    generate_text behaviour.
+    """
+    n_cycles = max(1, min(3, int(n_cycles)))
+
+    context_window = ngram_n - 1
+    seed_words = tokenise_alpha(prompt)
+
+    if vocab is not None:
+        seed_in_vocab = [w for w in seed_words if w in vocab]
+    else:
+        seed_in_vocab = list(seed_words)
+    if len(seed_in_vocab) >= context_window:
+        init = seed_in_vocab[-context_window:]
+    else:
+        init = [""] * (context_window - len(seed_in_vocab)) + seed_in_vocab
+    context = deque(init, maxlen=context_window)
+    out_words = list(seed_words)
+
+    # ── product axes ────────────────────────────────────────────────────
+    prompt_alpha = [w for w in seed_words if w]
+    if len(prompt_alpha) >= 2:
+        prompt_bigrams = [
+            (prompt_alpha[i], prompt_alpha[i + 1])
+            for i in range(len(prompt_alpha) - 1)
+        ]
+    elif prompt_alpha:
+        prompt_bigrams = [(prompt_alpha[-1],)]
+    else:
+        prompt_bigrams = [tuple()]
+
+    if context_index is not None and getattr(context_index, "zone_specs", None):
+        zone_specs = list(context_index.zone_specs)
+    else:
+        zone_specs = [None]
+
+    stream_len = max(1, len(sampler.stream))
+    pi_offsets = [
+        0,
+        max(1, stream_len // 97),
+        max(1, stream_len // 53),
+    ][:n_cycles]
+
+    def diagonal_triples(K):
+        nz, nb, no = len(zone_specs), len(prompt_bigrams), len(pi_offsets)
+        for k in range(K):
+            yield (
+                zone_specs[k % nz],
+                prompt_bigrams[k % nb],
+                pi_offsets[k % no],
+            )
+
+    def dist_for_ctx(ctxtuple):
+        for cut in range(len(ctxtuple), 0, -1):
+            trial = ("",) * (context_window - cut) + ctxtuple[-cut:]
+            try:
+                d = cpd[trial]
+                if list(d.samples()):
+                    return d
+            except Exception:
+                continue
+        try:
+            d = cpd[tuple([""] * context_window)]
+            if list(d.samples()):
+                return d
+        except Exception:
+            pass
+        return None
+
+    # ── attach context index, snapshot mutable state ────────────────────
+    if context_index is not None:
+        sampler.set_context_index(context_index)
+
+    original_ctx = list(getattr(sampler, "instruction_context", []) or [])
+    original_specs = (
+        list(context_index.zone_specs) if context_index is not None else []
+    )
+
+    # ── per-token loop ──────────────────────────────────────────────────
+    for _ in range(n_words):
+        dist = dist_for_ctx(tuple(context))
+        if dist is None:
+            context.clear()
+            context.extend([""] * context_window)
+            continue
+
+        cycle_scored = []
+        saved_pos = sampler.pos
+
+        for zs, bg, off in diagonal_triples(n_cycles):
+            if context_index is not None and zs is not None:
+                context_index.zone_specs = [zs]
+            sampler.instruction_context = list(bg) if bg else []
+            sampler.pos = (saved_pos + off) % stream_len
+
+            scored = _score_only(sampler, dist)
+            if scored:
+                cycle_scored.append(scored)
+
+        # restore mutated state before the canonical draw
+        sampler.pos = saved_pos
+        sampler.instruction_context = original_ctx
+        if context_index is not None:
+            context_index.zone_specs = original_specs
+
+        if not cycle_scored:
+            context.clear()
+            context.extend([""] * context_window)
+            continue
+
+        combined = _combine_scored_geometric(cycle_scored)
+        if not combined:
+            context.clear()
+            context.extend([""] * context_window)
+            continue
+
+        # ── novelty filter: prefer words not yet emitted ────────────────────
+        unseen_combo = [(w, p) for w, p in combined if sampler.history[w] == 0]
+        pool_combo = unseen_combo if unseen_combo else combined
+        pool_combo_total = sum(p for _, p in pool_combo)
+        if pool_combo_total > 0:
+            pool_combo = [(w, p / pool_combo_total) for w, p in pool_combo]
+        # ─────────────────────────────────────────────────────────────────────
+
+        # single canonical pi-stream draw per token
+        draw = sampler.next_unit()
+        cumulative = 0.0
+        chosen = pool_combo[-1][0]
+        for word, p in pool_combo:
+            cumulative += p
+            if draw < cumulative:
+                chosen = word
+                break
+
+        sampler.history[chosen] += 1
+
+        if chosen == "":
+            context.clear()
+            context.extend([""] * context_window)
+            continue
+
+        out_words.append(chosen)
+        context.append(chosen)
+
+    return capitalise_text(out_words)
 
 
 def all_pairs_match(pairs, text, fuzzy_threshold):
@@ -1103,19 +1355,30 @@ def load_model_from_path(path):
     return cpd, set(vocab), list(stream), dict(config), errors
 
 
-def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
+def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log,
+                 progress=None):
+    """Build (or retrieve cached) model+stream.  If `progress` is a gr.Progress
+    instance it will emit labelled steps so the UI shows a load bar."""
+
+    def _prog(frac, desc):
+        if progress is not None:
+            progress(frac, desc=desc)
+        log.append(desc)
+
     key = (corpus_fingerprint(corpus), int(ngram_n), float(lidstone_gamma), int(pi_prec), int(pi_stream_len))
     if CACHE.get('key') == key and CACHE.get('cpd') is not None:
-        log.append('Using cached model and stream.')
+        _prog(1.0, 'Using cached model and stream.')
         return CACHE['cpd'], CACHE['vocab'], CACHE['stream']
     CACHE['_corpus_text'] = corpus
-    log.append('Building trigram model...')
+
+    _prog(0.05, 'Building trigram model…')
     cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
-    log.append(f'Building stream with pi_prec={pi_prec}, pi_stream_len={pi_stream_len}...')
+
+    _prog(0.35, f'Building pi stream  (prec={pi_prec}, len={pi_stream_len})…')
     raw_stream = build_pi_stream(pi_prec, pi_stream_len)
 
     # --- vstack + np.roll column-match loop ---
-    log.append('Applying roll_until_column_match to stream...')
+    _prog(0.55, 'Applying roll_until_column_match to stream…')
     matrix = stream_to_matrix(raw_stream, n_cols=26)
     stacked, match_shift = roll_until_column_match(matrix)
     if match_shift >= 0:
@@ -1125,7 +1388,7 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
     stream = stacked.flatten().tolist()
     # ------------------------------------------
 
-    log.append('Building context zone index...')
+    _prog(0.75, 'Building context zone index…')
     corpus_tokens = tokenise_alpha(
         CACHE.get('_corpus_text', '')
     )
@@ -1138,7 +1401,7 @@ def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log):
         f'ngram_keys={len(context_index.ngram_zones)}.'
     )
     CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream, context_index=context_index)
-    log.append('Cached.')
+    _prog(1.0, 'Model ready — cached.')
     return cpd, vocab, stream
 
 
@@ -1191,11 +1454,12 @@ def run_single(
     semicircle_enable=False, semicircle_strength=0.6,
     semicircle_arches=5, semicircle_radius=1.0,
     semicircle_speed=0.05, semicircle_floor=0.05,
+    progress=gr.Progress(track_tqdm=False),
 ):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log)
+    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress)
     triangle = Triangle(int(pi_stream_len), offset_extra=int(offset), bend_degrees=float(bend_degrees))
     start = triangle.vertices[vertex]
     log.append(f'Triangle A={triangle.A} B={triangle.B} C={triangle.C} vertex={vertex} start={start}')
@@ -1211,7 +1475,13 @@ def run_single(
         context_index=CACHE.get('context_index'),
     )
     sampler.seek(start)
-    text = generate_text(cpd, sampler, prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
+    text = generate_text_combo_cycles(
+        cpd, sampler,
+        prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n),
+        vocab=vocab,
+        context_index=CACHE.get('context_index'),
+        n_cycles=DEFAULTS['CYCLES_N'],
+    )
     oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
     if oov:
         log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
@@ -1240,7 +1510,7 @@ def run_search(
         return '', 'Prompt is empty — search needs word pairs.', None
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log)
+    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress)
     pairs = extract_word_pairs(prompt)
     if not pairs:
         return '', 'No valid word pairs extracted from prompt.', None
@@ -1273,7 +1543,13 @@ def run_search(
                 context_index=CACHE.get('context_index'),
             )
             sampler.seek(start)
-            text = generate_text(cpd, sampler, prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n), vocab=vocab)
+            text = generate_text_combo_cycles(
+                cpd, sampler,
+                prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n),
+                vocab=vocab,
+                context_index=CACHE.get('context_index'),
+                n_cycles=DEFAULTS['CYCLES_N'],
+            )
             exact_ok, _failed = all_pairs_match(pairs, text, fuzzy_threshold=float(fuzzy_threshold))
             assoc_score, matched_pairs = collocation_association_score(text, prompt, min_freq=1, measure='pmi')
             if exact_ok or assoc_score > 0:
@@ -1387,7 +1663,8 @@ def _hf_latest_commit_sha(repo_id, token=None):
         return None
 
 
-def load_hf_model_on_demand(repo_id, token=None):
+def load_hf_model_on_demand(repo_id, token=None,
+                            progress=gr.Progress(track_tqdm=False)):
     """
     Resolves the latest commit on the HF repo before every download.
     Uses force_download=True so huggingface_hub never serves a stale
@@ -1397,6 +1674,8 @@ def load_hf_model_on_demand(repo_id, token=None):
     """
     try:
         from huggingface_hub import hf_hub_download
+
+        progress(0.05, desc='Resolving latest HF commit…')
         latest_sha = _hf_latest_commit_sha(repo_id, token)
         already_loaded_sha = HF_CACHE.get('loaded_sha')
         if (
@@ -1405,8 +1684,10 @@ def load_hf_model_on_demand(repo_id, token=None):
             and latest_sha == already_loaded_sha
             and CACHE.get('cpd') is not None
         ):
+            progress(1.0, desc='Already up-to-date.')
             return f'Model already up-to-date (sha={latest_sha[:7]})'
 
+        progress(0.20, desc=f'Downloading pi_model.pkl.gz from {repo_id}…')
         kwargs = dict(
             repo_id=repo_id,
             filename='pi_model.pkl.gz',
@@ -1417,10 +1698,18 @@ def load_hf_model_on_demand(repo_id, token=None):
         if token and token.strip():
             kwargs['token'] = token.strip()
         path = hf_hub_download(**kwargs)
+
+        progress(0.65, desc='Deserialising model from disk…')
         cpd, vocab, stream, config, errors = load_model_from_path(path)
         if cpd is None:
+            progress(1.0, desc='Load failed.')
             return 'Load failed: ' + ' | '.join(errors)
+
+        progress(0.90, desc='Updating in-memory cache…')
         CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
+        corpus_tokens = tokenise_alpha(CACHE.get('_corpus_text', ''))
+        if corpus_tokens:
+            CACHE['context_index'] = build_context_index(vocab, cpd, corpus_tokens)
         UI_STATE['version'] += 1
         sha_tag = f' sha={latest_sha[:7]}' if latest_sha else ''
         HF_CACHE.update(
@@ -1430,6 +1719,7 @@ def load_hf_model_on_demand(repo_id, token=None):
             model=None,
             status=f'Loaded latest model from {repo_id}{sha_tag}',
         )
+        progress(1.0, desc='Done.')
         return f'Loaded latest model from {repo_id}{sha_tag}.'
     except Exception as e:
         return f'Load failed: {e}'
@@ -1439,12 +1729,13 @@ def run_generate(file_obj, pasted_corpus, prompt,
                  pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
                  temperature, text_length, rep_penalty, insight_penalty,
                  semicircle_enable, semicircle_strength, semicircle_arches,
-                 semicircle_radius, semicircle_speed, semicircle_floor):
+                 semicircle_radius, semicircle_speed, semicircle_floor,
+                 progress=gr.Progress(track_tqdm=False)):
     log = []
     corpus, source = resolve_corpus(file_obj, pasted_corpus)
     log.append(f'Corpus source: {source} ({len(corpus)} chars).')
     cpd, vocab, stream = get_or_build(
-        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress
     )
     ctx_words = tokenise_alpha(prompt or '')
     sampler = _make_sampler(
@@ -1460,9 +1751,12 @@ def run_generate(file_obj, pasted_corpus, prompt,
         context_index=CACHE.get('context_index'),
     )
     sampler.seek(0)
-    text = generate_text(
-        cpd, sampler, prompt or '', int(text_length),
-        int(ngram_n), vocab
+    text = generate_text_combo_cycles(
+        cpd, sampler,
+        prompt or '', int(text_length), int(ngram_n),
+        vocab=vocab,
+        context_index=CACHE.get('context_index'),
+        n_cycles=DEFAULTS['CYCLES_N'],
     )
     oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
     if oov:
@@ -1484,7 +1778,7 @@ def run_generate(file_obj, pasted_corpus, prompt,
 
 def build_ui():
     with gr.Blocks(title='Full features app') as demo:
-        status_md = gr.Markdown("### Initialising…\n\nLoading latest model from Hugging Face…")
+        status_md = gr.Markdown("### Ready\n\nNo model loaded. Use **Load Latest from HF** or load a local file.")
         with gr.Tabs():
 
             # ----------------------------------------------------------------
@@ -1631,11 +1925,32 @@ def build_ui():
             # ----------------------------------------------------------------
             with gr.TabItem('Model I/O'):
                 gr.Markdown('Save/load compiled trigram model.')
-                save_btn = gr.Button('Save model', variant='primary')
+
+                # ── Load latest from HF (universal, always force-downloads) ──
+                gr.Markdown('#### Load latest model from Hugging Face')
+                model_hf_repo = gr.Textbox(label='HF repo ID', value=HF_REPO_ID)
+                model_hf_token = gr.Textbox(label='HF token (optional)', type='password')
+                load_latest_btn = gr.Button('🔄  Load Latest from HF', variant='primary')
+                load_latest_log = gr.Textbox(label='Load log', lines=3, interactive=False)
+
+                gr.Markdown('---')
+                gr.Markdown('#### Save / load local .pkl.gz')
+                save_btn = gr.Button('Save model', variant='secondary')
                 save_file = gr.File(label='Saved model file', interactive=False)
                 model_log = gr.Textbox(label='Model I/O log', lines=8)
                 load_file = gr.File(label='Load saved model .pkl.gz', file_types=['.gz', '.pkl'], type='filepath')
-                load_btn = gr.Button('Load model', variant='secondary')
+                load_btn = gr.Button('Load local model', variant='secondary')
+
+                def _load_latest_and_update_status(repo, tok):
+                    msg = load_hf_model_on_demand(repo, tok)
+                    status = HF_CACHE.get('status', 'Unknown')
+                    return msg, f"### Model status\n\n`{status}`"
+
+                load_latest_btn.click(
+                    _load_latest_and_update_status,
+                    inputs=[model_hf_repo, model_hf_token],
+                    outputs=[load_latest_log, status_md],
+                )
                 save_btn.click(
                     save_model_ui,
                     inputs=[filein, pasted, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
@@ -1662,19 +1977,16 @@ def build_ui():
                 hf_log = gr.Textbox(label='Log', lines=4, interactive=False)
                 hf_open_btn.click(lambda: 'Thinking-lite ready', inputs=None, outputs=[hfstatus])
                 hf_save_btn.click(save_hf_model, inputs=[hf_repo, hf_token], outputs=[hf_log])
-                hf_load_btn.click(load_hf_model_on_demand, inputs=[hf_repo, hf_token], outputs=[hf_log])
+                def _hf_load_and_status(repo, tok):
+                    msg = load_hf_model_on_demand(repo, tok)
+                    status = HF_CACHE.get('status', 'Unknown')
+                    return msg, f"### Model status\n\n`{status}`"
+
+                hf_load_btn.click(_hf_load_and_status, inputs=[hf_repo, hf_token], outputs=[hf_log, status_md])
 
         gr.Markdown('Tip: model caches are reused until corpus or configuration changes.')
 
-        # ------------------------------------------------------------------
-        # Auto-load the latest model from HF every time the app starts
-        # ------------------------------------------------------------------
-        def _auto_load_on_startup():
-            msg = load_hf_model_on_demand(HF_REPO_ID)
-            status = HF_CACHE.get('status', 'Unknown')
-            return f"### Model status\n\n`{status}`\n\n_{msg}_"
-
-        demo.load(_auto_load_on_startup, inputs=None, outputs=[status_md])
+        # auto-load on startup removed — use "Load Latest from HF" button
 
     return demo
 
