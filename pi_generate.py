@@ -1851,76 +1851,6 @@ def build_ui():
                 )
 
             # ----------------------------------------------------------------
-            # Tab: Search
-            # ----------------------------------------------------------------
-            with gr.TabItem('Search'):
-                gr.Markdown('Prompt-aligned search with collocations.')
-                search_prompt = gr.Textbox(label='Prompt', lines=3, value='alice rabbit hole')
-                search_bend_max = gr.Slider(1.0, 90.0, value=DEFAULTS['BEND_MAX'], step=0.5, label='Bend max')
-                search_bend_step = gr.Slider(0.1, 5.0, value=DEFAULTS['BEND_STEP'], step=0.1, label='Bend step')
-                search_offset_step = gr.Slider(1, 1000, value=DEFAULTS['OFFSET_STEP'], step=1, label='Offset step')
-                search_fuzzy = gr.Slider(0.0, 1.0, value=DEFAULTS['FUZZY_THRESHOLD'], step=0.01, label='Fuzzy threshold')
-                search_max = gr.Slider(1, 25, value=DEFAULTS['MAX_SOLUTIONS'], step=1, label='Max solutions')
-                insight_penalty_search = gr.Slider(
-                    0.0, 5.0,
-                    value=DEFAULTS['INSIGHT_PENALTY'],
-                    step=0.05,
-                    label='Insight penalty — push away from conclusion-encoding labels',
-                )
-
-                with gr.Accordion('Semicircle wave mask', open=False):
-                    search_semicircle_enable = gr.Checkbox(
-                        value=DEFAULTS['SEMICIRCLE_ENABLE'],
-                        label='Enable semicircle wave mask',
-                    )
-                    search_semicircle_strength = gr.Slider(
-                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_STRENGTH'], step=0.01,
-                        label='Strength',
-                    )
-                    search_semicircle_arches = gr.Slider(
-                        1, 30, value=DEFAULTS['SEMICIRCLE_ARCHES'], step=1,
-                        label='Arches',
-                    )
-                    search_semicircle_radius = gr.Slider(
-                        0.05, 2.0, value=DEFAULTS['SEMICIRCLE_RADIUS'], step=0.05,
-                        label='Radius',
-                    )
-                    search_semicircle_speed = gr.Slider(
-                        0.0, 1.0, value=DEFAULTS['SEMICIRCLE_SPEED'], step=0.005,
-                        label='Speed',
-                    )
-                    search_semicircle_floor = gr.Slider(
-                        1e-3, 1.0, value=DEFAULTS['SEMICIRCLE_FLOOR'], step=0.005,
-                        label='Floor',
-                    )
-
-                search_btn = gr.Button('Run search', variant='primary')
-                search_out = gr.Textbox(label='Search result', lines=16)
-                search_log = gr.Textbox(label='Search log', lines=8)
-                search_file = gr.File(label='Search output')
-                search_btn.click(
-                    run_search,
-                    inputs=[
-                        filein, pasted, search_prompt,
-                        pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-                        text_length, temperature, rep_penalty,
-                        gr.Checkbox(value=DEFAULTS['SEASHELL_ENABLE'], visible=False),
-                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_STRENGTH']),
-                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_DECAY']),
-                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_PEAKS']),
-                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_WIDTH']),
-                        gr.Slider(visible=False, value=DEFAULTS['SEASHELL_FLOOR']),
-                        gr.Radio(choices=['A', 'B', 'C'], value=DEFAULTS['VERTEX'], visible=False),
-                        search_bend_max, search_bend_step, search_offset_step,
-                        search_fuzzy, search_max, insight_penalty_search,
-                        search_semicircle_enable, search_semicircle_strength,
-                        search_semicircle_arches, search_semicircle_radius,
-                        search_semicircle_speed, search_semicircle_floor,
-                    ],
-                    outputs=[search_out, search_log, search_file],
-                )
-
-            # ----------------------------------------------------------------
             # Tab: Model I/O
             # ----------------------------------------------------------------
             with gr.TabItem('Model I/O'):
@@ -1961,28 +1891,6 @@ def build_ui():
                     inputs=[load_file],
                     outputs=[model_log, pi_prec, pi_stream_len, ngram_n, lidstone_gamma],
                 )
-
-            # ----------------------------------------------------------------
-            # Tab: Thinking-lite
-            # ----------------------------------------------------------------
-            with gr.TabItem('Thinking-lite'):
-                gr.Markdown('Use the buttons below to load or save.')
-                hfstatus = gr.Textbox(label='Status', value='Idle', lines=2, interactive=False)
-                hf_repo = gr.Textbox(label='Hugging Face repo', value=HF_REPO_ID)
-                hf_token = gr.Textbox(label='HF token', type='password')
-                with gr.Row():
-                    hf_open_btn = gr.Button('Open Thinking-lite', variant='secondary')
-                    hf_save_btn = gr.Button('Save to Hugging Face', variant='primary')
-                    hf_load_btn = gr.Button('Load from Hugging Face', variant='secondary')
-                hf_log = gr.Textbox(label='Log', lines=4, interactive=False)
-                hf_open_btn.click(lambda: 'Thinking-lite ready', inputs=None, outputs=[hfstatus])
-                hf_save_btn.click(save_hf_model, inputs=[hf_repo, hf_token], outputs=[hf_log])
-                def _hf_load_and_status(repo, tok):
-                    msg = load_hf_model_on_demand(repo, tok)
-                    status = HF_CACHE.get('status', 'Unknown')
-                    return msg, f"### Model status\n\n`{status}`"
-
-                hf_load_btn.click(_hf_load_and_status, inputs=[hf_repo, hf_token], outputs=[hf_log, status_md])
 
         gr.Markdown('Tip: model caches are reused until corpus or configuration changes.')
 
