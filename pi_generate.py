@@ -923,8 +923,95 @@ class Triangle:
 # ---------------------------------------------------------------------------
 # Text generation
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# PSPACE Semantic Area Definitions
+# ---------------------------------------------------------------------------
 
-def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
+PSPACE_ZONES = [
+    {
+        "name": "NARRATIVE",
+        "desc": "High-frequency corpus words",
+        "pi_min": 0.00, "pi_max": 0.20,
+        "zone_key": "freq",
+        "freq_tier": "high",
+    },
+    {
+        "name": "DESCRIPTIVE",
+        "desc": "Alphabetic neighbourhood of prompt",
+        "pi_min": 0.20, "pi_max": 0.40,
+        "zone_key": "alpha",
+        "freq_tier": None,
+    },
+    {
+        "name": "RELATIONAL",
+        "desc": "Bigram-conditioned successors",
+        "pi_min": 0.40, "pi_max": 0.60,
+        "zone_key": "ngram_bigram",
+        "freq_tier": None,
+    },
+    {
+        "name": "EXISTENTIAL",
+        "desc": "Rare / low-frequency vocab",
+        "pi_min": 0.60, "pi_max": 0.80,
+        "zone_key": "freq",
+        "freq_tier": "low",
+    },
+    {
+        "name": "TRANSITIONAL",
+        "desc": "Char-trigram neighbours",
+        "pi_min": 0.80, "pi_max": 1.01,
+        "zone_key": "trigram_char",
+        "freq_tier": None,
+    },
+]
+
+
+def _pi_activate_zone(pi_val):
+    """Map a pi-stream unit float [0,1) to one PSPACE zone name."""
+    for z in PSPACE_ZONES:
+        if z["pi_min"] <= pi_val < z["pi_max"]:
+            return z["name"]
+    return PSPACE_ZONES[-1]["name"]
+
+
+def _restrict_specs_to_zone(context_index, zone_name):
+    """
+    Return the subset of context_index.zone_specs matching zone_name's
+    zone_key. Falls back to all specs if none match.
+    """
+    target = next((z for z in PSPACE_ZONES if z["name"] == zone_name), None)
+    if target is None or context_index is None:
+        return getattr(context_index, "zone_specs", [])
+    key = target["zone_key"]
+    matching = [s for s in context_index.zone_specs if s["name"] == key]
+    return matching if matching else context_index.zone_specs
+
+
+# ---------------------------------------------------------------------------
+# generate_text_pspace  — pi stream activates each semantic area, prints span
+# ---------------------------------------------------------------------------
+
+def generate_text_pspace(
+    cpd, sampler, prompt, n_words, ngram_n,
+    vocab=None, context_index=None, n_cycles=3,
+    span_words=8,            # how many words each activated zone produces
+    verbose_zones=True,      # if True, print zone activations to stdout
+):
+    """
+    PSPACE-zoned text generation.
+
+    For each span of `span_words` tokens:
+      1. Draw a pi-stream unit to SELECT the active PSPACE semantic zone.
+      2. Restrict zone_specs to that zone for the span duration.
+      3. Generate `span_words` tokens under that zone's attention.
+      4. Print (and collect) the span.
+
+    The spans are concatenated → the full generated text.
+    Equates to generate_text_combo_cycles output but with visible semantic
+    zone structure.
+    """
+    n_spans = max(1, (n_words + span_words - 1) // span_words)
+
     context_window = ngram_n - 1
     seed_words = tokenise_alpha(prompt)
     if vocab is not None:
@@ -935,8 +1022,45 @@ def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
         init = seed_in_vocab[-context_window:]
     else:
         init = [""] * (context_window - len(seed_in_vocab)) + seed_in_vocab
+
     context = deque(init, maxlen=context_window)
-    words = list(seed_words)
+    out_words = list(seed_words)
+    zone_log = []          # [(zone_name, span_text), ...]
+
+    if context_index is not None:
+        sampler.set_context_index(context_index)
+
+    original_specs = (
+        list(context_index.zone_specs) if context_index is not None else []
+    )
+    original_ctx = list(getattr(sampler, "instruction_context", []) or [])
+
+    # product axes (same as combo_cycles)
+    prompt_alpha = [w for w in seed_words if w]
+    if len(prompt_alpha) >= 2:
+        prompt_bigrams = [
+            (prompt_alpha[i], prompt_alpha[i + 1])
+            for i in range(len(prompt_alpha) - 1)
+        ]
+    elif prompt_alpha:
+        prompt_bigrams = [(prompt_alpha[-1],)]
+    else:
+        prompt_bigrams = [tuple()]
+
+    stream_len = max(1, len(sampler.stream))
+    pi_offsets = [0, max(1, stream_len // 97), max(1, stream_len // 53)][:n_cycles]
+
+    def diagonal_triples(K):
+        zone_specs_snap = getattr(context_index, "zone_specs", [None])
+        nz = len(zone_specs_snap)
+        nb = len(prompt_bigrams)
+        no = len(pi_offsets)
+        for k in range(K):
+            yield (
+                zone_specs_snap[k % nz] if zone_specs_snap else None,
+                prompt_bigrams[k % nb],
+                pi_offsets[k % no],
+            )
 
     def dist_for_ctx(ctxtuple):
         for cut in range(len(ctxtuple), 0, -1):
@@ -955,20 +1079,111 @@ def generate_text(cpd, sampler, prompt, n_words, ngram_n, vocab=None):
             pass
         return None
 
-    for _ in range(n_words):
-        dist = dist_for_ctx(tuple(context))
-        if dist is None:
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-        word = sampler.sample(dist)
-        if word == "":
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-        words.append(word)
-        context.append(word)
-    return capitalise_text(words)
+    words_remaining = n_words
+
+    for span_i in range(n_spans):
+        if words_remaining <= 0:
+            break
+
+        # ── 1. Pi-stream activates a PSPACE zone ────────────────────────
+        pi_val = sampler.next_unit()
+        zone_name = _pi_activate_zone(pi_val)
+
+        # ── 2. Restrict specs to the active zone ─────────────────────────
+        if context_index is not None:
+            context_index.zone_specs = _restrict_specs_to_zone(
+                context_index, zone_name
+            )
+
+        span_len = min(span_words, words_remaining)
+        span_collected = []
+
+        # ── 3. Generate span under active zone ───────────────────────────
+        for _ in range(span_len):
+            dist = dist_for_ctx(tuple(context))
+            if dist is None:
+                context.clear()
+                context.extend([""] * context_window)
+                continue
+
+            cycle_scored = []
+            saved_pos = sampler.pos
+
+            for zs, bg, off in diagonal_triples(n_cycles):
+                if context_index is not None and zs is not None:
+                    context_index.zone_specs = [zs]
+                sampler.instruction_context = list(bg) if bg else []
+                sampler.pos = (saved_pos + off) % stream_len
+
+                scored = _score_only(sampler, dist)
+                if scored:
+                    cycle_scored.append(scored)
+
+            # restore
+            sampler.pos = saved_pos
+            sampler.instruction_context = original_ctx
+            if context_index is not None:
+                context_index.zone_specs = _restrict_specs_to_zone(
+                    context_index, zone_name
+                )
+
+            if not cycle_scored:
+                context.clear()
+                context.extend([""] * context_window)
+                continue
+
+            combined = _combine_scored_geometric(cycle_scored)
+            if not combined:
+                context.clear()
+                context.extend([""] * context_window)
+                continue
+
+            unseen = [(w, p) for w, p in combined if sampler.history[w] == 0]
+            pool = unseen if unseen else combined
+            pool_total = sum(p for _, p in pool)
+            if pool_total > 0:
+                pool = [(w, p / pool_total) for w, p in pool]
+
+            draw = sampler.next_unit()
+            cumulative = 0.0
+            chosen = pool[-1][0]
+            for word, p in pool:
+                cumulative += p
+                if draw < cumulative:
+                    chosen = word
+                    break
+
+            sampler.history[chosen] += 1
+
+            if chosen == "":
+                context.clear()
+                context.extend([""] * context_window)
+                continue
+
+            span_collected.append(chosen)
+            out_words.append(chosen)
+            context.append(chosen)
+
+        words_remaining -= span_len
+
+        # ── 4. Print and record the activated zone span ───────────────────
+        span_text = " ".join(span_collected)
+        zone_log.append((zone_name, span_text))
+
+        if verbose_zones:
+            zdef = next((z for z in PSPACE_ZONES if z["name"] == zone_name), {})
+            print(
+                f"[PSPACE:{zone_name}] (pi={pi_val:.4f}, {zdef.get('desc','')}) "
+                f"→ {span_text}"
+            )
+
+    # ── restore all mutated state ─────────────────────────────────────────
+    if context_index is not None:
+        context_index.zone_specs = original_specs
+    sampler.instruction_context = original_ctx
+
+    full_text = capitalise_text(out_words)
+    return full_text, zone_log
 
 
 # ---------------------------------------------------------------------------
@@ -1475,13 +1690,18 @@ def run_single(
         context_index=CACHE.get('context_index'),
     )
     sampler.seek(start)
-    text = generate_text_combo_cycles(
+    text, zone_log = generate_text_pspace(
         cpd, sampler,
-        prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n),
+        prompt=prompt or '',
+        n_words=int(gen_words),
+        ngram_n=int(ngram_n),
         vocab=vocab,
         context_index=CACHE.get('context_index'),
         n_cycles=DEFAULTS['CYCLES_N'],
+        span_words=8,           # tune: ~sentence-fragment length
+        verbose_zones=True,     # prints zone activations to log
     )
+    # Collect zone log into the UI log
     oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
     if oov:
         log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
