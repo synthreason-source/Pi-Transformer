@@ -38,9 +38,9 @@ if NLTK_DATA_DIR not in nltk.data.path:
     nltk.data.path.insert(0, NLTK_DATA_DIR)
 
 for pkg, path in [
-    ("punkt", "tokenizers/punkt"),
+    ("punkt",     "tokenizers/punkt"),
     ("punkt_tab", "tokenizers/punkt_tab"),
-    ("words", "corpora/words"),
+    ("words",     "corpora/words"),
 ]:
     try:
         nltk.data.find(path)
@@ -89,6 +89,7 @@ DEFAULTS = dict(
     BEND_MAX=45.0,
     INSIGHT_PENALTY=3.95,
     CYCLES_N=32,
+    SPAN_WORDS=8,          # NEW: words per PSPACE zone span
 )
 
 EMBEDDED_CORPUS = """
@@ -117,11 +118,11 @@ time as she went down to look about her and wonder what was going to happen next
 
 _WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
 
-HF_REPO_ID = "trainman999/Thinking-lite"
+HF_REPO_ID    = "trainman999/Thinking-lite"
 LOCAL_CACHE_DIR = os.path.join(NLTK_DATA_DIR, "hf_model_cache")
 os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
 HF_CACHE = {"loaded": False, "tokenizer": None, "model": None, "status": "Idle"}
-CACHE = dict(key=None, cpd=None, vocab=None, stream=None, context_index=None)
+CACHE    = dict(key=None, cpd=None, vocab=None, stream=None, context_index=None)
 UI_STATE = {'version': 0}
 
 
@@ -138,7 +139,7 @@ def apply_insight_penalty(scored, strength):
     penalised = []
     for word, p in scored:
         excess = max(0.0, p - mean_p)
-        p_adj = p / (1.0 + strength * excess / mean_p)
+        p_adj  = p / (1.0 + strength * excess / mean_p)
         penalised.append((word, max(1e-12, p_adj)))
     total = sum(p for _, p in penalised)
     if total > 0:
@@ -173,7 +174,7 @@ class _LidstoneFactory:
 
     def __init__(self, gamma, bins):
         self.gamma = float(gamma)
-        self.bins = max(1, int(bins))
+        self.bins  = max(1, int(bins))
 
     def __call__(self, fd):
         return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
@@ -184,9 +185,7 @@ def build_model(corpus, ngram_n, lidstone_gamma):
         corpus = corpus.decode("utf-8", errors="ignore")
     elif not isinstance(corpus, str):
         corpus = str(corpus) if corpus is not None else ""
-    ngram_n = int(ngram_n)
-    if ngram_n < 2:
-        ngram_n = 2
+    ngram_n        = max(2, int(ngram_n))
     lidstone_gamma = float(lidstone_gamma)
     tokens = tokenise_alpha(corpus)
     if not tokens:
@@ -194,9 +193,9 @@ def build_model(corpus, ngram_n, lidstone_gamma):
             "Corpus produced zero tokens after tokenisation. "
             "Upload a non-empty text corpus or paste some text."
         )
-    padded = [""] * (ngram_n - 1) + tokens + [""]
+    padded    = [""] * (ngram_n - 1) + tokens + [""]
     trigrams_ = list(ngrams(padded, ngram_n))
-    cfd = ConditionalFreqDist((tuple(tg[:-1]), tg[-1]) for tg in trigrams_)
+    cfd   = ConditionalFreqDist((tuple(tg[:-1]), tg[-1]) for tg in trigrams_)
     vocab = set(tokens) | {""}
     for ctx in list(cfd.conditions()):
         if len(cfd[ctx]) == 0:
@@ -210,9 +209,9 @@ def build_model(corpus, ngram_n, lidstone_gamma):
 
 def build_pi_stream(decimals, length):
     decimals = int(decimals)
-    length = int(length)
-    mp.dps = decimals + 50
-    D = 10 ** decimals
+    length   = int(length)
+    mp.dps   = decimals + 50
+    D    = 10 ** decimals
     frac = int(mp.floor(mpi * D)) - 3 * D
     stream = []
     for _ in range(length):
@@ -223,80 +222,50 @@ def build_pi_stream(decimals, length):
 
 
 # ---------------------------------------------------------------------------
-# ContextZoneIndex — sorted/categorised data structures for attention
+# ContextZoneIndex — sorted zones + trigram latent-space BOS sort
 # ---------------------------------------------------------------------------
 
 class ContextZoneIndex:
     """
-    Pre-built, sorted data structures that the prompt can attend to.
+    Pre-built attention zones over corpus vocabulary.
 
     Zones
     -----
-    freq_zones   : dict[str, list[str]]
-        Words bucketed by corpus frequency tier:
-        "high"   >= FREQ_HIGH_THRESH  occurrences
-        "mid"    >= FREQ_MID_THRESH   occurrences
-        "low"    < FREQ_MID_THRESH    occurrences
-        Each list is sorted descending by frequency.
+    freq_zones      : high / mid / low frequency buckets
+    alpha_zones     : first-letter buckets
+    ngram_zones     : bigram-context → ranked successors
+    latent_bos_data : trigram contexts sorted by cosine similarity to the
+                      sentence-beginning (BOS) anchor vector, bucketed
+                      into quartiles q0 (most BOS-like) … q3 (least).
 
-    alpha_zones  : dict[str, list[str]]
-        Words bucketed by first letter (a–z), sorted alphabetically within
-        each bucket.
-
-    ngram_zones  : dict[tuple, list[str]]
-        For every bigram context tuple in the CPD, the sorted list of
-        successor words ordered by descending conditional probability.
-
-    prompt_zone  : dict[str, list[str]]
-        Dynamically populated per generation call: for each prompt word,
-        stores the words in the corpus vocab that share at least one
-        alphabetic trigram with it (loose semantic neighbourhood).
-
-    Attention gradient
-    ------------------
-    `zone_gradient(zone_words, candidates, sigma)` returns a weight vector
-    over `candidates` shaped as a Gaussian curve centred on the rank of the
-    highest-scored zone word inside `candidates`.  Words outside the attended
-    zone are masked toward a floor value, not zeroed — this is a soft mask.
+    All zones share the identical ZoneRetriever protocol:
+        key_fn(prompt_words) → [keys]
+        data[key]            → [word, …]
     """
 
     FREQ_HIGH_THRESH = 10
     FREQ_MID_THRESH  = 3
 
-    def __init__(self, vocab, cpd, token_freq):
-        self.vocab      = set(vocab)
-        self.token_freq = dict(token_freq)   # word → int count
-        self._build_freq_zones()
-        self._build_alpha_zones()
-        self._build_ngram_zones(cpd)
-        self._make_zone_specs()
-        self.prompt_zone = {}
-
-    # ──────────────────────────────────────────────────────────────────────
-    # ZoneRetriever protocol — isomorphic retrieval syntax across all zones
-    #
-    # Every zone type is structurally identical:
-    #
-    #   key_fn(prompt_words)  →  [key₁, key₂, …]   (prompt → lookup keys)
-    #   data[key]             →  [word₁, word₂, …]  (sorted candidate list)
-    #   gradient params       →  (sigma, floor)      (attention curve shape)
-    #
-    # _ZONE_SPECS encodes this triple for each zone so that zone builders,
-    # zone selection, and gradient computation all go through one code path.
-    # ──────────────────────────────────────────────────────────────────────
-
-    # Each spec: (name, sigma, floor)
-    # key_fn and data are added dynamically in __init__ after the structures
-    # are built.  See _make_zone_specs().
     _ZONE_SPEC_TEMPLATES = [
         ("ngram_bigram",  0.25, 0.04),
         ("ngram_unigram", 0.30, 0.04),
         ("alpha",         0.40, 0.05),
         ("freq",          0.50, 0.05),
         ("trigram_char",  0.35, 0.04),
+        ("latent_bos",    0.30, 0.04),   # NEW
     ]
 
-    # ── zone builders ─────────────────────────────────────────────────────
+    def __init__(self, vocab, cpd, token_freq):
+        self.vocab      = set(vocab)
+        self.token_freq = dict(token_freq)
+        self._build_freq_zones()
+        self._build_alpha_zones()
+        self._build_ngram_zones(cpd)
+        self._build_trigram_latent_index(cpd)   # NEW
+        self._make_zone_specs()
+        self.prompt_zone = {}
+
+    # ── zone builders ──────────────────────────────────────────────────────
 
     def _build_freq_zones(self):
         pairs = sorted(
@@ -305,12 +274,9 @@ class ContextZoneIndex:
         )
         high, mid, low = [], [], []
         for w, c in pairs:
-            if c >= self.FREQ_HIGH_THRESH:
-                high.append(w)
-            elif c >= self.FREQ_MID_THRESH:
-                mid.append(w)
-            else:
-                low.append(w)
+            if   c >= self.FREQ_HIGH_THRESH: high.append(w)
+            elif c >= self.FREQ_MID_THRESH:  mid.append(w)
+            else:                            low.append(w)
         self.freq_zones = {"high": high, "mid": mid, "low": low}
 
     def _build_alpha_zones(self):
@@ -335,97 +301,161 @@ class ContextZoneIndex:
             pass
         self.ngram_zones = zones
 
-    # ── ZoneRetriever specs ───────────────────────────────────────────────
+    # ── NEW: trigram latent-space index, sorted by BOS-anchor proximity ───
+
+    def _build_trigram_latent_index(self, cpd):
+        """
+        1. Build a dense probability vector over vocab_list for every
+           trigram context key in ngram_zones.
+        2. Compute a BOS anchor = mean of all ("", w) context vectors.
+        3. Sort all contexts by cosine similarity to that anchor (desc).
+        4. Bucket into quartiles q0..q3; each bucket holds the union of
+           successor words for its contexts — this is the latent-sorted
+           dataset the latent_bos zone spec reads from.
+        """
+        self.vocab_list = sorted(w for w in self.vocab if w)
+        V = len(self.vocab_list)
+        if V == 0:
+            self.latent_vectors     = {}
+            self.latent_sorted_keys = []
+            self.latent_sim_scores  = {}
+            self.latent_bos_data    = {}
+            return
+
+        word_to_idx = {w: i for i, w in enumerate(self.vocab_list)}
+
+        def ctx_to_vector(ctx):
+            vec = np.zeros(V, dtype=np.float64)
+            try:
+                d = cpd[ctx]
+                for s in d.samples():
+                    if s and s in word_to_idx:
+                        vec[word_to_idx[s]] = max(0.0, float(d.prob(s)))
+            except Exception:
+                pass
+            norm = vec.sum()
+            if norm > 0:
+                vec /= norm
+            return vec
+
+        self.latent_vectors = {ctx: ctx_to_vector(ctx) for ctx in self.ngram_zones}
+
+        # BOS anchor: mean of all ("", w) context vectors
+        bos_vecs = [
+            vec for ctx, vec in self.latent_vectors.items()
+            if len(ctx) >= 1 and ctx[0] == ""
+        ]
+        if bos_vecs:
+            anchor = np.mean(np.vstack(bos_vecs), axis=0)
+            a_norm = np.linalg.norm(anchor)
+            if a_norm > 0:
+                anchor /= a_norm
+        else:
+            anchor = np.ones(V, dtype=np.float64) / max(1, V)
+
+        def cosine_sim(vec):
+            n = np.linalg.norm(vec)
+            return float(np.dot(vec / n, anchor)) if n >= 1e-12 else 0.0
+
+        self.latent_sim_scores  = {ctx: cosine_sim(v) for ctx, v in self.latent_vectors.items()}
+        self.latent_sorted_keys = sorted(
+            self.latent_vectors.keys(),
+            key=lambda ctx: self.latent_sim_scores[ctx],
+            reverse=True,
+        )
+
+        # Build quartile buckets over the sorted dataset
+        n_keys          = len(self.latent_sorted_keys)
+        latent_bos_data = {f"q{q}": [] for q in range(4)}
+        for rank, ctx in enumerate(self.latent_sorted_keys):
+            q = min(3, rank * 4 // max(1, n_keys))
+            latent_bos_data[f"q{q}"].extend(self.ngram_zones.get(ctx, []))
+
+        for q_key in latent_bos_data:
+            seen_l, deduped = set(), []
+            for w in latent_bos_data[q_key]:
+                if w not in seen_l:
+                    seen_l.add(w)
+                    deduped.append(w)
+            latent_bos_data[q_key] = deduped
+
+        self.latent_bos_data = latent_bos_data
+
+    def print_latent_sorted_dataset(self, top_n=20):
+        """Print trigram contexts sorted by BOS-latent cosine similarity."""
+        print(f"{'Rank':<5} {'Context':<28} {'CosSim':>8}  Top successors")
+        print("-" * 78)
+        for rank, ctx in enumerate(self.latent_sorted_keys[:top_n]):
+            sim   = self.latent_sim_scores[ctx]
+            succs = self.ngram_zones.get(ctx, [])[:5]
+            ctx_s = " | ".join(f"'{w}'" for w in ctx)
+            print(f"{rank:<5} ({ctx_s:<26}) {sim:>8.4f}  {succs}")
+
+    # ── zone specs ────────────────────────────────────────────────────────
 
     def _make_zone_specs(self):
-        """
-        Build self.zone_specs: a list of dicts, one per zone type.
-        Every spec has the same interface:
-            spec['name']    : str
-            spec['key_fn']  : prompt_words -> list of lookup keys
-            spec['data']    : dict mapping key -> sorted word list
-            spec['sigma']   : float  (Gaussian attention width)
-            spec['floor']   : float  (minimum attention weight)
-
-        This is the isomorphism: every zone is retrieved via the identical
-        pattern  data.get(key_fn(prompt)[i], [])  regardless of zone type.
-        The only things that differ are key_fn and data — not the retrieval
-        syntax.
-        """
-
         def _char_trigrams(word):
             return {word[i:i+3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
 
-        # --- ngram_bigram: key = (w_i, w_{i+1}) ---
         def key_fn_bigram(prompt_words):
-            return [
-                (prompt_words[i], prompt_words[i + 1])
-                for i in range(len(prompt_words) - 1)
-            ]
+            return [(prompt_words[i], prompt_words[i+1]) for i in range(len(prompt_words)-1)]
 
-        # --- ngram_unigram: key = (w_i,) ---
         def key_fn_unigram(prompt_words):
             return [(w,) for w in prompt_words if w]
 
-        # --- alpha: key = first letter of each prompt word ---
         def key_fn_alpha(prompt_words):
             return [w[0] for w in prompt_words if w and w[0].isalpha()]
 
-        # --- freq: key = "high" | "mid" | "low" selected by prompt ---
         high_set = set(self.freq_zones["high"])
 
         def key_fn_freq(prompt_words):
             if any(w in high_set for w in prompt_words):
                 return ["high"]
-            if all(self.token_freq.get(w, 0) < self.FREQ_MID_THRESH
-                   for w in prompt_words):
+            if all(self.token_freq.get(w, 0) < self.FREQ_MID_THRESH for w in prompt_words):
                 return ["low"]
             return ["mid"]
 
-        # --- trigram_char: key = frozenset of char-trigrams of prompt ---
-        # Data is built on-the-fly as a single-key dict keyed by sentinel.
         trig_index = defaultdict(set)
         for v in self.vocab:
             if v:
                 for tg in _char_trigrams(v):
                     trig_index[tg].add(v)
         self._trig_index = trig_index
+        self._trig_data  = {}
 
         def key_fn_trigram(prompt_words):
             prompt_tgs = set()
             for w in prompt_words:
                 prompt_tgs |= _char_trigrams(w)
-            # Use a single sentinel key "__trig__" that maps to neighbours
             neighbours = set()
             for tg in prompt_tgs:
                 neighbours |= trig_index.get(tg, set())
             self._trig_data["__trig__"] = sorted(neighbours)
             return ["__trig__"]
 
-        self._trig_data = {}
+        # NEW: latent_bos key_fn — map prompt words to BOS-quartile bucket
+        n_keys = len(self.latent_sorted_keys)
 
-        # Assemble specs — all five use the same retrieval interface
+        def key_fn_latent(prompt_words):
+            for ctx in self.latent_sorted_keys:
+                if any(w in ctx for w in prompt_words):
+                    rank = self.latent_sorted_keys.index(ctx)
+                    q    = min(3, rank * 4 // max(1, n_keys))
+                    return [f"q{q}"]
+            return ["q0"]
+
         templates = {t[0]: (t[1], t[2]) for t in self._ZONE_SPEC_TEMPLATES}
         self.zone_specs = [
-            dict(name="ngram_bigram",  key_fn=key_fn_bigram,   data=self.ngram_zones,  sigma=templates["ngram_bigram"][0],  floor=templates["ngram_bigram"][1]),
-            dict(name="ngram_unigram", key_fn=key_fn_unigram,  data=self.ngram_zones,  sigma=templates["ngram_unigram"][0], floor=templates["ngram_unigram"][1]),
-            dict(name="alpha",         key_fn=key_fn_alpha,    data=self.alpha_zones,  sigma=templates["alpha"][0],         floor=templates["alpha"][1]),
-            dict(name="freq",          key_fn=key_fn_freq,     data=self.freq_zones,   sigma=templates["freq"][0],          floor=templates["freq"][1]),
-            dict(name="trigram_char",  key_fn=key_fn_trigram,  data=self._trig_data,   sigma=templates["trigram_char"][0],  floor=templates["trigram_char"][1]),
+            dict(name="ngram_bigram",  key_fn=key_fn_bigram,   data=self.ngram_zones,     sigma=templates["ngram_bigram"][0],  floor=templates["ngram_bigram"][1]),
+            dict(name="ngram_unigram", key_fn=key_fn_unigram,  data=self.ngram_zones,     sigma=templates["ngram_unigram"][0], floor=templates["ngram_unigram"][1]),
+            dict(name="alpha",         key_fn=key_fn_alpha,    data=self.alpha_zones,     sigma=templates["alpha"][0],         floor=templates["alpha"][1]),
+            dict(name="freq",          key_fn=key_fn_freq,     data=self.freq_zones,      sigma=templates["freq"][0],          floor=templates["freq"][1]),
+            dict(name="trigram_char",  key_fn=key_fn_trigram,  data=self._trig_data,      sigma=templates["trigram_char"][0],  floor=templates["trigram_char"][1]),
+            dict(name="latent_bos",    key_fn=key_fn_latent,   data=self.latent_bos_data, sigma=templates["latent_bos"][0],    floor=templates["latent_bos"][1]),
         ]
 
-    # ── prompt-driven zone selection (isomorphic across all zone types) ───
-
     def select_zones_for_prompt(self, prompt_words):
-        """
-        Unified retrieval: for every zone spec, call key_fn(prompt_words)
-        to get the lookup keys, then retrieve data[key] for each key.
-        All five zone types use the identical retrieval syntax.
-
-        Returns a priority-ordered, deduped list of candidate words.
-        """
-        selected = []
-        seen = set()
+        selected, seen = [], set()
 
         def _add(words):
             for w in words:
@@ -433,58 +463,32 @@ class ContextZoneIndex:
                     seen.add(w)
                     selected.append(w)
 
-        # Isomorphic retrieval loop — same syntax for every zone type
         for spec in self.zone_specs:
-            keys = spec["key_fn"](prompt_words)   # prompt → lookup keys
-            for key in keys:
-                _add(spec["data"].get(key, []))    # data[key] → word list
-
+            for key in spec["key_fn"](prompt_words):
+                _add(spec["data"].get(key, []))
         return selected
-
-    # ── attention gradient ────────────────────────────────────────────────
 
     @staticmethod
     def zone_gradient(zone_set, candidates, sigma=0.35, floor=0.05):
-        """
-        Soft Gaussian attention mask over `candidates`.
-
-        Parameters
-        ----------
-        zone_set   : set of words that belong to the attended zone
-        candidates : list of (word, prob) in rank order (index 0 = highest prob)
-        sigma      : std-dev of the Gaussian window in normalised rank units
-        floor      : minimum weight so no candidate is fully zeroed
-
-        Returns a numpy weight vector of shape (len(candidates),) summing to 1.
-        """
         n = len(candidates)
         if n == 0:
             return np.array([], dtype=np.float64)
-
-        indices = np.arange(n, dtype=np.float64)
-        norm_idx = indices / max(1, n - 1)   # [0, 1]
-
-        # Find the normalised rank centroid of zone members within candidates
+        indices  = np.arange(n, dtype=np.float64)
+        norm_idx = indices / max(1, n - 1)
         zone_ranks = [
             i / max(1, n - 1)
             for i, (w, _) in enumerate(candidates)
             if w in zone_set
         ]
-        if zone_ranks:
-            centre = float(np.mean(zone_ranks))
-        else:
-            centre = 0.0   # default: attend toward high-probability end
-
-        gauss = np.exp(-0.5 * ((norm_idx - centre) / max(1e-6, sigma)) ** 2)
+        centre  = float(np.mean(zone_ranks)) if zone_ranks else 0.0
+        gauss   = np.exp(-0.5 * ((norm_idx - centre) / max(1e-6, sigma)) ** 2)
         weights = floor + (1.0 - floor) * gauss
         weights /= weights.sum()
         return weights
 
 
 def build_context_index(vocab, cpd, corpus_tokens):
-    """Build a ContextZoneIndex from already-tokenised corpus data."""
-    freq = Counter(corpus_tokens)
-    return ContextZoneIndex(vocab, cpd, freq)
+    return ContextZoneIndex(vocab, cpd, Counter(corpus_tokens))
 
 
 # ---------------------------------------------------------------------------
@@ -492,34 +496,23 @@ def build_context_index(vocab, cpd, corpus_tokens):
 # ---------------------------------------------------------------------------
 
 def stream_to_matrix(stream, n_cols=26):
-    """Reshape flat stream into a 2D numpy array of shape (rows, n_cols)."""
-    arr = np.array(stream, dtype=np.int32)
+    arr  = np.array(stream, dtype=np.int32)
     trim = (len(arr) // n_cols) * n_cols
     return arr[:trim].reshape(-1, n_cols)
 
 
 def roll_until_column_match(arr, max_iters=None):
-    """
-    vstack arr with np.roll(arr, shift, axis=1) for shift=1,2,... until
-    at least one column index i satisfies rolled[:, i] == original[:, i]
-    element-wise. Returns (stacked_array, winning_shift).
-    shift=-1 means no column match found within max_iters.
-    """
     if arr.ndim == 1:
         arr = arr.reshape(1, -1)
-    n_cols = arr.shape[1]
-    if max_iters is None:
-        max_iters = n_cols
-
-    original = arr.copy()
-    stacked = arr.copy()
-
+    n_cols    = arr.shape[1]
+    max_iters = max_iters or n_cols
+    original  = arr.copy()
+    stacked   = arr.copy()
     for shift in range(1, max_iters + 1):
-        rolled = np.roll(original, shift, axis=1)
+        rolled  = np.roll(original, shift, axis=1)
         stacked = np.vstack([stacked, rolled])
         if np.any(np.all(rolled == original, axis=0)):
             return stacked, shift
-
     return stacked, -1
 
 
@@ -529,33 +522,28 @@ def roll_until_column_match(arr, max_iters=None):
 
 class SeashellResonator:
     def __init__(self, sampler, strength, decay, peaks, width, floor):
-        self.sampler = sampler
+        self.sampler       = sampler
         self.base_strength = max(0.0, float(strength))
-        self.decay = min(0.9999, max(0.0, float(decay)))
-        self.peaks = max(1, int(peaks))
-        self.width = max(0.02, float(width))
-        self.floor = max(1e-6, float(floor))
-        self.energy = 1.0
-        self.step_index = 0
+        self.decay         = min(0.9999, max(0.0, float(decay)))
+        self.peaks         = max(1, int(peaks))
+        self.width         = max(0.02, float(width))
+        self.floor         = max(1e-6, float(floor))
+        self.energy        = 1.0
+        self.step_index    = 0
         self.centers = []
-        self.phases = []
+        self.phases  = []
         self.spreads = []
         self._seed_from_stream()
 
     def _seed_from_stream(self):
-        self.centers = []
-        self.phases = []
-        self.spreads = []
+        self.centers, self.phases, self.spreads = [], [], []
         for _ in range(self.peaks):
-            c = self.sampler.next_unit()
-            ph = 2.0 * math.pi * self.sampler.next_unit()
-            spread = self.width * (0.65 + 0.7 * self.sampler.next_unit())
-            self.centers.append(c)
-            self.phases.append(ph)
-            self.spreads.append(spread)
+            self.centers.append(self.sampler.next_unit())
+            self.phases.append(2.0 * math.pi * self.sampler.next_unit())
+            self.spreads.append(self.width * (0.65 + 0.7 * self.sampler.next_unit()))
 
     def reset(self):
-        self.energy = 1.0
+        self.energy     = 1.0
         self.step_index = 0
         self._seed_from_stream()
 
@@ -566,27 +554,24 @@ class SeashellResonator:
     def gains(self, n_items):
         if n_items <= 0:
             return []
-        gains = []
-        t = self.step_index
-        live_strength = self.base_strength * self.energy
-        drift = 0.017 * math.sin(0.11 * t)
-        shimmer = 0.09 * math.sin(0.19 * t + 1.7)
+        t       = self.step_index
+        ls      = self.base_strength * self.energy
+        drift   = 0.017 * math.sin(0.11 * t)
+        shimmer = 0.09  * math.sin(0.19 * t + 1.7)
+        gains   = []
         for rank in range(n_items):
-            idx = rank / max(1, n_items - 1)
+            idx      = rank / max(1, n_items - 1)
             response = 0.0
             for center, phase, spread in zip(self.centers, self.phases, self.spreads):
-                moving_center = (center + drift * math.sin(phase + 0.07 * t)) % 1.0
-                d = self._wrapped_distance(idx, moving_center)
-                gauss = math.exp(-(d * d) / max(1e-9, 2.0 * spread * spread))
+                mc     = (center + drift * math.sin(phase + 0.07 * t)) % 1.0
+                d      = self._wrapped_distance(idx, mc)
+                gauss  = math.exp(-(d * d) / max(1e-9, 2.0 * spread * spread))
                 ripple = 0.5 + 0.5 * math.cos(
-                    (d / max(1e-9, spread)) * math.pi * (1.5 + shimmer)
-                    + phase
-                    + 0.13 * t
+                    (d / max(1e-9, spread)) * math.pi * (1.5 + shimmer) + phase + 0.13 * t
                 )
                 response += gauss * (0.55 + 0.45 * ripple)
             response /= max(1, self.peaks)
-            gain = self.floor + (1.0 - self.floor) + live_strength * response
-            gains.append(max(self.floor, gain))
+            gains.append(max(self.floor, self.floor + (1.0 - self.floor) + ls * response))
         total = sum(gains)
         if total > 0:
             gains = [g / total for g in gains]
@@ -595,9 +580,9 @@ class SeashellResonator:
     def apply(self, scored):
         if not scored:
             return scored
-        g = self.gains(len(scored))
+        g        = self.gains(len(scored))
         weighted = [(w, p * gain) for (w, p), gain in zip(scored, g)]
-        total = sum(p for _, p in weighted)
+        total    = sum(p for _, p in weighted)
         if total > 0:
             weighted = [(w, p / total) for w, p in weighted]
         self.energy *= self.decay
@@ -609,23 +594,23 @@ class SeashellResonator:
 
 
 # ---------------------------------------------------------------------------
-# SemicircleWaveMask
+# SemicircleWaveMask  — BUG FIX: sign inversion (-p*gain) corrected to p*gain
 # ---------------------------------------------------------------------------
 
 class SemicircleWaveMask:
     def __init__(self, sampler, strength, arches, radius, speed, floor):
-        self.sampler = sampler
-        self.strength = max(0.0, float(strength))
-        self.arches = max(1, int(arches))
-        self.radius = max(0.02, float(radius))
-        self.speed = float(speed)
-        self.floor = max(1e-6, float(floor))
+        self.sampler    = sampler
+        self.strength   = max(0.0, float(strength))
+        self.arches     = max(1, int(arches))
+        self.radius     = max(0.02, float(radius))
+        self.speed      = float(speed)
+        self.floor      = max(1e-6, float(floor))
         self.step_index = 0
-        self.phase0 = self.sampler.next_unit()
+        self.phase0     = self.sampler.next_unit()
 
     def reset(self):
         self.step_index = 0
-        self.phase0 = self.sampler.next_unit()
+        self.phase0     = self.sampler.next_unit()
 
     def _arch(self, x):
         d = (x - 0.5) / self.radius
@@ -638,11 +623,10 @@ class SemicircleWaveMask:
         phase = self.phase0 + self.speed * self.step_index
         gains = []
         for rank in range(n_items):
-            idx = rank / max(1, n_items - 1)
+            idx      = rank / max(1, n_items - 1)
             slot_pos = (idx * self.arches + phase) % 1.0
-            arch = self._arch(slot_pos)
-            gain = (1.0 - self.strength) + self.strength * arch
-            gains.append(max(self.floor, gain))
+            arch     = self._arch(slot_pos)
+            gains.append(max(self.floor, (1.0 - self.strength) + self.strength * arch))
         total = sum(gains)
         if total > 0:
             gains = [g / total for g in gains]
@@ -651,9 +635,9 @@ class SemicircleWaveMask:
     def apply(self, scored):
         if not scored:
             return scored
-        g = self.gains(len(scored))
-        weighted = [(w, -p * gain) for (w, p), gain in zip(scored, g)]
-        total = sum(p for _, p in weighted)
+        g        = self.gains(len(scored))
+        weighted = [(w, p * gain) for (w, p), gain in zip(scored, g)]  # FIXED: was -p*gain
+        total    = sum(p for _, p in weighted)
         if total > 0:
             weighted = [(w, p / total) for w, p in weighted]
         self.step_index += 1
@@ -661,7 +645,7 @@ class SemicircleWaveMask:
 
 
 # ---------------------------------------------------------------------------
-# PiSampler  — XOR fusion replaced with vstack/hstack instruction-context blend
+# PiSampler
 # ---------------------------------------------------------------------------
 
 class PiSampler:
@@ -688,154 +672,90 @@ class PiSampler:
         insight_penalty=1.5,
         instruction_context=None,
     ):
-        self.stream = stream
-        self.digits_per_sample = digits_per_sample
-        self.pos = 0
-        self.temperature = max(1e-3, float(temperature))
-        self.top_k = max(1, int(top_k))
-        self.top_p = max(1e-3, min(1.0, float(top_p)))
-        self.repetition_penalty = max(1.0, float(repetition_penalty))
-        self.insight_penalty = max(0.0, float(insight_penalty))
-        self.history = Counter()
+        self.stream              = stream
+        self.digits_per_sample   = digits_per_sample
+        self.pos                 = 0
+        self.temperature         = max(1e-3, float(temperature))
+        self.top_k               = max(1, int(top_k))
+        self.top_p               = max(1e-3, min(1.0, float(top_p)))
+        self.repetition_penalty  = max(1.0, float(repetition_penalty))
+        self.insight_penalty     = max(0.0, float(insight_penalty))
+        self.history             = Counter()
         self.instruction_context = list(instruction_context) if instruction_context else []
-        self.seashell = None
+        self.seashell   = None
+        self.semicircle = None
         if seashell_enable:
             self.seashell = SeashellResonator(
-                self,
-                seashell_strength,
-                seashell_decay,
-                seashell_peaks,
-                seashell_width,
-                seashell_floor,
+                self, seashell_strength, seashell_decay,
+                seashell_peaks, seashell_width, seashell_floor,
             )
-        self.semicircle = None
         if semicircle_enable:
             self.semicircle = SemicircleWaveMask(
-                self,
-                semicircle_strength,
-                semicircle_arches,
-                semicircle_radius,
-                semicircle_speed,
-                semicircle_floor,
+                self, semicircle_strength, semicircle_arches,
+                semicircle_radius, semicircle_speed, semicircle_floor,
             )
 
     def seek(self, pos):
         self.pos = pos % len(self.stream)
         self.history.clear()
-        if self.seashell is not None:
-            self.seashell.reset()
-        if self.semicircle is not None:
-            self.semicircle.reset()
+        if self.seashell   is not None: self.seashell.reset()
+        if self.semicircle is not None: self.semicircle.reset()
 
     def next_unit(self):
-        val = 0
+        val  = 0
         base = 26 ** self.digits_per_sample
         for _ in range(self.digits_per_sample):
-            val = val * 26 + self.stream[self.pos % (val+1)]
+            val  = val * 26 + self.stream[self.pos % max(1, val + 1)]
             self.pos += 1
         return val / base
 
-    # ------------------------------------------------------------------
-    # Zone-attention blend
-    # The prompt selects which sorted/categorised data structure zones to
-    # attend to.  Within each attended zone, a Gaussian probability gradient
-    # masks away the non-attended parts of the candidate set.
-    # ------------------------------------------------------------------
-
     def set_context_index(self, context_index):
-        """Attach the pre-built ContextZoneIndex for this generation run."""
         self._context_index = context_index
 
     def _zone_attention_blend(self, scored):
-        """
-        Attention over sorted/categorised data structures.
-
-        Pipeline
-        --------
-        1. Use self.instruction_context (prompt words) to SELECT which zones
-           of the ContextZoneIndex to attend to — this returns an ordered
-           priority list of candidate words (zone_selection).
-
-        2. Build the zone membership set from zone_selection.
-
-        3. Compute a per-zone Gaussian attention gradient over the scored
-           candidates.  The gradient is a soft probability mask: candidates
-           whose words sit inside the attended zone get a high weight, those
-           outside get a floor weight.  Multiple zones are combined by
-           vstack-ing their gradient rows and taking a weighted column mean.
-
-        4. hstack a history-penalty column alongside the zone-gradient matrix
-           so recency is factored into the final weight at no extra cost.
-
-        5. Blend the resulting weight vector with the base probabilities via
-           geometric mean and renormalise.
-        """
         n = len(scored)
         if n == 0:
             return scored
 
-        ctx = getattr(self, '_context_index', None)
+        ctx    = getattr(self, "_context_index", None)
         prompt = self.instruction_context
 
-        # ── step 1: prompt selects zones ──────────────────────────────────
         if ctx is not None and prompt:
             zone_selection = ctx.select_zones_for_prompt(prompt)
         else:
             zone_selection = [w for w, _ in scored]
 
-        zone_set = set(zone_selection)
-
-        # ── step 2: per-zone gradient rows ────────────────────────────────
-        # We compute one gradient row per distinct attended zone type so that
-        # the zones' signals can be independently weighted before combining.
         gradient_rows = []
-
         if ctx is not None and prompt:
-            # Isomorphic gradient loop — same retrieval syntax for all zone types.
-            # For each zone spec: retrieve words via data[key_fn(prompt)[i]],
-            # then compute a Gaussian attention gradient using the spec's sigma/floor.
             for spec in ctx.zone_specs:
-                keys = spec["key_fn"](prompt)          # prompt → lookup keys
-                for key in keys:
-                    words = spec["data"].get(key, [])  # data[key] → word list
+                for key in spec["key_fn"](prompt):
+                    words = spec["data"].get(key, [])
                     if words:
                         g = ContextZoneIndex.zone_gradient(
                             set(words), scored,
-                            sigma=spec["sigma"],
-                            floor=spec["floor"],
+                            sigma=spec["sigma"], floor=spec["floor"],
                         )
                         gradient_rows.append(g)
 
-        # Fallback: uniform gradient if nothing was selected
         if not gradient_rows:
             gradient_rows.append(np.ones(n, dtype=np.float64) / n)
 
-        # ── step 3: vstack zone gradient rows ─────────────────────────────
-        zone_matrix = np.vstack(gradient_rows)        # (n_zones, n)
-
-        # ── step 4: hstack history-penalty column ─────────────────────────
+        zone_matrix = np.vstack(gradient_rows)
         history_col = np.array(
             [1.0 / (1.0 + self.history[w]) for w, _ in scored],
             dtype=np.float64,
-        ).reshape(1, -1)                              # (1, n)
-        full_matrix = np.vstack([zone_matrix, -history_col])  # (n_zones+1, n)
+        ).reshape(1, -1)
+        full_matrix = np.vstack([zone_matrix, history_col])
+        row_norms   = full_matrix.sum(axis=1, keepdims=True).clip(1e-12)
+        augmented   = np.hstack([full_matrix, row_norms])
 
-        # hstack a normalisation sentinel: each row's own L1 norm as a
-        # (n_rows, 1) column — this anchors the per-row scale before combining
-        row_norms = full_matrix.sum(axis=1, keepdims=True).clip(1e-12)
-        augmented = np.hstack([full_matrix, row_norms])       # (n_zones+1, n+1)
-
-        # ── step 5: weighted column mean over candidate axis ──────────────
-        # Weight each zone row by its mean gradient value (zones that are
-        # more focused/informative get higher weight)
-        row_weights = augmented[:, :n].mean(axis=1)           # (n_zones+1,)
+        row_weights = augmented[:, :n].mean(axis=1)
         row_weights = np.clip(row_weights, 1e-12, None)
         row_weights /= row_weights.sum()
-        weights = (augmented[:, :n] * row_weights[:, None]).sum(axis=0)  # (n,)
+        weights = (augmented[:, :n] * row_weights[:, None]).sum(axis=0)
         weights = np.clip(weights, 1e-12, None)
         weights /= weights.sum()
 
-        # ── step 6: geometric-mean blend with base probabilities ──────────
         blended = [
             (word, math.sqrt(max(1e-24, p) * float(w)))
             for (word, p), w in zip(scored, weights)
@@ -852,22 +772,20 @@ class PiSampler:
 
         base_scored = []
         for s in samples:
-            p = max(1e-12, float(dist.prob(s)))
+            p     = max(1e-12, float(dist.prob(s)))
             count = self.history[s]
             if count > 0:
                 p /= self.repetition_penalty ** count
             base_scored.append((s, p))
 
         base_scored = apply_insight_penalty(base_scored, self.insight_penalty)
-
-        scored = [(s, p ** (1.0 / self.temperature)) for s, p in base_scored]
-        total = sum(p for _, p in scored)
-        scored = [(s, p / total) for s, p in scored]
-
+        scored      = [(s, p ** (1.0 / self.temperature)) for s, p in base_scored]
+        total       = sum(p for _, p in scored)
+        scored      = [(s, p / total) for s, p in scored]
         scored.sort(key=lambda x: x[1], reverse=True)
         scored = scored[: self.top_k]
-        kept = []
-        accum = 0.0
+
+        kept, accum = [], 0.0
         for s, p in scored:
             kept.append((s, p))
             accum += p
@@ -875,27 +793,18 @@ class PiSampler:
                 break
         scored = kept
 
-        if self.seashell is not None:
-            scored = self.seashell.apply(scored)
-
-        if self.semicircle is not None:
-            scored = self.semicircle.apply(scored)
-
-        # zone-attention blend: prompt selects data structures, gradient masks non-attended
+        if self.seashell   is not None: scored = self.seashell.apply(scored)
+        if self.semicircle is not None: scored = self.semicircle.apply(scored)
         scored = self._zone_attention_blend(scored)
 
-        # ── novelty filter: prefer words not yet emitted ────────────────────
-        unseen = [(w, p) for w, p in scored if self.history[w] == 0]
-        pool = unseen if unseen else scored   # fall back if all candidates seen
+        unseen     = [(w, p) for w, p in scored if self.history[w] == 0]
+        pool       = unseen if unseen else scored
         pool_total = sum(p for _, p in pool)
         if pool_total > 0:
             pool = [(w, p / pool_total) for w, p in pool]
-        # ─────────────────────────────────────────────────────────────────────
 
-        # single pi-stream draw for final selection
         draw = self.next_unit()
-        cumulative = 0.0
-        chosen = pool[-1][0]
+        cumulative, chosen = 0.0, pool[-1][0]
         for word, p in pool:
             cumulative += p
             if draw < cumulative:
@@ -912,62 +821,28 @@ class PiSampler:
 
 class Triangle:
     def __init__(self, stream_len, offset_extra=0, bend_degrees=13.0):
-        base = offset_extra % stream_len
+        base       = offset_extra % stream_len
         bend_shift = int(round((bend_degrees / 360.0) * stream_len))
-        self.A = base % stream_len
-        self.B = (base + stream_len // 3 + bend_shift) % stream_len
-        self.C = (base + 2 * stream_len // 3 + bend_shift) % stream_len
+        self.A     = base % stream_len
+        self.B     = (base + stream_len // 3 + bend_shift) % stream_len
+        self.C     = (base + 2 * stream_len // 3 + bend_shift) % stream_len
         self.vertices = {"A": self.A, "B": self.B, "C": self.C}
 
 
-# ---------------------------------------------------------------------------
-# Text generation
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # PSPACE Semantic Area Definitions
 # ---------------------------------------------------------------------------
 
 PSPACE_ZONES = [
-    {
-        "name": "NARRATIVE",
-        "desc": "High-frequency corpus words",
-        "pi_min": 0.00, "pi_max": 0.20,
-        "zone_key": "freq",
-        "freq_tier": "high",
-    },
-    {
-        "name": "DESCRIPTIVE",
-        "desc": "Alphabetic neighbourhood of prompt",
-        "pi_min": 0.20, "pi_max": 0.40,
-        "zone_key": "alpha",
-        "freq_tier": None,
-    },
-    {
-        "name": "RELATIONAL",
-        "desc": "Bigram-conditioned successors",
-        "pi_min": 0.40, "pi_max": 0.60,
-        "zone_key": "ngram_bigram",
-        "freq_tier": None,
-    },
-    {
-        "name": "EXISTENTIAL",
-        "desc": "Rare / low-frequency vocab",
-        "pi_min": 0.60, "pi_max": 0.80,
-        "zone_key": "freq",
-        "freq_tier": "low",
-    },
-    {
-        "name": "TRANSITIONAL",
-        "desc": "Char-trigram neighbours",
-        "pi_min": 0.80, "pi_max": 1.01,
-        "zone_key": "trigram_char",
-        "freq_tier": None,
-    },
+    {"name": "NARRATIVE",    "desc": "High-frequency corpus words",        "pi_min": 0.00, "pi_max": 0.20, "zone_key": "freq",         "freq_tier": "high"},
+    {"name": "DESCRIPTIVE",  "desc": "Alphabetic neighbourhood of prompt", "pi_min": 0.20, "pi_max": 0.40, "zone_key": "alpha",        "freq_tier": None},
+    {"name": "RELATIONAL",   "desc": "Bigram-conditioned successors",      "pi_min": 0.40, "pi_max": 0.60, "zone_key": "ngram_bigram", "freq_tier": None},
+    {"name": "EXISTENTIAL",  "desc": "Rare / low-frequency vocab",         "pi_min": 0.60, "pi_max": 0.80, "zone_key": "freq",         "freq_tier": "low"},
+    {"name": "TRANSITIONAL", "desc": "Char-trigram neighbours",            "pi_min": 0.80, "pi_max": 1.01, "zone_key": "trigram_char", "freq_tier": None},
 ]
 
 
 def _pi_activate_zone(pi_val):
-    """Map a pi-stream unit float [0,1) to one PSPACE zone name."""
     for z in PSPACE_ZONES:
         if z["pi_min"] <= pi_val < z["pi_max"]:
             return z["name"]
@@ -975,73 +850,120 @@ def _pi_activate_zone(pi_val):
 
 
 def _restrict_specs_to_zone(context_index, zone_name):
-    """
-    Return the subset of context_index.zone_specs matching zone_name's
-    zone_key. Falls back to all specs if none match.
-    """
-    target = next((z for z in PSPACE_ZONES if z["name"] == zone_name), None)
+    target   = next((z for z in PSPACE_ZONES if z["name"] == zone_name), None)
     if target is None or context_index is None:
         return getattr(context_index, "zone_specs", [])
-    key = target["zone_key"]
+    key      = target["zone_key"]
     matching = [s for s in context_index.zone_specs if s["name"] == key]
     return matching if matching else context_index.zone_specs
 
 
 # ---------------------------------------------------------------------------
-# generate_text_pspace  — pi stream activates each semantic area, prints span
+# _score_only  — PiSampler.sample up to but NOT including the final draw
+# ---------------------------------------------------------------------------
+
+def _score_only(sampler, dist):
+    samples = list(dist.samples())
+    if not samples:
+        return []
+
+    base_scored = []
+    for s in samples:
+        p     = max(1e-12, float(dist.prob(s)))
+        count = sampler.history[s]
+        if count > 0:
+            p /= sampler.repetition_penalty ** count
+        base_scored.append((s, p))
+
+    base_scored = apply_insight_penalty(base_scored, sampler.insight_penalty)
+    scored      = [(s, p ** (1.0 / sampler.temperature)) for s, p in base_scored]
+    total       = sum(p for _, p in scored)
+    if total > 0:
+        scored = [(s, p / total) for s, p in scored]
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    scored = scored[: sampler.top_k]
+    kept, accum = [], 0.0
+    for s, p in scored:
+        kept.append((s, p))
+        accum += p
+        if accum >= sampler.top_p:
+            break
+    scored = kept
+
+    if sampler.seashell   is not None: scored = sampler.seashell.apply(scored)
+    if sampler.semicircle is not None: scored = sampler.semicircle.apply(scored)
+    return sampler._zone_attention_blend(scored)
+
+
+def _combine_scored_geometric(scored_lists, floor=1e-12):
+    if not scored_lists:
+        return []
+    cycle_maps = [dict(sl) for sl in scored_lists]
+    union = set()
+    for d in cycle_maps: union.update(d.keys())
+    if not union:
+        return []
+    K        = len(cycle_maps)
+    combined = []
+    for w in union:
+        log_sum = sum(math.log(max(floor, d.get(w, floor))) for d in cycle_maps)
+        combined.append((w, math.exp(log_sum / K)))
+    total = sum(p for _, p in combined)
+    if total > 0:
+        combined = [(w, p / total) for w, p in combined]
+    combined.sort(key=lambda x: x[1], reverse=True)
+    return combined
+
+
+# ---------------------------------------------------------------------------
+# generate_text_pspace
+# Pi stream activates PSPACE semantic areas; each area prints its span.
+# Latent-BOS-sorted dataset informs the latent_bos zone spec throughout.
+# Concatenation of all spans == full generated text.
 # ---------------------------------------------------------------------------
 
 def generate_text_pspace(
     cpd, sampler, prompt, n_words, ngram_n,
     vocab=None, context_index=None, n_cycles=3,
-    span_words=8,            # how many words each activated zone produces
-    verbose_zones=True,      # if True, print zone activations to stdout
+    span_words=8,
+    verbose_zones=True,
 ):
     """
-    PSPACE-zoned text generation.
-
-    For each span of `span_words` tokens:
-      1. Draw a pi-stream unit to SELECT the active PSPACE semantic zone.
-      2. Restrict zone_specs to that zone for the span duration.
-      3. Generate `span_words` tokens under that zone's attention.
-      4. Print (and collect) the span.
-
-    The spans are concatenated → the full generated text.
-    Equates to generate_text_combo_cycles output but with visible semantic
-    zone structure.
+    Per span of `span_words` tokens:
+      1. Draw pi-stream unit → activate PSPACE semantic zone.
+      2. Restrict zone_specs to that zone for the span.
+      3. Run combinatorial cycles over (zone_spec, prompt_bigram, pi_offset).
+      4. Print and collect the span.
+    Concatenation of spans == full generated text.
     """
-    n_spans = max(1, (n_words + span_words - 1) // span_words)
-
+    n_spans        = max(1, (n_words + span_words - 1) // span_words)
     context_window = ngram_n - 1
-    seed_words = tokenise_alpha(prompt)
+    seed_words     = tokenise_alpha(prompt)
+
     if vocab is not None:
         seed_in_vocab = [w for w in seed_words if w in vocab]
     else:
         seed_in_vocab = list(seed_words)
+
     if len(seed_in_vocab) >= context_window:
         init = seed_in_vocab[-context_window:]
     else:
         init = [""] * (context_window - len(seed_in_vocab)) + seed_in_vocab
 
-    context = deque(init, maxlen=context_window)
+    context   = deque(init, maxlen=context_window)
     out_words = list(seed_words)
-    zone_log = []          # [(zone_name, span_text), ...]
+    zone_log  = []
 
     if context_index is not None:
         sampler.set_context_index(context_index)
 
-    original_specs = (
-        list(context_index.zone_specs) if context_index is not None else []
-    )
-    original_ctx = list(getattr(sampler, "instruction_context", []) or [])
+    original_specs = list(context_index.zone_specs) if context_index is not None else []
+    original_ctx   = list(getattr(sampler, "instruction_context", []) or [])
 
-    # product axes (same as combo_cycles)
     prompt_alpha = [w for w in seed_words if w]
     if len(prompt_alpha) >= 2:
-        prompt_bigrams = [
-            (prompt_alpha[i], prompt_alpha[i + 1])
-            for i in range(len(prompt_alpha) - 1)
-        ]
+        prompt_bigrams = [(prompt_alpha[i], prompt_alpha[i+1]) for i in range(len(prompt_alpha)-1)]
     elif prompt_alpha:
         prompt_bigrams = [(prompt_alpha[-1],)]
     else:
@@ -1051,13 +973,11 @@ def generate_text_pspace(
     pi_offsets = [0, max(1, stream_len // 97), max(1, stream_len // 53)][:n_cycles]
 
     def diagonal_triples(K):
-        zone_specs_snap = getattr(context_index, "zone_specs", [None])
-        nz = len(zone_specs_snap)
-        nb = len(prompt_bigrams)
-        no = len(pi_offsets)
+        snap = getattr(context_index, "zone_specs", [None]) if context_index else [None]
+        nz, nb, no = len(snap), len(prompt_bigrams), len(pi_offsets)
         for k in range(K):
             yield (
-                zone_specs_snap[k % nz] if zone_specs_snap else None,
+                snap[k % nz] if snap else None,
                 prompt_bigrams[k % nb],
                 pi_offsets[k % no],
             )
@@ -1081,24 +1001,22 @@ def generate_text_pspace(
 
     words_remaining = n_words
 
-    for span_i in range(n_spans):
+    for _span_i in range(n_spans):
         if words_remaining <= 0:
             break
 
-        # ── 1. Pi-stream activates a PSPACE zone ────────────────────────
-        pi_val = sampler.next_unit()
+        # ── 1. Pi activates PSPACE zone ───────────────────────────────────
+        pi_val    = sampler.next_unit()
         zone_name = _pi_activate_zone(pi_val)
 
-        # ── 2. Restrict specs to the active zone ─────────────────────────
+        # ── 2. Restrict specs to active zone ──────────────────────────────
         if context_index is not None:
-            context_index.zone_specs = _restrict_specs_to_zone(
-                context_index, zone_name
-            )
+            context_index.zone_specs = _restrict_specs_to_zone(context_index, zone_name)
 
-        span_len = min(span_words, words_remaining)
+        span_len       = min(span_words, words_remaining)
         span_collected = []
 
-        # ── 3. Generate span under active zone ───────────────────────────
+        # ── 3. Generate span tokens ───────────────────────────────────────
         for _ in range(span_len):
             dist = dist_for_ctx(tuple(context))
             if dist is None:
@@ -1107,7 +1025,7 @@ def generate_text_pspace(
                 continue
 
             cycle_scored = []
-            saved_pos = sampler.pos
+            saved_pos    = sampler.pos
 
             for zs, bg, off in diagonal_triples(n_cycles):
                 if context_index is not None and zs is not None:
@@ -1119,34 +1037,26 @@ def generate_text_pspace(
                 if scored:
                     cycle_scored.append(scored)
 
-            # restore
             sampler.pos = saved_pos
             sampler.instruction_context = original_ctx
             if context_index is not None:
-                context_index.zone_specs = _restrict_specs_to_zone(
-                    context_index, zone_name
-                )
+                context_index.zone_specs = _restrict_specs_to_zone(context_index, zone_name)
 
             if not cycle_scored:
-                context.clear()
-                context.extend([""] * context_window)
-                continue
+                context.clear(); context.extend([""] * context_window); continue
 
             combined = _combine_scored_geometric(cycle_scored)
             if not combined:
-                context.clear()
-                context.extend([""] * context_window)
-                continue
+                context.clear(); context.extend([""] * context_window); continue
 
-            unseen = [(w, p) for w, p in combined if sampler.history[w] == 0]
-            pool = unseen if unseen else combined
+            unseen     = [(w, p) for w, p in combined if sampler.history[w] == 0]
+            pool       = unseen if unseen else combined
             pool_total = sum(p for _, p in pool)
             if pool_total > 0:
                 pool = [(w, p / pool_total) for w, p in pool]
 
             draw = sampler.next_unit()
-            cumulative = 0.0
-            chosen = pool[-1][0]
+            cumulative, chosen = 0.0, pool[-1][0]
             for word, p in pool:
                 cumulative += p
                 if draw < cumulative:
@@ -1154,11 +1064,8 @@ def generate_text_pspace(
                     break
 
             sampler.history[chosen] += 1
-
             if chosen == "":
-                context.clear()
-                context.extend([""] * context_window)
-                continue
+                context.clear(); context.extend([""] * context_window); continue
 
             span_collected.append(chosen)
             out_words.append(chosen)
@@ -1166,361 +1073,304 @@ def generate_text_pspace(
 
         words_remaining -= span_len
 
-        # ── 4. Print and record the activated zone span ───────────────────
+        # ── 4. Print and record activated zone span ───────────────────────
         span_text = " ".join(span_collected)
         zone_log.append((zone_name, span_text))
-
         if verbose_zones:
             zdef = next((z for z in PSPACE_ZONES if z["name"] == zone_name), {})
-            print(
-                f"[PSPACE:{zone_name}] (pi={pi_val:.4f}, {zdef.get('desc','')}) "
-                f"→ {span_text}"
-            )
+            print(f"[PSPACE:{zone_name}] (pi={pi_val:.4f}, {zdef.get('desc','')}) → {span_text}")
 
-    # ── restore all mutated state ─────────────────────────────────────────
+    # Restore
     if context_index is not None:
         context_index.zone_specs = original_specs
     sampler.instruction_context = original_ctx
 
-    full_text = capitalise_text(out_words)
-    return full_text, zone_log
+    return capitalise_text(out_words), zone_log
 
 
 # ---------------------------------------------------------------------------
-# Combinatorial cycles around generate_text
-#
-# Per-token, K cycles (K in [1,3]) walk a diagonal slice of the cartesian
-# product (zone_spec, prompt_bigram, pi_stream_offset). Each cycle produces
-# a full scored candidate list via _score_only (which mirrors PiSampler.sample
-# up to but not including the final draw). The K lists are merged by geometric
-# mean over the union vocab and a single pi-stream draw selects the winner.
-#
-# Scope: cheap. Diagonal walk keeps total cost O(K * sample-work) rather than
-# O(|zones| * |bigrams| * |offsets|).
+# Utility helpers
 # ---------------------------------------------------------------------------
 
-def _score_only(sampler, dist):
-    """
-    Mirror PiSampler.sample() through every blend step but stop before the
-    final draw. Returns the scored list [(word, prob), ...].
+def corpus_fingerprint(corpus):
+    if isinstance(corpus, bytes):
+        return hashlib.md5(corpus).hexdigest()
+    return hashlib.md5((corpus or "").encode("utf-8", errors="ignore")).hexdigest()
 
-    Does not mutate sampler.history. Does not call sampler.next_unit().
-    Reads sampler.instruction_context and sampler._context_index.zone_specs
-    which the cycle wrapper has already temporarily mutated.
-    """
-    samples = list(dist.samples())
-    if not samples:
-        return []
-
-    base_scored = []
-    for s in samples:
-        p = max(1e-12, float(dist.prob(s)))
-        count = sampler.history[s]
-        if count > 0:
-            p /= sampler.repetition_penalty ** count
-        base_scored.append((s, p))
-
-    base_scored = apply_insight_penalty(base_scored, sampler.insight_penalty)
-
-    scored = [(s, p ** (1.0 / sampler.temperature)) for s, p in base_scored]
-    total = sum(p for _, p in scored)
-    if total > 0:
-        scored = [(s, p / total) for s, p in scored]
-
-    scored.sort(key=lambda x: x[1], reverse=True)
-    scored = scored[: sampler.top_k]
-
-    kept, accum = [], 0.0
-    for s, p in scored:
-        kept.append((s, p))
-        accum += p
-        if accum >= sampler.top_p:
-            break
-    scored = kept
-
-    if sampler.seashell is not None:
-        scored = sampler.seashell.apply(scored)
-    if sampler.semicircle is not None:
-        scored = sampler.semicircle.apply(scored)
-
-    scored = sampler._zone_attention_blend(scored)
-    return scored
-
-
-def _combine_scored_geometric(scored_lists, floor=1e-12):
-    """Geometric-mean combine of K [(word, prob)] lists over the union vocab."""
-    if not scored_lists:
-        return []
-
-    cycle_maps = [dict(sl) for sl in scored_lists]
-    union = set()
-    for d in cycle_maps:
-        union.update(d.keys())
-    if not union:
-        return []
-
-    K = len(cycle_maps)
-    combined = []
-    for w in union:
-        log_sum = 0.0
-        for d in cycle_maps:
-            log_sum += math.log(max(floor, d.get(w, floor)))
-        combined.append((w, math.exp(log_sum / K)))
-
-    total = sum(p for _, p in combined)
-    if total > 0:
-        combined = [(w, p / total) for w, p in combined]
-    combined.sort(key=lambda x: x[1], reverse=True)
-    return combined
-
-
-def generate_text_combo_cycles(
-    cpd, sampler, prompt, n_words, ngram_n,
-    vocab=None, context_index=None, n_cycles=3,
-):
-    """
-    generate_text + per-token combinatorial cycles over
-    (zone_spec, prompt_bigram, pi_stream_offset).
-
-    Pass n_cycles=1 and context_index=None to degenerate to the original
-    generate_text behaviour.
-    """
-    n_cycles = max(1, min(3, int(n_cycles)))
-
-    context_window = ngram_n - 1
-    seed_words = tokenise_alpha(prompt)
-
-    if vocab is not None:
-        seed_in_vocab = [w for w in seed_words if w in vocab]
-    else:
-        seed_in_vocab = list(seed_words)
-    if len(seed_in_vocab) >= context_window:
-        init = seed_in_vocab[-context_window:]
-    else:
-        init = [""] * (context_window - len(seed_in_vocab)) + seed_in_vocab
-    context = deque(init, maxlen=context_window)
-    out_words = list(seed_words)
-
-    # ── product axes ────────────────────────────────────────────────────
-    prompt_alpha = [w for w in seed_words if w]
-    if len(prompt_alpha) >= 2:
-        prompt_bigrams = [
-            (prompt_alpha[i], prompt_alpha[i + 1])
-            for i in range(len(prompt_alpha) - 1)
-        ]
-    elif prompt_alpha:
-        prompt_bigrams = [(prompt_alpha[-1],)]
-    else:
-        prompt_bigrams = [tuple()]
-
-    if context_index is not None and getattr(context_index, "zone_specs", None):
-        zone_specs = list(context_index.zone_specs)
-    else:
-        zone_specs = [None]
-
-    stream_len = max(1, len(sampler.stream))
-    pi_offsets = [
-        0,
-        max(1, stream_len // 97),
-        max(1, stream_len // 53),
-    ][:n_cycles]
-
-    def diagonal_triples(K):
-        nz, nb, no = len(zone_specs), len(prompt_bigrams), len(pi_offsets)
-        for k in range(K):
-            yield (
-                zone_specs[k % nz],
-                prompt_bigrams[k % nb],
-                pi_offsets[k % no],
-            )
-
-    def dist_for_ctx(ctxtuple):
-        for cut in range(len(ctxtuple), 0, -1):
-            trial = ("",) * (context_window - cut) + ctxtuple[-cut:]
-            try:
-                d = cpd[trial]
-                if list(d.samples()):
-                    return d
-            except Exception:
-                continue
-        try:
-            d = cpd[tuple([""] * context_window)]
-            if list(d.samples()):
-                return d
-        except Exception:
-            pass
-        return None
-
-    # ── attach context index, snapshot mutable state ────────────────────
-    if context_index is not None:
-        sampler.set_context_index(context_index)
-
-    original_ctx = list(getattr(sampler, "instruction_context", []) or [])
-    original_specs = (
-        list(context_index.zone_specs) if context_index is not None else []
-    )
-
-    # ── per-token loop ──────────────────────────────────────────────────
-    for _ in range(n_words):
-        dist = dist_for_ctx(tuple(context))
-        if dist is None:
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-
-        cycle_scored = []
-        saved_pos = sampler.pos
-
-        for zs, bg, off in diagonal_triples(n_cycles):
-            if context_index is not None and zs is not None:
-                context_index.zone_specs = [zs]
-            sampler.instruction_context = list(bg) if bg else []
-            sampler.pos = (saved_pos + off) % stream_len
-
-            scored = _score_only(sampler, dist)
-            if scored:
-                cycle_scored.append(scored)
-
-        # restore mutated state before the canonical draw
-        sampler.pos = saved_pos
-        sampler.instruction_context = original_ctx
-        if context_index is not None:
-            context_index.zone_specs = original_specs
-
-        if not cycle_scored:
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-
-        combined = _combine_scored_geometric(cycle_scored)
-        if not combined:
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-
-        # ── novelty filter: prefer words not yet emitted ────────────────────
-        unseen_combo = [(w, p) for w, p in combined if sampler.history[w] == 0]
-        pool_combo = unseen_combo if unseen_combo else combined
-        pool_combo_total = sum(p for _, p in pool_combo)
-        if pool_combo_total > 0:
-            pool_combo = [(w, p / pool_combo_total) for w, p in pool_combo]
-        # ─────────────────────────────────────────────────────────────────────
-
-        # single canonical pi-stream draw per token
-        draw = sampler.next_unit()
-        cumulative = 0.0
-        chosen = pool_combo[-1][0]
-        for word, p in pool_combo:
-            cumulative += p
-            if draw < cumulative:
-                chosen = word
-                break
-
-        sampler.history[chosen] += 1
-
-        if chosen == "":
-            context.clear()
-            context.extend([""] * context_window)
-            continue
-
-        out_words.append(chosen)
-        context.append(chosen)
-
-    return capitalise_text(out_words)
-
-
-def all_pairs_match(pairs, text, fuzzy_threshold):
-    lower_text = text.lower()
-    for pair in pairs:
-        pair_str = " ".join(pair)
-        if pair_str in lower_text:
-            continue
-        if SequenceMatcher(None, pair_str, lower_text).quick_ratio() >= fuzzy_threshold:
-            continue
-        return False, pair
-    return True, None
-
-
-def collocation_association_score(text, prompt, min_freq=1, measure="pmi"):
-    text_tokens = tokenise_alpha(text)
-    prompt_tokens = tokenise_alpha(prompt)
-    pairs = list(ngrams(prompt_tokens, 2))
-    trigrams = list(ngrams(prompt_tokens, 3))
-    bigram_finder = BigramCollocationFinder.from_words(text_tokens)
-    trigram_finder = TrigramCollocationFinder.from_words(text_tokens)
-    if min_freq > 1:
-        bigram_finder.apply_freq_filter(min_freq)
-        trigram_finder.apply_freq_filter(min_freq)
-    bm = BigramAssocMeasures()
-    tm = TrigramAssocMeasures()
-    if measure == "likelihood_ratio":
-        bigram_scores = dict(bigram_finder.score_ngrams(bm.likelihood_ratio))
-        trigram_scores = dict(trigram_finder.score_ngrams(tm.likelihood_ratio))
-    else:
-        bigram_scores = dict(bigram_finder.score_ngrams(bm.pmi))
-        trigram_scores = dict(trigram_finder.score_ngrams(tm.pmi))
-    score = 0.0
-    matched_pairs = []
-    for pair in pairs:
-        if pair in bigram_scores:
-            score += bigram_scores[pair]
-            matched_pairs.append(pair)
-    for tri in trigrams:
-        if tri in trigram_scores:
-            score += trigram_scores[tri]
-    return score, matched_pairs
-
-
-def find_words(stream, dictionary, word_find_min):
-    prefixes = set()
-    for w in dictionary:
-        for i in range(1, len(w) + 1):
-            prefixes.add(w[:i])
-    buf = deque(maxlen=35)
-    all_chars = []
-    found = defaultdict(list)
-    for pos, digit in enumerate(stream):
-        ch = chr(ord('a') + digit)
-        buf.append(ch)
-        all_chars.append(ch)
-        s = ''.join(buf)
-        for length in range(word_find_min, min(16, len(s)) + 1):
-            cand = s[-length:]
-            if cand not in prefixes:
-                continue
-            if cand in dictionary:
-                found[cand].append(pos - length + 1)
-    return ''.join(all_chars), found
-
-
-# ---------------------------------------------------------------------------
-# Corpus / model utilities
-# ---------------------------------------------------------------------------
 
 def resolve_corpus(file_obj, pasted_corpus):
     if file_obj is not None:
-        path = file_obj.name if hasattr(file_obj, 'name') else file_obj
         try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                txt = f.read()
-            if txt.strip():
-                return txt, f'file:{os.path.basename(path)}'
-        except Exception as e:
-            return EMBEDDED_CORPUS, f'embedded fallback (file read failed: {e})'
+            with open(file_obj.name, "rb") as fh:
+                raw = fh.read()
+            try:
+                text = gzip.decompress(raw).decode("utf-8", errors="ignore")
+                return text, "gzip file"
+            except Exception:
+                return raw.decode("utf-8", errors="ignore"), "uploaded file"
+        except Exception:
+            pass
     if pasted_corpus and pasted_corpus.strip():
-        return pasted_corpus, 'pasted text'
-    return EMBEDDED_CORPUS, 'embedded fallback'
+        return pasted_corpus.strip(), "pasted text"
+    return EMBEDDED_CORPUS.strip(), "embedded corpus"
 
 
-def corpus_fingerprint(corpus):
-    if isinstance(corpus, str):
-        b = corpus.encode('utf-8', errors='ignore')
-    elif isinstance(corpus, bytes):
-        b = corpus
-    else:
-        b = str(corpus).encode('utf-8', errors='ignore')
-    return hashlib.sha256(b).hexdigest()
+# ---------------------------------------------------------------------------
+# get_or_build — build / cache model, stream, context index
+# ---------------------------------------------------------------------------
 
+def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log,
+                 progress=None):
+    def _prog(frac, desc):
+        if progress is not None:
+            progress(frac, desc=desc)
+        log.append(desc)
+
+    key = (corpus_fingerprint(corpus), int(ngram_n), float(lidstone_gamma),
+           int(pi_prec), int(pi_stream_len))
+    if CACHE.get('key') == key and CACHE.get('cpd') is not None:
+        _prog(1.0, 'Using cached model and stream.')
+        return CACHE['cpd'], CACHE['vocab'], CACHE['stream']
+    CACHE['_corpus_text'] = corpus
+
+    _prog(0.05, 'Building ngram model…')
+    cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
+
+    _prog(0.35, f'Building pi stream (prec={pi_prec}, len={pi_stream_len})…')
+    raw_stream = build_pi_stream(pi_prec, pi_stream_len)
+
+    _prog(0.55, 'Applying roll_until_column_match…')
+    matrix  = stream_to_matrix(raw_stream, n_cols=26)
+    stacked, match_shift = roll_until_column_match(matrix)
+    log.append(
+        f'Column match shift={match_shift}; stacked shape={stacked.shape}.'
+        if match_shift >= 0
+        else f'No exact column match; stacked shape={stacked.shape}.'
+    )
+    stream = stacked.flatten().tolist()
+
+    _prog(0.72, 'Building context zone index + trigram latent space…')
+    corpus_tokens = tokenise_alpha(CACHE.get('_corpus_text', ''))
+    context_index = build_context_index(vocab, cpd, corpus_tokens)
+
+    log.append(
+        f'Zone index: high={len(context_index.freq_zones["high"])} '
+        f'mid={len(context_index.freq_zones["mid"])} '
+        f'low={len(context_index.freq_zones["low"])} '
+        f'alpha_keys={len(context_index.alpha_zones)} '
+        f'ngram_keys={len(context_index.ngram_zones)}.'
+    )
+
+    # Latent BOS sort summary
+    if context_index.latent_sorted_keys:
+        top_ctx = context_index.latent_sorted_keys[0]
+        top_sim = context_index.latent_sim_scores[top_ctx]
+        log.append(
+            f'Latent BOS sort: {len(context_index.latent_sorted_keys)} contexts sorted. '
+            f'Top context={top_ctx}, cosine_sim={top_sim:.4f}. '
+            + 'Quartile sizes: '
+            + ', '.join(
+                f'q{i}={len(context_index.latent_bos_data.get(f"q{i}", []))}'
+                for i in range(4)
+            )
+        )
+
+    CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream, context_index=context_index)
+    _prog(1.0, 'Model ready — cached.')
+    return cpd, vocab, stream
+
+
+# ---------------------------------------------------------------------------
+# _make_sampler
+# ---------------------------------------------------------------------------
+
+def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
+                  seashell_enable, seashell_strength, seashell_decay,
+                  seashell_peaks, seashell_width, seashell_floor,
+                  insight_penalty,
+                  semicircle_enable=False, semicircle_strength=0.6,
+                  semicircle_arches=5, semicircle_radius=1.0,
+                  semicircle_speed=0.05, semicircle_floor=0.05,
+                  instruction_context=None,
+                  context_index=None):
+    sampler = PiSampler(
+        stream,
+        digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
+        temperature=temperature,
+        top_k=top_k,
+        top_p=top_p,
+        repetition_penalty=rep_penalty,
+        seashell_enable=seashell_enable,
+        seashell_strength=seashell_strength,
+        seashell_decay=seashell_decay,
+        seashell_peaks=seashell_peaks,
+        seashell_width=seashell_width,
+        seashell_floor=seashell_floor,
+        semicircle_enable=semicircle_enable,
+        semicircle_strength=semicircle_strength,
+        semicircle_arches=semicircle_arches,
+        semicircle_radius=semicircle_radius,
+        semicircle_speed=semicircle_speed,
+        semicircle_floor=semicircle_floor,
+        insight_penalty=insight_penalty,
+        instruction_context=instruction_context,
+    )
+    if context_index is not None:
+        sampler.set_context_index(context_index)
+    return sampler
+
+
+# ---------------------------------------------------------------------------
+# run_single
+# ---------------------------------------------------------------------------
+
+def run_single(
+    file_obj, pasted_corpus, prompt,
+    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+    gen_words, temperature, top_k, top_p, rep_penalty,
+    seashell_enable, seashell_strength, seashell_decay,
+    seashell_peaks, seashell_width, seashell_floor,
+    bend_degrees, offset, vertex, insight_penalty,
+    semicircle_enable=False, semicircle_strength=0.6,
+    semicircle_arches=5, semicircle_radius=1.0,
+    semicircle_speed=0.05, semicircle_floor=0.05,
+    progress=gr.Progress(track_tqdm=False),
+):
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress
+    )
+    triangle = Triangle(int(pi_stream_len), offset_extra=int(offset), bend_degrees=float(bend_degrees))
+    start    = triangle.vertices[vertex]
+    log.append(f'Triangle A={triangle.A} B={triangle.B} C={triangle.C} vertex={vertex} start={start}')
+
+    ctx_words = tokenise_alpha(prompt or '')
+    sampler   = _make_sampler(
+        stream, temperature, top_k, top_p, rep_penalty,
+        seashell_enable, seashell_strength, seashell_decay,
+        seashell_peaks, seashell_width, seashell_floor,
+        insight_penalty,
+        semicircle_enable, semicircle_strength, semicircle_arches,
+        semicircle_radius, semicircle_speed, semicircle_floor,
+        instruction_context=ctx_words,
+        context_index=CACHE.get('context_index'),
+    )
+    sampler.seek(start)
+
+    text, zone_log = generate_text_pspace(
+        cpd, sampler,
+        prompt=prompt or '', n_words=int(gen_words), ngram_n=int(ngram_n),
+        vocab=vocab,
+        context_index=CACHE.get('context_index'),
+        n_cycles=DEFAULTS['CYCLES_N'],
+        span_words=DEFAULTS['SPAN_WORDS'],
+        verbose_zones=False,
+    )
+    for zname, ztext in zone_log:
+        log.append(f'[PSPACE:{zname}] {ztext}')
+
+    oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
+    if oov:
+        log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
+    log.append(f'Done. {len(text.split())} output tokens.')
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix='.txt', prefix='pigenerate_', mode='w', encoding='utf-8'
+    )
+    tmp.write(text)
+    tmp.close()
+    return text, '\n'.join(log), tmp.name
+
+
+# ---------------------------------------------------------------------------
+# run_generate  (lightweight tab)
+# ---------------------------------------------------------------------------
+
+def run_generate(file_obj, pasted_corpus, prompt,
+                 pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
+                 temperature, text_length, rep_penalty, insight_penalty,
+                 semicircle_enable, semicircle_strength, semicircle_arches,
+                 semicircle_radius, semicircle_speed, semicircle_floor,
+                 progress=gr.Progress(track_tqdm=False)):
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
+    cpd, vocab, stream = get_or_build(
+        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress
+    )
+    ctx_words = tokenise_alpha(prompt or '')
+    sampler   = _make_sampler(
+        stream, temperature,
+        DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
+        DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'],
+        DEFAULTS['SEASHELL_DECAY'],  DEFAULTS['SEASHELL_PEAKS'],
+        DEFAULTS['SEASHELL_WIDTH'],  DEFAULTS['SEASHELL_FLOOR'],
+        insight_penalty,
+        bool(semicircle_enable), semicircle_strength, semicircle_arches,
+        semicircle_radius, semicircle_speed, semicircle_floor,
+        instruction_context=ctx_words,
+        context_index=CACHE.get('context_index'),
+    )
+    sampler.seek(0)
+
+    text, zone_log = generate_text_pspace(
+        cpd, sampler,
+        prompt or '', int(text_length), int(ngram_n),
+        vocab=vocab,
+        context_index=CACHE.get('context_index'),
+        n_cycles=DEFAULTS['CYCLES_N'],
+        span_words=DEFAULTS['SPAN_WORDS'],
+        verbose_zones=False,
+    )
+    for zname, ztext in zone_log:
+        log.append(f'[PSPACE:{zname}] {ztext}')
+
+    oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
+    if oov:
+        log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
+    if semicircle_enable:
+        log.append(
+            f'Semicircle wave mask ON '
+            f'(strength={semicircle_strength}, arches={int(semicircle_arches)}, '
+            f'radius={semicircle_radius}, speed={semicircle_speed}, floor={semicircle_floor}).'
+        )
+    log.append(f'Generated {len(text.split())} tokens.')
+    return text, '\n'.join(log)
+
+
+
+def save_model_ui(file_obj, pasted_corpus, pi_prec, pi_stream_len, ngram_n, lidstone_gamma):
+    log = []
+    corpus, source = resolve_corpus(file_obj, pasted_corpus)
+    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
+    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
+    tmp.close()
+    save_model_to_path(tmp.name, cpd, vocab, stream, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, corpus)
+    log.append(f'Saved model to {os.path.basename(tmp.name)}')
+    return tmp.name, '\n'.join(log)
+
+
+def load_model_ui(modelfile):
+    if modelfile is None:
+        return 'No file uploaded.', gr.update(), gr.update(), gr.update(), gr.update()
+    path = modelfile.name if hasattr(modelfile, 'name') else modelfile
+    cpd, vocab, stream, config, errors = load_model_from_path(path)
+    if cpd is None:
+        return 'Failed to load model: ' + ' | '.join(errors), gr.update(), gr.update(), gr.update(), gr.update()
+    CACHE.update(key=('LOADED', path), cpd=cpd, vocab=vocab, stream=stream)
+    log = [f'Loaded model from {os.path.basename(path)}.']
+    if errors:
+        log.extend([f'! {e}' for e in errors])
+    return (
+        '\n'.join(log),
+        gr.update(value=config.get('pi_prec', DEFAULTS['PI_PREC'])),
+        gr.update(value=config.get('pi_stream_len', DEFAULTS['PI_STREAM_LEN'])),
+        gr.update(value=config.get('ngram_n', DEFAULTS['NGRAM_N'])),
+        gr.update(value=config.get('lidstone_gamma', DEFAULTS['LIDSTONE_GAMMA'])),
+    )
 
 def save_model_to_path(path, cpd, vocab, stream, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, corpustext):
     payload = dict(
@@ -1570,428 +1420,6 @@ def load_model_from_path(path):
     return cpd, set(vocab), list(stream), dict(config), errors
 
 
-def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log,
-                 progress=None):
-    """Build (or retrieve cached) model+stream.  If `progress` is a gr.Progress
-    instance it will emit labelled steps so the UI shows a load bar."""
-
-    def _prog(frac, desc):
-        if progress is not None:
-            progress(frac, desc=desc)
-        log.append(desc)
-
-    key = (corpus_fingerprint(corpus), int(ngram_n), float(lidstone_gamma), int(pi_prec), int(pi_stream_len))
-    if CACHE.get('key') == key and CACHE.get('cpd') is not None:
-        _prog(1.0, 'Using cached model and stream.')
-        return CACHE['cpd'], CACHE['vocab'], CACHE['stream']
-    CACHE['_corpus_text'] = corpus
-
-    _prog(0.05, 'Building trigram model…')
-    cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
-
-    _prog(0.35, f'Building pi stream  (prec={pi_prec}, len={pi_stream_len})…')
-    raw_stream = build_pi_stream(pi_prec, pi_stream_len)
-
-    # --- vstack + np.roll column-match loop ---
-    _prog(0.55, 'Applying roll_until_column_match to stream…')
-    matrix = stream_to_matrix(raw_stream, n_cols=26)
-    stacked, match_shift = roll_until_column_match(matrix)
-    if match_shift >= 0:
-        log.append(f'Column match found at shift={match_shift}; stacked shape={stacked.shape}.')
-    else:
-        log.append(f'No exact column match within {matrix.shape[1]} shifts; using full stacked shape={stacked.shape}.')
-    stream = stacked.flatten().tolist()
-    # ------------------------------------------
-
-    _prog(0.75, 'Building context zone index…')
-    corpus_tokens = tokenise_alpha(
-        CACHE.get('_corpus_text', '')
-    )
-    context_index = build_context_index(vocab, cpd, corpus_tokens)
-    log.append(
-        f'Zone index: high={len(context_index.freq_zones["high"])} '
-        f'mid={len(context_index.freq_zones["mid"])} '
-        f'low={len(context_index.freq_zones["low"])} '
-        f'alpha_keys={len(context_index.alpha_zones)} '
-        f'ngram_keys={len(context_index.ngram_zones)}.'
-    )
-    CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream, context_index=context_index)
-    _prog(1.0, 'Model ready — cached.')
-    return cpd, vocab, stream
-
-
-def _make_sampler(stream, temperature, top_k, top_p, rep_penalty,
-                  seashell_enable, seashell_strength, seashell_decay,
-                  seashell_peaks, seashell_width, seashell_floor,
-                  insight_penalty,
-                  semicircle_enable=False, semicircle_strength=0.6,
-                  semicircle_arches=5, semicircle_radius=1.0,
-                  semicircle_speed=0.05, semicircle_floor=0.05,
-                  instruction_context=None,
-                  context_index=None):
-    return PiSampler(
-        stream,
-        digits_per_sample=DEFAULTS['DIGITS_PER_SAMPLE'],
-        temperature=temperature,
-        top_k=top_k,
-        top_p=top_p,
-        repetition_penalty=rep_penalty,
-        seashell_enable=seashell_enable,
-        seashell_strength=seashell_strength,
-        seashell_decay=seashell_decay,
-        seashell_peaks=seashell_peaks,
-        seashell_width=seashell_width,
-        seashell_floor=seashell_floor,
-        semicircle_enable=semicircle_enable,
-        semicircle_strength=semicircle_strength,
-        semicircle_arches=semicircle_arches,
-        semicircle_radius=semicircle_radius,
-        semicircle_speed=semicircle_speed,
-        semicircle_floor=semicircle_floor,
-        insight_penalty=insight_penalty,
-        instruction_context=instruction_context,
-    )
-    if context_index is not None:
-        sampler.set_context_index(context_index)
-
-
-# ---------------------------------------------------------------------------
-# run_single / run_search / run_generate
-# ---------------------------------------------------------------------------
-
-def run_single(
-    file_obj, pasted_corpus, prompt,
-    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-    gen_words, temperature, top_k, top_p, rep_penalty,
-    seashell_enable, seashell_strength, seashell_decay,
-    seashell_peaks, seashell_width, seashell_floor,
-    bend_degrees, offset, vertex, insight_penalty,
-    semicircle_enable=False, semicircle_strength=0.6,
-    semicircle_arches=5, semicircle_radius=1.0,
-    semicircle_speed=0.05, semicircle_floor=0.05,
-    progress=gr.Progress(track_tqdm=False),
-):
-    log = []
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress)
-    triangle = Triangle(int(pi_stream_len), offset_extra=int(offset), bend_degrees=float(bend_degrees))
-    start = triangle.vertices[vertex]
-    log.append(f'Triangle A={triangle.A} B={triangle.B} C={triangle.C} vertex={vertex} start={start}')
-    ctx_words = tokenise_alpha(prompt or '')
-    sampler = _make_sampler(
-        stream, temperature, top_k, top_p, rep_penalty,
-        seashell_enable, seashell_strength, seashell_decay,
-        seashell_peaks, seashell_width, seashell_floor,
-        insight_penalty,
-        semicircle_enable, semicircle_strength, semicircle_arches,
-        semicircle_radius, semicircle_speed, semicircle_floor,
-        instruction_context=ctx_words,
-        context_index=CACHE.get('context_index'),
-    )
-    sampler.seek(start)
-    text, zone_log = generate_text_pspace(
-        cpd, sampler,
-        prompt=prompt or '',
-        n_words=int(gen_words),
-        ngram_n=int(ngram_n),
-        vocab=vocab,
-        context_index=CACHE.get('context_index'),
-        n_cycles=DEFAULTS['CYCLES_N'],
-        span_words=8,           # tune: ~sentence-fragment length
-        verbose_zones=True,     # prints zone activations to log
-    )
-    # Collect zone log into the UI log
-    oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
-    if oov:
-        log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
-    log.append(f'Done. {len(text.split())} output tokens.')
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.txt', prefix='pigenerate_', mode='w', encoding='utf-8')
-    tmp.write(text)
-    tmp.close()
-    return text, '\n'.join(log), tmp.name
-
-
-def run_search(
-    file_obj, pasted_corpus, prompt,
-    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-    gen_words, temperature, rep_penalty,
-    seashell_enable, seashell_strength, seashell_decay,
-    seashell_peaks, seashell_width, seashell_floor,
-    vertex, bend_max, bend_step, offset_step,
-    fuzzy_threshold, max_solutions, insight_penalty,
-    semicircle_enable=False, semicircle_strength=0.6,
-    semicircle_arches=5, semicircle_radius=1.0,
-    semicircle_speed=0.05, semicircle_floor=0.05,
-    progress=gr.Progress(track_tqdm=False),
-):
-    log = []
-    if not prompt or not prompt.strip():
-        return '', 'Prompt is empty — search needs word pairs.', None
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress)
-    pairs = extract_word_pairs(prompt)
-    if not pairs:
-        return '', 'No valid word pairs extracted from prompt.', None
-    log.append(f'Prompt yields {len(pairs)} word pairs.')
-    ctx_words = tokenise_alpha(prompt)
-    bend_values = []
-    b = 0.0
-    while b <= float(bend_max) + 1e-9:
-        bend_values.append(round(b, 4))
-        b += float(bend_step)
-    offset_values = list(range(0, int(pi_stream_len), max(1, int(offset_step))))
-    total = len(bend_values) * len(offset_values)
-    log.append(f'Search grid: {len(bend_values)} bends × {len(offset_values)} offsets = {total} candidates.')
-    scored_results = []
-    counter = 0
-    for bend in bend_values:
-        for offset in offset_values:
-            counter += 1
-            progress(counter / max(1, total), desc=f'bend={bend} offset={offset}')
-            triangle = Triangle(int(pi_stream_len), offset_extra=offset, bend_degrees=bend)
-            start = triangle.vertices[vertex]
-            sampler = _make_sampler(
-                stream, temperature, DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
-                seashell_enable, seashell_strength, seashell_decay,
-                seashell_peaks, seashell_width, seashell_floor,
-                insight_penalty,
-                semicircle_enable, semicircle_strength, semicircle_arches,
-                semicircle_radius, semicircle_speed, semicircle_floor,
-                instruction_context=ctx_words,
-                context_index=CACHE.get('context_index'),
-            )
-            sampler.seek(start)
-            text = generate_text_combo_cycles(
-                cpd, sampler,
-                prompt=prompt, n_words=int(gen_words), ngram_n=int(ngram_n),
-                vocab=vocab,
-                context_index=CACHE.get('context_index'),
-                n_cycles=DEFAULTS['CYCLES_N'],
-            )
-            exact_ok, _failed = all_pairs_match(pairs, text, fuzzy_threshold=float(fuzzy_threshold))
-            assoc_score, matched_pairs = collocation_association_score(text, prompt, min_freq=1, measure='pmi')
-            if exact_ok or assoc_score > 0:
-                scored_results.append({
-                    'prompt': prompt,
-                    'bend': bend,
-                    'offset': offset,
-                    'vertex': vertex,
-                    'text': text,
-                    'assoc_score': assoc_score,
-                    'matched_pairs': matched_pairs,
-                    'exact_ok': exact_ok,
-                })
-                log.append(f'✓ candidate bend={bend} offset={offset} score={assoc_score:.4f}')
-    if not scored_results:
-        log.append('No matches found in the searched grid.')
-        return '', '\n'.join(log), None
-    scored_results.sort(key=lambda r: (r['exact_ok'], r['assoc_score'], len(r['matched_pairs'])), reverse=True)
-    top_results = scored_results[: int(max_solutions)]
-    parts = []
-    for i, r in enumerate(top_results, 1):
-        parts.append(
-            f"=== MATCH {i} ===\n"
-            f"bend = {r['bend']} offset = {r['offset']} vertex = {r['vertex']}\n"
-            f"assoc_score = {r['assoc_score']:.4f} exact_ok = {r['exact_ok']}\n"
-            f"matched_pairs = {r['matched_pairs']}\n\n"
-            f"{r['text']}\n"
-        )
-    rendered = '\n'.join(parts)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.jsonl', prefix='pi_search_', mode='w', encoding='utf-8')
-    for r in top_results:
-        tmp.write(json.dumps(r, ensure_ascii=False) + '\n')
-    tmp.close()
-    return rendered, '\n'.join(log), tmp.name
-
-
-def save_model_ui(file_obj, pasted_corpus, pi_prec, pi_stream_len, ngram_n, lidstone_gamma):
-    log = []
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
-    tmp.close()
-    save_model_to_path(tmp.name, cpd, vocab, stream, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, corpus)
-    log.append(f'Saved model to {os.path.basename(tmp.name)}')
-    return tmp.name, '\n'.join(log)
-
-
-def load_model_ui(modelfile):
-    if modelfile is None:
-        return 'No file uploaded.', gr.update(), gr.update(), gr.update(), gr.update()
-    path = modelfile.name if hasattr(modelfile, 'name') else modelfile
-    cpd, vocab, stream, config, errors = load_model_from_path(path)
-    if cpd is None:
-        return 'Failed to load model: ' + ' | '.join(errors), gr.update(), gr.update(), gr.update(), gr.update()
-    CACHE.update(key=('LOADED', path), cpd=cpd, vocab=vocab, stream=stream)
-    log = [f'Loaded model from {os.path.basename(path)}.']
-    if errors:
-        log.extend([f'! {e}' for e in errors])
-    return (
-        '\n'.join(log),
-        gr.update(value=config.get('pi_prec', DEFAULTS['PI_PREC'])),
-        gr.update(value=config.get('pi_stream_len', DEFAULTS['PI_STREAM_LEN'])),
-        gr.update(value=config.get('ngram_n', DEFAULTS['NGRAM_N'])),
-        gr.update(value=config.get('lidstone_gamma', DEFAULTS['LIDSTONE_GAMMA'])),
-    )
-
-
-def save_hf_model(repo_id, token=None):
-    try:
-        from huggingface_hub import HfApi, upload_file
-        if CACHE.get('cpd') is None or CACHE.get('stream') is None or CACHE.get('vocab') is None:
-            corpus, _ = resolve_corpus(None, None)
-            cpd, vocab, stream = get_or_build(
-                corpus, DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'],
-                DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], [],
-            )
-        else:
-            cpd, vocab, stream = CACHE['cpd'], CACHE['vocab'], CACHE['stream']
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix='.pkl.gz', prefix='pi_model_')
-        tmp.close()
-        save_model_to_path(
-            tmp.name, cpd, vocab, stream,
-            DEFAULTS['NGRAM_N'], DEFAULTS['LIDSTONE_GAMMA'],
-            DEFAULTS['PI_PREC'], DEFAULTS['PI_STREAM_LEN'], EMBEDDED_CORPUS,
-        )
-        kwargs = dict(
-            path_or_fileobj=tmp.name,
-            path_in_repo='pi_model.pkl.gz',
-            repo_id=repo_id,
-            repo_type='model',
-        )
-        if token and token.strip():
-            kwargs['token'] = token.strip()
-        upload_file(**kwargs)
-        return f'Saved full model to {repo_id}/pi_model.pkl.gz'
-    except Exception as e:
-        return f'Save failed: {e}'
-
-
-def _hf_latest_commit_sha(repo_id, token=None):
-    """Return the latest commit sha for repo_id, or None on failure."""
-    try:
-        from huggingface_hub import list_repo_commits
-        kwargs = dict(repo_id=repo_id, repo_type='model')
-        if token and token.strip():
-            kwargs['token'] = token.strip()
-        commits = list(list_repo_commits(**kwargs))
-        return commits[0].commit_id if commits else None
-    except Exception:
-        return None
-
-
-def load_hf_model_on_demand(repo_id, token=None,
-                            progress=gr.Progress(track_tqdm=False)):
-    """
-    Resolves the latest commit on the HF repo before every download.
-    Uses force_download=True so huggingface_hub never serves a stale
-    cached blob when the remote file has been updated.
-    Skips the download only when the in-memory model already matches
-    the latest remote commit sha.
-    """
-    try:
-        from huggingface_hub import hf_hub_download
-
-        progress(0.05, desc='Resolving latest HF commit…')
-        latest_sha = _hf_latest_commit_sha(repo_id, token)
-        already_loaded_sha = HF_CACHE.get('loaded_sha')
-        if (
-            HF_CACHE.get('loaded')
-            and latest_sha is not None
-            and latest_sha == already_loaded_sha
-            and CACHE.get('cpd') is not None
-        ):
-            progress(1.0, desc='Already up-to-date.')
-            return f'Model already up-to-date (sha={latest_sha[:7]})'
-
-        progress(0.20, desc=f'Downloading pi_model.pkl.gz from {repo_id}…')
-        kwargs = dict(
-            repo_id=repo_id,
-            filename='pi_model.pkl.gz',
-            repo_type='model',
-            cache_dir=LOCAL_CACHE_DIR,
-            force_download=True,
-        )
-        if token and token.strip():
-            kwargs['token'] = token.strip()
-        path = hf_hub_download(**kwargs)
-
-        progress(0.65, desc='Deserialising model from disk…')
-        cpd, vocab, stream, config, errors = load_model_from_path(path)
-        if cpd is None:
-            progress(1.0, desc='Load failed.')
-            return 'Load failed: ' + ' | '.join(errors)
-
-        progress(0.90, desc='Updating in-memory cache…')
-        CACHE.update(key=('HF', repo_id), cpd=cpd, vocab=vocab, stream=stream)
-        corpus_tokens = tokenise_alpha(CACHE.get('_corpus_text', ''))
-        if corpus_tokens:
-            CACHE['context_index'] = build_context_index(vocab, cpd, corpus_tokens)
-        UI_STATE['version'] += 1
-        sha_tag = f' sha={latest_sha[:7]}' if latest_sha else ''
-        HF_CACHE.update(
-            loaded=True,
-            loaded_sha=latest_sha,
-            tokenizer=None,
-            model=None,
-            status=f'Loaded latest model from {repo_id}{sha_tag}',
-        )
-        progress(1.0, desc='Done.')
-        return f'Loaded latest model from {repo_id}{sha_tag}.'
-    except Exception as e:
-        return f'Load failed: {e}'
-
-
-def run_generate(file_obj, pasted_corpus, prompt,
-                 pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-                 temperature, text_length, rep_penalty, insight_penalty,
-                 semicircle_enable, semicircle_strength, semicircle_arches,
-                 semicircle_radius, semicircle_speed, semicircle_floor,
-                 progress=gr.Progress(track_tqdm=False)):
-    log = []
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f'Corpus source: {source} ({len(corpus)} chars).')
-    cpd, vocab, stream = get_or_build(
-        corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log, progress=progress
-    )
-    ctx_words = tokenise_alpha(prompt or '')
-    sampler = _make_sampler(
-        stream, temperature,
-        DEFAULTS['TOP_K'], DEFAULTS['TOP_P'], rep_penalty,
-        DEFAULTS['SEASHELL_ENABLE'], DEFAULTS['SEASHELL_STRENGTH'],
-        DEFAULTS['SEASHELL_DECAY'], DEFAULTS['SEASHELL_PEAKS'],
-        DEFAULTS['SEASHELL_WIDTH'], DEFAULTS['SEASHELL_FLOOR'],
-        insight_penalty,
-        bool(semicircle_enable), semicircle_strength, semicircle_arches,
-        semicircle_radius, semicircle_speed, semicircle_floor,
-        instruction_context=ctx_words,
-        context_index=CACHE.get('context_index'),
-    )
-    sampler.seek(0)
-    text = generate_text_combo_cycles(
-        cpd, sampler,
-        prompt or '', int(text_length), int(ngram_n),
-        vocab=vocab,
-        context_index=CACHE.get('context_index'),
-        n_cycles=DEFAULTS['CYCLES_N'],
-    )
-    oov = [w for w in tokenise_alpha(prompt or '') if w not in vocab]
-    if oov:
-        log.append(f'{len(oov)} prompt tokens not in corpus vocab: {oov}')
-    if semicircle_enable:
-        log.append(
-            f'Semicircle wave mask ON '
-            f'(strength={semicircle_strength}, arches={int(semicircle_arches)}, '
-            f'radius={semicircle_radius}, speed={semicircle_speed}, '
-            f'floor={semicircle_floor}).'
-        )
-    log.append(f'Generated {len(text.split())} tokens.')
-    return text, '\n'.join(log)
-
-
 # ---------------------------------------------------------------------------
 # Gradio UI
 # ---------------------------------------------------------------------------
@@ -2022,7 +1450,7 @@ def build_ui():
                             0.0, 5.0,
                             value=DEFAULTS['INSIGHT_PENALTY'],
                             step=0.05,
-                            label='Insight penalty — push away from conclusion-encoding labels',
+                            label='Insight penalty â€” push away from conclusion-encoding labels',
                         )
 
                 with gr.Accordion('Semicircle wave mask', open=False):
@@ -2036,23 +1464,23 @@ def build_ui():
                     )
                     semicircle_strength = gr.Slider(
                         0.0, 1.0, value=DEFAULTS['SEMICIRCLE_STRENGTH'], step=0.01,
-                        label='Strength — blend amount of the mask (0 = pass-through)',
+                        label='Strength â€” blend amount of the mask (0 = pass-through)',
                     )
                     semicircle_arches = gr.Slider(
                         1, 30, value=DEFAULTS['SEMICIRCLE_ARCHES'], step=1,
-                        label='Arches — number of semi-circles tiled across candidates',
+                        label='Arches â€” number of semi-circles tiled across candidates',
                     )
                     semicircle_radius = gr.Slider(
                         0.05, 2.0, value=DEFAULTS['SEMICIRCLE_RADIUS'], step=0.05,
-                        label='Radius — arch width (>=1 fills the slot, smaller = narrower)',
+                        label='Radius â€” arch width (>=1 fills the slot, smaller = narrower)',
                     )
                     semicircle_speed = gr.Slider(
                         0.0, 1.0, value=DEFAULTS['SEMICIRCLE_SPEED'], step=0.005,
-                        label='Speed — phase advance per generation step (wave travel)',
+                        label='Speed â€” phase advance per generation step (wave travel)',
                     )
                     semicircle_floor = gr.Slider(
                         1e-3, 1.0, value=DEFAULTS['SEMICIRCLE_FLOOR'], step=0.005,
-                        label='Floor — minimum gain so no candidate is fully zeroed',
+                        label='Floor â€” minimum gain so no candidate is fully zeroed',
                     )
 
                 btn_gen = gr.Button('Generate', variant='primary')
@@ -2076,11 +1504,11 @@ def build_ui():
             with gr.TabItem('Model I/O'):
                 gr.Markdown('Save/load compiled trigram model.')
 
-                # ── Load latest from HF (universal, always force-downloads) ──
+                # â”€â”€ Load latest from HF (universal, always force-downloads) â”€â”€
                 gr.Markdown('#### Load latest model from Hugging Face')
                 model_hf_repo = gr.Textbox(label='HF repo ID', value=HF_REPO_ID)
                 model_hf_token = gr.Textbox(label='HF token (optional)', type='password')
-                load_latest_btn = gr.Button('🔄  Load Latest from HF', variant='primary')
+                load_latest_btn = gr.Button('ðŸ”„  Load Latest from HF', variant='primary')
                 load_latest_log = gr.Textbox(label='Load log', lines=3, interactive=False)
 
                 gr.Markdown('---')
@@ -2114,7 +1542,7 @@ def build_ui():
 
         gr.Markdown('Tip: model caches are reused until corpus or configuration changes.')
 
-        # auto-load on startup removed — use "Load Latest from HF" button
+        # auto-load on startup removed â€” use "Load Latest from HF" button
 
     return demo
 
