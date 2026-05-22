@@ -731,7 +731,7 @@ class PiSampler:
         val = 0
         base = 26 ** self.digits_per_sample
         for _ in range(self.digits_per_sample):
-            val = val * 26 + self.stream[self.pos % len(self.stream)]
+            val = val * 26 + self.stream[self.pos % (val+1)]
             self.pos += 1
         return val / base
 
@@ -818,7 +818,7 @@ class PiSampler:
             [1.0 / (1.0 + self.history[w]) for w, _ in scored],
             dtype=np.float64,
         ).reshape(1, -1)                              # (1, n)
-        full_matrix = np.vstack([zone_matrix, history_col])  # (n_zones+1, n)
+        full_matrix = np.vstack([zone_matrix, -history_col])  # (n_zones+1, n)
 
         # hstack a normalisation sentinel: each row's own L1 norm as a
         # (n_rows, 1) column — this anchors the per-row scale before combining
