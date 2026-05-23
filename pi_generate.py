@@ -1,732 +1,750 @@
-# -*- coding: utf-8 -*-
-# ===========================================================================
-#  app.py  —  Pi-Trigram Generator  +  Layer Tensor tab
-#  Self-contained single file. layer_isomorphism classes are embedded below.
-# ===========================================================================
+# =============================================================================
+#  layer_isomorphism_torch.py
+#  All 14 isomorphism layers (L0–L13) as torch.nn.Module subclasses.
+#
+#  Design principles
+#  -----------------
+#  • Every layer is a self-contained nn.Module with a custom __init__ that
+#    registers its hyper-parameters as nn.Parameter (learnable) or as named
+#    buffers (non-gradient scalars that still move with .to(device)).
+#  • forward() accepts and returns plain Python / numpy inputs where the
+#    upstream code expects them, but all heavy maths runs on torch tensors.
+#  • IsomorphismPipeline wires all layers together and mirrors the API of
+#    the original IsomorphismGenerator so app.py needs only a one-line swap.
+#  • No external dependencies beyond torch, numpy, math, collections.
+# =============================================================================
 
 from __future__ import annotations
 
-import os
-import sys
-import re
 import math
-import json
-import gzip
-import pickle
-import hashlib
-import tempfile
-import threading
-from collections import defaultdict, deque, Counter
-from difflib import SequenceMatcher
+from collections import Counter, deque
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
-import gradio as gr
-from mpmath import mp, pi as mpi
-
-import nltk
-from nltk.util import ngrams
-from nltk.tokenize import word_tokenize
-from nltk.probability import (
-    ConditionalFreqDist,
-    ConditionalProbDist,
-    LidstoneProbDist,
-)
-from nltk.collocations import (
-    BigramCollocationFinder,
-    TrigramCollocationFinder,
-    BigramAssocMeasures,
-    TrigramAssocMeasures,
-)
-
-NLTK_DATA_DIR = os.environ.get("NLTK_DATA", "/tmp/nltk_data")
-os.makedirs(NLTK_DATA_DIR, exist_ok=True)
-if NLTK_DATA_DIR not in nltk.data.path:
-    nltk.data.path.insert(0, NLTK_DATA_DIR)
-
-for pkg, path in [
-    ("punkt",     "tokenizers/punkt"),
-    ("punkt_tab", "tokenizers/punkt_tab"),
-    ("words",     "corpora/words"),
-]:
-    try:
-        nltk.data.find(path)
-    except LookupError:
-        try:
-            nltk.download(pkg, download_dir=NLTK_DATA_DIR, quiet=True)
-        except Exception:
-            pass
-
-from nltk.corpus import words as nltk_words
-
-if hasattr(sys, "set_int_max_str_digits"):
-    sys.set_int_max_str_digits(300000)
-
-DEFAULTS = dict(
-    PI_PREC=15000,
-    PI_STREAM_LEN=12000,
-    DIGITS_PER_SAMPLE=3,
-    NGRAM_N=2,
-    LIDSTONE_GAMMA=0.1,
-    GEN_WORDS=400,
-    WORD_FIND_MIN=2,
-    TEMPERATURE=4.3,
-    TOP_K=100,
-    TOP_P=1.0,
-    REP_PENALTY=1.13,
-    SEASHELL_ENABLE=True,
-    SEASHELL_STRENGTH=14.35,
-    SEASHELL_DECAY=0.185,
-    SEASHELL_PEAKS=14,
-    SEASHELL_WIDTH=0.96,
-    SEASHELL_FLOOR=0.35,
-    SEMICIRCLE_ENABLE=True,
-    SEMICIRCLE_STRENGTH=0.6,
-    SEMICIRCLE_ARCHES=5,
-    SEMICIRCLE_RADIUS=1.0,
-    SEMICIRCLE_SPEED=0.05,
-    SEMICIRCLE_FLOOR=0.05,
-    BEND_DEGREES=13.0,
-    OFFSET=0,
-    VERTEX="A",
-    FUZZY_THRESHOLD=0.92,
-    MAX_SOLUTIONS=15,
-    BEND_STEP=0.5,
-    OFFSET_STEP=50,
-    BEND_MAX=45.0,
-    INSIGHT_PENALTY=3.95,
-    CYCLES_N=32,
-    SPAN_WORDS=8,
-)
-
-EMBEDDED_CORPUS = """
-Alice was beginning to get very tired of sitting by her sister on the bank,
-and of having nothing to do. Once or twice she had peeped into the book her
-sister was reading, but it had no pictures or conversations in it.
-
-So she was considering in her own mind whether the pleasure of making a
-daisy chain would be worth the trouble of getting up and picking the daisies.
-
-Suddenly a White Rabbit with pink eyes ran close by her.
-
-There was nothing so very remarkable in that, nor did Alice think it so very
-much out of the way to hear the Rabbit say to itself, "Oh dear! Oh dear!
-I shall be late!"
-
-When the Rabbit actually took a watch out of its waistcoat pocket and looked
-at it and hurried on, Alice started to her feet.
-
-The rabbit hole went straight on like a tunnel for some way and then dipped
-suddenly down.
-
-Either the well was very deep or she fell very slowly, for she had plenty of
-time as she went down to look about her and wonder what was going to happen next.
-"""
-
-_WORD_RE = re.compile(r"[a-z]+(?:'[a-z]+)?")
-
-HF_REPO_ID      = "trainman999/Thinking-lite"
-LOCAL_CACHE_DIR  = os.path.join(NLTK_DATA_DIR, "hf_model_cache")
-os.makedirs(LOCAL_CACHE_DIR, exist_ok=True)
-HF_CACHE = {"loaded": False, "tokenizer": None, "model": None, "status": "Idle"}
-CACHE    = dict(key=None, cpd=None, vocab=None, stream=None, context_index=None)
-UI_STATE = {"version": 0}
-
-
-
-def tokenise_alpha(text):
-    if text is None:
-        return []
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", errors="ignore")
-    elif not isinstance(text, str):
-        text = str(text)
-    return text.lower().split()
-
-
-
-def capitalise_text(words):
-    return " ".join(words) if words else ""
-
-
-class _LidstoneFactory:
-    __slots__ = ("gamma", "bins")
-
-    def __init__(self, gamma, bins):
-        self.gamma = float(gamma)
-        self.bins  = max(1, int(bins))
-
-    def __call__(self, fd):
-        return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
-
-
-def build_model(corpus, ngram_n, lidstone_gamma):
-    if isinstance(corpus, bytes):
-        corpus = corpus.decode("utf-8", errors="ignore")
-    elif not isinstance(corpus, str):
-        corpus = str(corpus) if corpus is not None else ""
-    ngram_n        = max(2, int(ngram_n))
-    lidstone_gamma = float(lidstone_gamma)
-    tokens = tokenise_alpha(corpus)
-    if not tokens:
-        raise ValueError(
-            "Corpus produced zero tokens after tokenisation. "
-            "Upload a non-empty text corpus or paste some text."
-        )
-    padded    = [""] * (ngram_n - 1) + tokens + [""]
-    trigrams_ = list(ngrams(padded, ngram_n))
-    cfd   = ConditionalFreqDist((tuple(tg[:-1]), tg[-1]) for tg in trigrams_)
-    vocab = set(tokens) | {""}
-    for ctx in list(cfd.conditions()):
-        if len(cfd[ctx]) == 0:
-            cfd[ctx][""] += 1
-    cpd = ConditionalProbDist(
-        cfd,
-        _LidstoneFactory(gamma=lidstone_gamma, bins=max(1, len(vocab))),
-    )
-    return cpd, vocab
-
-
-def build_pi_stream(decimals, length):
-    decimals = int(decimals)
-    length   = int(length)
-    mp.dps   = decimals + 50
-    D    = 10 ** decimals
-    frac = int(mp.floor(mpi * D)) - 3 * D
-    stream = []
-    for _ in range(length):
-        frac *= 26
-        stream.append(frac // D)
-        frac %= D
-    return stream
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
-# ContextZoneIndex
+# Shared utilities
 # ---------------------------------------------------------------------------
 
-class ContextZoneIndex:
-    FREQ_HIGH_THRESH = 10
-    FREQ_MID_THRESH  = 3
+def _to_tensor(probs, dtype=torch.float64) -> torch.Tensor:
+    if isinstance(probs, torch.Tensor):
+        return probs.to(dtype)
+    if isinstance(probs, np.ndarray):
+        return torch.from_numpy(probs.astype(np.float64)).to(dtype)
+    return torch.tensor(probs, dtype=dtype)
 
-    _ZONE_SPEC_TEMPLATES = [
-        ("ngram_bigram",  0.25, 0.04),
-        ("ngram_unigram", 0.30, 0.04),
-        ("alpha",         0.40, 0.05),
-        ("freq",          0.50, 0.05),
-        ("trigram_char",  0.35, 0.04),
-        ("latent_bos",    0.30, 0.04),
-    ]
 
-    def __init__(self, vocab, cpd, token_freq):
-        self.vocab      = set(vocab)
-        self.token_freq = dict(token_freq)
-        self._build_freq_zones()
-        self._build_alpha_zones()
-        self._build_ngram_zones(cpd)
-        self._build_trigram_latent_index(cpd)
-        self._make_zone_specs()
-        self.prompt_zone = {}
+def _normalise(t: torch.Tensor) -> torch.Tensor:
+    """Safe L1 normalisation."""
+    s = t.sum()
+    return t / s.clamp(min=1e-30)
 
-    def _build_freq_zones(self):
-        pairs = sorted(
-            [(w, self.token_freq.get(w, 0)) for w in self.vocab if w],
-            key=lambda x: x[1], reverse=True,
+
+def _char_trigrams(word: str):
+    return {word[i:i + 3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
+
+
+# ---------------------------------------------------------------------------
+# L0 – Raw distribution with repetition penalty
+# ---------------------------------------------------------------------------
+
+class L0_RawDist(nn.Module):
+    """
+    Extracts the CPD posterior for a context, applies per-token repetition
+    penalty, and returns a normalised probability distribution.
+
+    Custom init
+    -----------
+    rep_penalty : learnable scalar (clamped ≥ 1.0 in forward)
+                  Registered as nn.Parameter so it participates in gradient
+                  flow when the pipeline is fine-tuned end-to-end.
+    """
+
+    def __init__(self, rep_penalty: float = 1.13):
+        super().__init__()
+        # Learnable repetition-penalty exponent base
+        self.rep_penalty = nn.Parameter(torch.tensor(rep_penalty, dtype=torch.float64))
+
+    def forward(
+        self,
+        dist,                   # nltk ConditionalProbDist slice (cpd[ctx])
+        history: Counter,
+    ) -> Tuple[List[Tuple[str, float]], Dict]:
+        pen = self.rep_penalty.clamp(min=1.0)
+
+        raw: List[Tuple[str, float]] = []
+        for s in dist.samples():
+            if not s:
+                continue
+            p   = max(1e-12, float(dist.prob(s)))
+            cnt = history[s]
+            if cnt > 0:
+                p /= pen.detach().item() ** cnt
+            raw.append((s, p))
+
+        if not raw:
+            return raw, {}
+
+        raw.sort(key=lambda x: x[1], reverse=True)
+
+        probs_t = _to_tensor([p for _, p in raw])
+        probs_t = _normalise(probs_t)
+
+        words   = [w for w, _ in raw]
+        pairs   = list(zip(words, probs_t.tolist()))
+
+        layer = {
+            "name":   "L0_RAW_DIST",
+            "words":  words,
+            "probs":  probs_t.detach().numpy(),
+            "source": f"CPD posterior + rep_penalty={pen.detach().item():.4f}",
+        }
+        return pairs, layer
+
+
+# ---------------------------------------------------------------------------
+# L1 – Temperature scaling
+# ---------------------------------------------------------------------------
+
+class L1_TempScaled(nn.Module):
+    """
+    Applies temperature scaling: p_i ∝ p_i^(1/T).
+
+    Custom init
+    -----------
+    temperature : learnable scalar (clamped ≥ 1e-3).
+                  Initialised from the constructor argument.
+    """
+
+    def __init__(self, temperature: float = 4.3):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.tensor(temperature, dtype=torch.float64))
+
+    def forward(
+        self, pairs: List[Tuple[str, float]]
+    ) -> Tuple[List[Tuple[str, float]], Dict]:
+        T = self.temperature.clamp(min=1e-3)
+
+        probs_t  = _to_tensor([p for _, p in pairs])
+        scaled_t = probs_t.pow(1.0 / T)
+        scaled_t = _normalise(scaled_t)
+
+        words = [w for w, _ in pairs]
+        out   = list(zip(words, scaled_t.tolist()))
+
+        layer = {
+            "name":   "L1_TEMP_SCALED",
+            "words":  words,
+            "probs":  scaled_t.detach().numpy(),
+            "source": f"temperature={T.detach().item():.4f}",
+        }
+        return out, layer
+
+
+# ---------------------------------------------------------------------------
+# L2 – Insight penalty
+# ---------------------------------------------------------------------------
+
+class L2_InsightPenalty(nn.Module):
+    """
+    Penalises tokens whose probability exceeds the mean by a factor
+    proportional to `insight_penalty`.  Acts as a soft entropy booster.
+
+    Custom init
+    -----------
+    insight_penalty : learnable, clamped ≥ 0.
+    """
+
+    def __init__(self, insight_penalty: float = 3.95):
+        super().__init__()
+        self.insight_penalty = nn.Parameter(
+            torch.tensor(insight_penalty, dtype=torch.float64)
         )
-        high, mid, low = [], [], []
-        for w, c in pairs:
-            if   c >= self.FREQ_HIGH_THRESH: high.append(w)
-            elif c >= self.FREQ_MID_THRESH:  mid.append(w)
-            else:                            low.append(w)
-        self.freq_zones = {"high": high, "mid": mid, "low": low}
 
-    def _build_alpha_zones(self):
-        zones = defaultdict(list)
-        for w in sorted(self.vocab):
-            if w and w[0].isalpha():
-                zones[w[0]].append(w)
-        self.alpha_zones = dict(zones)
+    def forward(
+        self, pairs: List[Tuple[str, float]]
+    ) -> Tuple[List[Tuple[str, float]], Dict]:
+        strength = self.insight_penalty.clamp(min=0.0)
 
-    def _build_ngram_zones(self, cpd):
-        zones = {}
-        try:
-            for ctx in cpd.conditions():
-                d = cpd[ctx]
-                ranked = sorted(
-                    [s for s in d.samples() if s],
-                    key=lambda s: d.prob(s), reverse=True,
-                )
-                if ranked:
-                    zones[ctx] = ranked
-        except Exception:
-            pass
-        self.ngram_zones = zones
+        probs_t  = _to_tensor([p for _, p in pairs])
+        mean_p   = probs_t.mean().clamp(min=1e-30)
+        excess   = (probs_t - mean_p).clamp(min=0.0)
+        penalised = probs_t / (1.0 + strength * excess / mean_p)
+        penalised = _normalise(penalised.clamp(min=1e-12))
 
-    def _build_trigram_latent_index(self, cpd):
-        self.vocab_list = sorted(w for w in self.vocab if w)
-        V = len(self.vocab_list)
-        if V == 0:
-            self.latent_vectors     = {}
-            self.latent_sorted_keys = []
-            self.latent_sim_scores  = {}
-            self.latent_bos_data    = {}
-            return
+        words = [w for w, _ in pairs]
+        out   = list(zip(words, penalised.tolist()))
 
-        word_to_idx = {w: i for i, w in enumerate(self.vocab_list)}
+        layer = {
+            "name":   "L2_INSIGHT",
+            "words":  words,
+            "probs":  penalised.detach().numpy(),
+            "source": f"insight_penalty={strength.detach().item():.4f}",
+        }
+        return out, layer
 
-        def ctx_to_vector(ctx):
-            vec = np.zeros(V, dtype=np.float64)
-            try:
-                d = cpd[ctx]
-                for s in d.samples():
-                    if s and s in word_to_idx:
-                        vec[word_to_idx[s]] = max(0.0, float(d.prob(s)))
-            except Exception:
-                pass
-            norm = vec.sum()
-            if norm > 0:
-                vec /= norm
-            return vec
 
-        self.latent_vectors = {ctx: ctx_to_vector(ctx) for ctx in self.ngram_zones}
+# ---------------------------------------------------------------------------
+# L3 – Top-K / Top-P truncation
+# ---------------------------------------------------------------------------
 
-        bos_vecs = [
-            vec for ctx, vec in self.latent_vectors.items()
-            if len(ctx) >= 1 and ctx[0] == ""
-        ]
-        if bos_vecs:
-            anchor = np.mean(np.vstack(bos_vecs), axis=0)
-            a_norm = np.linalg.norm(anchor)
-            if a_norm > 0:
-                anchor /= a_norm
-        else:
-            anchor = np.ones(V, dtype=np.float64) / max(1, V)
+class L3_TopKTopP(nn.Module):
+    """
+    Truncates the candidate set to the top-K tokens and then applies
+    nucleus (top-P) filtering.
 
-        def cosine_sim(vec):
-            n = np.linalg.norm(vec)
-            return float(np.dot(vec / n, anchor)) if n >= 1e-12 else 0.0
+    Custom init
+    -----------
+    top_k   : integer buffer (not learnable; registered so it moves with device).
+    top_p   : learnable scalar in (0, 1].
+    """
 
-        self.latent_sim_scores  = {ctx: cosine_sim(v) for ctx, v in self.latent_vectors.items()}
-        self.latent_sorted_keys = sorted(
-            self.latent_vectors.keys(),
-            key=lambda ctx: self.latent_sim_scores[ctx],
-            reverse=True,
-        )
+    def __init__(self, top_k: int = 100, top_p: float = 1.0):
+        super().__init__()
+        # top_k is discrete — keep as buffer
+        self.register_buffer("top_k_buf", torch.tensor(top_k, dtype=torch.int64))
+        # top_p is continuous — learnable
+        self.top_p = nn.Parameter(torch.tensor(top_p, dtype=torch.float64))
 
-        n_keys          = len(self.latent_sorted_keys)
-        latent_bos_data = {f"q{q}": [] for q in range(4)}
-        for rank, ctx in enumerate(self.latent_sorted_keys):
-            q = min(3, rank * 4 // max(1, n_keys))
-            latent_bos_data[f"q{q}"].extend(self.ngram_zones.get(ctx, []))
+    def forward(
+        self, pairs: List[Tuple[str, float]]
+    ) -> Tuple[List[Tuple[str, float]], Dict]:
+        k    = int(self.top_k_buf.item())
+        p_th = float(self.top_p.clamp(1e-3, 1.0).item())
 
-        for q_key in latent_bos_data:
-            seen_l, deduped = set(), []
-            for w in latent_bos_data[q_key]:
-                if w not in seen_l:
-                    seen_l.add(w)
-                    deduped.append(w)
-            latent_bos_data[q_key] = deduped
+        truncated = pairs[:k]
+        kept, cumulative = [], 0.0
+        for w, p in truncated:
+            kept.append((w, p))
+            cumulative += p
+            if cumulative >= p_th:
+                break
 
-        self.latent_bos_data = latent_bos_data
+        probs_t = _to_tensor([p for _, p in kept])
+        probs_t = _normalise(probs_t)
 
-    def print_latent_sorted_dataset(self, top_n=20):
-        print(f"{'Rank':<5} {'Context':<28} {'CosSim':>8}  Top successors")
-        print("-" * 78)
-        for rank, ctx in enumerate(self.latent_sorted_keys[:top_n]):
-            sim   = self.latent_sim_scores[ctx]
-            succs = self.ngram_zones.get(ctx, [])[:5]
-            ctx_s = " | ".join(f"'{w}'" for w in ctx)
-            print(f"{rank:<5} ({ctx_s:<26}) {sim:>8.4f}  {succs}")
+        words = [w for w, _ in kept]
+        out   = list(zip(words, probs_t.tolist()))
 
-    def _make_zone_specs(self):
-        def _char_trigrams(word):
-            return {word[i:i+3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
+        layer = {
+            "name":   "L3_TOPK_TOPP",
+            "words":  words,
+            "probs":  probs_t.detach().numpy(),
+            "source": f"top_k={k} top_p={p_th:.4f}",
+        }
+        return out, layer
 
-        def key_fn_bigram(prompt_words):
-            return [(prompt_words[i], prompt_words[i+1]) for i in range(len(prompt_words)-1)]
 
-        def key_fn_unigram(prompt_words):
-            return [(w,) for w in prompt_words if w]
+# ---------------------------------------------------------------------------
+# Shared Gaussian-gradient zone layer base
+# ---------------------------------------------------------------------------
 
-        def key_fn_alpha(prompt_words):
-            return [w[0] for w in prompt_words if w and w[0].isalpha()]
+class _ZoneGradientBase(nn.Module):
+    """
+    Base class for zone layers L4–L9.
 
-        high_set = set(self.freq_zones["high"])
+    Every zone layer applies a Gaussian gradient over the ranked candidate
+    list, centring the peak at the mean rank of tokens in the active zone.
 
-        def key_fn_freq(prompt_words):
-            if any(w in high_set for w in prompt_words):
-                return ["high"]
-            if all(self.token_freq.get(w, 0) < self.FREQ_MID_THRESH for w in prompt_words):
-                return ["low"]
-            return ["mid"]
+    Custom init (shared)
+    --------------------
+    sigma : learnable width of the Gaussian (clamped > 0).
+    floor : learnable minimum weight (clamped to [0, 1)).
+    Both are per-layer learnable parameters.
+    """
 
-        trig_index = defaultdict(set)
-        for v in self.vocab:
-            if v:
-                for tg in _char_trigrams(v):
-                    trig_index[tg].add(v)
-        self._trig_index = trig_index
-        self._trig_data  = {}
+    def __init__(self, name: str, sigma: float, floor: float, source_hint: str = ""):
+        super().__init__()
+        self._layer_name  = name
+        self._source_hint = source_hint
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
+        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
 
-        def key_fn_trigram(prompt_words):
-            prompt_tgs = set()
-            for w in prompt_words:
-                prompt_tgs |= _char_trigrams(w)
-            neighbours = set()
-            for tg in prompt_tgs:
-                neighbours |= trig_index.get(tg, set())
-            self._trig_data["__trig__"] = sorted(neighbours)
-            return ["__trig__"]
-
-        n_keys = len(self.latent_sorted_keys)
-
-        def key_fn_latent(prompt_words):
-            for ctx in self.latent_sorted_keys:
-                if any(w in ctx for w in prompt_words):
-                    rank = self.latent_sorted_keys.index(ctx)
-                    q    = min(3, rank * 4 // max(1, n_keys))
-                    return [f"q{q}"]
-            return ["q0"]
-
-        templates = {t[0]: (t[1], t[2]) for t in self._ZONE_SPEC_TEMPLATES}
-        self.zone_specs = [
-            dict(name="ngram_bigram",  key_fn=key_fn_bigram,   data=self.ngram_zones,     sigma=templates["ngram_bigram"][0],  floor=templates["ngram_bigram"][1]),
-            dict(name="ngram_unigram", key_fn=key_fn_unigram,  data=self.ngram_zones,     sigma=templates["ngram_unigram"][0], floor=templates["ngram_unigram"][1]),
-            dict(name="alpha",         key_fn=key_fn_alpha,    data=self.alpha_zones,     sigma=templates["alpha"][0],         floor=templates["alpha"][1]),
-            dict(name="freq",          key_fn=key_fn_freq,     data=self.freq_zones,      sigma=templates["freq"][0],          floor=templates["freq"][1]),
-            dict(name="trigram_char",  key_fn=key_fn_trigram,  data=self._trig_data,      sigma=templates["trigram_char"][0],  floor=templates["trigram_char"][1]),
-            dict(name="latent_bos",    key_fn=key_fn_latent,   data=self.latent_bos_data, sigma=templates["latent_bos"][0],    floor=templates["latent_bos"][1]),
-        ]
-
-    def select_zones_for_prompt(self, prompt_words):
-        selected, seen = [], set()
-
-        def _add(words):
-            for w in words:
-                if w and w not in seen:
-                    seen.add(w)
-                    selected.append(w)
-
-        for spec in self.zone_specs:
-            for key in spec["key_fn"](prompt_words):
-                _add(spec["data"].get(key, []))
-        return selected
-
-    @staticmethod
-    def zone_gradient(zone_set, candidates, sigma=0.35, floor=0.05):
+    def _gradient(
+        self,
+        zone_set: set,
+        candidates: List[Tuple[str, float]],
+    ) -> torch.Tensor:
         n = len(candidates)
         if n == 0:
-            return np.array([], dtype=np.float64)
-        indices  = np.arange(n, dtype=np.float64)
-        norm_idx = indices / max(1, n - 1)
+            return torch.zeros(0, dtype=torch.float64)
+
+        sigma = self.sigma.clamp(min=1e-6)
+        floor = self.floor.clamp(min=0.0, max=1.0 - 1e-6)
+
+        indices   = torch.arange(n, dtype=torch.float64)
+        norm_idx  = indices / max(1, n - 1)
+
         zone_ranks = [
             i / max(1, n - 1)
             for i, (w, _) in enumerate(candidates)
             if w in zone_set
         ]
-        centre  = float(np.mean(zone_ranks)) if zone_ranks else 0.0
-        gauss   = np.exp(-0.5 * ((norm_idx - centre) / max(1e-6, sigma)) ** 2)
+        centre = float(torch.tensor(zone_ranks).mean()) if zone_ranks else 0.0
+
+        gauss   = torch.exp(-0.5 * ((norm_idx - centre) / sigma) ** 2)
         weights = floor + (1.0 - floor) * gauss
-        weights /= weights.sum()
-        return weights
+        return _normalise(weights)
 
-
-def build_context_index(vocab, cpd, corpus_tokens):
-    return ContextZoneIndex(vocab, cpd, Counter(corpus_tokens))
-
-
-# ---------------------------------------------------------------------------
-# vstack + np.roll column-match loop
-# ---------------------------------------------------------------------------
-
-def stream_to_matrix(stream, n_cols=26):
-    arr  = np.array(stream, dtype=np.int32)
-    trim = (len(arr) // n_cols) * n_cols
-    return arr[:trim].reshape(-1, n_cols)
-
-
-def roll_until_column_match(arr, max_iters=None):
-    if arr.ndim == 1:
-        arr = arr.reshape(1, -1)
-    n_cols    = arr.shape[1]
-    max_iters = max_iters or n_cols
-    original  = arr.copy()
-    stacked   = arr.copy()
-    for shift in range(1, max_iters + 1):
-        rolled  = np.roll(original, shift, axis=1)
-        stacked = np.vstack([stacked, rolled])
-        if np.any(np.all(rolled == original, axis=0)):
-            return stacked, shift
-    return stacked, -1
-
-
-
-
+    def _make_layer(self, weights: torch.Tensor, candidates, source_extra: str = "") -> Dict:
+        return {
+            "name":   self._layer_name,
+            "words":  [w for w, _ in candidates],
+            "probs":  weights.detach().numpy(),
+            "source": f"{self._source_hint} {source_extra}".strip(),
+        }
 
 
 # ---------------------------------------------------------------------------
-# PSPACE zones
+# L4 – Frequency zone gradient
 # ---------------------------------------------------------------------------
 
-PSPACE_ZONES = [
-    {"name": "NARRATIVE",    "desc": "High-frequency corpus words",        "pi_min": 0.00, "pi_max": 0.20, "zone_key": "freq",         "freq_tier": "high"},
-    {"name": "DESCRIPTIVE",  "desc": "Alphabetic neighbourhood of prompt", "pi_min": 0.20, "pi_max": 0.40, "zone_key": "alpha",        "freq_tier": None},
-    {"name": "RELATIONAL",   "desc": "Bigram-conditioned successors",      "pi_min": 0.40, "pi_max": 0.60, "zone_key": "ngram_bigram", "freq_tier": None},
-    {"name": "EXISTENTIAL",  "desc": "Rare / low-frequency vocab",         "pi_min": 0.60, "pi_max": 0.80, "zone_key": "freq",         "freq_tier": "low"},
-    {"name": "TRANSITIONAL", "desc": "Char-trigram neighbours",            "pi_min": 0.80, "pi_max": 1.01, "zone_key": "trigram_char", "freq_tier": None},
-]
+class L4_ZoneFreq(_ZoneGradientBase):
+    """
+    Gaussian gradient over the frequency-zone bucket (high / mid / low)
+    appropriate for the current prompt words.
+
+    Custom init
+    -----------
+    sigma, floor : learnable Gaussian shape (inherited from base).
+    freq_high_thresh, freq_mid_thresh : integer buffers.
+    """
+
+    def __init__(self, sigma: float = 0.50, floor: float = 0.05,
+                 freq_high_thresh: int = 10, freq_mid_thresh: int = 3):
+        super().__init__("L4_ZONE_FREQ", sigma, floor, "freq_zone")
+        self.register_buffer("freq_high_thresh",
+                             torch.tensor(freq_high_thresh, dtype=torch.int64))
+        self.register_buffer("freq_mid_thresh",
+                             torch.tensor(freq_mid_thresh, dtype=torch.int64))
+
+    def forward(
+        self,
+        candidates:   List[Tuple[str, float]],
+        prompt_words: List[str],
+        freq_zones:   Dict[str, List[str]],
+        token_freq:   Dict[str, int],
+    ) -> Dict:
+        hi_th = int(self.freq_high_thresh.item())
+        mi_th = int(self.freq_mid_thresh.item())
+
+        high_set = set(freq_zones.get("high", []))
+        if any(w in high_set for w in prompt_words):
+            key = "high"
+        elif all(token_freq.get(w, 0) < mi_th for w in prompt_words):
+            key = "low"
+        else:
+            key = "mid"
+
+        zone_set = set(freq_zones.get(key, []))
+        weights  = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, f"key={key}")
 
 
-def _pi_activate_zone(pi_val):
-    for z in PSPACE_ZONES:
-        if z["pi_min"] <= pi_val < z["pi_max"]:
-            return z["name"]
-    return PSPACE_ZONES[-1]["name"]
 # ---------------------------------------------------------------------------
-# Utility helpers
+# L5 – Alpha-zone gradient
 # ---------------------------------------------------------------------------
 
-def corpus_fingerprint(corpus):
-    if isinstance(corpus, bytes):
-        return hashlib.md5(corpus).hexdigest()
-    return hashlib.md5((corpus or "").encode("utf-8", errors="ignore")).hexdigest()
+class L5_ZoneAlpha(_ZoneGradientBase):
+    """
+    Gaussian gradient favouring tokens that share an initial letter with
+    any prompt word.
 
+    Custom init
+    -----------
+    sigma, floor : learnable (inherited).
+    """
 
-def resolve_corpus(file_obj, pasted_corpus):
-    if file_obj is not None:
-        try:
-            path = file_obj if isinstance(file_obj, str) else file_obj.name
-            with open(path, "rb") as fh:
-                raw = fh.read()
-            try:
-                text = gzip.decompress(raw).decode("utf-8", errors="ignore")
-                return text, "gzip file"
-            except Exception:
-                return raw.decode("utf-8", errors="ignore"), "uploaded file"
-        except Exception:
-            pass
-    if pasted_corpus and pasted_corpus.strip():
-        return pasted_corpus.strip(), "pasted text"
-    return EMBEDDED_CORPUS.strip(), "embedded corpus"
+    def __init__(self, sigma: float = 0.40, floor: float = 0.05):
+        super().__init__("L5_ZONE_ALPHA", sigma, floor, "alpha_zone")
+
+    def forward(
+        self,
+        candidates:   List[Tuple[str, float]],
+        prompt_words: List[str],
+        alpha_zones:  Dict[str, List[str]],
+    ) -> Dict:
+        alpha_words: set = set()
+        for w in prompt_words:
+            if w and w[0].isalpha():
+                alpha_words.update(alpha_zones.get(w[0], []))
+
+        weights = self._gradient(alpha_words, candidates)
+        keys    = [w[0] for w in prompt_words if w]
+        return self._make_layer(weights, candidates, f"keys={keys}")
 
 
 # ---------------------------------------------------------------------------
-# get_or_build
+# L6 – Bigram n-gram zone gradient
 # ---------------------------------------------------------------------------
 
-def get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log,
-                 progress=None):
-    def _prog(frac, desc):
-        if progress is not None:
-            progress(frac, desc=desc)
-        log.append(desc)
+class L6_ZoneBigram(_ZoneGradientBase):
+    """
+    Gaussian gradient using successors predicted by prompt bigrams.
 
-    key = (corpus_fingerprint(corpus), int(ngram_n), float(lidstone_gamma),
-           int(pi_prec), int(pi_stream_len))
-    if CACHE.get("key") == key and CACHE.get("cpd") is not None:
-        _prog(1.0, "Using cached model and stream.")
-        return CACHE["cpd"], CACHE["vocab"], CACHE["stream"]
-    CACHE["_corpus_text"] = corpus
+    Custom init
+    -----------
+    sigma, floor : learnable (inherited).
+    """
 
-    _prog(0.05, "Building ngram model...")
-    cpd, vocab = build_model(corpus, ngram_n, lidstone_gamma)
+    def __init__(self, sigma: float = 0.25, floor: float = 0.04):
+        super().__init__("L6_ZONE_BIGRAM", sigma, floor, "ngram bigram context")
 
-    _prog(0.35, f"Building pi stream (prec={pi_prec}, len={pi_stream_len})...")
-    raw_stream = build_pi_stream(pi_prec, pi_stream_len)
-
-    _prog(0.55, "Applying roll_until_column_match...")
-    matrix  = stream_to_matrix(raw_stream, n_cols=26)
-    stacked, match_shift = roll_until_column_match(matrix)
-    log.append(
-        f"Column match shift={match_shift}; stacked shape={stacked.shape}."
-        if match_shift >= 0
-        else f"No exact column match; stacked shape={stacked.shape}."
-    )
-    stream = stacked.flatten().tolist()
-
-    _prog(0.72, "Building context zone index + trigram latent space...")
-    corpus_tokens = tokenise_alpha(CACHE.get("_corpus_text", ""))
-    context_index = build_context_index(vocab, cpd, corpus_tokens)
-
-    log.append(
-        f"Zone index: high={len(context_index.freq_zones['high'])} "
-        f"mid={len(context_index.freq_zones['mid'])} "
-        f"low={len(context_index.freq_zones['low'])} "
-        f"alpha_keys={len(context_index.alpha_zones)} "
-        f"ngram_keys={len(context_index.ngram_zones)}."
-    )
-
-    if context_index.latent_sorted_keys:
-        top_ctx = context_index.latent_sorted_keys[0]
-        top_sim = context_index.latent_sim_scores[top_ctx]
-        log.append(
-            f"Latent BOS sort: {len(context_index.latent_sorted_keys)} contexts sorted. "
-            f"Top context={top_ctx}, cosine_sim={top_sim:.4f}. "
-            + "Quartile sizes: "
-            + ", ".join(
-                f"q{i}={len(context_index.latent_bos_data.get(f'q{i}', []))}"
-                for i in range(4)
+    def forward(
+        self,
+        candidates:   List[Tuple[str, float]],
+        prompt_words: List[str],
+        ngram_zones:  Dict,
+    ) -> Dict:
+        bigram_words: set = set()
+        for i in range(len(prompt_words) - 1):
+            bigram_words.update(
+                ngram_zones.get((prompt_words[i], prompt_words[i + 1]), [])
             )
+
+        weights = self._gradient(bigram_words, candidates)
+        return self._make_layer(weights, candidates)
+
+
+# ---------------------------------------------------------------------------
+# L7 – Live trigram context zone gradient
+# ---------------------------------------------------------------------------
+
+class L7_ZoneTrigram(_ZoneGradientBase):
+    """
+    Gaussian gradient using the two most-recent generated tokens as the
+    live n-gram context key.
+
+    Custom init
+    -----------
+    sigma, floor : learnable (inherited, tighter defaults for live ctx).
+    """
+
+    def __init__(self, sigma: float = 0.20, floor: float = 0.03):
+        super().__init__("L7_ZONE_TRIGRAM", sigma, floor, "live_ctx")
+
+    def forward(
+        self,
+        candidates:    List[Tuple[str, float]],
+        context_deque: deque,
+        ngram_zones:   Dict,
+    ) -> Dict:
+        ctx_list = list(context_deque)
+        if len(ctx_list) >= 2:
+            key      = tuple(ctx_list[-2:])
+            zone_set = set(ngram_zones.get(key, []))
+            src      = f"live_ctx={key}"
+        elif len(ctx_list) == 1:
+            key      = (ctx_list[-1],)
+            zone_set = set(ngram_zones.get(key, []))
+            src      = f"live_ctx=({ctx_list[-1]},)"
+        else:
+            zone_set = set()
+            src      = "no live context"
+
+        weights = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, src)
+
+
+# ---------------------------------------------------------------------------
+# L8 – Character-trigram neighbour gradient
+# ---------------------------------------------------------------------------
+
+class L8_ZoneCharTrig(_ZoneGradientBase):
+    """
+    Gaussian gradient over tokens that share character-trigrams with the
+    prompt words (surface-form similarity).
+
+    Custom init
+    -----------
+    sigma, floor : learnable (inherited).
+    """
+
+    def __init__(self, sigma: float = 0.35, floor: float = 0.04):
+        super().__init__("L8_ZONE_CHAR_TRIG", sigma, floor, "char-trigram neighbours")
+
+    def forward(
+        self,
+        candidates:    List[Tuple[str, float]],
+        prompt_words:  List[str],
+        char_trig_idx: Dict[str, set],
+    ) -> Dict:
+        prompt_tgs: set = set()
+        for w in prompt_words:
+            prompt_tgs |= _char_trigrams(w)
+
+        char_neighbours: set = set()
+        for tg in prompt_tgs:
+            char_neighbours |= char_trig_idx.get(tg, set())
+
+        weights = self._gradient(char_neighbours, candidates)
+        return self._make_layer(weights, candidates)
+
+
+# ---------------------------------------------------------------------------
+# L9 – Latent BOS quartile gradient
+# ---------------------------------------------------------------------------
+
+class L9_ZoneLatent(_ZoneGradientBase):
+    """
+    Gaussian gradient anchored by the latent-BOS cosine-similarity quartile
+    that best matches the current prompt.
+
+    Custom init
+    -----------
+    sigma, floor : learnable (inherited).
+    """
+
+    def __init__(self, sigma: float = 0.30, floor: float = 0.04):
+        super().__init__("L9_ZONE_LATENT", sigma, floor, "latent_bos_quartile")
+
+    def forward(
+        self,
+        candidates:         List[Tuple[str, float]],
+        prompt_words:       List[str],
+        latent_sorted_keys: List,
+        latent_bos_data:    Dict[str, List[str]],
+    ) -> Dict:
+        n_keys = len(latent_sorted_keys)
+        q_key  = "q0"
+        for ctx in latent_sorted_keys:
+            if any(w in ctx for w in prompt_words):
+                rank  = latent_sorted_keys.index(ctx)
+                q_key = f"q{min(3, rank * 4 // max(1, n_keys))}"
+                break
+
+        zone_set = set(latent_bos_data.get(q_key, []))
+        weights  = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, f"quartile={q_key}")
+
+
+# ---------------------------------------------------------------------------
+# L10 – History repetition column
+# ---------------------------------------------------------------------------
+
+class L10_History(nn.Module):
+    """
+    Produces a 1/(1+count) column for each candidate token based on how
+    many times it has already appeared in the generated sequence.
+
+    Custom init
+    -----------
+    smoothing : learnable additive offset in the denominator (clamped ≥ 0).
+                Default 1.0 recovers the original formula.
+    """
+
+    def __init__(self, smoothing: float = 1.0):
+        super().__init__()
+        self.smoothing = nn.Parameter(torch.tensor(smoothing, dtype=torch.float64))
+
+    def forward(
+        self,
+        candidates: List[Tuple[str, float]],
+        history:    Counter,
+    ) -> Dict:
+        smooth = self.smoothing.clamp(min=0.0)
+        counts = torch.tensor(
+            [history[w] for w, _ in candidates], dtype=torch.float64
         )
+        hist_vec = 1.0 / (smooth + counts)
+        hist_vec = _normalise(hist_vec)
 
-    CACHE.update(key=key, cpd=cpd, vocab=vocab, stream=stream, context_index=context_index)
-    _prog(1.0, "Model ready — cached.")
-    return cpd, vocab, stream
-
-
-
-# ---------------------------------------------------------------------------
-# Model save / load
-# ---------------------------------------------------------------------------
-
-def save_model_to_path(path, cpd, vocab, stream, ngram_n, lidstone_gamma,
-                       pi_prec, pi_stream_len, corpustext):
-    payload = dict(
-        magic="PI_TRIGRAM_MODEL_V1",
-        version=1,
-        cpd=cpd,
-        vocab=set(vocab),
-        stream=list(stream),
-        config=dict(
-            ngram_n=int(ngram_n),
-            lidstone_gamma=float(lidstone_gamma),
-            pi_prec=int(pi_prec),
-            pi_stream_len=int(pi_stream_len),
-            digits_per_sample=int(DEFAULTS["DIGITS_PER_SAMPLE"]),
-        ),
-        corpus_sha256=corpus_fingerprint(corpustext),
-        corpus_chars=len(corpustext) if corpustext else 0,
-        vocab_size=len(vocab),
-    )
-    with gzip.open(path, "wb") as f:
-        pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
-    return path
-
-
-def load_model_from_path(path):
-    errors = []
-    try:
-        with gzip.open(path, "rb") as f:
-            payload = pickle.load(f)
-    except Exception as e:
-        try:
-            with open(path, "rb") as f:
-                payload = pickle.load(f)
-        except Exception as e2:
-            return None, None, None, None, [
-                f"Could not read file: {e}",
-                f"Uncompressed fallback also failed: {e2}",
-            ]
-    if not isinstance(payload, dict):
-        return None, None, None, None, ["File does not contain a model dict."]
-    cpd    = payload.get("cpd")
-    vocab  = payload.get("vocab")
-    stream = payload.get("stream")
-    config = payload.get("config", {})
-    if cpd is None or vocab is None or stream is None:
-        return None, None, None, None, errors + ["Missing required fields: cpd/vocab/stream."]
-    return cpd, set(vocab), list(stream), dict(config), errors
-
-
-def save_model_ui(file_obj, pasted_corpus, pi_prec, pi_stream_len, ngram_n, lidstone_gamma):
-    log = []
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f"Corpus source: {source} ({len(corpus)} chars).")
-    cpd, vocab, stream = get_or_build(corpus, ngram_n, lidstone_gamma, pi_prec, pi_stream_len, log)
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pkl.gz", prefix="pi_model_")
-    tmp.close()
-    save_model_to_path(tmp.name, cpd, vocab, stream, ngram_n, lidstone_gamma,
-                       pi_prec, pi_stream_len, corpus)
-    log.append(f"Saved model to {os.path.basename(tmp.name)}")
-    return tmp.name, "\n".join(log)
-
-
-def load_model_ui(modelfile):
-    if modelfile is None:
-        return "No file uploaded.", gr.update(), gr.update(), gr.update(), gr.update()
-    path = modelfile if isinstance(modelfile, str) else modelfile.name
-    cpd, vocab, stream, config, errors = load_model_from_path(path)
-    if cpd is None:
-        return "Failed to load model: " + " | ".join(errors), gr.update(), gr.update(), gr.update(), gr.update()
-    CACHE.update(key=("LOADED", path), cpd=cpd, vocab=vocab, stream=stream)
-    log = [f"Loaded model from {os.path.basename(path)}."]
-    if errors:
-        log.extend([f"! {e}" for e in errors])
-    return (
-        "\n".join(log),
-        gr.update(value=config.get("pi_prec",        DEFAULTS["PI_PREC"])),
-        gr.update(value=config.get("pi_stream_len",  DEFAULTS["PI_STREAM_LEN"])),
-        gr.update(value=config.get("ngram_n",        DEFAULTS["NGRAM_N"])),
-        gr.update(value=config.get("lidstone_gamma", DEFAULTS["LIDSTONE_GAMMA"])),
-    )
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L10_HISTORY",
+            "words":  words,
+            "probs":  hist_vec.detach().numpy(),
+            "source": f"repetition history smoothing={smooth.detach().item():.4f}",
+        }
 
 
 # ---------------------------------------------------------------------------
-# HF model loader (stub — kept for UI compatibility)
+# L11 – Tensor blend of zone layers
 # ---------------------------------------------------------------------------
 
-def load_hf_model_on_demand(repo_id, hf_token=None):
-    HF_CACHE["status"] = f"HF loading not implemented in this build ({repo_id})."
-    return HF_CACHE["status"]
+class L11_TensorBlend(nn.Module):
+    """
+    Row-weighted vstack of L4–L10.  Each row's weight is its mean probability
+    over the candidate set; the resulting column vector is the blended
+    distribution.
+
+    Custom init
+    -----------
+    zone_weights : learnable 7-vector of per-row mixing weights
+                   (L4, L5, L6, L7, L8, L9, L10).  Initialised to all-ones
+                   (uniform) and normalised in forward via softmax so they
+                   always sum to 1.
+    eps          : small constant buffer for numerical safety.
+    """
+
+    N_ROWS = 7  # L4 through L10
+
+    def __init__(self, init_weights: Optional[List[float]] = None):
+        super().__init__()
+        if init_weights is None:
+            init_weights = [1.0] * self.N_ROWS
+        assert len(init_weights) == self.N_ROWS
+        self.zone_weights = nn.Parameter(
+            torch.tensor(init_weights, dtype=torch.float64)
+        )
+        self.register_buffer("eps", torch.tensor(1e-12, dtype=torch.float64))
+
+    def forward(
+        self,
+        zone_layers: List[Dict],   # L4..L10 dicts
+        candidates:  List[Tuple[str, float]],
+    ) -> Dict:
+        n = len(candidates)
+        rows = []
+        for layer in zone_layers:
+            p = _to_tensor(layer["probs"])
+            if p.shape[0] != n:
+                p = F.pad(p, (0, n - p.shape[0]))[:n]
+            rows.append(p.unsqueeze(0))                 # (1, n)
+
+        zone_matrix = torch.cat(rows, dim=0)            # (N_ROWS, n)
+        row_weights = F.softmax(self.zone_weights, dim=0)  # (N_ROWS,) summing to 1
+
+        blended = (zone_matrix * row_weights.unsqueeze(1)).sum(dim=0)   # (n,)
+        blended = _normalise(blended.clamp(min=float(self.eps)))
+
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L11_TENSOR_BLEND",
+            "words":  words,
+            "probs":  blended.detach().numpy(),
+            "source": (
+                f"row-weighted blend of L4..L10 ({len(zone_layers)} rows) "
+                f"softmax_weights={row_weights.tolist()}"
+            ),
+        }
 
 
-# ===========================================================================
-#  Layer Isomorphism  (embedded — no separate file needed)
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# L12 – Final distribution (geometric mean of L3 and L11)
+# ---------------------------------------------------------------------------
 
-def _li_normalise(vec: np.ndarray) -> np.ndarray:
-    t = vec.sum()
-    return vec / t if t > 1e-30 else np.ones_like(vec) / max(1, len(vec))
+class L12_Final(nn.Module):
+    """
+    Geometric mean of the top-K/P distribution (L3) and the tensor-blend
+    distribution (L11).
+
+    Custom init
+    -----------
+    blend_alpha : learnable exponent for L3's contribution in the geometric
+                  mean: p_final ∝ p_L3^α · p_L11^(1-α).
+                  Initialised to 0.5 (equal weight); clamped to (0, 1).
+    """
+
+    def __init__(self, blend_alpha: float = 0.5):
+        super().__init__()
+        self.blend_alpha = nn.Parameter(torch.tensor(blend_alpha, dtype=torch.float64))
+
+    def forward(
+        self,
+        L3_pairs: List[Tuple[str, float]],
+        L11:      Dict,
+    ) -> Tuple[List[Tuple[str, float]], Dict]:
+        alpha = self.blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6)
+        beta  = 1.0 - alpha
+
+        p3  = _to_tensor([p for _, p in L3_pairs]).clamp(min=1e-24)
+        p11 = _to_tensor(L11["probs"]).clamp(min=1e-24)
+
+        blended = p3.pow(alpha) * p11.pow(beta)
+        blended = _normalise(blended)
+
+        # Sort descending
+        sorted_idx = torch.argsort(blended, descending=True)
+        words_arr  = [L3_pairs[i][0] for i in sorted_idx.tolist()]
+        probs_arr  = blended[sorted_idx]
+
+        out = list(zip(words_arr, probs_arr.tolist()))
+        layer = {
+            "name":   "L12_FINAL",
+            "words":  words_arr,
+            "probs":  probs_arr.detach().numpy(),
+            "source": f"geo_mean(L3^{alpha.detach().item():.3f}, L11^{beta.detach().item():.3f})",
+        }
+        return out, layer
 
 
-def _li_insight_penalty(pairs, strength):
-    if not pairs or strength <= 0:
-        return pairs
-    mean_p = sum(p for _, p in pairs) / len(pairs)
-    if mean_p <= 0:
-        return pairs
-    out = []
-    for w, p in pairs:
-        excess = max(0.0, p - mean_p)
-        p2 = p / (1.0 + strength * excess / mean_p)
-        out.append((w, max(1e-12, p2)))
-    t = sum(p for _, p in out)
-    return [(w, p / t) for w, p in out] if t > 0 else out
+# ---------------------------------------------------------------------------
+# L13 – Contextual requestor position
+# ---------------------------------------------------------------------------
+
+class L13_CtxReqPos(nn.Module):
+    """
+    Encodes the pi-stream cursor position at the moment of each draw as a
+    Gaussian gradient over the candidate set.  The normalised position
+    [0, 1] drives the Gaussian centre so tokens at rank ≈ pos·(n-1) get
+    the highest weight.
+
+    Custom init
+    -----------
+    sigma : learnable Gaussian width (clamped > 0).
+    floor : learnable minimum weight (clamped to [0, 1)).
+    Both default to values used in the original code.
+    """
+
+    def __init__(self, sigma: float = 0.30, floor: float = 0.04):
+        super().__init__()
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
+        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
+
+    def forward(
+        self,
+        candidates:  List[Tuple[str, float]],
+        draw_pos:    int,
+        stream_len:  int,
+    ) -> Dict:
+        n         = len(candidates)
+        sigma     = self.sigma.clamp(min=1e-6)
+        floor     = self.floor.clamp(min=0.0, max=1.0 - 1e-6)
+        norm_pos  = (draw_pos % max(1, stream_len)) / max(1, stream_len - 1)
+
+        indices  = torch.arange(n, dtype=torch.float64) / max(1, n - 1)
+        gauss    = torch.exp(-0.5 * ((indices - norm_pos) / sigma) ** 2)
+        weights  = floor + (1.0 - floor) * gauss
+        weights  = _normalise(weights)
+
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L13_CTX_REQ_POS",
+            "words":  words,
+            "probs":  weights.detach().numpy(),
+            "source": (
+                f"ctx_req_pos={draw_pos} "
+                f"norm={norm_pos:.4f} "
+                f"stream_len={stream_len}"
+            ),
+        }
 
 
-def _li_zone_gradient(zone_set, candidates, sigma=0.35, floor=0.05) -> np.ndarray:
-    n = len(candidates)
-    if n == 0:
-        return np.array([], dtype=np.float64)
-    indices  = np.arange(n, dtype=np.float64)
-    norm_idx = indices / max(1, n - 1)
-    zone_ranks = [
-        i / max(1, n - 1)
-        for i, (w, _) in enumerate(candidates)
-        if w in zone_set
-    ]
-    centre  = float(np.mean(zone_ranks)) if zone_ranks else 0.0
-    gauss   = np.exp(-0.5 * ((norm_idx - centre) / max(1e-6, sigma)) ** 2)
-    weights = floor + (1.0 - floor) * gauss
-    return _li_normalise(weights)
-
-
-def _li_char_trigrams(word: str):
-    return {word[i:i+3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
-
+# ---------------------------------------------------------------------------
+# LayerFrame (unchanged data class)
+# ---------------------------------------------------------------------------
 
 class LayerFrame:
-    __slots__ = ("step", "layers", "chosen", "context_window", "zone_name", "draw_pos", "next_draw_pos")
+    """Container for one generation step's full layer stack."""
+    __slots__ = (
+        "step", "layers", "chosen", "context_window",
+        "zone_name", "draw_pos", "next_draw_pos",
+    )
 
     def __init__(
         self,
-        step: int,
-        layers: List[Dict],
-        chosen: str = "",
-        context_window: Tuple[str, ...] = (),
-        zone_name: str = "",
-        draw_pos: int = 0,
-        next_draw_pos: int = 0,
+        step:           int,
+        layers:         List[Dict],
+        chosen:         str         = "",
+        context_window: Tuple       = (),
+        zone_name:      str         = "",
+        draw_pos:       int         = 0,
+        next_draw_pos:  int         = 0,
     ):
         self.step           = step
         self.layers         = layers
@@ -742,39 +760,47 @@ class LayerFrame:
                 return layer
         return None
 
-    def tensor(self) -> np.ndarray:
-        rows = [l["probs"] for l in self.layers]
+    def tensor(self) -> torch.Tensor:
+        rows = [_to_tensor(l["probs"]) for l in self.layers]
         if not rows:
-            return np.array([])
-        max_len = max(len(r) for r in rows)
-        padded  = [np.pad(r, (0, max_len - len(r))) for r in rows]
-        return np.vstack(padded)
+            return torch.zeros(0, dtype=torch.float64)
+        max_len = max(r.shape[0] for r in rows)
+        padded  = [F.pad(r, (0, max_len - r.shape[0])) for r in rows]
+        return torch.stack(padded)   # (n_layers, max_vocab)
 
 
-class IsomorphismGenerator:
+# ---------------------------------------------------------------------------
+# IsomorphismPipeline  – drop-in replacement for IsomorphismGenerator
+# ---------------------------------------------------------------------------
+
+class IsomorphismPipeline(nn.Module):
     """
-    13-layer isomorphic probability tensor for every generated token.
+    Full 14-layer isomorphic probability pipeline as a single nn.Module.
 
-    L0  RAW_DIST       CPD posterior + rep_penalty
-    L1  TEMP_SCALED    temperature scaling
-    L2  INSIGHT        insight penalty
-    L3  TOPK_TOPP      top-k / top-p truncation
-    L4  ZONE_FREQ      freq-zone Gaussian gradient
-    L5  ZONE_ALPHA     alpha-zone Gaussian gradient
-    L6  ZONE_BIGRAM    prompt bigram ngram_zones gradient
-    L7  ZONE_TRIGRAM   live (w-2,w-1) context ngram_zones gradient
-    L8  ZONE_CHAR_TRIG char-trigram neighbour gradient
-    L9  ZONE_LATENT    latent-BOS quartile gradient
-    L10 HISTORY        1/(1+count) repetition column
-    L11 TENSOR_BLEND   row-weighted vstack of L4..L10
-    L12 FINAL          geometric mean(L3, L11) -> chosen token
+    Every layer is a child module discoverable by standard PyTorch tooling
+    (parameters(), state_dict(), etc.).  The pipeline can be fine-tuned
+    end-to-end if differentiable loss signals are available.
+
+    Custom init
+    -----------
+    All hyper-parameters are forwarded to the corresponding layer modules.
+    The layer modules register them as nn.Parameter (learnable) or as named
+    buffers (discrete / non-differentiable values).
+
+    Drop-in API
+    -----------
+    Identical to the original IsomorphismGenerator:
+        gen = IsomorphismPipeline(cpd, context_index, vocab, ...)
+        gen.seed_stream(stream)
+        for frame in gen.generate(prompt, n_words, draw_fn): ...
     """
 
     LAYER_NAMES = [
-        "L0_RAW_DIST", "L1_TEMP_SCALED", "L2_INSIGHT", "L3_TOPK_TOPP",
-        "L4_ZONE_FREQ", "L5_ZONE_ALPHA", "L6_ZONE_BIGRAM", "L7_ZONE_TRIGRAM",
-        "L8_ZONE_CHAR_TRIG", "L9_ZONE_LATENT", "L10_HISTORY",
-        "L11_TENSOR_BLEND", "L12_FINAL", "L13_CTX_REQ_POS",
+        "L0_RAW_DIST",      "L1_TEMP_SCALED",   "L2_INSIGHT",
+        "L3_TOPK_TOPP",     "L4_ZONE_FREQ",      "L5_ZONE_ALPHA",
+        "L6_ZONE_BIGRAM",   "L7_ZONE_TRIGRAM",   "L8_ZONE_CHAR_TRIG",
+        "L9_ZONE_LATENT",   "L10_HISTORY",        "L11_TENSOR_BLEND",
+        "L12_FINAL",        "L13_CTX_REQ_POS",
     ]
 
     def __init__(
@@ -782,30 +808,58 @@ class IsomorphismGenerator:
         cpd,
         context_index,
         vocab,
-        ngram_n: int = 2,
-        temperature: float = 4.3,
-        top_k: int = 100,
-        top_p: float = 1.0,
-        rep_penalty: float = 1.13,
+        ngram_n:         int   = 2,
+        temperature:     float = 4.3,
+        top_k:           int   = 100,
+        top_p:           float = 1.0,
+        rep_penalty:     float = 1.13,
         insight_penalty: float = 3.95,
-        history: Optional[Counter] = None,
+        history:         Optional[Counter] = None,
+        # ── per-layer custom init overrides ──────────────────────────
+        l4_sigma: float = 0.50,   l4_floor: float = 0.05,
+        l5_sigma: float = 0.40,   l5_floor: float = 0.05,
+        l6_sigma: float = 0.25,   l6_floor: float = 0.04,
+        l7_sigma: float = 0.20,   l7_floor: float = 0.03,
+        l8_sigma: float = 0.35,   l8_floor: float = 0.04,
+        l9_sigma: float = 0.30,   l9_floor: float = 0.04,
+        l10_smoothing:    float = 1.0,
+        l11_init_weights: Optional[List[float]] = None,
+        l12_blend_alpha:  float = 0.5,
+        l13_sigma: float = 0.30,  l13_floor: float = 0.04,
     ):
-        self.cpd             = cpd
-        self.ctx_idx         = context_index
-        self.vocab           = set(vocab)
-        self.ngram_n         = max(2, int(ngram_n))
-        self.context_window  = self.ngram_n - 1
-        self.temperature     = max(1e-3, float(temperature))
-        self.top_k           = max(1, int(top_k))
-        self.top_p           = max(1e-3, min(1.0, float(top_p)))
-        self.rep_penalty     = max(1.0, float(rep_penalty))
-        self.insight_penalty = max(0.0, float(insight_penalty))
-        self.history         = Counter(history) if history else Counter()
-        self._step           = 0
-        self._pos            = 0   # contextual requestor position (pi-stream cursor)
+        super().__init__()
+
+        # ── non-module state ──────────────────────────────────────────
+        self.cpd            = cpd
+        self.ctx_idx        = context_index
+        self.vocab          = set(vocab)
+        self.ngram_n        = max(2, int(ngram_n))
+        self.context_window = self.ngram_n - 1
+        self.history        = Counter(history) if history else Counter()
+        self._step          = 0
+        self._pos           = 0
+        self._stream: List[int] = []
         self._char_trig_index: Dict[str, set] = (
             getattr(context_index, "_trig_index", {}) if context_index else {}
         )
+
+        # ── child layer modules ───────────────────────────────────────
+        self.l0  = L0_RawDist(rep_penalty=rep_penalty)
+        self.l1  = L1_TempScaled(temperature=temperature)
+        self.l2  = L2_InsightPenalty(insight_penalty=insight_penalty)
+        self.l3  = L3_TopKTopP(top_k=top_k, top_p=top_p)
+        self.l4  = L4_ZoneFreq(sigma=l4_sigma, floor=l4_floor)
+        self.l5  = L5_ZoneAlpha(sigma=l5_sigma, floor=l5_floor)
+        self.l6  = L6_ZoneBigram(sigma=l6_sigma, floor=l6_floor)
+        self.l7  = L7_ZoneTrigram(sigma=l7_sigma, floor=l7_floor)
+        self.l8  = L8_ZoneCharTrig(sigma=l8_sigma, floor=l8_floor)
+        self.l9  = L9_ZoneLatent(sigma=l9_sigma, floor=l9_floor)
+        self.l10 = L10_History(smoothing=l10_smoothing)
+        self.l11 = L11_TensorBlend(init_weights=l11_init_weights)
+        self.l12 = L12_Final(blend_alpha=l12_blend_alpha)
+        self.l13 = L13_CtxReqPos(sigma=l13_sigma, floor=l13_floor)
+
+    # ── internal helpers ──────────────────────────────────────────────
 
     def _dist_for_ctx(self, ctx_tuple):
         for cut in range(len(ctx_tuple), 0, -1):
@@ -824,250 +878,92 @@ class IsomorphismGenerator:
             pass
         return None
 
-    def _build_L0(self, dist):
-        raw = []
-        for s in dist.samples():
-            if s:
-                p   = max(1e-12, float(dist.prob(s)))
-                cnt = self.history[s]
-                if cnt > 0:
-                    p /= self.rep_penalty ** cnt
-                raw.append((s, p))
-        raw.sort(key=lambda x: x[1], reverse=True)
-        t   = sum(p for _, p in raw)
-        raw = [(w, p / t) for w, p in raw] if t > 0 else raw
-        words = [w for w, _ in raw]
-        probs = np.array([p for _, p in raw], dtype=np.float64)
-        return raw, {"name": "L0_RAW_DIST", "words": words, "probs": probs,
-                     "source": "CPD posterior + rep_penalty"}
+    # ── public API ────────────────────────────────────────────────────
 
-    def _build_L1(self, L0_pairs):
-        scaled = [(w, p ** (1.0 / self.temperature)) for w, p in L0_pairs]
-        t      = sum(p for _, p in scaled)
-        scaled = [(w, p / t) for w, p in scaled] if t > 0 else scaled
-        words  = [w for w, _ in scaled]
-        probs  = np.array([p for _, p in scaled], dtype=np.float64)
-        return scaled, {"name": "L1_TEMP_SCALED", "words": words, "probs": probs,
-                        "source": f"temperature={self.temperature}"}
-
-    def _build_L2(self, L1_pairs):
-        penalised = _li_insight_penalty(L1_pairs, self.insight_penalty)
-        words     = [w for w, _ in penalised]
-        probs     = np.array([p for _, p in penalised], dtype=np.float64)
-        return penalised, {"name": "L2_INSIGHT", "words": words, "probs": probs,
-                           "source": f"insight_penalty={self.insight_penalty}"}
-
-    def _build_L3(self, L2_pairs):
-        trunc       = L2_pairs[:self.top_k]
-        kept, accum = [], 0.0
-        for w, p in trunc:
-            kept.append((w, p))
-            accum += p
-            if accum >= self.top_p:
-                break
-        t    = sum(p for _, p in kept)
-        kept = [(w, p / t) for w, p in kept] if t > 0 else kept
-        words = [w for w, _ in kept]
-        probs = np.array([p for _, p in kept], dtype=np.float64)
-        return kept, {"name": "L3_TOPK_TOPP", "words": words, "probs": probs,
-                      "source": f"top_k={self.top_k} top_p={self.top_p}"}
-
-    def _zone_layer(self, name, zone_set, candidates, sigma, floor, source) -> Dict:
-        g = _li_zone_gradient(zone_set, candidates, sigma=sigma, floor=floor)
-        return {"name": name, "words": [w for w, _ in candidates],
-                "probs": g, "source": source}
-
-    def _build_zone_layers(self, L3_pairs, prompt_words, context_deque):
-        ci     = self.ctx_idx
-        layers = []
-
-        if ci is None:
-            flat = _li_normalise(np.ones(len(L3_pairs)))
-            for name in ["L4_ZONE_FREQ", "L5_ZONE_ALPHA", "L6_ZONE_BIGRAM",
-                         "L7_ZONE_TRIGRAM", "L8_ZONE_CHAR_TRIG", "L9_ZONE_LATENT"]:
-                layers.append({"name": name, "words": [w for w, _ in L3_pairs],
-                                "probs": flat.copy(), "source": "no context_index"})
-            return layers
-
-        high_set = set(ci.freq_zones.get("high", []))
-        if any(w in high_set for w in prompt_words):
-            freq_key = "high"
-        elif all(ci.token_freq.get(w, 0) < ci.FREQ_MID_THRESH for w in prompt_words):
-            freq_key = "low"
-        else:
-            freq_key = "mid"
-        layers.append(self._zone_layer(
-            "L4_ZONE_FREQ", set(ci.freq_zones.get(freq_key, [])),
-            L3_pairs, 0.50, 0.05, f"freq_zone={freq_key}"))
-
-        alpha_words: set = set()
-        for w in prompt_words:
-            if w and w[0].isalpha():
-                alpha_words.update(ci.alpha_zones.get(w[0], []))
-        layers.append(self._zone_layer(
-            "L5_ZONE_ALPHA", alpha_words, L3_pairs, 0.40, 0.05,
-            f"alpha_keys={[w[0] for w in prompt_words if w]}"))
-
-        bigram_words: set = set()
-        for i in range(len(prompt_words) - 1):
-            bigram_words.update(ci.ngram_zones.get(
-                (prompt_words[i], prompt_words[i + 1]), []))
-        layers.append(self._zone_layer(
-            "L6_ZONE_BIGRAM", bigram_words, L3_pairs, 0.25, 0.04,
-            "ngram bigram context"))
-
-        ctx_list   = list(context_deque)
-        trig_words: set = set()
-        if len(ctx_list) >= 2:
-            trig_key   = tuple(ctx_list[-2:])
-            trig_words = set(ci.ngram_zones.get(trig_key, []))
-            trig_src   = f"live_ctx={trig_key}"
-        elif len(ctx_list) == 1:
-            trig_key   = (ctx_list[-1],)
-            trig_words = set(ci.ngram_zones.get(trig_key, []))
-            trig_src   = f"live_ctx=({ctx_list[-1]},)"
-        else:
-            trig_src = "no live context"
-        layers.append(self._zone_layer(
-            "L7_ZONE_TRIGRAM", trig_words, L3_pairs, 0.20, 0.03, trig_src))
-
-        prompt_tgs: set = set()
-        for w in prompt_words:
-            prompt_tgs |= _li_char_trigrams(w)
-        char_neighbours: set = set()
-        for tg in prompt_tgs:
-            char_neighbours |= self._char_trig_index.get(tg, set())
-        layers.append(self._zone_layer(
-            "L8_ZONE_CHAR_TRIG", char_neighbours, L3_pairs, 0.35, 0.04,
-            "char-trigram neighbours"))
-
-        n_keys = len(ci.latent_sorted_keys)
-        q_key  = "q0"
-        for ctx in ci.latent_sorted_keys:
-            if any(w in ctx for w in prompt_words):
-                rank  = ci.latent_sorted_keys.index(ctx)
-                q_key = f"q{min(3, rank * 4 // max(1, n_keys))}"
-                break
-        layers.append(self._zone_layer(
-            "L9_ZONE_LATENT", set(ci.latent_bos_data.get(q_key, [])),
-            L3_pairs, 0.30, 0.04, f"latent_bos_quartile={q_key}"))
-
-        return layers
-
-    def _build_L10(self, L3_pairs) -> Dict:
-        hist_vec = np.array(
-            [1.0 / (1.0 + self.history[w]) for w, _ in L3_pairs],
-            dtype=np.float64)
-        return {"name": "L10_HISTORY", "words": [w for w, _ in L3_pairs],
-                "probs": _li_normalise(hist_vec), "source": "repetition history"}
-
-    def _build_L11(self, zone_layers, L10, L3_pairs) -> Dict:
-        n           = len(L3_pairs)
-        rows        = [l["probs"] for l in zone_layers] + [L10["probs"]]
-        zone_matrix = np.vstack(rows)
-        row_norms   = zone_matrix.sum(axis=1, keepdims=True).clip(1e-12)
-        augmented   = np.hstack([zone_matrix, row_norms])
-        row_weights = augmented[:, :n].mean(axis=1)
-        row_weights = np.clip(row_weights, 1e-12, None)
-        row_weights /= row_weights.sum()
-        weights     = (augmented[:, :n] * row_weights[:, None]).sum(axis=0)
-        return {"name": "L11_TENSOR_BLEND",
-                "words": [w for w, _ in L3_pairs],
-                "probs": _li_normalise(np.clip(weights, 1e-12, None)),
-                "source": f"row-weighted blend of L4..L10 ({len(rows)} rows)"}
-
-    def _build_L12(self, L3_pairs, L11):
-        blended = [
-            (w, math.sqrt(max(1e-24, p) * float(lw)))
-            for (w, p), lw in zip(L3_pairs, L11["probs"])
-        ]
-        t       = sum(p for _, p in blended)
-        blended = [(w, p / t) for w, p in blended] if t > 0 else blended
-        blended.sort(key=lambda x: x[1], reverse=True)
-        words = [w for w, _ in blended]
-        probs = np.array([p for _, p in blended], dtype=np.float64)
-        return blended, {"name": "L12_FINAL", "words": words, "probs": probs,
-                         "source": "geometric mean(L3, L11)"}
-
-    def _build_L13(self, L3_pairs: list, draw_pos: int, stream_len: int) -> Dict:
-        """
-        L13  CONTEXTUAL REQUESTOR POSITION
-        ───────────────────────────────────
-        Records the pi-stream cursor position at the moment this token was
-        drawn.  The position is normalised to [0, 1] over the stream length
-        and broadcast as a uniform-weighted column over the L3 candidate set,
-        then added to the tensor.  After this layer is built, the internal
-        cursor advances by draw_pos % stream_len so the *next* step's draw
-        begins from a position that encodes where *this* step landed.
-        """
-        n        = len(L3_pairs)
-        norm_pos = (draw_pos % max(1, stream_len)) / max(1, stream_len - 1)
-        # Broadcast the scalar position as a rank-weighted gradient:
-        # words near rank = norm_pos * (n-1) get the highest weight.
-        centre   = norm_pos
-        indices  = np.arange(n, dtype=np.float64) / max(1, n - 1)
-        sigma    = 0.30
-        floor    = 0.04
-        gauss    = np.exp(-0.5 * ((indices - centre) / max(1e-6, sigma)) ** 2)
-        weights  = floor + (1.0 - floor) * gauss
-        weights  = _li_normalise(weights)
-        return {
-            "name":   "L13_CTX_REQ_POS",
-            "words":  [w for w, _ in L3_pairs],
-            "probs":  weights,
-            "source": f"ctx_req_pos={draw_pos} norm={norm_pos:.4f} stream_len={stream_len}",
-        }
+    def seed_stream(self, stream: list):
+        """Attach the raw pi-stream so L13 can read its length & cursor."""
+        self._stream = list(stream)
+        self._pos    = 0
 
     def step(
         self,
         context_deque: deque,
-        prompt_words: List[str],
-        draw: float,
-        zone_name: str = "",
+        prompt_words:  List[str],
+        draw:          float,
+        zone_name:     str = "",
     ) -> Optional[LayerFrame]:
         dist = self._dist_for_ctx(tuple(context_deque))
         if dist is None:
             return None
 
-        L0_pairs, L0 = self._build_L0(dist)
+        # ── forward pass through the 14 layers ───────────────────────
+        L0_pairs, L0 = self.l0(dist, self.history)
         if not L0_pairs:
             return None
 
-        L1_pairs, L1 = self._build_L1(L0_pairs)
-        L2_pairs, L2 = self._build_L2(L1_pairs)
-        L3_pairs, L3 = self._build_L3(L2_pairs)
+        L1_pairs, L1 = self.l1(L0_pairs)
+        L2_pairs, L2 = self.l2(L1_pairs)
+        L3_pairs, L3 = self.l3(L2_pairs)
         if not L3_pairs:
             return None
 
-        zone_layers    = self._build_zone_layers(L3_pairs, prompt_words, context_deque)
-        L10            = self._build_L10(L3_pairs)
-        L11            = self._build_L11(zone_layers, L10, L3_pairs)
-        L12_pairs, L12 = self._build_L12(L3_pairs, L11)
+        ci = self.ctx_idx
+
+        if ci is None:
+            # Fallback: uniform zone layers
+            flat = _normalise(torch.ones(len(L3_pairs), dtype=torch.float64))
+            flat_np = flat.detach().numpy()
+            words = [w for w, _ in L3_pairs]
+            zone_layers = [
+                {"name": n, "words": words, "probs": flat_np.copy(),
+                 "source": "no context_index"}
+                for n in ["L4_ZONE_FREQ", "L5_ZONE_ALPHA", "L6_ZONE_BIGRAM",
+                           "L7_ZONE_TRIGRAM", "L8_ZONE_CHAR_TRIG", "L9_ZONE_LATENT"]
+            ]
+        else:
+            L4 = self.l4(L3_pairs, prompt_words, ci.freq_zones, ci.token_freq)
+            L5 = self.l5(L3_pairs, prompt_words, ci.alpha_zones)
+            L6 = self.l6(L3_pairs, prompt_words, ci.ngram_zones)
+            L7 = self.l7(L3_pairs, context_deque, ci.ngram_zones)
+            L8 = self.l8(L3_pairs, prompt_words, self._char_trig_index)
+            L9 = self.l9(
+                L3_pairs, prompt_words,
+                ci.latent_sorted_keys, ci.latent_bos_data,
+            )
+            zone_layers = [L4, L5, L6, L7, L8, L9]
+
+        L10 = self.l10(L3_pairs, self.history)
+        L11 = self.l11(zone_layers + [L10], L3_pairs)
+        L12_pairs, L12 = self.l12(L3_pairs, L11)
 
         # ── L13: contextual requestor position ────────────────────────
-        # Capture where the pi-stream cursor sat when we called step().
-        draw_pos    = self._pos
-        stream_len  = max(1, len(getattr(self, '_stream', [])) or 1)
-        L13         = self._build_L13(L3_pairs, draw_pos, stream_len)
+        draw_pos   = self._pos
+        stream_len = max(1, len(self._stream))
+        L13 = self.l13(L3_pairs, draw_pos, stream_len)
 
-        # Geometric blend of L12 final probs with L13 positional weights
-        l12_map = dict(zip([w for w, _ in L12_pairs], [p for _, p in L12_pairs]))
-        l13_map = dict(zip(L13['words'], L13['probs'].tolist()))
+        # Geometric blend of L12 and L13
+        l12_map = dict(L12_pairs)
+        l13_map = dict(zip(L13["words"], L13["probs"].tolist()))
         all_words = list(l12_map.keys())
-        floor     = 1e-12
-        blended   = [
-            (w, math.sqrt(max(floor, l12_map.get(w, floor)) *
-                          max(floor, l13_map.get(w, floor))))
+        floor_val = 1e-12
+
+        blended = [
+            (w, math.sqrt(
+                max(floor_val, l12_map.get(w, floor_val)) *
+                max(floor_val, l13_map.get(w, floor_val))
+            ))
             for w in all_words
         ]
-        bt = sum(p for _, p in blended)
+        bt      = sum(p for _, p in blended)
         blended = [(w, p / bt) for w, p in blended] if bt > 0 else blended
 
+        # Prefer unseen tokens
         unseen = [(w, p) for w, p in blended if self.history[w] == 0]
         pool   = unseen if unseen else blended
         t      = sum(p for _, p in pool)
         pool   = [(w, p / t) for w, p in pool] if t > 0 else pool
 
+        # Sample
         chosen, cumulative = pool[-1][0], 0.0
         for w, p in pool:
             cumulative += p
@@ -1077,13 +973,13 @@ class IsomorphismGenerator:
 
         self.history[chosen] += 1
 
-        # Advance internal cursor by draw_pos so the NEXT step starts
-        # from a position that encodes where THIS step landed.
-        next_draw_pos   = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
-        self._pos       = next_draw_pos
+        # Advance cursor
+        next_draw_pos = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
+        self._pos     = next_draw_pos
+        self._step   += 1
 
         return LayerFrame(
-            step           = self._step,
+            step           = self._step - 1,
             layers         = [L0, L1, L2, L3] + zone_layers + [L10, L11, L12, L13],
             chosen         = chosen,
             context_window = tuple(context_deque),
@@ -1092,12 +988,11 @@ class IsomorphismGenerator:
             next_draw_pos  = next_draw_pos,
         )
 
-    def seed_stream(self, stream: list):
-        """Attach the raw pi-stream so L13 can read its length."""
-        self._stream = list(stream)
-        self._pos    = 0
-
     def generate(self, prompt: str, n_words: int, draw_fn, zone_fn=None):
+        """
+        Identical signature to the original IsomorphismGenerator.generate().
+        Yields LayerFrame objects.
+        """
         tokens       = [w.lower() for w in prompt.split() if w.isalpha()]
         vocab_tokens = [w for w in tokens if w in self.vocab]
 
@@ -1116,202 +1011,881 @@ class IsomorphismGenerator:
                 ctx.clear()
                 ctx.extend([""] * self.context_window)
                 continue
-            self._step += 1
             ctx.append(frame.chosen)
             yield frame
 
+    # ── PyTorch convenience ───────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# Layer Tensor Gradio backend
-# ---------------------------------------------------------------------------
-
-def _layer_iso_run(
-    file_obj, pasted_corpus, prompt,
-    pi_prec, pi_stream_len, ngram_n, lidstone_gamma,
-    temperature, gen_words, rep_penalty, insight_penalty,
-    progress=gr.Progress(track_tqdm=False),
-):
-    log = []
-    corpus, source = resolve_corpus(file_obj, pasted_corpus)
-    log.append(f"Corpus source: {source} ({len(corpus)} chars).")
-    cpd, vocab, stream = get_or_build(
-        corpus, int(ngram_n), float(lidstone_gamma),
-        int(pi_prec), int(pi_stream_len), log, progress=progress,
-    )
-    context_index = CACHE.get("context_index")
-
-    gen = IsomorphismGenerator(
-        cpd             = cpd,
-        context_index   = context_index,
-        vocab           = vocab,
-        ngram_n         = int(ngram_n),
-        temperature     = float(temperature),
-        top_k           = DEFAULTS["TOP_K"],
-        top_p           = DEFAULTS["TOP_P"],
-        rep_penalty     = float(rep_penalty),
-        insight_penalty = float(insight_penalty),
-    )
-
-    _pos    = [0]
-    _stream = list(stream)
-    _dps    = DEFAULTS["DIGITS_PER_SAMPLE"]
-    gen.seed_stream(_stream)   # attach stream so L13 can read length & cursor
-
-    def _draw():
-        val  = 0
-        base = 26 ** _dps
-        for _ in range(_dps):
-            val  = val * 26 + _stream[_pos[0] % max(1, val + 1)]
-            _pos[0] += 1
-        # Keep external cursor in sync with the IsomorphismGenerator internal cursor
-        _pos[0] = gen._pos % max(1, len(_stream))
-        return val / base
-
-    def _zone_fn(_draw_val):
-        return _pi_activate_zone(_draw_val)
-
-    frames = []
-    try:
-        for frame in gen.generate(
-            prompt  = prompt or "",
-            n_words = int(gen_words),
-            draw_fn = _draw,
-            zone_fn = _zone_fn,
-        ):
-            frames.append(frame)
-    except Exception as e:
-        log.append(f"Generation error: {e}")
-
-    if not frames:
-        return "", "No frames generated.", "{}", "\n".join(log)
-
-    words    = [f.chosen for f in frames if f.chosen]
-    out_text = (" ".join(tokenise_alpha(prompt or "")) + " " + " ".join(words)).strip()
-
-    header = ""
-    sep  = ""
-    rows = [header, sep]
-
-    for f in frames[:60]:
-        top_per_layer = []
-        for layer in f.layers:
-            if len(layer["words"]) > 0:
-                idx = int(np.argmax(layer["probs"]))
-                top_per_layer.append(f"{layer['words'][idx]}:{layer['probs'][idx]:.2f}")
+    def param_summary(self) -> str:
+        """
+        Returns a human-readable table of all learnable parameters with
+        their current values — handy for debugging or logging.
+        """
+        lines = [f"{'Parameter':<45} {'Value':>14}"]
+        lines.append("-" * 61)
+        for name, param in self.named_parameters():
+            v = param.data
+            if v.numel() == 1:
+                lines.append(f"  {name:<43} {v.item():>14.6f}")
             else:
-                top_per_layer.append("-")
-        ctx_str = ",".join(w for w in f.context_window if w) or "BOS"
+                lines.append(
+                    f"  {name:<43} shape={list(v.shape)}  "
+                    f"mean={v.mean().item():.4f}"
+                )
+        return "\n".join(lines)
 
-    table_md = "\n".join(rows)
+    # ── last-run frame store ──────────────────────────────────────────
+    #    Populated by generate_text(); accessible as pipeline.frames
+    frames: List[LayerFrame] = []
 
-    tensor_log = []
+    @staticmethod
+    def _frames_to_text(
+        frames:        List[LayerFrame],
+        prompt:        str  = "",
+        capitalise:    bool = True,
+        include_prompt: bool = True,
+    ) -> str:
+        """
+        Derive a plain string from a list of LayerFrame objects.
 
-    return out_text, table_md, json.dumps(tensor_log, indent=2), "\n".join(log)
+        This is the canonical text-assembly routine used internally by
+        ``generate_text()``.  It is also exposed as a static method so
+        callers can re-render text from a saved frame list without
+        re-running the pipeline:
+
+            text = IsomorphismPipeline._frames_to_text(
+                pipeline.frames, prompt="alice rabbit"
+            )
+
+        Parameters
+        ----------
+        frames : list[LayerFrame]
+            Ordered frames from a ``generate()`` run.  The text is built
+            by joining ``frame.chosen`` for every frame that has a
+            non-empty ``.chosen`` value.
+        prompt : str
+            Original prompt.  Prepended when ``include_prompt=True``.
+        capitalise : bool
+            Capitalise sentence starts (first word and words after . ! ?).
+        include_prompt : bool
+            Whether to include the prompt words before the generated ones.
+
+        Returns
+        -------
+        str
+        """
+        gen_words = [f.chosen for f in frames if f.chosen]
+
+        prompt_words: List[str] = (
+            prompt.strip().split()
+            if include_prompt and prompt.strip()
+            else []
+        )
+        all_words = prompt_words + gen_words
+
+        if not all_words:
+            return ""
+
+        if not capitalise:
+            return " ".join(all_words)
+
+        result: List[str] = []
+        cap_next = True
+        for w in all_words:
+            result.append(w.capitalize() if cap_next else w)
+            cap_next = bool(w.rstrip("\"'")[-1:] in {".", "!", "?"})
+        return " ".join(result)
+
+    def _make_draw_fn(
+        self,
+        stream:            Optional[List[int]],
+        digits_per_sample: int,
+        seed:              Optional[int],
+    ):
+        """
+        Build and return a ``draw_fn`` (``() -> float in [0,1)``) from
+        whichever source is available: an explicit stream argument, a
+        previously attached stream, or a PRNG fallback.
+        """
+        if stream is not None:
+            self.seed_stream(stream)
+
+        active_stream = getattr(self, "_stream", [])
+
+        if active_stream:
+            pos   = [self._pos]
+            dps   = max(1, int(digits_per_sample))
+            s_len = len(active_stream)
+
+            def _draw_pi() -> float:
+                val  = 0
+                base = 26 ** dps
+                for _ in range(dps):
+                    val    = val * 26 + active_stream[pos[0] % s_len]
+                    pos[0] = (pos[0] + 1) % s_len
+                self._pos = pos[0]
+                return val / base
+
+            return _draw_pi
+
+        import random as _random
+        rng = _random.Random(seed)
+        return rng.random
+
+    def generate_text(
+        self,
+        prompt:     str,
+        n_words:    int,
+        stream:     Optional[List[int]] = None,
+        *,
+        digits_per_sample: int          = 3,
+        seed:              Optional[int] = None,
+        capitalise:        bool          = True,
+        include_prompt:    bool          = True,
+        zone_fn                          = None,
+    ) -> str:
+        """
+        Generate text and return it as a plain string.
+
+        Internally collects every ``LayerFrame`` yielded by ``generate()``
+        into ``self.frames`` before assembling the final string via
+        ``_frames_to_text()``.  The frames remain available after the call:
+
+            text = pipeline.generate_text("alice rabbit", n_words=40)
+            # inspect the tensor for the third generated token:
+            print(pipeline.frames[2].tensor())
+            # re-render text from stored frames at any time:
+            text2 = IsomorphismPipeline._frames_to_text(
+                pipeline.frames, prompt="alice rabbit"
+            )
+
+        Parameters
+        ----------
+        prompt : str
+            Seed text.
+        n_words : int
+            Number of tokens to generate.
+        stream : list[int] | None
+            Raw pi-stream.  If omitted, uses the stream attached via
+            ``seed_stream()``.  Falls back to a PRNG seeded by ``seed``.
+        digits_per_sample : int
+            Stream positions consumed per draw (default 3).
+        seed : int | None
+            PRNG seed used when no stream is available.
+        capitalise : bool
+            Auto-capitalise sentence starts.
+        include_prompt : bool
+            Prepend prompt words to the returned string.
+        zone_fn : callable | None
+            Optional ``float -> str`` zone mapper passed to ``generate()``.
+
+        Returns
+        -------
+        str
+            The assembled text derived from ``self.frames``.
+        """
+        draw_fn = self._make_draw_fn(stream, digits_per_sample, seed)
+
+        # ── collect every frame — this is the source of truth ─────────
+        self.frames = list(
+            self.generate(
+                prompt  = prompt,
+                n_words = n_words,
+                draw_fn = draw_fn,
+                zone_fn = zone_fn,
+            )
+        )
+
+        # ── derive text purely from the frames ─────────────────────────
+        return self._frames_to_text(
+            self.frames,
+            prompt         = prompt,
+            capitalise     = capitalise,
+            include_prompt = include_prompt,
+        )
 
 
-# ===========================================================================
-#  Gradio UI
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Real corpus builder  (used by __main__ and importable for testing)
+# ---------------------------------------------------------------------------
 
-def build_ui():
-    with gr.Blocks(title="Pi Trigram — Layer Tensor") as demo:
-        gr.Markdown("## Pi Trigram · Layer Tensor Generator")
+def build_real_cpd(
+    corpus: str,
+    ngram_n: int = 2,
+    lidstone_gamma: float = 0.1,
+):
+    """
+    Build a genuine NLTK ConditionalProbDist + vocab from raw text.
 
+    Returns (cpd, vocab, tokens) — identical types to what app.py produces.
+    All heavy lifting is done with the same NLTK primitives so the
+    IsomorphismPipeline sees exactly the same distribution objects it
+    would encounter in production.
+    """
+    import os, sys
+    import nltk
+    from nltk.util import ngrams as nltk_ngrams
+    from nltk.probability import (
+        ConditionalFreqDist, ConditionalProbDist, LidstoneProbDist,
+    )
+
+    NLTK_DATA_DIR = os.environ.get("NLTK_DATA", "/tmp/nltk_data")
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    if NLTK_DATA_DIR not in nltk.data.path:
+        nltk.data.path.insert(0, NLTK_DATA_DIR)
+    for pkg, path in [("punkt", "tokenizers/punkt"),
+                      ("punkt_tab", "tokenizers/punkt_tab")]:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            nltk.download(pkg, download_dir=NLTK_DATA_DIR, quiet=True)
+
+    tokens = corpus.lower().split()
+    if not tokens:
+        raise ValueError("Corpus produced zero tokens.")
+
+    ngram_n = max(2, int(ngram_n))
+    padded  = [""] * (ngram_n - 1) + tokens + [""]
+    all_ng  = list(nltk_ngrams(padded, ngram_n))
+
+    cfd   = ConditionalFreqDist((tuple(ng[:-1]), ng[-1]) for ng in all_ng)
+    vocab = set(tokens) | {""}
+
+    class _LidFactory:
+        def __init__(self, gamma, bins):
+            self.gamma = gamma; self.bins = bins
+        def __call__(self, fd):
+            return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
+
+    cpd = ConditionalProbDist(
+        cfd,
+        _LidFactory(gamma=float(lidstone_gamma), bins=max(1, len(vocab))),
+    )
+    return cpd, vocab, tokens
+
+
+def build_real_context_index(vocab, cpd, tokens):
+    """
+    Build a ContextZoneIndex from real corpus tokens.
+
+    Requires app.py to be importable (or the ContextZoneIndex class to be
+    defined in this file).  Falls back gracefully to None if unavailable.
+    """
+    try:
+        import sys, os
+        # Try importing from app.py sitting beside this file
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        from app import ContextZoneIndex
+        from collections import Counter
+        return ContextZoneIndex(vocab, cpd, Counter(tokens))
+    except Exception as e:
+        print(f"  [context_index] not available ({e}); zone layers will use uniform weights.")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Smoke-test / CLI entry point
+# ---------------------------------------------------------------------------
+
+_EMBEDDED_CORPUS = """
+Alice was beginning to get very tired of sitting by her sister on the bank,
+and of having nothing to do. Once or twice she had peeped into the book her
+sister was reading, but it had no pictures or conversations in it.
+So she was considering in her own mind whether the pleasure of making a
+daisy chain would be worth the trouble of getting up and picking the daisies.
+Suddenly a White Rabbit with pink eyes ran close by her.
+There was nothing so very remarkable in that, nor did Alice think it so very
+much out of the way to hear the Rabbit say to itself, Oh dear! Oh dear!
+I shall be late! When the Rabbit actually took a watch out of its waistcoat
+pocket and looked at it and hurried on, Alice started to her feet.
+The rabbit hole went straight on like a tunnel for some way and then dipped
+suddenly down. Either the well was very deep or she fell very slowly,
+for she had plenty of time as she went down to look about her and wonder
+what was going to happen next. She tried to look down and make out what she
+was coming to, but it was too dark to see anything. Then she looked at the
+sides of the well and noticed that they were filled with cupboards and
+bookshelves. Here and there she saw maps and pictures hung upon pegs.
+She took down a jar from one of the shelves as she passed. The jar was
+labelled Orange Marmalade but to her great disappointment it was empty.
+"""
+
+
+# =============================================================================
+#  gradio_pipeline.py
+#  Gradio UI for IsomorphismPipeline (layer_isomorphism_torch.py)
+#
+#  Tabs
+#  ────
+#  Generate      — corpus, prompt, params → text output + per-step summary
+#  Layer Inspector — pick any generated step, see all 14 layers side-by-side
+#  Parameters    — live param table; adjust & re-apply without rebuilding CPD
+#  Model I/O     — save / load pipeline state_dict
+# =============================================================================
+
+
+import os
+import sys
+import json
+import random
+import tempfile
+import traceback
+from pathlib import Path
+from typing import List, Optional
+
+import numpy as np
+import gradio as gr
+import torch
+
+# ---------------------------------------------------------------------------
+# Make layer_isomorphism_torch importable whether this file lives beside it
+# or is run from a different cwd.
+# ---------------------------------------------------------------------------
+_HERE = Path(__file__).parent.resolve()
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
+
+
+# ---------------------------------------------------------------------------
+# Global state  (single-user demo; replace with session state for multi-user)
+# ---------------------------------------------------------------------------
+STATE: dict = {
+    "pipeline":   None,   # IsomorphismPipeline
+    "cpd":        None,
+    "vocab":      None,
+    "tokens":     None,
+    "ctx_idx":    None,
+    "frames":     [],     # List[LayerFrame] from last generate_text() call
+    "prompt":     "",
+    "corpus_src": "",
+}
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _build_corpus_and_pipeline(
+    corpus_text: str,
+    ngram_n: int,
+    gamma: float,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    rep_penalty: float,
+    insight_penalty: float,
+    l12_blend_alpha: float,
+) -> str:
+    """Build CPD + context index + pipeline. Returns status log string."""
+    log = []
+    try:
+        log.append(f"Building {ngram_n}-gram CPD (γ={gamma}) …")
+        cpd, vocab, tokens = build_real_cpd(corpus_text, ngram_n, gamma)
+        log.append(f"  vocab={len(vocab)}  tokens={len(tokens)}")
+
+        log.append("Building ContextZoneIndex …")
+        ctx_idx = build_real_context_index(vocab, cpd, tokens)
+        log.append(
+            "  ContextZoneIndex ready."
+            if ctx_idx is not None
+            else "  app.py not found — zone layers will be uniform."
+        )
+
+        pipeline = IsomorphismPipeline(
+            cpd             = cpd,
+            context_index   = ctx_idx,
+            vocab           = vocab,
+            ngram_n         = ngram_n,
+            temperature     = temperature,
+            top_k           = top_k,
+            top_p           = top_p,
+            rep_penalty     = rep_penalty,
+            insight_penalty = insight_penalty,
+            l12_blend_alpha = l12_blend_alpha,
+        )
+
+        STATE.update(
+            pipeline   = pipeline,
+            cpd        = cpd,
+            vocab      = vocab,
+            tokens     = tokens,
+            ctx_idx    = ctx_idx,
+            corpus_src = f"{len(corpus_text)} chars, {len(tokens)} tokens",
+        )
+        log.append("Pipeline ready ✓")
+    except Exception as e:
+        log.append(f"ERROR: {e}")
+        log.append(traceback.format_exc())
+    return "\n".join(log)
+
+
+def _require_pipeline() -> tuple[Optional[IsomorphismPipeline], str]:
+    p = STATE.get("pipeline")
+    if p is None:
+        return None, "⚠ Build the model first (Model tab)."
+    return p, ""
+
+
+# ---------------------------------------------------------------------------
+# Tab: Model / Corpus
+# ---------------------------------------------------------------------------
+
+def tab_model_build(
+    corpus_file,
+    pasted_corpus: str,
+    ngram_n: int,
+    gamma: float,
+    temperature: float,
+    top_k: int,
+    top_p: float,
+    rep_penalty: float,
+    insight_penalty: float,
+    l12_blend_alpha: float,
+):
+    if corpus_file is not None:
+        path = corpus_file if isinstance(corpus_file, str) else corpus_file.name
+        try:
+            corpus_text = Path(path).read_text(encoding="utf-8", errors="ignore")
+        except Exception as e:
+            return f"Could not read file: {e}", "", ""
+    elif pasted_corpus and pasted_corpus.strip():
+        corpus_text = pasted_corpus.strip()
+    else:
+        corpus_text = _EMBEDDED_CORPUS.strip()
+
+    log = _build_corpus_and_pipeline(
+        corpus_text, ngram_n, gamma, temperature, top_k, top_p,
+        rep_penalty, insight_penalty, l12_blend_alpha,
+    )
+    stats = STATE["corpus_src"]
+    return log, stats, ""
+
+
+# ---------------------------------------------------------------------------
+# Tab: Generate
+# ---------------------------------------------------------------------------
+
+def tab_generate(
+    prompt: str,
+    n_words: int,
+    seed: int,
+    capitalise: bool,
+    include_prompt: bool,
+):
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return err, "", "", []
+
+    # Reset history so each run is fresh
+    pipeline.history.clear()
+    pipeline._step = 0
+    pipeline._pos  = 0
+
+    rng = random.Random(seed)
+    try:
+        text = pipeline.generate_text(
+            prompt,
+            n_words        = n_words,
+            seed           = seed,
+            capitalise     = capitalise,
+            include_prompt = include_prompt,
+            zone_fn        = None,
+        )
+    except Exception as e:
+        return f"Generation error: {e}\n{traceback.format_exc()}", "", "", []
+
+    STATE["frames"] = pipeline.frames
+    STATE["prompt"] = prompt
+
+    # ── per-step summary table ────────────────────────────────────────
+    rows = []
+    for i, f in enumerate(pipeline.frames):
+        l12 = f.get("L12_FINAL")
+        top2 = ""
+        if l12 and l12["words"]:
+            idx = int(l12["probs"].argmax())
+            top2 = f"{l12['words'][idx]} ({l12['probs'][idx]:.3f})"
+        rows.append([
+            i,
+            f.chosen,
+            f.zone_name or "—",
+            f.draw_pos,
+            top2,
+            ",".join(w for w in f.context_window if w) or "BOS",
+        ])
+
+    headers = ["Step", "Chosen", "Zone", "Draw pos", "L12 top", "Context"]
+    step_choices = [str(i) for i in range(len(pipeline.frames))]
+
+    return (
+        text,
+        f"{len(pipeline.frames)} frames stored.",
+        _dataframe_md(headers, rows),
+        gr.update(choices=step_choices, value=step_choices[0] if step_choices else None),
+    )
+
+
+def _dataframe_md(headers, rows) -> str:
+    if not rows:
+        return "_No data_"
+    col_w = [max(len(str(h)), max((len(str(r[i])) for r in rows), default=0))
+             for i, h in enumerate(headers)]
+    def fmt(cells):
+        return "| " + " | ".join(str(c).ljust(col_w[i]) for i, c in enumerate(cells)) + " |"
+    sep = "| " + " | ".join("-" * w for w in col_w) + " |"
+    lines = [fmt(headers), sep] + [fmt(r) for r in rows]
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Tab: Layer Inspector
+# ---------------------------------------------------------------------------
+
+def tab_inspect_step(step_str: str):
+    frames = STATE.get("frames", [])
+    if not frames:
+        return "_No frames — run Generate first._", ""
+
+    try:
+        idx = int(step_str)
+    except (ValueError, TypeError):
+        idx = 0
+    idx = max(0, min(idx, len(frames) - 1))
+
+    f = frames[idx]
+    meta = (
+        f"**Step {f.step}** · chosen=`{f.chosen}` · "
+        f"zone=`{f.zone_name or '—'}` · draw_pos={f.draw_pos} · "
+        f"ctx={f.context_window}"
+    )
+
+    # Per-layer table: top-5 tokens for each layer
+    rows = []
+    for layer in f.layers:
+        words = layer["words"]
+        probs = layer["probs"]
+        if len(words) == 0:
+            rows.append([layer["name"], "—", "—", "—", "—", "—", layer["source"][:60]])
+            continue
+        top_n   = min(5, len(words))
+        top_idx = np.argsort(probs)[::-1][:top_n]
+        tops    = "  ".join(f"{words[i]}:{probs[i]:.3f}" for i in top_idx)
+        chosen_p = probs[words.index(f.chosen)] if f.chosen in words else 0.0
+        rows.append([
+            layer["name"],
+            tops,
+            f"{chosen_p:.4f}",
+            f"{probs.max():.4f}",
+            f"{probs.min():.4f}",
+            f"{float(np.std(probs)):.4f}",
+            layer["source"][:60],
+        ])
+
+    headers = ["Layer", "Top-5 tokens", "chosen_p", "max_p", "min_p", "std_p", "Source"]
+    table_md = _dataframe_md(headers, rows)
+
+    # Tensor shape info
+    t      = f.tensor()
+    tensor_info = f"Tensor shape: `{list(t.shape)}` (layers × vocab)"
+
+    return meta + "\n\n" + tensor_info, table_md
+
+
+# ---------------------------------------------------------------------------
+# Tab: Parameters
+# ---------------------------------------------------------------------------
+
+def tab_params_show():
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return err
+    return pipeline.param_summary()
+
+
+def tab_params_update(
+    rep_penalty:     float,
+    temperature:     float,
+    insight_penalty: float,
+    top_p:           float,
+    l10_smoothing:   float,
+    l12_blend_alpha: float,
+    l4_sigma: float, l4_floor: float,
+    l5_sigma: float, l5_floor: float,
+    l6_sigma: float, l6_floor: float,
+    l7_sigma: float, l7_floor: float,
+    l8_sigma: float, l8_floor: float,
+    l9_sigma: float, l9_floor: float,
+    l13_sigma: float, l13_floor: float,
+):
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return err
+
+    with torch.no_grad():
+        pipeline.l0.rep_penalty.copy_(torch.tensor(rep_penalty,     dtype=torch.float64))
+        pipeline.l1.temperature.copy_(torch.tensor(temperature,     dtype=torch.float64))
+        pipeline.l2.insight_penalty.copy_(torch.tensor(insight_penalty, dtype=torch.float64))
+        pipeline.l3.top_p.copy_(torch.tensor(top_p,               dtype=torch.float64))
+        pipeline.l10.smoothing.copy_(torch.tensor(l10_smoothing,   dtype=torch.float64))
+        pipeline.l12.blend_alpha.copy_(torch.tensor(l12_blend_alpha, dtype=torch.float64))
+        pipeline.l4.sigma.copy_(torch.tensor(l4_sigma, dtype=torch.float64))
+        pipeline.l4.floor.copy_(torch.tensor(l4_floor, dtype=torch.float64))
+        pipeline.l5.sigma.copy_(torch.tensor(l5_sigma, dtype=torch.float64))
+        pipeline.l5.floor.copy_(torch.tensor(l5_floor, dtype=torch.float64))
+        pipeline.l6.sigma.copy_(torch.tensor(l6_sigma, dtype=torch.float64))
+        pipeline.l6.floor.copy_(torch.tensor(l6_floor, dtype=torch.float64))
+        pipeline.l7.sigma.copy_(torch.tensor(l7_sigma, dtype=torch.float64))
+        pipeline.l7.floor.copy_(torch.tensor(l7_floor, dtype=torch.float64))
+        pipeline.l8.sigma.copy_(torch.tensor(l8_sigma, dtype=torch.float64))
+        pipeline.l8.floor.copy_(torch.tensor(l8_floor, dtype=torch.float64))
+        pipeline.l9.sigma.copy_(torch.tensor(l9_sigma, dtype=torch.float64))
+        pipeline.l9.floor.copy_(torch.tensor(l9_floor, dtype=torch.float64))
+        pipeline.l13.sigma.copy_(torch.tensor(l13_sigma, dtype=torch.float64))
+        pipeline.l13.floor.copy_(torch.tensor(l13_floor, dtype=torch.float64))
+
+    return pipeline.param_summary()
+
+
+# ---------------------------------------------------------------------------
+# Tab: Model I/O
+# ---------------------------------------------------------------------------
+
+def tab_save_model():
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return None, err
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".pt", prefix="isomorphism_pipeline_"
+    )
+    tmp.close()
+    torch.save(pipeline.state_dict(), tmp.name)
+    return tmp.name, f"Saved state_dict to {Path(tmp.name).name}"
+
+
+def tab_load_model(model_file):
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return f"Build the model first, then load weights.\n{err}"
+    if model_file is None:
+        return "No file uploaded."
+    path = model_file if isinstance(model_file, str) else model_file.name
+    try:
+        sd = torch.load(path, map_location="cpu")
+        pipeline.load_state_dict(sd, strict=False)
+        return f"Loaded weights from {Path(path).name}\n\n" + pipeline.param_summary()
+    except Exception as e:
+        return f"Load failed: {e}"
+
+
+# ---------------------------------------------------------------------------
+# Gradio layout
+# ---------------------------------------------------------------------------
+
+_CSS = """
+body { font-family: 'JetBrains Mono', 'Fira Mono', monospace; }
+.output-text textarea { font-family: Georgia, serif; font-size: 1.05em; }
+.layer-table { font-size: 0.78em; }
+"""
+
+def build_ui() -> gr.Blocks:
+    with gr.Blocks(title="IsomorphismPipeline", css=_CSS, theme=gr.themes.Soft()) as demo:
+
+        gr.Markdown(
+            "# IsomorphismPipeline\n"
+            "14-layer isomorphic probability tensor · PyTorch n-gram generator"
+        )
+
+        # ════════════════════════════════════════════════════════════
         with gr.Tabs():
 
-            # ── Tab: Layer Tensor ─────────────────────────────────────────
-            with gr.TabItem("Layer Tensor"):
+            # ── Tab 1: Model ─────────────────────────────────────────
+            with gr.TabItem("⚙ Model"):
+                gr.Markdown("### Corpus & Model Configuration")
                 gr.Markdown(
-                    "**Isomorphism generator** — runs the full 14-layer probability tensor "
-                    "(`L0`–`L13`) for every token.  Layer **L13** records the pi-stream "
-                    "contextual requestor position at each draw and feeds it forward to the "
-                    "next step."
+                    "Upload a `.txt` file **or** paste text below. "
+                    "Leave both empty to use the built-in Alice excerpt."
                 )
                 with gr.Row():
                     with gr.Column(scale=1):
-                        lt_filein   = gr.File(label="Upload corpus (.txt)", file_types=[".txt", ".md"], type="filepath")
-                        lt_pasted   = gr.Textbox(label="or paste corpus here", lines=5)
-                        lt_promptin = gr.Textbox(label="Prompt", lines=2, value="alice rabbit hole")
+                        m_file   = gr.File(label="Upload corpus (.txt)", file_types=[".txt", ".md"], type="filepath")
+                        m_pasted = gr.Textbox(label="Paste corpus", lines=6,
+                                              placeholder="Paste plain text here …")
                     with gr.Column(scale=1):
-                        lt_pi_prec        = gr.Slider(500,   30000, value=DEFAULTS["PI_PREC"],        step=500,   label="Pi precision")
-                        lt_pi_stream_len  = gr.Slider(500,   30000, value=DEFAULTS["PI_STREAM_LEN"],  step=500,   label="Stream length")
-                        lt_ngram_n        = gr.Slider(2,     6,     value=DEFAULTS["NGRAM_N"],         step=1,     label="N-gram order")
-                        lt_lidstone_gamma = gr.Slider(0.001, 1.0,   value=DEFAULTS["LIDSTONE_GAMMA"], step=0.001, label="Lidstone gamma")
-                        lt_temperature    = gr.Slider(0.1,   15.0,   value=DEFAULTS["TEMPERATURE"],    step=0.05,  label="Temperature")
-                        lt_gen_words      = gr.Slider(1,     1500,   value=80,                          step=1,     label="Words to generate")
-                        lt_rep_penalty    = gr.Slider(1.0,   112.0,   value=DEFAULTS["REP_PENALTY"],     step=0.01,  label="Repetition penalty")
-                        lt_insight_pen    = gr.Slider(0.0,   115.0,   value=DEFAULTS["INSIGHT_PENALTY"], step=0.05,  label="Insight penalty")
+                        m_ngram   = gr.Slider(2, 5,   value=2,   step=1,     label="N-gram order")
+                        m_gamma   = gr.Slider(0.001, 1.0, value=0.1, step=0.001, label="Lidstone γ")
+                        m_temp    = gr.Slider(0.1, 15.0, value=4.3, step=0.05,  label="Temperature")
+                        m_topk    = gr.Slider(1, 200,  value=40,  step=1,     label="Top-K")
+                        m_topp    = gr.Slider(0.01, 1.0, value=0.95, step=0.01, label="Top-P")
+                        m_rep     = gr.Slider(1.0, 10.0, value=1.13, step=0.01, label="Rep penalty")
+                        m_insight = gr.Slider(0.0, 15.0, value=3.95, step=0.05, label="Insight penalty")
+                        m_alpha   = gr.Slider(0.01, 0.99, value=0.5, step=0.01, label="L12 blend α")
 
-                btn_lt       = gr.Button("Run Layer Tensor", variant="primary")
-                lt_out_text  = gr.Textbox(label="Generated text", lines=6)
-                lt_out_table = gr.Markdown(label="Layer-by-layer top token per step")
-                lt_out_json  = gr.Code(label="Full tensor log (JSON)", language="json", lines=20)
-                lt_out_log   = gr.Textbox(label="Build log", lines=5)
+                m_build_btn = gr.Button("Build Model", variant="primary")
+                m_log       = gr.Textbox(label="Build log", lines=8, interactive=False)
+                m_stats     = gr.Textbox(label="Corpus stats", interactive=False)
+                m_err       = gr.Textbox(visible=False)
 
-                btn_lt.click(
-                    _layer_iso_run,
-                    inputs=[
-                        lt_filein, lt_pasted, lt_promptin,
-                        lt_pi_prec, lt_pi_stream_len, lt_ngram_n, lt_lidstone_gamma,
-                        lt_temperature, lt_gen_words, lt_rep_penalty, lt_insight_pen,
-                    ],
-                    outputs=[lt_out_text, lt_out_table, lt_out_json, lt_out_log],
+                m_build_btn.click(
+                    tab_model_build,
+                    inputs=[m_file, m_pasted, m_ngram, m_gamma,
+                            m_temp, m_topk, m_topp, m_rep, m_insight, m_alpha],
+                    outputs=[m_log, m_stats, m_err],
                 )
 
-            # ── Tab: Model I/O ────────────────────────────────────────────
-            with gr.TabItem("Model I/O"):
-                gr.Markdown("Save/load compiled trigram model.")
+            # ── Tab 2: Generate ──────────────────────────────────────
+            with gr.TabItem("✍ Generate"):
+                gr.Markdown("### Text Generation")
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        g_prompt   = gr.Textbox(label="Prompt", value="alice rabbit hole", lines=2)
+                        g_words    = gr.Slider(1, 2500, value=60, step=1, label="Words to generate")
+                        g_seed     = gr.Number(label="PRNG seed", value=42, precision=0)
+                        g_caps     = gr.Checkbox(label="Capitalise sentence starts", value=True)
+                        g_inc_pr   = gr.Checkbox(label="Include prompt in output", value=True)
+                        g_run_btn  = gr.Button("Generate", variant="primary")
+                    with gr.Column(scale=2):
+                        g_out_text  = gr.Textbox(label="Generated text", lines=10,
+                                                  elem_classes=["output-text"])
+                        g_frame_info = gr.Textbox(label="Frame store", interactive=False, lines=1)
 
-                gr.Markdown("#### Load latest model from Hugging Face")
-                model_hf_repo   = gr.Textbox(label="HF repo ID", value=HF_REPO_ID)
-                model_hf_token  = gr.Textbox(label="HF token (optional)", type="password")
-                load_latest_btn = gr.Button("🔄  Load Latest from HF", variant="primary")
-                load_latest_log = gr.Textbox(label="Load log", lines=3, interactive=False)
-                status_md       = gr.Markdown("### Ready")
-
-                gr.Markdown("---")
-                gr.Markdown("#### Save / load local .pkl.gz")
-                save_btn  = gr.Button("Save model", variant="secondary")
-                save_file = gr.File(label="Saved model file", interactive=False)
-                model_log = gr.Textbox(label="Model I/O log", lines=8)
-                load_file = gr.File(label="Load saved model .pkl.gz",
-                                    file_types=[".gz", ".pkl"], type="filepath")
-                load_btn  = gr.Button("Load local model", variant="secondary")
-
-                def _load_latest_and_update_status(repo, tok):
-                    msg    = load_hf_model_on_demand(repo, tok)
-                    status = HF_CACHE.get("status", "Unknown")
-                    return msg, f"### Model status\n\n`{status}`"
-
-                load_latest_btn.click(
-                    _load_latest_and_update_status,
-                    inputs=[model_hf_repo, model_hf_token],
-                    outputs=[load_latest_log, status_md],
+                g_step_dd   = gr.Dropdown(
+                    label="Jump to Layer Inspector step",
+                    choices=[], interactive=True,
                 )
-                save_btn.click(
-                    save_model_ui,
-                    inputs=[lt_filein, lt_pasted,
-                            lt_pi_prec, lt_pi_stream_len, lt_ngram_n, lt_lidstone_gamma],
-                    outputs=[save_file, model_log],
-                )
-                load_btn.click(
-                    load_model_ui,
-                    inputs=[load_file],
-                    outputs=[model_log,
-                             lt_pi_prec, lt_pi_stream_len, lt_ngram_n, lt_lidstone_gamma],
+                g_step_table = gr.Markdown(label="Per-step summary", elem_classes=["layer-table"])
+
+                g_run_btn.click(
+                    tab_generate,
+                    inputs=[g_prompt, g_words, g_seed, g_caps, g_inc_pr],
+                    outputs=[g_out_text, g_frame_info, g_step_table, g_step_dd],
                 )
 
-        gr.Markdown("Tip: model cache is reused until corpus or configuration changes.")
+            # ── Tab 3: Layer Inspector ───────────────────────────────
+            with gr.TabItem("🔬 Layer Inspector"):
+                gr.Markdown(
+                    "### Per-step Layer Stack\n"
+                    "Select a generation step to inspect all 14 layers side-by-side."
+                )
+                with gr.Row():
+                    li_step_num = gr.Number(label="Step index", value=0, precision=0, minimum=0)
+                    li_go_btn   = gr.Button("Inspect", variant="secondary")
+
+                li_meta  = gr.Markdown()
+                li_table = gr.Markdown(elem_classes=["layer-table"])
+
+                li_go_btn.click(
+                    tab_inspect_step,
+                    inputs=[li_step_num],
+                    outputs=[li_meta, li_table],
+                )
+
+                # Clicking dropdown in Generate tab populates the step number here
+                g_step_dd.change(
+                    fn=lambda s: int(s) if s else 0,
+                    inputs=[g_step_dd],
+                    outputs=[li_step_num],
+                )
+
+            # ── Tab 4: Parameters ────────────────────────────────────
+            with gr.TabItem("🎛 Parameters"):
+                gr.Markdown(
+                    "### Live Parameter Adjustment\n"
+                    "Modify learnable parameters in-place without rebuilding the model. "
+                    "Click **Apply** then re-generate to hear the effect."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("**Core**")
+                        p_rep     = gr.Slider(1.0, 10.0, value=1.13, step=0.01, label="rep_penalty (L0)")
+                        p_temp    = gr.Slider(0.1, 15.0, value=4.3,  step=0.05, label="temperature (L1)")
+                        p_insight = gr.Slider(0.0, 15.0, value=3.95, step=0.05, label="insight_penalty (L2)")
+                        p_topp    = gr.Slider(0.01, 1.0, value=0.95, step=0.01, label="top_p (L3)")
+                        p_smooth  = gr.Slider(0.0, 5.0,  value=1.0,  step=0.05, label="smoothing (L10)")
+                        p_balpha  = gr.Slider(0.01, 0.99,value=0.5,  step=0.01, label="blend_alpha (L12)")
+                    with gr.Column():
+                        gr.Markdown("**Zone σ / floor**")
+                        p_l4s = gr.Slider(0.01, 2.0, value=0.50, step=0.01, label="L4 σ")
+                        p_l4f = gr.Slider(0.00, 0.5, value=0.05, step=0.01, label="L4 floor")
+                        p_l5s = gr.Slider(0.01, 2.0, value=0.40, step=0.01, label="L5 σ")
+                        p_l5f = gr.Slider(0.00, 0.5, value=0.05, step=0.01, label="L5 floor")
+                        p_l6s = gr.Slider(0.01, 2.0, value=0.25, step=0.01, label="L6 σ")
+                        p_l6f = gr.Slider(0.00, 0.5, value=0.04, step=0.01, label="L6 floor")
+                        p_l7s = gr.Slider(0.01, 2.0, value=0.20, step=0.01, label="L7 σ")
+                        p_l7f = gr.Slider(0.00, 0.5, value=0.03, step=0.01, label="L7 floor")
+                    with gr.Column():
+                        gr.Markdown("**Zone σ / floor (cont.)**")
+                        p_l8s  = gr.Slider(0.01, 2.0, value=0.35, step=0.01, label="L8 σ")
+                        p_l8f  = gr.Slider(0.00, 0.5, value=0.04, step=0.01, label="L8 floor")
+                        p_l9s  = gr.Slider(0.01, 2.0, value=0.30, step=0.01, label="L9 σ")
+                        p_l9f  = gr.Slider(0.00, 0.5, value=0.04, step=0.01, label="L9 floor")
+                        p_l13s = gr.Slider(0.01, 2.0, value=0.30, step=0.01, label="L13 σ")
+                        p_l13f = gr.Slider(0.00, 0.5, value=0.04, step=0.01, label="L13 floor")
+
+                p_apply_btn = gr.Button("Apply Parameters", variant="primary")
+                p_show_btn  = gr.Button("Refresh Summary", variant="secondary")
+                p_summary   = gr.Textbox(label="Parameter summary", lines=28, interactive=False)
+
+                p_inputs = [
+                    p_rep, p_temp, p_insight, p_topp, p_smooth, p_balpha,
+                    p_l4s, p_l4f, p_l5s, p_l5f, p_l6s, p_l6f,
+                    p_l7s, p_l7f, p_l8s, p_l8f, p_l9s, p_l9f,
+                    p_l13s, p_l13f,
+                ]
+
+                p_apply_btn.click(tab_params_update, inputs=p_inputs, outputs=[p_summary])
+                p_show_btn.click(tab_params_show,   inputs=[],        outputs=[p_summary])
+
+            # ── Tab 5: Model I/O ─────────────────────────────────────
+            with gr.TabItem("💾 Model I/O"):
+                gr.Markdown(
+                    "### Save / Load\n"
+                    "Saves and loads the PyTorch `state_dict` (all 27 learnable parameters). "
+                    "The corpus and CPD are **not** saved — rebuild the model first, then load weights."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        io_save_btn  = gr.Button("Save state_dict (.pt)", variant="primary")
+                        io_save_file = gr.File(label="Download", interactive=False)
+                        io_save_log  = gr.Textbox(label="Save log", lines=2, interactive=False)
+
+                    with gr.Column():
+                        io_load_file = gr.File(
+                            label="Upload .pt file",
+                            file_types=[".pt", ".pth"],
+                            type="filepath",
+                        )
+                        io_load_btn = gr.Button("Load weights", variant="secondary")
+                        io_load_log = gr.Textbox(label="Load log", lines=20, interactive=False)
+
+                io_save_btn.click(tab_save_model, inputs=[], outputs=[io_save_file, io_save_log])
+                io_load_btn.click(tab_load_model, inputs=[io_load_file], outputs=[io_load_log])
+
+        gr.Markdown(
+            "_Build the model first (⚙ Model tab), then generate (✍ Generate), "
+            "then inspect individual steps (🔬 Layer Inspector)._"
+        )
 
     return demo
 
 
-# ===========================================================================
-#  Entry point
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    build_ui().queue(max_size=8).launch(
-        server_name=os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1"),
-        show_error=True,
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Gradio UI for IsomorphismPipeline")
+    parser.add_argument("--host",  default="127.0.0.1")
+    parser.add_argument("--port",  type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
+    args = parser.parse_args()
+
+    build_ui().queue(max_size=4).launch(
+        server_name = args.host,
+        server_port = args.port,
+        share       = args.share,
+        show_error  = True,
     )
