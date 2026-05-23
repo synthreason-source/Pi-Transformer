@@ -797,7 +797,7 @@ class IsomorphismPipeline(nn.Module):
 
     # Format-version constant for save/load files.  Bump when the on-disk
     # layout changes incompatibly.
-    SAVE_FORMAT_VERSION = 1
+    SAVE_FORMAT_VERSION = 2
 
     LAYER_NAMES = [
         "L0_RAW_DIST",      "L1_TEMP_SCALED",   "L2_INSIGHT",
@@ -1080,19 +1080,56 @@ class IsomorphismPipeline(nn.Module):
     #
     #   {
     #     "format_version" : int,
-    #     "kind"           : "full" | "weights",
+    #     "kind"           : "full" | "weights" | "midstate",
     #     "state_dict"     : OrderedDict[str, Tensor],
     #     "hparams"        : { ... see _init_hparams ... },
     #     "corpus_text"    : str            # full mode only
-    #     "lidstone_gamma" : float          # full mode only
+    #     "lidstone_gamma" : float          # full / midstate
     #     "tokens"         : list[str]      # full mode only (cached)
-    #     "vocab"          : list[str]      # full mode only (cached)
+    #     "vocab"          : list[str]      # full / midstate
+    #     "corpus_fingerprint" : dict       # midstate only
+    #         {"sha256": str, "n_bytes": int, "n_tokens": int,
+    #          "ngram_n": int, "lidstone_gamma": float}
     #     "history"        : dict[str,int]  # optional, defaults to {}
     #   }
     #
     # Files are written via `torch.save`, which uses pickle internally —
     # this lets us round-trip plain Python objects alongside tensors.
+    #
+    # Kinds
+    # -----
+    #   • full     – self-contained snapshot; ships the *raw corpus text*
+    #                inside the file. Largest. Reload re-tokenises and
+    #                re-tallies on every load (slow for big corpora).
+    #   • midstate – self-contained for *generation* but does NOT embed
+    #                the raw corpus. Stores the n-gram count table
+    #                (`cfd_counts`), vocab, and tokens — i.e. everything
+    #                downstream of tokenisation. The CPD is rebuilt from
+    #                the counts on load. Smaller than full (no whitespace,
+    #                no repeated tokens), and faster to load.
+    #   • weights  – just state_dict + hparams. Tiniest. Must be merged
+    #                into an already-built pipeline via `load_into`.
     # ─────────────────────────────────────────────────────────────────
+
+    def _extract_cfd_counts(self) -> Dict[Tuple[str, ...], Dict[str, int]]:
+        """
+        Pull the raw integer ngram counts back out of ``self.cpd``.
+
+        Each context maps to a ``LidstoneProbDist``, which exposes the
+        underlying ``FreqDist`` via ``.freqdist()`` — we just convert
+        that to a plain ``dict[str, int]`` so the result pickles cleanly
+        and survives NLTK version changes.
+        """
+        counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
+        for ctx in self.cpd.conditions():
+            dist = self.cpd[ctx]
+            fd   = getattr(dist, "freqdist", lambda: None)()
+            if fd is None:
+                continue
+            ctx_counts = {str(w): int(c) for w, c in fd.items()}
+            if ctx_counts:
+                counts[tuple(ctx)] = ctx_counts
+        return counts
 
     def _build_save_payload(
         self,
@@ -1119,6 +1156,17 @@ class IsomorphismPipeline(nn.Module):
             payload["lidstone_gamma"] = float(lidstone_gamma) if lidstone_gamma is not None else 0.1
             payload["tokens"]         = list(tokens) if tokens else []
             payload["vocab"]          = sorted(self.vocab)
+
+        elif kind == "midstate":
+            # Embed everything the pipeline needs to *generate* — minus
+            # the raw corpus text. The CPD is reconstructed on load from
+            # the counts table, so no external corpus is required.
+            payload["lidstone_gamma"] = (
+                float(lidstone_gamma) if lidstone_gamma is not None else 0.1
+            )
+            payload["vocab"]          = sorted(self.vocab)
+            payload["tokens"]         = list(tokens) if tokens else []
+            payload["cfd_counts"]     = self._extract_cfd_counts()
         return payload
 
     def save(
@@ -1137,25 +1185,42 @@ class IsomorphismPipeline(nn.Module):
         Parameters
         ----------
         path : str
-            Destination file path.  Suggested extension is ``.iso.pt``.
-        kind : {"full", "weights"}
-            * ``"full"``  – self-contained snapshot (params + corpus + hparams).
-            * ``"weights"`` – state_dict + hparams only; you must rebuild the
-              pipeline from the same corpus before calling ``load_into``.
-        corpus_text, lidstone_gamma, tokens
-            Required for ``kind="full"``.  Allow the loader to reconstruct
-            the CPD and ContextZoneIndex deterministically.
+            Destination file path.  Suggested extension is ``.iso.pt``
+            (full / midstate) or ``.pt`` (weights).
+        kind : {"full", "midstate", "weights"}
+            * ``"full"``     – self-contained snapshot (params + raw corpus
+              + hparams). Largest.
+            * ``"midstate"`` – self-contained for generation (params +
+              hparams + ngram count table + vocab + tokens) but does NOT
+              embed the raw corpus text. Reloads via :meth:`load_midstate`
+              with no external file required.
+            * ``"weights"``  – state_dict + hparams only; you must rebuild
+              the pipeline from the same corpus before calling
+              :meth:`load_into`.
+        corpus_text
+            Required for ``kind="full"``. Ignored for ``midstate`` and
+            ``weights`` (those pull counts from ``self.cpd`` instead).
+        lidstone_gamma
+            Required for ``full`` and ``midstate`` so the loader can
+            rebuild a CPD with the same smoothing.
+        tokens
+            Cached token list. Optional but recommended for ``full`` and
+            ``midstate`` — keeps the original token order around for
+            anything that needs it (e.g. some context-index builders).
         include_history : bool
-            If True (default), the current `self.history` Counter is also
-            stored so a resumed run continues with the same repetition state.
+            If True (default), the current ``self.history`` Counter is
+            also stored so a resumed run continues with the same
+            repetition state.
 
         Returns
         -------
         str
             The path that was written.
         """
-        if kind not in ("full", "weights"):
-            raise ValueError(f"kind must be 'full' or 'weights', got {kind!r}")
+        if kind not in ("full", "weights", "midstate"):
+            raise ValueError(
+                f"kind must be 'full', 'midstate' or 'weights', got {kind!r}"
+            )
 
         payload = self._build_save_payload(
             kind            = kind,
@@ -1234,6 +1299,102 @@ class IsomorphismPipeline(nn.Module):
             print(f"  [load] unexpected keys: {list(unexpected)}")
 
         # Restore the repetition history if it was saved.
+        if "history" in payload and isinstance(payload["history"], dict):
+            pipeline.history = Counter(payload["history"])
+
+        return pipeline
+
+    @classmethod
+    def load_midstate(
+        cls,
+        path:                  str,
+        *,
+        rebuild_context_index: bool = True,
+    ) -> "IsomorphismPipeline":
+        """
+        Reconstruct a fully-usable pipeline from a ``kind="midstate"``
+        snapshot. **No corpus file required** — the n-gram count table
+        is embedded in the snapshot itself, so the CPD can be rebuilt
+        in-process.
+
+        Parameters
+        ----------
+        path : str
+            Path to a ``.iso.pt`` midstate file.
+        rebuild_context_index : bool
+            If True (default), also rebuild the ContextZoneIndex from
+            the saved tokens. Set False to skip (zone layers will fall
+            back to uniform — faster but slightly different generations).
+
+        Returns
+        -------
+        IsomorphismPipeline
+            A fresh, fully-initialised pipeline with state_dict and
+            history restored.
+
+        Raises
+        ------
+        ValueError
+            If the file is not a midstate snapshot or the format
+            version is too new.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > cls.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({cls.SAVE_FORMAT_VERSION}). Upgrade the code."
+            )
+        if payload.get("kind") != "midstate":
+            raise ValueError(
+                f"load_midstate() requires a 'midstate' snapshot; got "
+                f"kind={payload.get('kind')!r}. Use load() for 'full' "
+                f"or load_into() for 'weights'."
+            )
+
+        cfd_counts = payload.get("cfd_counts")
+        if cfd_counts is None:
+            raise ValueError(
+                "Midstate file is missing 'cfd_counts' — was it written "
+                "by an older version of the code? Re-save it after upgrading."
+            )
+
+        hparams = dict(payload.get("hparams", {}))
+        ngram_n = int(hparams.get("ngram_n", 2))
+        gamma   = float(payload.get("lidstone_gamma", 0.1))
+        vocab   = set(payload.get("vocab") or [])
+        tokens  = list(payload.get("tokens") or [])
+
+        # Rebuild the CPD directly from the embedded counts. No corpus
+        # text is needed — we have everything tokenisation would produce.
+        cpd = _cpd_from_counts(cfd_counts, vocab, gamma)
+
+        ctx_idx = (
+            build_real_context_index(vocab, cpd, tokens)
+            if rebuild_context_index and tokens
+            else None
+        )
+
+        # Construct pipeline using saved hparams as kwargs.
+        init_kwargs = dict(hparams)
+        init_kwargs.pop("ngram_n", None)
+        pipeline = cls(
+            cpd           = cpd,
+            context_index = ctx_idx,
+            vocab         = vocab,
+            ngram_n       = ngram_n,
+            **init_kwargs,
+        )
+
+        # Restore learnable parameters and buffers.
+        missing, unexpected = pipeline.load_state_dict(
+            payload["state_dict"], strict=False
+        )
+        if missing or unexpected:
+            print(f"  [load_midstate] missing keys: {list(missing)}")
+            print(f"  [load_midstate] unexpected keys: {list(unexpected)}")
+
         if "history" in payload and isinstance(payload["history"], dict):
             pipeline.history = Counter(payload["history"])
 
@@ -1453,6 +1614,41 @@ class IsomorphismPipeline(nn.Module):
 # Real corpus builder  (used by __main__ and importable for testing)
 # ---------------------------------------------------------------------------
 
+def _cpd_from_counts(
+    cfd_counts:     Dict[Tuple[str, ...], Dict[str, int]],
+    vocab:          set,
+    lidstone_gamma: float = 0.1,
+):
+    """
+    Rebuild an NLTK ConditionalProbDist from raw ngram counts.
+
+    Used by both ``build_real_cpd`` (counts produced from a corpus) and
+    midstate loading (counts loaded from disk — no corpus needed).
+    """
+    from nltk.probability import (
+        ConditionalFreqDist, ConditionalProbDist, LidstoneProbDist, FreqDist,
+    )
+
+    cfd = ConditionalFreqDist()
+    for ctx, counts in cfd_counts.items():
+        ctx_key = tuple(ctx)
+        fd = FreqDist()
+        for word, c in counts.items():
+            fd[word] = int(c)
+        cfd[ctx_key] = fd
+
+    class _LidFactory:
+        def __init__(self, gamma, bins):
+            self.gamma = gamma; self.bins = bins
+        def __call__(self, fd):
+            return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
+
+    return ConditionalProbDist(
+        cfd,
+        _LidFactory(gamma=float(lidstone_gamma), bins=max(1, len(vocab))),
+    )
+
+
 def build_real_cpd(
     corpus: str,
     ngram_n: int = 2,
@@ -1469,9 +1665,6 @@ def build_real_cpd(
     import os, sys
     import nltk
     from nltk.util import ngrams as nltk_ngrams
-    from nltk.probability import (
-        ConditionalFreqDist, ConditionalProbDist, LidstoneProbDist,
-    )
 
     NLTK_DATA_DIR = os.environ.get("NLTK_DATA", "/tmp/nltk_data")
     os.makedirs(NLTK_DATA_DIR, exist_ok=True)
@@ -1492,20 +1685,39 @@ def build_real_cpd(
     padded  = [""] * (ngram_n - 1) + tokens + [""]
     all_ng  = list(nltk_ngrams(padded, ngram_n))
 
-    cfd   = ConditionalFreqDist((tuple(ng[:-1]), ng[-1]) for ng in all_ng)
+    # Tally counts into a plain nested dict (portable, picklable).
+    cfd_counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
+    for ng in all_ng:
+        ctx, word = tuple(ng[:-1]), ng[-1]
+        cfd_counts.setdefault(ctx, {})
+        cfd_counts[ctx][word] = cfd_counts[ctx].get(word, 0) + 1
+
     vocab = set(tokens) | {""}
-
-    class _LidFactory:
-        def __init__(self, gamma, bins):
-            self.gamma = gamma; self.bins = bins
-        def __call__(self, fd):
-            return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
-
-    cpd = ConditionalProbDist(
-        cfd,
-        _LidFactory(gamma=float(lidstone_gamma), bins=max(1, len(vocab))),
-    )
+    cpd   = _cpd_from_counts(cfd_counts, vocab, lidstone_gamma)
     return cpd, vocab, tokens
+
+
+def _cfd_counts_from_corpus(
+    corpus: str, ngram_n: int = 2,
+) -> Tuple[Dict[Tuple[str, ...], Dict[str, int]], set, List[str]]:
+    """
+    Lightweight: produce the (counts, vocab, tokens) triple WITHOUT
+    constructing a CPD.  Useful when you only need the counts (e.g. to
+    embed them in a midstate snapshot).
+    """
+    from nltk.util import ngrams as nltk_ngrams
+    tokens = corpus.lower().split()
+    if not tokens:
+        raise ValueError("Corpus produced zero tokens.")
+    ngram_n = max(2, int(ngram_n))
+    padded  = [""] * (ngram_n - 1) + tokens + [""]
+    cfd_counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
+    for ng in nltk_ngrams(padded, ngram_n):
+        ctx, word = tuple(ng[:-1]), ng[-1]
+        cfd_counts.setdefault(ctx, {})
+        cfd_counts[ctx][word] = cfd_counts[ctx].get(word, 0) + 1
+    vocab = set(tokens) | {""}
+    return cfd_counts, vocab, tokens
 
 
 def build_real_context_index(vocab, cpd, tokens):
@@ -2063,6 +2275,98 @@ def tab_load_weights(model_file):
     return "\n".join(lines)
 
 
+def tab_save_midstate(include_history: bool):
+    """
+    Save a MIDSTATE snapshot — state_dict + hparams + the n-gram count
+    table + vocab + tokens, but NOT the raw corpus text.  The file is
+    self-contained for generation: no external corpus needed on reload.
+    """
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return None, err
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".iso.pt", prefix="isomorphism_midstate_"
+    )
+    tmp.close()
+    try:
+        pipeline.save(
+            tmp.name,
+            kind            = "midstate",
+            lidstone_gamma  = STATE.get("lidstone_gamma", 0.1),
+            tokens          = STATE.get("tokens"),
+            include_history = bool(include_history),
+        )
+    except Exception as e:
+        return None, f"Save failed: {e}\n{traceback.format_exc()}"
+
+    # Quick stats for the log.
+    payload  = torch.load(tmp.name, map_location="cpu", weights_only=False)
+    n_ctxs   = len(payload.get("cfd_counts") or {})
+    n_pairs  = sum(len(v) for v in (payload.get("cfd_counts") or {}).values())
+    n_vocab  = len(payload.get("vocab") or [])
+    n_tokens = len(payload.get("tokens") or [])
+    size_kb  = os.path.getsize(tmp.name) / 1024.0
+    return tmp.name, (
+        f"Saved MIDSTATE to {Path(tmp.name).name} ({size_kb:,.1f} KB)\n"
+        f"  • format_version = {pipeline.SAVE_FORMAT_VERSION}\n"
+        f"  • raw corpus     : NOT embedded\n"
+        f"  • cfd_counts     : {n_ctxs:,} contexts, {n_pairs:,} (ctx,word) pairs\n"
+        f"  • vocab          : {n_vocab:,}    tokens cached: {n_tokens:,}\n"
+        f"  • history saved  : {include_history}\n"
+        f"  • reload with: IsomorphismPipeline.load_midstate(path)"
+    )
+
+
+def tab_load_midstate(model_file):
+    """
+    Load a MIDSTATE snapshot — no corpus needed; the snapshot embeds
+    everything required to rebuild the CPD.  Replaces the current
+    pipeline on success.
+    """
+    if model_file is None:
+        return "No midstate file uploaded."
+    path = model_file if isinstance(model_file, str) else model_file.name
+
+    try:
+        pipeline = IsomorphismPipeline.load_midstate(path)
+    except Exception as e:
+        return f"Load failed: {e}\n{traceback.format_exc()}"
+
+    # Repopulate STATE so the rest of the UI works.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    gamma   = float(payload.get("lidstone_gamma", 0.1))
+    ngram_n = int(payload.get("hparams", {}).get("ngram_n", 2))
+    tokens  = list(payload.get("tokens") or [])
+
+    STATE.update(
+        pipeline       = pipeline,
+        cpd            = pipeline.cpd,
+        vocab          = pipeline.vocab,
+        tokens         = tokens,
+        ctx_idx        = pipeline.ctx_idx,
+        # No raw corpus to report; describe what we do know.
+        corpus_src     = f"{len(tokens)} tokens, {len(pipeline.vocab)} vocab (midstate)",
+        corpus_text    = "",      # midstate carries no raw text
+        ngram_n        = ngram_n,
+        lidstone_gamma = gamma,
+        frames         = [],
+        prompt         = "",
+    )
+
+    n_ctxs = len(payload.get("cfd_counts") or {})
+    return (
+        f"Loaded MIDSTATE from {Path(path).name}\n"
+        f"  • cfd_counts    : {n_ctxs:,} contexts\n"
+        f"  • vocab         : {len(pipeline.vocab):,}\n"
+        f"  • tokens cached : {len(tokens):,}\n"
+        f"  • ngram_n       : {ngram_n}\n"
+        f"  • γ (Lidstone)  : {gamma}\n"
+        f"  • history       : {sum(pipeline.history.values())} total counts\n\n"
+        + pipeline.param_summary()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Gradio layout
 # ---------------------------------------------------------------------------
@@ -2225,8 +2529,13 @@ def build_ui() -> gr.Blocks:
             with gr.TabItem("💾 Model I/O"):
                 gr.Markdown(
                     "### Save / Load\n"
-                    "**Full snapshot** bundles the *weights + corpus + hyperparameters* — "
+                    "**Full snapshot** bundles the *weights + raw corpus + hyperparameters* — "
                     "completely self-contained, can be reloaded without rebuilding anything.\n\n"
+                    "**Midstate** saves weights + hyperparameters + the n-gram count "
+                    "table + vocab + tokens, **but not the raw corpus text**. "
+                    "Self-contained for generation: no external corpus needed on reload. "
+                    "Usually much smaller than a full snapshot because the counts "
+                    "compress repeated tokens.\n\n"
                     "**Weights-only** stores just the state_dict (smaller, faster) — "
                     "you must rebuild the model from the same corpus first, "
                     "then merge weights into it."
@@ -2313,6 +2622,56 @@ def build_ui() -> gr.Blocks:
                     tab_load_weights,
                     inputs  = [io_load_w_file],
                     outputs = [io_load_w_log],
+                )
+
+                # ── Midstate row (full-width) ─────────────────────────
+                gr.Markdown("---")
+                gr.Markdown(
+                    "#### Midstate (weights + hparams + n-gram counts)\n"
+                    "Self-contained for generation — no corpus file needed "
+                    "on reload. Smaller than a full snapshot because the "
+                    "raw corpus text is not stored."
+                )
+                with gr.Row():
+                    with gr.Column():
+                        io_mid_hist = gr.Checkbox(
+                            label="Include repetition history",
+                            value=True,
+                        )
+                        io_save_mid_btn = gr.Button(
+                            "💾 Save MIDSTATE (.iso.pt)",
+                            variant="primary",
+                        )
+                        io_save_mid_file = gr.File(
+                            label="Download (midstate)", interactive=False,
+                        )
+                        io_save_mid_log = gr.Textbox(
+                            label="Save log (midstate)", lines=8, interactive=False,
+                        )
+
+                    with gr.Column():
+                        io_load_mid_file = gr.File(
+                            label="Upload .iso.pt (midstate snapshot)",
+                            file_types=[".pt", ".pth"],
+                            type="filepath",
+                        )
+                        io_load_mid_btn = gr.Button(
+                            "📂 Load MIDSTATE (replaces current model)",
+                            variant="primary",
+                        )
+                        io_load_mid_log = gr.Textbox(
+                            label="Load log (midstate)", lines=20, interactive=False,
+                        )
+
+                io_save_mid_btn.click(
+                    tab_save_midstate,
+                    inputs  = [io_mid_hist],
+                    outputs = [io_save_mid_file, io_save_mid_log],
+                )
+                io_load_mid_btn.click(
+                    tab_load_midstate,
+                    inputs  = [io_load_mid_file],
+                    outputs = [io_load_mid_log],
                 )
 
         gr.Markdown(
