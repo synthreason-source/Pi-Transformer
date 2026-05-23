@@ -2680,7 +2680,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Row():
                     with gr.Column(scale=1):
                         tx_dataset = gr.Textbox(label="X (Text Instructions/Context)", lines=10, placeholder="")
-                        ty_instructions = gr.Textbox(label="Y (Text Instructions/Context) - One per line", lines=10, placeholder="")
+                        ty_instructions = gr.Textbox(label="Y (Text Instructions/Context)", lines=10, placeholder="")
                     
                     with gr.Column(scale=1):
                         t_boost = gr.Slider(minimum=1, maximum=1000, value=10, step=1, label="Frequency Boost (Count Multiplier)")
