@@ -2317,7 +2317,157 @@ def tab_save_midstate(include_history: bool):
         f"  • reload with: IsomorphismPipeline.load_midstate(path)"
     )
 
+def compute_xy_loss(pipeline, x_text, y_text):
+    """
+    Computes the Negative Log-Likelihood (NLL) of Y (instructions)
+    given X (dataset/prompt) using the pipeline's forward pass.
+    """
+    prompt_words = [w.lower() for w in x_text.split() if w.isalpha()]
+    target_words = [w.lower() for w in y_text.split() if w.isalpha()]
 
+    if not target_words:
+        return torch.tensor(0.0, requires_grad=True)
+
+    # Initialize context with X (prompt)
+    ctx = deque(maxlen=pipeline.context_window)
+    for w in prompt_words:
+        ctx.append(w)
+    if len(ctx) < pipeline.context_window:
+        ctx.extendleft([""] * (pipeline.context_window - len(ctx)))
+
+    pipeline.history.clear()
+    loss = torch.tensor(0.0, dtype=torch.float64, device=next(pipeline.parameters()).device)
+    valid_steps = 0
+
+    # Auto-regressive teacher forcing over Y
+    for target in target_words:
+        dist = pipeline._dist_for_ctx(tuple(ctx))
+        if dist is None:
+            ctx.append(target)
+            continue
+            
+        # Re-run the layers to calculate probabilities
+        L0pairs, _ = pipeline.l0(dist, pipeline.history)
+        if not L0pairs:
+            ctx.append(target)
+            continue
+
+        L1pairs, _ = pipeline.l1(L0pairs)
+        L2pairs, _ = pipeline.l2(L1pairs)
+        L3pairs, L3 = pipeline.l3(L2pairs)
+
+        if not L3pairs:
+            ctx.append(target)
+            continue
+
+        # Extract the final tensor blend (Approximating L12)
+        # Note: To get full end-to-end PyTorch gradients, your layer classes 
+        # (L0-L12) must return PyTorch Tensors instead of detached float pairs/numpy arrays.
+        words = [w for w, _ in L3pairs]
+        if target in words:
+            target_idx = words.index(target)
+            
+            # Using the raw tensor probability from L3 (or L12 if modified to yield tensors)
+            # Rebuilding a small gradient-tracked tensor for the target probability:
+            target_prob = L3pairs[target_idx][1]
+            p_tensor = torch.tensor(target_prob + 1e-12, dtype=torch.float64, requires_grad=True)
+            
+            # Accumulate Negative Log-Likelihood
+            loss = loss - torch.log(p_tensor)
+            valid_steps += 1
+
+        # Advance state
+        pipeline.history[target] += 1
+        ctx.append(target)
+
+    if valid_steps > 0:
+        return loss / valid_steps
+    return torch.tensor(0.0, requires_grad=True)
+def tab_train_xy_instructions(x_dataset_text, y_instructions_text, boost_count):
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return err, "Error: Build model first."
+
+    # Parse multi-line datasets
+    x_lines = [line.strip() for line in x_dataset_text.strip().split('\n') if line.strip()]
+    y_lines = [line.strip() for line in y_instructions_text.strip().split('\n') if line.strip()]
+
+    if not x_lines or not y_lines:
+        return "Error: Both X and Y must contain text.", pipeline.param_summary()
+
+    min_len = min(len(x_lines), len(y_lines))
+    x_lines = x_lines[:min_len]
+    y_lines = y_lines[:min_len]
+
+    # 1. Extract existing counts and vocab
+    cfdcounts = pipeline._extract_cfd_counts()
+    vocab = set(pipeline.vocab)
+    ngram_n = pipeline.ngram_n
+    
+    from nltk.util import ngrams as nltk_ngrams
+    new_tokens_total = []
+
+    # 2. Inject new pairs directly into the frequency dictionary
+    for x_text, y_text in zip(x_lines, y_lines):
+        # Combine X and Y so the model learns the transition from dataset to instruction
+        combined_text = f"{x_text} {y_text}"
+        tokens = [w.lower() for w in combined_text.split() if w.isalpha()]
+        if not tokens:
+            continue
+        
+        vocab.update(tokens)
+        new_tokens_total.extend(tokens)
+        
+        padded = [""] * (ngram_n - 1) + tokens
+        
+        # Inject multiple times based on boost_count to heavily weight this specific sequence
+        for _ in range(int(boost_count)): 
+            for ng in nltk_ngrams(padded, ngram_n):
+                ctx, word = tuple(ng[:-1]), ng[-1]
+                cfdcounts.setdefault(ctx, {})
+                cfdcounts[ctx][word] = cfdcounts[ctx].get(word, 0) + 1
+
+    # 3. Rebuild the NLTK ConditionalProbDist
+    gamma = STATE.get('lidstone_gamma', 0.1)
+    
+    # Re-use the Lidstone factory logic from your existing cpd_from_counts method
+    from nltk.probability import ConditionalFreqDist, ConditionalProbDist, LidstoneProbDist, FreqDist
+    class LidFactory:
+        def __init__(self, gamma, bins):
+            self.gamma = gamma
+            self.bins = bins
+        def __call__(self, fd):
+            return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
+
+    cfd = ConditionalFreqDist()
+    for ctx, counts in cfdcounts.items():
+        ctx_key = tuple(ctx)
+        fd = FreqDist()
+        for word, c in counts.items():
+            fd[word] = int(c)
+        cfd[ctx_key] = fd
+
+    # Overwrite pipeline properties in memory
+    pipeline.cpd = ConditionalProbDist(cfd, LidFactory(gamma, max(1, len(vocab))))
+    pipeline.vocab = sorted(vocab)
+    
+    # 4. Update UI State and (optionally) ContextZoneIndex
+    STATE['cpd'] = pipeline.cpd
+    STATE['vocab'] = pipeline.vocab
+    
+    if 'tokens' in STATE and isinstance(STATE['tokens'], list):
+        STATE['tokens'].extend(new_tokens_total)
+    
+    # Rebuild index if app.py is available
+    try:
+        from app import ContextZoneIndex
+        from collections import Counter
+        pipeline.ctxidx = ContextZoneIndex(pipeline.vocab, pipeline.cpd, Counter(STATE.get('tokens', new_tokens_total)))
+        STATE['ctxidx'] = pipeline.ctxidx
+    except Exception:
+        pass # Fallback if ContextZoneIndex can't be rebuilt dynamically
+
+    return f"Successfully injected {min_len} X->Y pair(s) into the n-gram counts with a {int(boost_count)}x frequency boost.", pipeline.param_summary()
 def tab_load_midstate(model_file):
     """
     Load a MIDSTATE snapshot — no corpus needed; the snapshot embeds
@@ -2524,7 +2674,27 @@ def build_ui() -> gr.Blocks:
 
                 p_apply_btn.click(tab_params_update, inputs=p_inputs, outputs=[p_summary])
                 p_show_btn.click(tab_params_show,   inputs=[],        outputs=[p_summary])
+            with gr.TabItem("Inject X->Y"):
+                gr.Markdown("### Direct Instruction Injection\nInstantly adds X->Y mappings to the model's core n-gram count table without parameter training. Use Boost to heavily weight these sequences.")
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        tx_dataset = gr.Textbox(label="X (Text Instructions/Context)", lines=10, placeholder="alice rabbit hole\nwhite rabbit pocket")
+                        ty_instructions = gr.Textbox(label="Y (Dataset Prompts) - One per line", lines=10, placeholder="How much does language affect our thinking?\nDo the cosmos have a purpose?")
+                    
+                    with gr.Column(scale=1):
+                        t_boost = gr.Slider(minimum=1, maximum=1000, value=10, step=1, label="Frequency Boost (Count Multiplier)")
+                        t_train_btn = gr.Button("Inject into Model", variant="primary")
+                        
+                        t_logs = gr.Textbox(label="Injection Logs", lines=6, interactive=False)
+                        t_summary = gr.Textbox(label="Current Parameters", lines=12, interactive=False)
 
+                # Wiring
+                t_train_btn.click(
+                    tab_train_xy_instructions,
+                    inputs=[tx_dataset, ty_instructions, t_boost],
+                    outputs=[t_logs, t_summary]
+                )
             # ── Tab 5: Model I/O ─────────────────────────────────────
             with gr.TabItem("💾 Model I/O"):
                 gr.Markdown(
