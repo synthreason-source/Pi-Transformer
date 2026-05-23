@@ -795,6 +795,10 @@ class IsomorphismPipeline(nn.Module):
         for frame in gen.generate(prompt, n_words, draw_fn): ...
     """
 
+    # Format-version constant for save/load files.  Bump when the on-disk
+    # layout changes incompatibly.
+    SAVE_FORMAT_VERSION = 1
+
     LAYER_NAMES = [
         "L0_RAW_DIST",      "L1_TEMP_SCALED",   "L2_INSIGHT",
         "L3_TOPK_TOPP",     "L4_ZONE_FREQ",      "L5_ZONE_ALPHA",
@@ -841,6 +845,29 @@ class IsomorphismPipeline(nn.Module):
         self._stream: List[int] = []
         self._char_trig_index: Dict[str, set] = (
             getattr(context_index, "_trig_index", {}) if context_index else {}
+        )
+
+        # Remember the construction-time hyper-params so save/load can
+        # reconstruct an identically-shaped pipeline.
+        self._init_hparams: Dict = dict(
+            ngram_n         = self.ngram_n,
+            temperature     = float(temperature),
+            top_k           = int(top_k),
+            top_p           = float(top_p),
+            rep_penalty     = float(rep_penalty),
+            insight_penalty = float(insight_penalty),
+            l4_sigma        = float(l4_sigma),  l4_floor = float(l4_floor),
+            l5_sigma        = float(l5_sigma),  l5_floor = float(l5_floor),
+            l6_sigma        = float(l6_sigma),  l6_floor = float(l6_floor),
+            l7_sigma        = float(l7_sigma),  l7_floor = float(l7_floor),
+            l8_sigma        = float(l8_sigma),  l8_floor = float(l8_floor),
+            l9_sigma        = float(l9_sigma),  l9_floor = float(l9_floor),
+            l10_smoothing   = float(l10_smoothing),
+            l11_init_weights = (
+                list(l11_init_weights) if l11_init_weights is not None else None
+            ),
+            l12_blend_alpha = float(l12_blend_alpha),
+            l13_sigma       = float(l13_sigma), l13_floor = float(l13_floor),
         )
 
         # ── child layer modules ───────────────────────────────────────
@@ -1033,6 +1060,223 @@ class IsomorphismPipeline(nn.Module):
                     f"mean={v.mean().item():.4f}"
                 )
         return "\n".join(lines)
+
+    # ─────────────────────────────────────────────────────────────────
+    # SAVE / LOAD
+    # ─────────────────────────────────────────────────────────────────
+    #
+    # Two modes are supported:
+    #
+    #   • "weights"  – just the state_dict (small file, requires you to
+    #                  rebuild the pipeline from the same corpus first).
+    #
+    #   • "full"     – state_dict + corpus text + ngram_n + Lidstone γ +
+    #                  cached vocab/tokens + construction hparams.
+    #                  A subsequent `IsomorphismPipeline.load(path)` call
+    #                  rebuilds the CPD and ContextZoneIndex automatically
+    #                  and returns a fully-usable pipeline.
+    #
+    # The on-disk layout (full mode) is::
+    #
+    #   {
+    #     "format_version" : int,
+    #     "kind"           : "full" | "weights",
+    #     "state_dict"     : OrderedDict[str, Tensor],
+    #     "hparams"        : { ... see _init_hparams ... },
+    #     "corpus_text"    : str            # full mode only
+    #     "lidstone_gamma" : float          # full mode only
+    #     "tokens"         : list[str]      # full mode only (cached)
+    #     "vocab"          : list[str]      # full mode only (cached)
+    #     "history"        : dict[str,int]  # optional, defaults to {}
+    #   }
+    #
+    # Files are written via `torch.save`, which uses pickle internally —
+    # this lets us round-trip plain Python objects alongside tensors.
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_save_payload(
+        self,
+        kind:           str,
+        corpus_text:    Optional[str] = None,
+        lidstone_gamma: Optional[float] = None,
+        tokens:         Optional[List[str]] = None,
+        include_history: bool = True,
+    ) -> Dict:
+        """Assemble the dict that will be `torch.save`-d."""
+        payload: Dict = {
+            "format_version": self.SAVE_FORMAT_VERSION,
+            "kind":           kind,
+            "state_dict":     self.state_dict(),
+            "hparams":        dict(self._init_hparams),
+        }
+        if include_history:
+            payload["history"] = dict(self.history)
+
+        if kind == "full":
+            if corpus_text is None:
+                raise ValueError("full save requires corpus_text")
+            payload["corpus_text"]    = corpus_text
+            payload["lidstone_gamma"] = float(lidstone_gamma) if lidstone_gamma is not None else 0.1
+            payload["tokens"]         = list(tokens) if tokens else []
+            payload["vocab"]          = sorted(self.vocab)
+        return payload
+
+    def save(
+        self,
+        path:           str,
+        *,
+        kind:           str             = "full",
+        corpus_text:    Optional[str]   = None,
+        lidstone_gamma: Optional[float] = None,
+        tokens:         Optional[List[str]] = None,
+        include_history: bool           = True,
+    ) -> str:
+        """
+        Persist the pipeline to disk.
+
+        Parameters
+        ----------
+        path : str
+            Destination file path.  Suggested extension is ``.iso.pt``.
+        kind : {"full", "weights"}
+            * ``"full"``  – self-contained snapshot (params + corpus + hparams).
+            * ``"weights"`` – state_dict + hparams only; you must rebuild the
+              pipeline from the same corpus before calling ``load_into``.
+        corpus_text, lidstone_gamma, tokens
+            Required for ``kind="full"``.  Allow the loader to reconstruct
+            the CPD and ContextZoneIndex deterministically.
+        include_history : bool
+            If True (default), the current `self.history` Counter is also
+            stored so a resumed run continues with the same repetition state.
+
+        Returns
+        -------
+        str
+            The path that was written.
+        """
+        if kind not in ("full", "weights"):
+            raise ValueError(f"kind must be 'full' or 'weights', got {kind!r}")
+
+        payload = self._build_save_payload(
+            kind            = kind,
+            corpus_text     = corpus_text,
+            lidstone_gamma  = lidstone_gamma,
+            tokens          = tokens,
+            include_history = include_history,
+        )
+        torch.save(payload, path)
+        return path
+
+    @classmethod
+    def load(
+        cls,
+        path:           str,
+        *,
+        rebuild_context_index: bool = True,
+    ) -> "IsomorphismPipeline":
+        """
+        Reconstruct a fully-usable pipeline from a ``kind="full"`` snapshot.
+
+        Rebuilds the CPD (and, if available, the ContextZoneIndex) from the
+        embedded corpus, then loads the saved state_dict so every learnable
+        parameter is restored exactly.
+
+        Raises
+        ------
+        ValueError
+            If the file is a ``weights``-only snapshot.  Use
+            ``load_into(existing_pipeline, path)`` for that case.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > cls.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({cls.SAVE_FORMAT_VERSION}). Upgrade the code."
+            )
+
+        if payload.get("kind") != "full":
+            raise ValueError(
+                "load() requires a 'full' snapshot.  For weights-only files "
+                "use IsomorphismPipeline.load_into(existing_pipeline, path)."
+            )
+
+        corpus_text = payload["corpus_text"]
+        gamma       = float(payload.get("lidstone_gamma", 0.1))
+        hparams     = dict(payload.get("hparams", {}))
+        ngram_n     = int(hparams.get("ngram_n", 2))
+
+        # Rebuild CPD from the embedded corpus.
+        cpd, vocab, tokens = build_real_cpd(corpus_text, ngram_n, gamma)
+
+        ctx_idx = None
+        if rebuild_context_index:
+            ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+        # Construct a fresh pipeline using the saved hparams as kwargs.
+        # We pop ngram_n because it's already passed positionally below.
+        init_kwargs = dict(hparams)
+        init_kwargs.pop("ngram_n", None)
+        pipeline = cls(
+            cpd           = cpd,
+            context_index = ctx_idx,
+            vocab         = vocab,
+            ngram_n       = ngram_n,
+            **init_kwargs,
+        )
+
+        # Restore learnable parameters and buffers.
+        missing, unexpected = pipeline.load_state_dict(payload["state_dict"], strict=False)
+        if missing or unexpected:
+            # Non-fatal: just inform via the print stream.
+            print(f"  [load] missing keys: {list(missing)}")
+            print(f"  [load] unexpected keys: {list(unexpected)}")
+
+        # Restore the repetition history if it was saved.
+        if "history" in payload and isinstance(payload["history"], dict):
+            pipeline.history = Counter(payload["history"])
+
+        return pipeline
+
+    def load_into(self, path: str, *, strict: bool = False) -> Dict:
+        """
+        Load weights (and history, if present) from a snapshot file into
+        *this* pipeline in-place.  Works for both ``"full"`` and ``"weights"``
+        kinds.  The CPD and context index of `self` are kept untouched —
+        only learnable parameters / buffers are updated.
+
+        Returns
+        -------
+        dict
+            A small report: ``{"missing": [...], "unexpected": [...],
+            "kind": ..., "format_version": ...}``.
+        """
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > self.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({self.SAVE_FORMAT_VERSION})."
+            )
+
+        sd = payload.get("state_dict", payload)   # tolerate raw state_dicts
+        result = self.load_state_dict(sd, strict=strict)
+
+        # PyTorch returns a NamedTuple-ish object; normalise.
+        missing    = list(getattr(result, "missing_keys",    []) or [])
+        unexpected = list(getattr(result, "unexpected_keys", []) or [])
+
+        if "history" in payload and isinstance(payload["history"], dict):
+            self.history = Counter(payload["history"])
+
+        return {
+            "missing":        missing,
+            "unexpected":     unexpected,
+            "kind":           payload.get("kind", "weights"),
+            "format_version": fmt,
+        }
 
     # ── last-run frame store ──────────────────────────────────────────
     #    Populated by generate_text(); accessible as pipeline.frames
@@ -1321,7 +1565,7 @@ labelled Orange Marmalade but to her great disappointment it was empty.
 #  Generate      — corpus, prompt, params → text output + per-step summary
 #  Layer Inspector — pick any generated step, see all 14 layers side-by-side
 #  Parameters    — live param table; adjust & re-apply without rebuilding CPD
-#  Model I/O     — save / load pipeline state_dict
+#  Model I/O     — save / load FULL pipeline (corpus + weights) or weights-only
 # =============================================================================
 
 
@@ -1351,14 +1595,17 @@ if str(_HERE) not in sys.path:
 # Global state  (single-user demo; replace with session state for multi-user)
 # ---------------------------------------------------------------------------
 STATE: dict = {
-    "pipeline":   None,   # IsomorphismPipeline
-    "cpd":        None,
-    "vocab":      None,
-    "tokens":     None,
-    "ctx_idx":    None,
-    "frames":     [],     # List[LayerFrame] from last generate_text() call
-    "prompt":     "",
-    "corpus_src": "",
+    "pipeline":     None,   # IsomorphismPipeline
+    "cpd":          None,
+    "vocab":        None,
+    "tokens":       None,
+    "ctx_idx":      None,
+    "frames":       [],     # List[LayerFrame] from last generate_text() call
+    "prompt":       "",
+    "corpus_src":   "",
+    "corpus_text":  "",     # raw corpus text (needed for full-mode save)
+    "ngram_n":      2,
+    "lidstone_gamma": 0.1,
 }
 
 
@@ -1406,12 +1653,15 @@ def _build_corpus_and_pipeline(
         )
 
         STATE.update(
-            pipeline   = pipeline,
-            cpd        = cpd,
-            vocab      = vocab,
-            tokens     = tokens,
-            ctx_idx    = ctx_idx,
-            corpus_src = f"{len(corpus_text)} chars, {len(tokens)} tokens",
+            pipeline       = pipeline,
+            cpd            = cpd,
+            vocab          = vocab,
+            tokens         = tokens,
+            ctx_idx        = ctx_idx,
+            corpus_src     = f"{len(corpus_text)} chars, {len(tokens)} tokens",
+            corpus_text    = corpus_text,
+            ngram_n        = ngram_n,
+            lidstone_gamma = gamma,
         )
         log.append("Pipeline ready ✓")
     except Exception as e:
@@ -1420,7 +1670,7 @@ def _build_corpus_and_pipeline(
     return "\n".join(log)
 
 
-def _require_pipeline() -> tuple[Optional[IsomorphismPipeline], str]:
+def _require_pipeline() -> tuple[Optional["IsomorphismPipeline"], str]:
     p = STATE.get("pipeline")
     if p is None:
         return None, "⚠ Build the model first (Model tab)."
@@ -1644,27 +1894,149 @@ def tab_params_update(
         pipeline.l13.sigma.copy_(torch.tensor(l13_sigma, dtype=torch.float64))
         pipeline.l13.floor.copy_(torch.tensor(l13_floor, dtype=torch.float64))
 
+    # Keep _init_hparams in sync so a subsequent save reflects current values.
+    pipeline._init_hparams.update(
+        rep_penalty     = float(rep_penalty),
+        temperature     = float(temperature),
+        insight_penalty = float(insight_penalty),
+        top_p           = float(top_p),
+        l10_smoothing   = float(l10_smoothing),
+        l12_blend_alpha = float(l12_blend_alpha),
+        l4_sigma=float(l4_sigma), l4_floor=float(l4_floor),
+        l5_sigma=float(l5_sigma), l5_floor=float(l5_floor),
+        l6_sigma=float(l6_sigma), l6_floor=float(l6_floor),
+        l7_sigma=float(l7_sigma), l7_floor=float(l7_floor),
+        l8_sigma=float(l8_sigma), l8_floor=float(l8_floor),
+        l9_sigma=float(l9_sigma), l9_floor=float(l9_floor),
+        l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+    )
+
     return pipeline.param_summary()
 
 
 # ---------------------------------------------------------------------------
-# Tab: Model I/O
+# Tab: Model I/O   — full-pipeline save/load
+# ---------------------------------------------------------------------------
+#
+# Two save flavours:
+#
+#   • "Full"     — bundles weights + corpus + hparams.  Loaded via
+#                  IsomorphismPipeline.load(path); rebuilds the CPD and
+#                  ContextZoneIndex automatically.  Self-contained.
+#
+#   • "Weights"  — state_dict + hparams only.  You must build the model
+#                  from the same corpus first, then "Load weights" merges
+#                  the saved parameters into it.
+#
+# The UI exposes both via separate buttons so users always know what's
+# happening on disk.
 # ---------------------------------------------------------------------------
 
-def tab_save_model():
+def tab_save_full(include_history: bool):
+    """Save full pipeline snapshot (weights + corpus + hparams)."""
+    pipeline, err = _require_pipeline()
+    if pipeline is None:
+        return None, err
+
+    corpus_text = STATE.get("corpus_text")
+    if not corpus_text:
+        return None, "No corpus text in memory — build the model first."
+
+    tmp = tempfile.NamedTemporaryFile(
+        delete=False, suffix=".iso.pt", prefix="isomorphism_full_"
+    )
+    tmp.close()
+    try:
+        pipeline.save(
+            tmp.name,
+            kind            = "full",
+            corpus_text     = corpus_text,
+            lidstone_gamma  = STATE.get("lidstone_gamma", 0.1),
+            tokens          = STATE.get("tokens"),
+            include_history = bool(include_history),
+        )
+    except Exception as e:
+        return None, f"Save failed: {e}\n{traceback.format_exc()}"
+
+    size_kb = os.path.getsize(tmp.name) / 1024.0
+    return tmp.name, (
+        f"Saved FULL snapshot to {Path(tmp.name).name} ({size_kb:,.1f} KB)\n"
+        f"  • format_version = {pipeline.SAVE_FORMAT_VERSION}\n"
+        f"  • includes corpus ({len(corpus_text):,} chars) + state_dict\n"
+        f"  • history saved   = {include_history}"
+    )
+
+
+def tab_save_weights(include_history: bool):
+    """Save weights-only snapshot (no corpus)."""
     pipeline, err = _require_pipeline()
     if pipeline is None:
         return None, err
 
     tmp = tempfile.NamedTemporaryFile(
-        delete=False, suffix=".pt", prefix="isomorphism_pipeline_"
+        delete=False, suffix=".pt", prefix="isomorphism_weights_"
     )
     tmp.close()
-    torch.save(pipeline.state_dict(), tmp.name)
-    return tmp.name, f"Saved state_dict to {Path(tmp.name).name}"
+    try:
+        pipeline.save(
+            tmp.name,
+            kind            = "weights",
+            include_history = bool(include_history),
+        )
+    except Exception as e:
+        return None, f"Save failed: {e}\n{traceback.format_exc()}"
+
+    size_kb = os.path.getsize(tmp.name) / 1024.0
+    return tmp.name, (
+        f"Saved WEIGHTS-only to {Path(tmp.name).name} ({size_kb:,.1f} KB)\n"
+        f"  • state_dict + hparams (no corpus)\n"
+        f"  • history saved = {include_history}"
+    )
 
 
-def tab_load_model(model_file):
+def tab_load_full(model_file):
+    """Load a FULL snapshot — replaces the current pipeline entirely."""
+    if model_file is None:
+        return "No file uploaded."
+    path = model_file if isinstance(model_file, str) else model_file.name
+    try:
+        pipeline = IsomorphismPipeline.load(path)
+    except Exception as e:
+        return f"Load failed: {e}\n{traceback.format_exc()}"
+
+    # Repopulate STATE so the rest of the UI is consistent.
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    corpus_text = payload.get("corpus_text", "")
+    gamma       = float(payload.get("lidstone_gamma", 0.1))
+    ngram_n     = int(payload.get("hparams", {}).get("ngram_n", 2))
+    tokens      = payload.get("tokens", [])
+
+    STATE.update(
+        pipeline       = pipeline,
+        cpd            = pipeline.cpd,
+        vocab          = pipeline.vocab,
+        tokens         = tokens,
+        ctx_idx        = pipeline.ctx_idx,
+        corpus_src     = f"{len(corpus_text)} chars, {len(tokens)} tokens (loaded)",
+        corpus_text    = corpus_text,
+        ngram_n        = ngram_n,
+        lidstone_gamma = gamma,
+        frames         = [],
+        prompt         = "",
+    )
+
+    return (
+        f"Loaded FULL snapshot from {Path(path).name}\n"
+        f"  • corpus     : {len(corpus_text):,} chars, {len(tokens):,} tokens\n"
+        f"  • ngram_n    : {ngram_n}\n"
+        f"  • γ (Lidstone): {gamma}\n"
+        f"  • history    : {sum(pipeline.history.values())} total counts\n\n"
+        + pipeline.param_summary()
+    )
+
+
+def tab_load_weights(model_file):
+    """Load a WEIGHTS-only snapshot into the existing pipeline in-place."""
     pipeline, err = _require_pipeline()
     if pipeline is None:
         return f"Build the model first, then load weights.\n{err}"
@@ -1672,11 +2044,23 @@ def tab_load_model(model_file):
         return "No file uploaded."
     path = model_file if isinstance(model_file, str) else model_file.name
     try:
-        sd = torch.load(path, map_location="cpu")
-        pipeline.load_state_dict(sd, strict=False)
-        return f"Loaded weights from {Path(path).name}\n\n" + pipeline.param_summary()
+        report = pipeline.load_into(path, strict=False)
     except Exception as e:
-        return f"Load failed: {e}"
+        return f"Load failed: {e}\n{traceback.format_exc()}"
+
+    lines = [
+        f"Loaded {report['kind'].upper()} snapshot into existing pipeline.",
+        f"  • format_version : {report['format_version']}",
+        f"  • missing keys   : {len(report['missing'])}",
+        f"  • unexpected     : {len(report['unexpected'])}",
+    ]
+    if report["missing"]:
+        lines.append(f"    missing: {report['missing'][:6]}{'…' if len(report['missing'])>6 else ''}")
+    if report["unexpected"]:
+        lines.append(f"    unexpected: {report['unexpected'][:6]}{'…' if len(report['unexpected'])>6 else ''}")
+    lines.append("")
+    lines.append(pipeline.param_summary())
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1841,30 +2225,100 @@ def build_ui() -> gr.Blocks:
             with gr.TabItem("💾 Model I/O"):
                 gr.Markdown(
                     "### Save / Load\n"
-                    "Saves and loads the PyTorch `state_dict` (all 27 learnable parameters). "
-                    "The corpus and CPD are **not** saved — rebuild the model first, then load weights."
+                    "**Full snapshot** bundles the *weights + corpus + hyperparameters* — "
+                    "completely self-contained, can be reloaded without rebuilding anything.\n\n"
+                    "**Weights-only** stores just the state_dict (smaller, faster) — "
+                    "you must rebuild the model from the same corpus first, "
+                    "then merge weights into it."
                 )
-                with gr.Row():
-                    with gr.Column():
-                        io_save_btn  = gr.Button("Save state_dict (.pt)", variant="primary")
-                        io_save_file = gr.File(label="Download", interactive=False)
-                        io_save_log  = gr.Textbox(label="Save log", lines=2, interactive=False)
 
+                with gr.Row():
+                    # ── Full save / load column ─────────────────────
                     with gr.Column():
-                        io_load_file = gr.File(
-                            label="Upload .pt file",
+                        gr.Markdown("#### Full pipeline (recommended)")
+                        io_full_hist = gr.Checkbox(
+                            label="Include repetition history",
+                            value=True,
+                        )
+                        io_save_full_btn = gr.Button(
+                            "💾 Save FULL snapshot (.iso.pt)",
+                            variant="primary",
+                        )
+                        io_save_full_file = gr.File(label="Download (full)", interactive=False)
+                        io_save_full_log  = gr.Textbox(
+                            label="Save log (full)", lines=4, interactive=False,
+                        )
+
+                        gr.Markdown("---")
+                        io_load_full_file = gr.File(
+                            label="Upload .iso.pt (full snapshot)",
                             file_types=[".pt", ".pth"],
                             type="filepath",
                         )
-                        io_load_btn = gr.Button("Load weights", variant="secondary")
-                        io_load_log = gr.Textbox(label="Load log", lines=20, interactive=False)
+                        io_load_full_btn = gr.Button(
+                            "📂 Load FULL snapshot (replaces current model)",
+                            variant="primary",
+                        )
+                        io_load_full_log = gr.Textbox(
+                            label="Load log (full)", lines=20, interactive=False,
+                        )
 
-                io_save_btn.click(tab_save_model, inputs=[], outputs=[io_save_file, io_save_log])
-                io_load_btn.click(tab_load_model, inputs=[io_load_file], outputs=[io_load_log])
+                    # ── Weights-only save / load column ─────────────
+                    with gr.Column():
+                        gr.Markdown("#### Weights only")
+                        io_w_hist = gr.Checkbox(
+                            label="Include repetition history",
+                            value=False,
+                        )
+                        io_save_w_btn  = gr.Button(
+                            "💾 Save WEIGHTS-only (.pt)",
+                            variant="secondary",
+                        )
+                        io_save_w_file = gr.File(label="Download (weights)", interactive=False)
+                        io_save_w_log  = gr.Textbox(
+                            label="Save log (weights)", lines=4, interactive=False,
+                        )
+
+                        gr.Markdown("---")
+                        io_load_w_file = gr.File(
+                            label="Upload .pt (weights snapshot)",
+                            file_types=[".pt", ".pth"],
+                            type="filepath",
+                        )
+                        io_load_w_btn = gr.Button(
+                            "📂 Load WEIGHTS into current model",
+                            variant="secondary",
+                        )
+                        io_load_w_log = gr.Textbox(
+                            label="Load log (weights)", lines=20, interactive=False,
+                        )
+
+                # Wiring -------------------------------------------------
+                io_save_full_btn.click(
+                    tab_save_full,
+                    inputs  = [io_full_hist],
+                    outputs = [io_save_full_file, io_save_full_log],
+                )
+                io_load_full_btn.click(
+                    tab_load_full,
+                    inputs  = [io_load_full_file],
+                    outputs = [io_load_full_log],
+                )
+                io_save_w_btn.click(
+                    tab_save_weights,
+                    inputs  = [io_w_hist],
+                    outputs = [io_save_w_file, io_save_w_log],
+                )
+                io_load_w_btn.click(
+                    tab_load_weights,
+                    inputs  = [io_load_w_file],
+                    outputs = [io_load_w_log],
+                )
 
         gr.Markdown(
             "_Build the model first (⚙ Model tab), then generate (✍ Generate), "
-            "then inspect individual steps (🔬 Layer Inspector)._"
+            "then inspect individual steps (🔬 Layer Inspector). "
+            "Save/Load is on the 💾 Model I/O tab._"
         )
 
     return demo
