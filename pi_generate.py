@@ -2329,17 +2329,4 @@ def build_ui() -> gr.Blocks:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Gradio UI for IsomorphismPipeline")
-    parser.add_argument("--host",  default="127.0.0.1")
-    parser.add_argument("--port",  type=int, default=7860)
-    parser.add_argument("--share", action="store_true")
-    args = parser.parse_args()
-
-    build_ui().queue(max_size=4).launch(
-        server_name = args.host,
-        server_port = args.port,
-        share       = args.share,
-        show_error  = True,
-    )
+    build_ui().queue(max_size=4).launch()
