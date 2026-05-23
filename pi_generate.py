@@ -1188,10 +1188,8 @@ def _layer_iso_run(
     words    = [f.chosen for f in frames if f.chosen]
     out_text = (" ".join(tokenise_alpha(prompt or "")) + " " + " ".join(words)).strip()
 
-    header = "| Step | Chosen | Zone | Ctx | " + " | ".join(
-        l.split("_", 1)[1] for l in IsomorphismGenerator.LAYER_NAMES
-    ) + " |"
-    sep  = "|" + "---|" * (4 + len(IsomorphismGenerator.LAYER_NAMES))
+    header = ""
+    sep  = ""
     rows = [header, sep]
 
     for f in frames[:60]:
@@ -1203,35 +1201,11 @@ def _layer_iso_run(
             else:
                 top_per_layer.append("-")
         ctx_str = ",".join(w for w in f.context_window if w) or "BOS"
-        rows.append(
-            f"| {f.step} | **{f.chosen}** | {f.zone_name or '-'} | {ctx_str} | "
-            + " | ".join(top_per_layer) + " |"
-        )
+
     table_md = "\n".join(rows)
 
     tensor_log = []
-    for f in frames:
-        tensor_log.append({
-            "step":          f.step,
-            "chosen":        f.chosen,
-            "zone":          f.zone_name,
-            "ctx":           list(f.context_window),
-            "draw_pos":      f.draw_pos,
-            "next_draw_pos": f.next_draw_pos,
-            "shape":         list(f.tensor().shape),
-            "layers": [
-                {
-                    "name": l["name"],
-                    "top3": sorted(
-                        zip(l["words"], l["probs"].tolist()),
-                        key=lambda x: -x[1]
-                    )[:3],
-                }
-                for l in f.layers
-            ],
-        })
 
-    log.append(f"Generated {len(frames)} frames, {len(words)} tokens.")
     return out_text, table_md, json.dumps(tensor_log, indent=2), "\n".join(log)
 
 
