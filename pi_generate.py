@@ -32,7 +32,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
+import gradio as gr
 
 # ---------------------------------------------------------------------------
 # Shared utilities
@@ -1582,41 +1582,236 @@ def build_real_context_index(vocab, cpd, tokens):
         return None
 
 
-# ---------------------------------------------------------------------------
-# Embedded smoke-test corpus
-# ---------------------------------------------------------------------------
-with open(input("Filename: "), "r", encoding = "utf-8") as file:
-    _EMBEDDED_CORPUS = file.read()
+
+# =============================================================================
+#  Gradio helpers
+# =============================================================================
+
+def _make_heatmap(frames):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not frames:
+        return None
+
+    layer_names = [layer["name"] for layer in frames[0].layers]
+    n_layers = len(layer_names)
+    n_steps  = len(frames)
+
+    mat = np.zeros((n_layers, n_steps))
+    for s, frame in enumerate(frames):
+        for r, layer in enumerate(frame.layers):
+            words = layer.get("words", [])
+            probs = layer.get("probs", np.array([]))
+            if frame.chosen in words and len(probs):
+                idx = words.index(frame.chosen)
+                if idx < len(probs):
+                    mat[r, s] = float(probs[idx])
+
+    fig, ax = plt.subplots(figsize=(max(8, n_steps * 0.30), max(4, n_layers * 0.45)))
+    im = ax.imshow(mat, aspect="auto", interpolation="nearest",
+                   cmap="viridis", origin="upper")
+    ax.set_yticks(range(n_layers))
+    ax.set_yticklabels(layer_names, fontsize=7)
+    ax.set_xlabel("Generation step")
+    ax.set_ylabel("Layer")
+    ax.set_title("P(chosen token) — per layer x step", fontsize=9)
+    fig.colorbar(im, ax=ax, label="probability", shrink=0.8)
+    fig.tight_layout()
+    return fig
 
 
+def _make_step_log(frames, limit=40):
+    if not frames:
+        return ""
+    header = "{:>4}  {:<18} {:>9}  {:>9}".format("Step", "Chosen", "draw_pos", "next_pos")
+    lines  = [header, "-" * len(header)]
+    for i, f in enumerate(frames[:limit]):
+        lines.append("{:>4}  {:<18} {:>9}  {:>9}".format(
+            i, f.chosen, f.draw_pos, f.next_draw_pos))
+    if len(frames) > limit:
+        lines.append("... ({} more steps not shown)".format(len(frames) - limit))
+    return "\\n".join(lines)
 
-# ---------------------------------------------------------------------------
-# Smoke test
-# ---------------------------------------------------------------------------
+
+def run_generation(
+    corpus_file, prompt, n_words, use_locked, seed,
+    ngram_n, lidstone_gamma,
+    temperature, top_k, top_p,
+    rep_penalty, insight_penalty, l12_blend_alpha,
+    l13_sigma, l13_floor,
+    l14_sigma, l14_floor, l14_lock_strength, l14_blend_alpha,
+    progress=gr.Progress(track_tqdm=True),
+):
+    # read corpus
+    if corpus_file is None:
+        return "Please upload a corpus .txt file.", "", None, ""
+    try:
+        path = corpus_file.name if hasattr(corpus_file, "name") else str(corpus_file)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            corpus_text = fh.read()
+    except Exception as exc:
+        return "Could not read corpus file:\\n{}".format(exc), "", None, ""
+
+    if not corpus_text.strip():
+        return "The uploaded corpus file is empty.", "", None, ""
+    if not str(prompt).strip():
+        return "Please enter a prompt.", "", None, ""
+
+    try:
+        progress(0.10, desc="Building CPD & context index ...")
+        cpd, vocab, tokens = build_real_cpd(
+            corpus_text, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma)
+        )
+        ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+        progress(0.40, desc="Constructing pipeline ...")
+        cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
+        kwargs = dict(
+            cpd=cpd, context_index=ctx_idx, vocab=vocab,
+            ngram_n=int(ngram_n),
+            temperature=float(temperature),
+            top_k=int(top_k), top_p=float(top_p),
+            rep_penalty=float(rep_penalty),
+            insight_penalty=float(insight_penalty),
+            l12_blend_alpha=float(l12_blend_alpha),
+            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+        )
+        if bool(use_locked):
+            kwargs.update(
+                l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
+                l14_lock_strength=float(l14_lock_strength),
+                l14_blend_alpha=float(l14_blend_alpha),
+            )
+        pipe = cls(**kwargs)
+
+        progress(0.60, desc="Generating text ...")
+        seed_val = int(seed) if seed is not None else None
+        text = pipe.generate_text(
+            prompt=str(prompt).strip(),
+            n_words=int(n_words),
+            seed=seed_val,
+        )
+
+        progress(0.85, desc="Building heatmap ...")
+        frames   = getattr(pipe, "frames", [])
+        heatmap  = _make_heatmap(frames)
+        step_log = _make_step_log(frames)
+
+        param_summary = pipe.param_summary()
+        if bool(use_locked) and hasattr(pipe, "lock_table_summary"):
+            param_summary += "\\n\\n" + pipe.lock_table_summary()
+
+        progress(1.0, desc="Done!")
+        return text, param_summary, heatmap, step_log
+
+    except Exception:
+        return "Error:\\n\\n{}".format(traceback.format_exc()), "", None, ""
+
+
+# =============================================================================
+#  Gradio UI
+# =============================================================================
+
+with gr.Blocks(title="Isomorphism Pipeline", theme=gr.themes.Soft()) as demo:
+
+    gr.Markdown(
+        "# Isomorphism Pipeline\n"
+        "Upload a plain-text corpus, tune every hyper-parameter, then generate."
+    )
+
+    with gr.Row():
+
+        # LEFT panel
+        with gr.Column(scale=1, min_width=360):
+
+            gr.Markdown("### Corpus & prompt")
+            corpus_file = gr.File(
+                label="Corpus text file (.txt)",
+                file_types=[".txt"],
+                file_count="single",
+            )
+            prompt_box = gr.Textbox(
+                label="Prompt (seed text)",
+                placeholder="Enter a few words to seed generation ...",
+                lines=2,
+            )
+            run_btn = gr.Button("Generate", variant="primary", size="lg")
+            with gr.Row():
+                n_words_sl = gr.Slider(10, 500, value=100, step=5, label="Words to generate")
+                seed_box   = gr.Number(label="Random seed", value=42, precision=0)
+
+            use_locked_cb = gr.Checkbox(
+                label="Use LockedIsomorphismPipeline (enables L14)", value=True
+            )
+
+            gr.Markdown("### Core hyper-parameters")
+            with gr.Row():
+                ngram_n_sl  = gr.Slider(2, 5, value=3, step=1,            label="n-gram order")
+                lidstone_sl = gr.Slider(0.001, 1.0, value=0.1, step=0.001, label="Lidstone gamma")
+            with gr.Row():
+                temp_sl  = gr.Slider(0.1, 10.0, value=4.3, step=0.05, label="Temperature (L1)")
+                top_k_sl = gr.Slider(1, 500,    value=100, step=1,     label="Top-K (L3)")
+            with gr.Row():
+                top_p_sl = gr.Slider(0.01, 1.0, value=1.0,  step=0.01, label="Top-P (L3)")
+                rep_sl   = gr.Slider(1.0,  5.0, value=1.13, step=0.01, label="Rep. penalty (L0)")
+            with gr.Row():
+                insight_sl   = gr.Slider(0.0, 10.0, value=3.95, step=0.05, label="Insight penalty (L2)")
+                l12_alpha_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01,  label="L12 blend alpha")
+
+            gr.Markdown("### L13 — Contextual request position")
+            with gr.Row():
+                l13_sigma_sl = gr.Slider(0.01, 1.0, value=0.30, step=0.01,  label="sigma")
+                l13_floor_sl = gr.Slider(0.0,  0.5, value=0.04, step=0.005, label="floor")
+
+            with gr.Group() as l14_panel:
+                gr.Markdown("### L14 — Locked state index")
+                with gr.Row():
+                    l14_sigma_sl = gr.Slider(0.01, 1.0, value=0.25, step=0.01,  label="sigma")
+                    l14_floor_sl = gr.Slider(0.0,  0.5, value=0.03, step=0.005, label="floor")
+                with gr.Row():
+                    l14_ls_sl = gr.Slider(0.0,  1.0,  value=1.0, step=0.01, label="lock_strength")
+                    l14_ba_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01, label="blend_alpha")
+
+            use_locked_cb.change(
+                fn=lambda v: gr.update(visible=v),
+                inputs=use_locked_cb,
+                outputs=l14_panel,
+            )
+
+           
+
+        # RIGHT panel
+        with gr.Column(scale=1, min_width=360):
+
+            gr.Markdown("### Generated text")
+            output_text = gr.Textbox(label="Output", lines=10, interactive=False)
+
+            gr.Markdown("### Layer heatmap (P of chosen token per layer x step)")
+            heatmap_out = gr.Plot(label="Layer heatmap")
+
+            gr.Markdown("### Step log (first 40 steps)")
+            step_log_box = gr.Textbox(label="Step log", lines=8,
+                                      interactive=False)
+
+            gr.Markdown("### Parameter summary")
+            param_box = gr.Textbox(label="Parameters", lines=12,
+                                   interactive=False)
+
+    run_btn.click(
+        fn=run_generation,
+        inputs=[
+            corpus_file, prompt_box, n_words_sl, use_locked_cb, seed_box,
+            ngram_n_sl, lidstone_sl,
+            temp_sl, top_k_sl, top_p_sl,
+            rep_sl, insight_sl, l12_alpha_sl,
+            l13_sigma_sl, l13_floor_sl,
+            l14_sigma_sl, l14_floor_sl, l14_ls_sl, l14_ba_sl,
+        ],
+        outputs=[output_text, param_box, heatmap_out, step_log_box],
+    )
+
 
 if __name__ == "__main__":
-    print("Building CPD from embedded corpus ...")
-    cpd, vocab, tokens = build_real_cpd(_EMBEDDED_CORPUS, ngram_n=3, lidstone_gamma=0.1)
-    ctx_idx = build_real_context_index(vocab, cpd, tokens)
-
-    print("\nConstructing LockedIsomorphismPipeline ...")
-    pipe = LockedIsomorphismPipeline(
-        cpd             = cpd,
-        context_index   = ctx_idx,
-        vocab           = vocab,
-        ngram_n         = 3,
-        temperature     = 1.8,
-        top_k           = 60,
-        top_p           = 0.95,
-        rep_penalty     = 1.10,
-        insight_penalty = 2.5,
-        l12_blend_alpha = 0.5,
-        l14_sigma         = 0.20,
-        l14_floor         = 0.03,
-        l14_lock_strength = 1.0,
-        l14_blend_alpha   = 0.40,
-    )
-    while True:
-        text = pipe.generate_text(input("USER: "), n_words=500, seed=42)
-        print("\n--- Generated ---")
-        print(text)
+    demo.launch(share=False)
