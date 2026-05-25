@@ -1,42 +1,72 @@
 # =============================================================================
 #  layer_isomorphism_torch.py
-#  All 15 isomorphism layers (L0–L14) as torch.nn.Module subclasses.
+#  Full integrated module: L0..L14 isomorphism stack + sentence preprocessor.
 #
-#  L0–L13 are the original token / zone / blend / cursor stack.
-#  L14 (NEW) is a previous-state-dependent index dimension with monotonic
-#  write-once semantics keyed by trigram prefix.  Its modulus indication
-#  is offset by the count of "missing states" (observed-but-uncommitted
-#  trigram keys), so unresolved context literally pushes the cursor
-#  forward through the modulus.
+#  Layers
+#  ------
+#    L0  – Raw distribution with repetition penalty
+#    L1  – Temperature scaling
+#    L2  – Insight penalty
+#    L3  – Top-K / Top-P truncation
+#    L4  – Frequency zone gradient
+#    L5  – Alpha-zone gradient
+#    L6  – Bigram zone gradient
+#    L7  – Live trigram zone gradient
+#    L8  – Character-trigram neighbour gradient
+#    L9  – Latent BOS quartile gradient
+#    L10 – History repetition column
+#    L11 – Tensor blend of zone layers
+#    L12 – Geometric mean of L3 and L11
+#    L13 – Contextual requestor position
+#    L14 – Locked state index (previous-state-dependent, write-once)
 #
-#  Design principles
-#  -----------------
-#  • Every layer is a self-contained nn.Module with a custom __init__ that
-#    registers its hyper-parameters as nn.Parameter (learnable) or as named
-#    buffers (non-gradient scalars that still move with .to(device)).
-#  • forward() accepts and returns plain Python / numpy inputs where the
-#    upstream code expects them, but all heavy maths runs on torch tensors.
-#  • IsomorphismPipeline wires L0..L13 together and mirrors the original
-#    API.  LockedIsomorphismPipeline subclasses it and inserts L14 into
-#    the final sampling stage.
-#  • No external dependencies beyond torch, numpy, math, collections.
+#  Dataset preprocessor
+#  --------------------
+#  SentenceDatasetPreprocessor splits the raw corpus into "uniform"
+#  sentences obeying the invariant:
+#
+#      every sentence's FIRST word and LAST word each occur EXACTLY ONCE
+#      in the entire corpus — they cannot be repeated elsewhere
+#
+#  Sentences violating the invariant are dropped (reported in summary()).
+#  The MIDDLE words of the surviving sentences form the arbitrary source
+#  pool from which beginnings are sampled at every natural ending during
+#  generation.  No synthetic markers are introduced — every token in the
+#  training stream is a real corpus word.
+#
+#  SentenceAwareGenerator wraps a pipeline and applies the rule:
+#  whenever the live context's most-recent token is a natural ending
+#  (a globally-unique sentence-final word), sample a fresh seed from
+#  the middle-word pool and push it into the context so the pipeline
+#  predicts upon it.  Generation otherwise runs unchanged.
 # =============================================================================
 
 from __future__ import annotations
 
 import math
+import os
+import random
+import re
+import sys
+import traceback
 from collections import Counter, deque
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import gradio as gr
 
-# ---------------------------------------------------------------------------
-# Shared utilities
-# ---------------------------------------------------------------------------
+try:
+    import gradio as gr
+    _HAS_GRADIO = True
+except ImportError:
+    _HAS_GRADIO = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shared utilities
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _to_tensor(probs, dtype=torch.float64) -> torch.Tensor:
     if isinstance(probs, torch.Tensor):
@@ -56,9 +86,9 @@ def _char_trigrams(word: str):
     return {word[i:i + 3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
 
 
-# ---------------------------------------------------------------------------
-# L0 – Raw distribution with repetition penalty
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L0 – Raw distribution with repetition penalty
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L0_RawDist(nn.Module):
     """
@@ -91,8 +121,8 @@ class L0_RawDist(nn.Module):
         probs_t = _to_tensor([p for _, p in raw])
         probs_t = _normalise(probs_t)
 
-        words   = [w for w, _ in raw]
-        pairs   = list(zip(words, probs_t.tolist()))
+        words = [w for w, _ in raw]
+        pairs = list(zip(words, probs_t.tolist()))
 
         layer = {
             "name":   "L0_RAW_DIST",
@@ -103,9 +133,9 @@ class L0_RawDist(nn.Module):
         return pairs, layer
 
 
-# ---------------------------------------------------------------------------
-# L1 – Temperature scaling
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L1 – Temperature scaling
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L1_TempScaled(nn.Module):
     """Applies temperature scaling: p_i ∝ p_i^(1/T)."""
@@ -133,9 +163,9 @@ class L1_TempScaled(nn.Module):
         return out, layer
 
 
-# ---------------------------------------------------------------------------
-# L2 – Insight penalty
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L2 – Insight penalty
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L2_InsightPenalty(nn.Module):
     """Penalises tokens whose probability exceeds the mean."""
@@ -167,9 +197,9 @@ class L2_InsightPenalty(nn.Module):
         return out, layer
 
 
-# ---------------------------------------------------------------------------
-# L3 – Top-K / Top-P truncation
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L3 – Top-K / Top-P truncation
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L3_TopKTopP(nn.Module):
     """Truncates the candidate set to top-K then applies nucleus (top-P)."""
@@ -206,15 +236,15 @@ class L3_TopKTopP(nn.Module):
         return out, layer
 
 
-# ---------------------------------------------------------------------------
-# Shared Gaussian-gradient zone layer base (L4–L9, L13)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shared Gaussian-gradient zone layer base
+# ═══════════════════════════════════════════════════════════════════════════
 
 class _ZoneGradientBase(nn.Module):
     """
-    Base class for zone layers L4–L9.  Each applies a Gaussian gradient
-    over the ranked candidate list, centring the peak at the mean rank
-    of tokens in the active zone.
+    Base class for L4–L9.  Each applies a Gaussian gradient over the
+    ranked candidate list, centring the peak at the mean rank of tokens
+    in the active zone.
     """
 
     def __init__(self, name: str, sigma: float, floor: float, source_hint: str = ""):
@@ -255,9 +285,9 @@ class _ZoneGradientBase(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# L4 – Frequency zone gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L4 – Frequency zone gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L4_ZoneFreq(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.50, floor: float = 0.05,
@@ -284,9 +314,9 @@ class L4_ZoneFreq(_ZoneGradientBase):
         return self._make_layer(weights, candidates, f"key={key}")
 
 
-# ---------------------------------------------------------------------------
-# L5 – Alpha-zone gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L5 – Alpha-zone gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L5_ZoneAlpha(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.40, floor: float = 0.05):
@@ -302,9 +332,9 @@ class L5_ZoneAlpha(_ZoneGradientBase):
         return self._make_layer(weights, candidates, f"keys={keys}")
 
 
-# ---------------------------------------------------------------------------
-# L6 – Bigram n-gram zone gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L6 – Bigram zone gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L6_ZoneBigram(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.25, floor: float = 0.04):
@@ -320,9 +350,9 @@ class L6_ZoneBigram(_ZoneGradientBase):
         return self._make_layer(weights, candidates)
 
 
-# ---------------------------------------------------------------------------
-# L7 – Live trigram context zone gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L7 – Live trigram context zone gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L7_ZoneTrigram(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.20, floor: float = 0.03):
@@ -346,9 +376,9 @@ class L7_ZoneTrigram(_ZoneGradientBase):
         return self._make_layer(weights, candidates, src)
 
 
-# ---------------------------------------------------------------------------
-# L8 – Character-trigram neighbour gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L8 – Character-trigram neighbour gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L8_ZoneCharTrig(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.35, floor: float = 0.04):
@@ -367,9 +397,9 @@ class L8_ZoneCharTrig(_ZoneGradientBase):
         return self._make_layer(weights, candidates)
 
 
-# ---------------------------------------------------------------------------
-# L9 – Latent BOS quartile gradient
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L9 – Latent BOS quartile gradient
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L9_ZoneLatent(_ZoneGradientBase):
     def __init__(self, sigma: float = 0.30, floor: float = 0.04):
@@ -389,12 +419,12 @@ class L9_ZoneLatent(_ZoneGradientBase):
         return self._make_layer(weights, candidates, f"quartile={q_key}")
 
 
-# ---------------------------------------------------------------------------
-# L10 – History repetition column
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L10 – History repetition column
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L10_History(nn.Module):
-    """1/(smoothing+count) column. Default smoothing=1.0 reproduces the original."""
+    """1/(smoothing+count) column."""
 
     def __init__(self, smoothing: float = 1.0):
         super().__init__()
@@ -414,9 +444,9 @@ class L10_History(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# L11 – Tensor blend of zone layers (softmax row weights)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L11 – Tensor blend of zone layers
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L11_TensorBlend(nn.Module):
     N_ROWS = 7  # L4..L10
@@ -456,9 +486,9 @@ class L11_TensorBlend(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# L12 – Final distribution (geometric mean of L3 and L11)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L12 – Final distribution (geometric mean of L3 and L11)
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L12_Final(nn.Module):
     def __init__(self, blend_alpha: float = 0.5):
@@ -489,9 +519,9 @@ class L12_Final(nn.Module):
         return out, layer
 
 
-# ---------------------------------------------------------------------------
-# L13 – Contextual requestor position (Gaussian over pi-cursor)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L13 – Contextual requestor position (Gaussian over pi-cursor)
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L13_CtxReqPos(nn.Module):
     def __init__(self, sigma: float = 0.30, floor: float = 0.04):
@@ -520,45 +550,15 @@ class L13_CtxReqPos(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# L14 – Locked state index (NEW)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  L14 – Locked state index
+# ═══════════════════════════════════════════════════════════════════════════
 
 class L14_LockedStateIndex(nn.Module):
     """
     Previous-state-dependent index dimension with monotonic write-once
-    semantics — the "forbid altering" rule.
-
-    Keyed by the trigram prefix (last two non-empty tokens of the live
-    context, matching L7's key space).  Maintains:
-
-        _locked   : Dict[key -> first committed token]
-        _observed : Set[keys seen but not yet committed]
-
-    Forward branches
-    ----------------
-    LOCKED   — key already in _locked.  Returns a near one-hot
-               distribution on the locked token (weighted by
-               `lock_strength`), with the floor used as the residual
-               mass on everything else.  Higher transient indexes
-               therefore CANNOT alter the previously locked state.
-
-    UNLOCKED — key not yet locked.  Records it in _observed and emits
-               a Gaussian gradient.  The Gaussian centre is the live
-               cursor position offset by the number of "missing states":
-
-                   offset_pos = (draw_pos + n_missing) mod stream_len
-
-               so unresolved context literally pushes the cursor
-               forward through the modulus.
-
-    Custom init
-    -----------
-    sigma         : Gaussian width (clamped > 0)
-    floor         : minimum weight  (clamped to [0, 1))
-    lock_strength : hardness of the lock peak (clamped to [0, 1])
-                    1.0 -> hard lock (~one-hot)
-                    0.0 -> recovers a flat floor (no locking effect)
+    semantics — the "forbid altering" rule.  Keyed by the trigram prefix
+    (last two non-empty tokens of the live context).
     """
 
     LAYER_NAME = "L14_LOCKED_STATE_INDEX"
@@ -574,24 +574,14 @@ class L14_LockedStateIndex(nn.Module):
         self.floor         = nn.Parameter(torch.tensor(floor,         dtype=torch.float64))
         self.lock_strength = nn.Parameter(torch.tensor(lock_strength, dtype=torch.float64))
 
-        # Non-parameter state (not in state_dict; reset between runs).
         self._locked:   Dict[Tuple[str, ...], str] = {}
         self._observed: Set[Tuple[str, ...]]       = set()
 
-    # ── state control ────────────────────────────────────────────────
-
     def reset_state(self) -> None:
-        """Forget every lock and observation.  Called at run start."""
         self._locked.clear()
         self._observed.clear()
 
     def commit(self, key: Tuple[str, ...], token: str) -> bool:
-        """
-        Lock ``token`` under ``key`` iff key is not already locked.
-        Returns True on a successful new lock, False otherwise.  This
-        enforces the write-once / monotonic rule: higher-transient
-        indexes cannot overwrite a previous commitment.
-        """
         if not key or not token:
             return False
         if key in self._locked:
@@ -608,19 +598,14 @@ class L14_LockedStateIndex(nn.Module):
     def n_missing(self) -> int:
         return len(self._observed)
 
-    # ── trigram key extraction ───────────────────────────────────────
-
     @staticmethod
     def key_from_ctx(context_deque: deque) -> Tuple[str, ...]:
-        """Trigram prefix: last two non-empty tokens of the context."""
         ctx_list = [w for w in context_deque if w]
         if len(ctx_list) >= 2:
             return tuple(ctx_list[-2:])
         if len(ctx_list) == 1:
             return (ctx_list[-1],)
         return ()
-
-    # ── forward ──────────────────────────────────────────────────────
 
     def forward(
         self,
@@ -648,7 +633,6 @@ class L14_LockedStateIndex(nn.Module):
 
         key = self.key_from_ctx(context_deque)
 
-        # ─── LOCKED branch ───────────────────────────────────────────
         if key and key in self._locked:
             locked_token = self._locked[key]
             f = float(floor)
@@ -658,9 +642,6 @@ class L14_LockedStateIndex(nn.Module):
             if locked_token in words:
                 idx          = words.index(locked_token)
                 weights[idx] = f + w * (1.0 - f)
-            # else: locked token isn't in the candidate set; we degrade
-            # gracefully to a uniform floor — the parent's L12·L13
-            # contribution then dominates the blend for this step.
             weights = _normalise(weights)
 
             source = (
@@ -669,7 +650,6 @@ class L14_LockedStateIndex(nn.Module):
             )
             locked_flag = True
 
-        # ─── UNLOCKED branch ─────────────────────────────────────────
         else:
             if key:
                 self._observed.add(key)
@@ -700,9 +680,9 @@ class L14_LockedStateIndex(nn.Module):
         }
 
 
-# ---------------------------------------------------------------------------
-# LayerFrame (unchanged data class)
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  LayerFrame
+# ═══════════════════════════════════════════════════════════════════════════
 
 class LayerFrame:
     """Container for one generation step's full layer stack."""
@@ -744,16 +724,12 @@ class LayerFrame:
         return torch.stack(padded)
 
 
-# ---------------------------------------------------------------------------
-# IsomorphismPipeline  – drop-in replacement for IsomorphismGenerator
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  IsomorphismPipeline
+# ═══════════════════════════════════════════════════════════════════════════
 
 class IsomorphismPipeline(nn.Module):
-    """
-    Full 14-layer isomorphic probability pipeline (L0..L13) as a single
-    nn.Module.  See LockedIsomorphismPipeline below for the 15-layer
-    variant that adds L14.
-    """
+    """Full 14-layer isomorphic probability pipeline (L0..L13)."""
 
     SAVE_FORMAT_VERSION = 2
 
@@ -777,7 +753,6 @@ class IsomorphismPipeline(nn.Module):
         rep_penalty:     float = 1.13,
         insight_penalty: float = 3.95,
         history:         Optional[Counter] = None,
-        # ── per-layer custom init overrides ──────────────────────────
         l4_sigma: float = 0.50,   l4_floor: float = 0.05,
         l5_sigma: float = 0.40,   l5_floor: float = 0.05,
         l6_sigma: float = 0.25,   l6_floor: float = 0.04,
@@ -803,6 +778,7 @@ class IsomorphismPipeline(nn.Module):
         self._char_trig_index: Dict[str, set] = (
             getattr(context_index, "_trig_index", {}) if context_index else {}
         )
+        self.preprocessor = None   # set externally by build_sentence_pipeline
 
         self._init_hparams: Dict = dict(
             ngram_n         = self.ngram_n,
@@ -999,9 +975,7 @@ class IsomorphismPipeline(nn.Module):
                 )
         return "\n".join(lines)
 
-    # ─────────────────────────────────────────────────────────────────
-    # SAVE / LOAD
-    # ─────────────────────────────────────────────────────────────────
+    # ── save / load ───────────────────────────────────────────────────
 
     def _extract_cfd_counts(self) -> Dict[Tuple[str, ...], Dict[str, int]]:
         counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
@@ -1061,9 +1035,7 @@ class IsomorphismPipeline(nn.Module):
         include_history: bool           = True,
     ) -> str:
         if kind not in ("full", "weights", "midstate"):
-            raise ValueError(
-                f"kind must be 'full', 'midstate' or 'weights', got {kind!r}"
-            )
+            raise ValueError(f"kind must be 'full', 'midstate' or 'weights', got {kind!r}")
 
         payload = self._build_save_payload(
             kind            = kind,
@@ -1077,12 +1049,10 @@ class IsomorphismPipeline(nn.Module):
 
     @classmethod
     def _construct_from_payload(cls, payload, cpd, ctx_idx, vocab, ngram_n):
-        """Build a pipeline of the appropriate class from a save payload."""
         hparams = dict(payload.get("hparams", {}))
         init_kwargs = dict(hparams)
         init_kwargs.pop("ngram_n", None)
 
-        # If the saved class is LockedIsomorphismPipeline, dispatch to it.
         saved_class = payload.get("class_name", cls.__name__)
         target_cls = cls
         if saved_class == "LockedIsomorphismPipeline" and cls is IsomorphismPipeline:
@@ -1097,26 +1067,18 @@ class IsomorphismPipeline(nn.Module):
         )
 
     @classmethod
-    def load(
-        cls,
-        path:           str,
-        *,
-        rebuild_context_index: bool = True,
-    ) -> "IsomorphismPipeline":
+    def load(cls, path: str, *, rebuild_context_index: bool = True) -> "IsomorphismPipeline":
         payload = torch.load(path, map_location="cpu", weights_only=False)
 
         fmt = payload.get("format_version", 0)
         if fmt > cls.SAVE_FORMAT_VERSION:
             raise ValueError(
                 f"Snapshot format version {fmt} is newer than supported "
-                f"({cls.SAVE_FORMAT_VERSION}). Upgrade the code."
+                f"({cls.SAVE_FORMAT_VERSION})."
             )
 
         if payload.get("kind") != "full":
-            raise ValueError(
-                "load() requires a 'full' snapshot.  For weights-only files "
-                "use IsomorphismPipeline.load_into(existing_pipeline, path)."
-            )
+            raise ValueError("load() requires a 'full' snapshot.")
 
         corpus_text = payload["corpus_text"]
         gamma       = float(payload.get("lidstone_gamma", 0.1))
@@ -1138,32 +1100,18 @@ class IsomorphismPipeline(nn.Module):
         return pipeline
 
     @classmethod
-    def load_midstate(
-        cls,
-        path:                  str,
-        *,
-        rebuild_context_index: bool = True,
-    ) -> "IsomorphismPipeline":
+    def load_midstate(cls, path: str, *, rebuild_context_index: bool = True) -> "IsomorphismPipeline":
         payload = torch.load(path, map_location="cpu", weights_only=False)
 
         fmt = payload.get("format_version", 0)
         if fmt > cls.SAVE_FORMAT_VERSION:
-            raise ValueError(
-                f"Snapshot format version {fmt} is newer than supported "
-                f"({cls.SAVE_FORMAT_VERSION}). Upgrade the code."
-            )
+            raise ValueError(f"Snapshot format version {fmt} too new.")
         if payload.get("kind") != "midstate":
-            raise ValueError(
-                f"load_midstate() requires a 'midstate' snapshot; got "
-                f"kind={payload.get('kind')!r}."
-            )
+            raise ValueError(f"load_midstate() requires a 'midstate' snapshot.")
 
         cfd_counts = payload.get("cfd_counts")
         if cfd_counts is None:
-            raise ValueError(
-                "Midstate file is missing 'cfd_counts' — was it written "
-                "by an older version of the code?"
-            )
+            raise ValueError("Midstate file missing 'cfd_counts'.")
 
         ngram_n = int(payload.get("hparams", {}).get("ngram_n", 2))
         gamma   = float(payload.get("lidstone_gamma", 0.1))
@@ -1171,7 +1119,6 @@ class IsomorphismPipeline(nn.Module):
         tokens  = list(payload.get("tokens") or [])
 
         cpd = _cpd_from_counts(cfd_counts, vocab, gamma)
-
         ctx_idx = (
             build_real_context_index(vocab, cpd, tokens)
             if rebuild_context_index and tokens
@@ -1179,15 +1126,12 @@ class IsomorphismPipeline(nn.Module):
         )
 
         pipeline = cls._construct_from_payload(payload, cpd, ctx_idx, vocab, ngram_n)
-
         missing, unexpected = pipeline.load_state_dict(payload["state_dict"], strict=False)
         if missing or unexpected:
             print(f"  [load_midstate] missing keys: {list(missing)}")
             print(f"  [load_midstate] unexpected keys: {list(unexpected)}")
-
         if "history" in payload and isinstance(payload["history"], dict):
             pipeline.history = Counter(payload["history"])
-
         return pipeline
 
     def load_into(self, path: str, *, strict: bool = False) -> Dict:
@@ -1195,10 +1139,7 @@ class IsomorphismPipeline(nn.Module):
 
         fmt = payload.get("format_version", 0)
         if fmt > self.SAVE_FORMAT_VERSION:
-            raise ValueError(
-                f"Snapshot format version {fmt} is newer than supported "
-                f"({self.SAVE_FORMAT_VERSION})."
-            )
+            raise ValueError(f"Snapshot format version {fmt} too new.")
 
         sd = payload.get("state_dict", payload)
         result = self.load_state_dict(sd, strict=strict)
@@ -1216,7 +1157,7 @@ class IsomorphismPipeline(nn.Module):
             "format_version": fmt,
         }
 
-    # ── last-run frame store ──────────────────────────────────────────
+    # ── frame store ───────────────────────────────────────────────────
     frames: List[LayerFrame] = []
 
     @staticmethod
@@ -1270,8 +1211,7 @@ class IsomorphismPipeline(nn.Module):
 
             return _draw_pi
 
-        import random as _random
-        rng = _random.Random(seed)
+        rng = random.Random(seed)
         return rng.random
 
     def generate_text(
@@ -1305,28 +1245,12 @@ class IsomorphismPipeline(nn.Module):
         )
 
 
-# ---------------------------------------------------------------------------
-# LockedIsomorphismPipeline – 15-layer variant including L14
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  LockedIsomorphismPipeline – 15-layer variant including L14
+# ═══════════════════════════════════════════════════════════════════════════
 
 class LockedIsomorphismPipeline(IsomorphismPipeline):
-    """
-    IsomorphismPipeline + L14_LockedStateIndex.
-
-    Adds a previous-state-dependent index dimension keyed by trigram
-    prefix.  Once a key is committed during generation it is locked —
-    higher transient indexes (later steps) cannot alter the state.
-    The unlocked branch uses a Gaussian whose centre is offset by the
-    count of observed-but-uncommitted keys ("missing states").
-
-    Adds the following hyper-parameters
-    -----------------------------------
-        l14_sigma          : Gaussian width (unlocked branch)
-        l14_floor          : floor weight
-        l14_lock_strength  : peak hardness on the locked token   [0..1]
-        l14_blend_alpha    : exponent of L14 in the final blend  (0..1)
-                             0 = ignore L14; 1 = pure L14
-    """
+    """IsomorphismPipeline + L14_LockedStateIndex."""
 
     LAYER_NAMES = IsomorphismPipeline.LAYER_NAMES + ["L14_LOCKED_STATE_INDEX"]
 
@@ -1357,14 +1281,11 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
             l14_blend_alpha   = float(l14_blend_alpha),
         )
 
-    # ── lifecycle ────────────────────────────────────────────────────
-
     def seed_stream(self, stream):
         super().seed_stream(stream)
         self.l14.reset_state()
 
     def reset_locked_state(self) -> None:
-        """Wipe L14's lock table without disturbing the stream."""
         self.l14.reset_state()
 
     def lock_table_summary(self, limit: int = 50) -> str:
@@ -1380,8 +1301,6 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         if len(items) > limit:
             lines.append(f"  ... and {len(items) - limit} more")
         return "\n".join(lines)
-
-    # ── step (overrides parent) ──────────────────────────────────────
 
     def step(
         self,
@@ -1437,11 +1356,9 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         draw_pos   = self._pos
         stream_len = max(1, len(self._stream))
         L13        = self.l13(L3_pairs, draw_pos, stream_len)
+        L14        = self.l14(L3_pairs, context_deque, draw_pos, stream_len)
 
-        # ── NEW: L14 ─────────────────────────────────────────────────
-        L14 = self.l14(L3_pairs, context_deque, draw_pos, stream_len)
-
-        # Geometric blend L12 · L13 · L14
+        # Geometric blend L12 · L13 · L14 (fixed: max-floor, real probs)
         alpha14   = float(self.l14_blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6))
         floor_val = 1e-12
 
@@ -1451,9 +1368,9 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
 
         blended = []
         for w in l12_map.keys():
-            p12 = min(floor_val, l12_map.get(w, floor_val))
-            p13 = torch.argmax(torch.tensor(L13["probs"]))
-            p14 = torch.argmax(torch.tensor(L14["probs"]))
+            p12 = max(floor_val, l12_map.get(w, floor_val))
+            p13 = max(floor_val, l13_map.get(w, floor_val))
+            p14 = max(floor_val, l14_map.get(w, floor_val))
             base   = math.sqrt(p12 * p13)
             merged = (base ** (1.0 - alpha14)) * (p14 ** alpha14)
             blended.append((w, merged))
@@ -1467,14 +1384,14 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         t      = sum(p for _, p in pool)
         pool   = [(w, p / t) for w, p in pool] if t > 0 else pool
 
-        chosen, cumulative = pool[-1][0] if pool else "", 0.0
+        chosen, cumulative = (pool[-1][0] if pool else ""), 0.0
         for w, p in pool:
             cumulative += p
             if draw < cumulative:
                 chosen = w
                 break
 
-        # COMMIT — the write-once rule in action
+        # Commit: write-once rule
         key = L14_LockedStateIndex.key_from_ctx(context_deque)
         if key and chosen:
             self.l14.commit(key, chosen)
@@ -1497,9 +1414,9 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         )
 
 
-# ---------------------------------------------------------------------------
-# Real corpus builder
-# ---------------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+#  CPD construction
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _cpd_from_counts(
     cfd_counts:     Dict[Tuple[str, ...], Dict[str, int]],
@@ -1531,7 +1448,6 @@ def _cpd_from_counts(
 
 
 def build_real_cpd(corpus: str, ngram_n: int = 2, lidstone_gamma: float = 0.1):
-    import os
     import nltk
     from nltk.util import ngrams as nltk_ngrams
 
@@ -1571,7 +1487,6 @@ def build_real_cpd(corpus: str, ngram_n: int = 2, lidstone_gamma: float = 0.1):
 def build_real_context_index(vocab, cpd, tokens):
     """Build a ContextZoneIndex from real corpus tokens (if app.py is available)."""
     try:
-        import sys, os
         _here = os.path.dirname(os.path.abspath(__file__))
         if _here not in sys.path:
             sys.path.insert(0, _here)
@@ -1582,10 +1497,434 @@ def build_real_context_index(vocab, cpd, tokens):
         return None
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+#  SentenceDatasetPreprocessor
+# ═══════════════════════════════════════════════════════════════════════════
 
-# =============================================================================
+_SENTENCE_END_PUNCT = ".!?"
+
+
+class SentenceDatasetPreprocessor:
+    """
+    Splits a raw corpus into uniform sentences and enforces the invariant:
+
+        EVERY sentence's FIRST word and LAST word each occur EXACTLY ONCE
+        in the entire corpus.  They cannot be repeated elsewhere — not as
+        the first/last word of any other sentence, and not anywhere in the
+        middle of any sentence (including their own).
+
+    Sentences that violate the invariant are DROPPED (count reported in
+    summary()).  The MIDDLE words of the surviving sentences form the
+    arbitrary source pool from which "beginnings" are sampled at every
+    natural ending during generation.
+
+    No synthetic markers are introduced: every token in `self.tokens` is
+    a real word from the input corpus.
+
+    Public attributes
+    -----------------
+      sentences   : List[List[str]]   surviving sentences (in order)
+      beginnings  : List[str]         first word of each sentence (unique)
+      endings     : List[str]         last  word of each sentence (unique)
+      middle_pool : List[str]         arbitrary-source pool (real words)
+      tokens      : List[str]         flat training stream (no markers)
+      dropped     : int               sentences killed by the invariant
+      skipped     : int               sentences too short to consider
+    """
+
+    def __init__(
+        self,
+        text:               str,
+        *,
+        lowercase:          bool = True,
+        min_sentence_len:   int  = 3,
+        unique_middle_pool: bool = True,
+        strict:             bool = True,
+    ):
+        self.lowercase          = bool(lowercase)
+        self.min_sentence_len   = max(2, int(min_sentence_len))
+        self.unique_middle_pool = bool(unique_middle_pool)
+        self.strict             = bool(strict)
+
+        # outputs
+        self.sentences:   List[List[str]] = []
+        self.beginnings:  List[str]       = []
+        self.endings:     List[str]       = []
+        self.middle_pool: List[str]       = []
+        self.tokens:      List[str]       = []
+        self.dropped:     int             = 0
+        self.skipped:     int             = 0
+
+        # cached membership sets for O(1) lookup
+        self._beginnings_set: set = set()
+        self._endings_set:    set = set()
+        self._middle_set:     set = set()
+
+        self._process(text)
+
+    # ── tokenisation ──────────────────────────────────────────────────
+
+    def _tokenize_sentences(self, text: str) -> List[List[str]]:
+        if self.lowercase:
+            text = text.lower()
+        text = re.sub(r"\s+", " ", text).strip()
+
+        sentences: List[List[str]] = []
+        current:   List[str]       = []
+
+        for raw in text.split(" "):
+            if not raw:
+                continue
+            ends_sentence = raw[-1] in _SENTENCE_END_PUNCT
+            clean = "".join(c for c in raw if c.isalpha())
+            if clean:
+                current.append(clean)
+            if ends_sentence:
+                if len(current) >= self.min_sentence_len:
+                    sentences.append(current)
+                elif current:
+                    self.skipped += 1
+                current = []
+
+        if current:
+            if len(current) >= self.min_sentence_len:
+                sentences.append(current)
+            else:
+                self.skipped += 1
+        return sentences
+
+    # ── invariant enforcement ─────────────────────────────────────────
+
+    def _enforce_unique_boundaries(
+        self,
+        sentences: List[List[str]],
+    ) -> List[List[str]]:
+        """
+        Keep only sentences whose first and last words each occur exactly
+        once across the entire corpus (counted over all sentences combined).
+        """
+        global_counts: Counter = Counter()
+        for s in sentences:
+            global_counts.update(s)
+
+        kept: List[List[str]] = []
+        for s in sentences:
+            first, last = s[0], s[-1]
+            if first == last:
+                self.dropped += 1
+                continue
+            if global_counts[first] != 1 or global_counts[last] != 1:
+                self.dropped += 1
+                continue
+            kept.append(s)
+        return kept
+
+    # ── core processing ───────────────────────────────────────────────
+
+    def _process(self, text: str) -> None:
+        raw = self._tokenize_sentences(text)
+        if not raw:
+            raise ValueError("Preprocessor found no usable sentences.")
+
+        kept = self._enforce_unique_boundaries(raw) if self.strict else list(raw)
+        if not kept:
+            raise ValueError(
+                f"No sentences satisfied the unique-boundary invariant "
+                f"({self.dropped} dropped, {self.skipped} too short). "
+                "Pass strict=False to keep all sentences."
+            )
+
+        # Build per-sentence outputs and the global middle pool
+        ordered_pool: List[str] = []
+        for s in kept:
+            self.sentences.append(s)
+            self.beginnings.append(s[0])
+            self.endings.append(s[-1])
+            ordered_pool.extend(s[1:-1])
+            self.tokens.extend(s)            # plain concatenation; no markers
+
+        if self.unique_middle_pool:
+            seen = set()
+            self.middle_pool = []
+            for w in ordered_pool:
+                if w not in seen:
+                    seen.add(w)
+                    self.middle_pool.append(w)
+        else:
+            self.middle_pool = ordered_pool
+
+        self._beginnings_set = set(self.beginnings)
+        self._endings_set    = set(self.endings)
+        self._middle_set     = set(self.middle_pool)
+
+    # ── public utilities ──────────────────────────────────────────────
+
+    def to_corpus(self) -> str:
+        return " ".join(self.tokens)
+
+    def vocab(self) -> set:
+        return set(self.tokens)
+
+    def is_beginning(self, token: str) -> bool:
+        return token in self._beginnings_set
+
+    def is_natural_ending(self, token: str) -> bool:
+        """True iff `token` is one of the globally-unique sentence-final words."""
+        return token in self._endings_set
+
+    def sample_arbitrary(
+        self,
+        rng_value: Optional[float] = None,
+        *,
+        rng:       Optional[random.Random] = None,
+    ) -> str:
+        """
+        Arbitrarily pick a word from the middle-word pool.  These are the
+        "beginnings" that get predicted upon at each natural ending.
+        """
+        if not self.middle_pool:
+            return ""
+        n = len(self.middle_pool)
+        if rng_value is not None:
+            i = int(rng_value * n) % n
+        else:
+            rng = rng or random
+            i = rng.randrange(n)
+        return self.middle_pool[i]
+
+    def summary(self) -> str:
+        n_sent = len(self.sentences)
+        avg    = sum(len(s) for s in self.sentences) / max(1, n_sent)
+        return (
+            "SentenceDatasetPreprocessor\n"
+            f"  sentences kept    : {n_sent}\n"
+            f"  dropped (invariant): {self.dropped}\n"
+            f"  skipped (too short): {self.skipped}\n"
+            f"  total tokens      : {len(self.tokens)}\n"
+            f"  vocab size        : {len(self.vocab())}\n"
+            f"  unique beginnings : {len(self._beginnings_set)}\n"
+            f"  unique endings    : {len(self._endings_set)}\n"
+            f"  middle-pool size  : {len(self.middle_pool)}\n"
+            f"  avg sentence len  : {avg:.2f}\n"
+            f"  beginning example : {self.beginnings[0]    if self.beginnings  else '∅'}\n"
+            f"  ending example    : {self.endings[0]       if self.endings     else '∅'}\n"
+            f"  middle example    : {self.middle_pool[0]   if self.middle_pool else '∅'}"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  build_sentence_pipeline – factory
+# ═══════════════════════════════════════════════════════════════════════════
+
+def build_sentence_pipeline(
+    raw_text:            str,
+    *,
+    locked:              bool  = True,
+    ngram_n:             int   = 3,
+    lidstone_gamma:      float = 0.1,
+    min_sentence_len:    int   = 3,
+    pipeline_kwargs:     Optional[Dict] = None,
+    preprocessor_kwargs: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, SentenceDatasetPreprocessor]:
+    """
+    raw_text  ──►  SentenceDatasetPreprocessor  ──►  CPD + ctx_index  ──►  pipeline
+
+    The preprocessor is also stashed on the returned pipeline as
+    `pipeline.preprocessor` so SentenceAwareGenerator can find it
+    without a second argument.
+    """
+    pre = SentenceDatasetPreprocessor(
+        raw_text,
+        min_sentence_len=min_sentence_len,
+        **(preprocessor_kwargs or {}),
+    )
+    corpus_text = pre.to_corpus()
+
+    cpd, vocab, tokens = build_real_cpd(
+        corpus_text,
+        ngram_n=int(ngram_n),
+        lidstone_gamma=float(lidstone_gamma),
+    )
+    ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs = dict(
+        cpd           = cpd,
+        context_index = ctx_idx,
+        vocab         = vocab,
+        ngram_n       = int(ngram_n),
+    )
+    if pipeline_kwargs:
+        kwargs.update(pipeline_kwargs)
+    pipe = cls(**kwargs)
+
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SentenceAwareGenerator
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SentenceAwareGenerator:
+    """
+    Wraps a pipeline so that whenever the live context's most-recent
+    token is a NATURAL ENDING (one of the globally-unique sentence-final
+    words), the next step:
+
+        1. samples a word ARBITRARILY from the preprocessor's middle pool
+        2. pushes it into the context as the new "beginning"
+        3. the pipeline then PREDICTS UPON that word in the following step
+
+    The arbitrary draw uses the same pi-stream-backed draw function the
+    pipeline uses for L13, so the whole loop stays a single deterministic
+    isomorphism over the input pi-stream.
+    """
+
+    def __init__(
+        self,
+        pipeline:    IsomorphismPipeline,
+        preprocessor: Optional[SentenceDatasetPreprocessor] = None,
+        *,
+        emit_seed:   bool = True,
+    ):
+        if preprocessor is None:
+            preprocessor = getattr(pipeline, "preprocessor", None)
+        if preprocessor is None:
+            raise ValueError(
+                "SentenceAwareGenerator needs a preprocessor — either pass "
+                "one in or use build_sentence_pipeline() which attaches it."
+            )
+        self.pipeline  = pipeline
+        self.pre       = preprocessor
+        self.emit_seed = bool(emit_seed)
+
+    # ── helpers ──────────────────────────────────────────────────────
+
+    def _seed_context(self, prompt: str) -> deque:
+        tokens       = [w.lower() for w in prompt.split() if w.isalpha()]
+        vocab_tokens = [w for w in tokens if w in self.pipeline.vocab]
+        cw           = self.pipeline.context_window
+        if len(vocab_tokens) >= cw:
+            init = vocab_tokens[-cw:]
+        else:
+            init = [""] * (cw - len(vocab_tokens)) + vocab_tokens
+        return deque(init, maxlen=cw)
+
+    def _format(self, words: List[str], prompt: str, capitalise: bool) -> str:
+        """
+        Insert periods after natural endings, capitalise sentence starts.
+        Beginnings and endings are themselves real corpus words, so we
+        rely on the preprocessor's `is_natural_ending` to detect breaks.
+        """
+        prompt_words = prompt.strip().split() if prompt.strip() else []
+        all_words    = prompt_words + words
+        if not all_words:
+            return ""
+
+        out:      List[str] = []
+        cap_next: bool      = True
+        pre                 = self.pre
+        for w in all_words:
+            tok = w.capitalize() if (capitalise and cap_next) else w
+            if pre.is_natural_ending(w) and not tok.endswith(tuple(_SENTENCE_END_PUNCT)):
+                tok = tok + "."
+                cap_next = True
+            else:
+                cap_next = bool(tok.rstrip("\"'")[-1:] in {".", "!", "?"})
+            out.append(tok)
+        return " ".join(out)
+
+    # ── main API ─────────────────────────────────────────────────────
+
+    def generate(
+        self,
+        prompt:            str,
+        n_words:           int,
+        *,
+        stream:            Optional[List[int]] = None,
+        digits_per_sample: int  = 3,
+        seed:              Optional[int] = None,
+    ) -> List[str]:
+        """Return the raw list of emitted tokens (including arbitrary seeds)."""
+        pipe    = self.pipeline
+        pre     = self.pre
+        draw_fn = pipe._make_draw_fn(stream, digits_per_sample, seed)
+
+        prompt_tokens = [w.lower() for w in prompt.split() if w.isalpha()]
+        ctx           = self._seed_context(prompt)
+
+        words:  List[str]            = []
+        frames: List[LayerFrame]     = []
+        produced                     = 0
+
+        # safety cap: don't loop forever if every prediction is an ending
+        max_iters = n_words * 8
+        iters     = 0
+
+        while produced < n_words and iters < max_iters:
+            iters += 1
+            last  = ctx[-1] if (len(ctx) and ctx[-1]) else ""
+
+            # Rule: at every natural ending, sample arbitrary middle word
+            if last and pre.is_natural_ending(last):
+                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
+                if not seed_word:
+                    break
+                ctx.append(seed_word)
+                if self.emit_seed:
+                    words.append(seed_word)
+                    produced += 1
+                    if produced >= n_words:
+                        break
+                continue
+
+            # Normal pipeline step
+            frame = pipe.step(ctx, prompt_tokens, draw_fn())
+            if frame is None:
+                # dead context — arbitrary restart from the middle pool
+                ctx.clear()
+                ctx.extend([""] * pipe.context_window)
+                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
+                if not seed_word:
+                    break
+                ctx.append(seed_word)
+                if self.emit_seed:
+                    words.append(seed_word)
+                    produced += 1
+                continue
+
+            frames.append(frame)
+            ctx.append(frame.chosen)
+            words.append(frame.chosen)
+            produced += 1
+
+        pipe.frames = frames
+        return words
+
+    def generate_text(
+        self,
+        prompt:            str,
+        n_words:           int,
+        *,
+        stream:            Optional[List[int]] = None,
+        digits_per_sample: int  = 3,
+        seed:              Optional[int] = None,
+        capitalise:        bool = True,
+    ) -> str:
+        words = self.generate(
+            prompt            = prompt,
+            n_words           = n_words,
+            stream            = stream,
+            digits_per_sample = digits_per_sample,
+            seed              = seed,
+        )
+        return self._format(words, prompt, capitalise)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Gradio helpers
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _make_heatmap(frames):
     import matplotlib
@@ -1596,8 +1935,8 @@ def _make_heatmap(frames):
         return None
 
     layer_names = [layer["name"] for layer in frames[0].layers]
-    n_layers = len(layer_names)
-    n_steps  = len(frames)
+    n_layers    = len(layer_names)
+    n_steps     = len(frames)
 
     mat = np.zeros((n_layers, n_steps))
     for s, frame in enumerate(frames):
@@ -1632,7 +1971,7 @@ def _make_step_log(frames, limit=40):
             i, f.chosen, f.draw_pos, f.next_draw_pos))
     if len(frames) > limit:
         lines.append("... ({} more steps not shown)".format(len(frames) - limit))
-    return "\\n".join(lines)
+    return "\n".join(lines)
 
 
 def run_generation(
@@ -1642,9 +1981,19 @@ def run_generation(
     rep_penalty, insight_penalty, l12_blend_alpha,
     l13_sigma, l13_floor,
     l14_sigma, l14_floor, l14_lock_strength, l14_blend_alpha,
-    progress=gr.Progress(track_tqdm=True),
+    use_preprocessor, min_sentence_len,
+    progress=None,
 ):
-    # read corpus
+    if progress is None and _HAS_GRADIO:
+        progress = gr.Progress(track_tqdm=True)
+
+    def _progress(*args, **kwargs):
+        if progress is not None:
+            try:
+                progress(*args, **kwargs)
+            except Exception:
+                pass
+
     if corpus_file is None:
         return "Please upload a corpus .txt file.", "", None, ""
     try:
@@ -1652,7 +2001,7 @@ def run_generation(
         with open(path, "r", encoding="utf-8", errors="replace") as fh:
             corpus_text = fh.read()
     except Exception as exc:
-        return "Could not read corpus file:\\n{}".format(exc), "", None, ""
+        return f"Could not read corpus file:\n{exc}", "", None, ""
 
     if not corpus_text.strip():
         return "The uploaded corpus file is empty.", "", None, ""
@@ -1660,158 +2009,257 @@ def run_generation(
         return "Please enter a prompt.", "", None, ""
 
     try:
-        progress(0.10, desc="Building CPD & context index ...")
-        cpd, vocab, tokens = build_real_cpd(
-            corpus_text, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma)
-        )
-        ctx_idx = build_real_context_index(vocab, cpd, tokens)
+        pre = None
+        if bool(use_preprocessor):
+            _progress(0.05, desc="Preprocessing into uniform sentences ...")
+            _progress(0.10, desc="Building pipeline from preprocessor ...")
 
-        progress(0.40, desc="Constructing pipeline ...")
-        cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
-        kwargs = dict(
-            cpd=cpd, context_index=ctx_idx, vocab=vocab,
-            ngram_n=int(ngram_n),
-            temperature=float(temperature),
-            top_k=int(top_k), top_p=float(top_p),
-            rep_penalty=float(rep_penalty),
-            insight_penalty=float(insight_penalty),
-            l12_blend_alpha=float(l12_blend_alpha),
-            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
-        )
-        if bool(use_locked):
-            kwargs.update(
-                l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
-                l14_lock_strength=float(l14_lock_strength),
-                l14_blend_alpha=float(l14_blend_alpha),
+            pipeline_kwargs = dict(
+                temperature     = float(temperature),
+                top_k           = int(top_k),
+                top_p           = float(top_p),
+                rep_penalty     = float(rep_penalty),
+                insight_penalty = float(insight_penalty),
+                l12_blend_alpha = float(l12_blend_alpha),
+                l13_sigma       = float(l13_sigma),
+                l13_floor       = float(l13_floor),
             )
-        pipe = cls(**kwargs)
+            if bool(use_locked):
+                pipeline_kwargs.update(
+                    l14_sigma         = float(l14_sigma),
+                    l14_floor         = float(l14_floor),
+                    l14_lock_strength = float(l14_lock_strength),
+                    l14_blend_alpha   = float(l14_blend_alpha),
+                )
 
-        progress(0.60, desc="Generating text ...")
-        seed_val = int(seed) if seed is not None else None
-        text = pipe.generate_text(
-            prompt=str(prompt).strip(),
-            n_words=int(n_words),
-            seed=seed_val,
-        )
+            pipe, pre = build_sentence_pipeline(
+                corpus_text,
+                locked            = bool(use_locked),
+                ngram_n           = int(ngram_n),
+                lidstone_gamma    = float(lidstone_gamma),
+                min_sentence_len  = int(min_sentence_len),
+                pipeline_kwargs   = pipeline_kwargs,
+            )
 
-        progress(0.85, desc="Building heatmap ...")
+            _progress(0.65, desc="Generating with sentence-aware loop ...")
+            gen = SentenceAwareGenerator(pipe, pre)
+            text = gen.generate_text(
+                prompt            = str(prompt).strip(),
+                n_words           = int(n_words),
+                seed              = int(seed) if seed is not None else None,
+            )
+        else:
+            _progress(0.10, desc="Building CPD & context index ...")
+            cpd, vocab, tokens = build_real_cpd(
+                corpus_text, ngram_n=int(ngram_n),
+                lidstone_gamma=float(lidstone_gamma),
+            )
+            ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+            _progress(0.40, desc="Constructing pipeline ...")
+            cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
+            kwargs = dict(
+                cpd=cpd, context_index=ctx_idx, vocab=vocab,
+                ngram_n=int(ngram_n),
+                temperature=float(temperature),
+                top_k=int(top_k), top_p=float(top_p),
+                rep_penalty=float(rep_penalty),
+                insight_penalty=float(insight_penalty),
+                l12_blend_alpha=float(l12_blend_alpha),
+                l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+            )
+            if bool(use_locked):
+                kwargs.update(
+                    l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
+                    l14_lock_strength=float(l14_lock_strength),
+                    l14_blend_alpha=float(l14_blend_alpha),
+                )
+            pipe = cls(**kwargs)
+
+            _progress(0.60, desc="Generating text ...")
+            seed_val = int(seed) if seed is not None else None
+            text = pipe.generate_text(
+                prompt=str(prompt).strip(),
+                n_words=int(n_words),
+                seed=seed_val,
+            )
+
+        _progress(0.85, desc="Building heatmap ...")
         frames   = getattr(pipe, "frames", [])
         heatmap  = _make_heatmap(frames)
         step_log = _make_step_log(frames)
 
         param_summary = pipe.param_summary()
+        if pre is not None:
+            param_summary += "\n\n" + pre.summary()
         if bool(use_locked) and hasattr(pipe, "lock_table_summary"):
-            param_summary += "\\n\\n" + pipe.lock_table_summary()
+            param_summary += "\n\n" + pipe.lock_table_summary()
 
-        progress(1.0, desc="Done!")
+        _progress(1.0, desc="Done!")
         return text, param_summary, heatmap, step_log
 
     except Exception:
-        return "Error:\\n\\n{}".format(traceback.format_exc()), "", None, ""
+        return f"Error:\n\n{traceback.format_exc()}", "", None, ""
 
 
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 #  Gradio UI
-# =============================================================================
+# ═══════════════════════════════════════════════════════════════════════════
 
-with gr.Blocks(title="Isomorphism Pipeline", theme=gr.themes.Soft()) as demo:
+def build_demo():
+    if not _HAS_GRADIO:
+        raise RuntimeError("gradio is not installed.")
 
-    gr.Markdown(
-        "# Isomorphism Pipeline\n"
-        "Upload a plain-text corpus, tune every hyper-parameter, then generate."
-    )
+    with gr.Blocks(title="Isomorphism Pipeline", theme=gr.themes.Soft()) as demo:
 
-    with gr.Row():
+        gr.Markdown(
+            "# Isomorphism Pipeline\n"
+            "Upload a plain-text corpus, optionally preprocess it into uniform "
+            "sentences with globally-unique beginnings/endings, tune every "
+            "hyper-parameter, then generate."
+        )
 
-        # LEFT panel
-        with gr.Column(scale=1, min_width=360):
+        with gr.Row():
 
-            gr.Markdown("### Corpus & prompt")
-            corpus_file = gr.File(
-                label="Corpus text file (.txt)",
-                file_types=[".txt"],
-                file_count="single",
-            )
-            prompt_box = gr.Textbox(
-                label="Prompt (seed text)",
-                placeholder="Enter a few words to seed generation ...",
-                lines=2,
-            )
-            run_btn = gr.Button("Generate", variant="primary", size="lg")
-            with gr.Row():
-                n_words_sl = gr.Slider(10, 500, value=100, step=5, label="Words to generate")
-                seed_box   = gr.Number(label="Random seed", value=42, precision=0)
+            # ── LEFT panel ───────────────────────────────────────────
+            with gr.Column(scale=1, min_width=360):
 
-            use_locked_cb = gr.Checkbox(
-                label="Use LockedIsomorphismPipeline (enables L14)", value=True
-            )
+                gr.Markdown("### Corpus & prompt")
+                corpus_file = gr.File(
+                    label="Corpus text file (.txt)",
+                    file_types=[".txt"],
+                    file_count="single",
+                )
+                prompt_box = gr.Textbox(
+                    label="Prompt (seed text)",
+                    placeholder="Enter a few words to seed generation ...",
+                    lines=2,
+                )
+                run_btn = gr.Button("Generate", variant="primary", size="lg")
 
-            gr.Markdown("### Core hyper-parameters")
-            with gr.Row():
-                ngram_n_sl  = gr.Slider(2, 5, value=3, step=1,            label="n-gram order")
-                lidstone_sl = gr.Slider(0.001, 1.0, value=0.1, step=0.001, label="Lidstone gamma")
-            with gr.Row():
-                temp_sl  = gr.Slider(0.1, 10.0, value=4.3, step=0.05, label="Temperature (L1)")
-                top_k_sl = gr.Slider(1, 500,    value=100, step=1,     label="Top-K (L3)")
-            with gr.Row():
-                top_p_sl = gr.Slider(0.01, 1.0, value=1.0,  step=0.01, label="Top-P (L3)")
-                rep_sl   = gr.Slider(1.0,  5.0, value=1.13, step=0.01, label="Rep. penalty (L0)")
-            with gr.Row():
-                insight_sl   = gr.Slider(0.0, 10.0, value=3.95, step=0.05, label="Insight penalty (L2)")
-                l12_alpha_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01,  label="L12 blend alpha")
-
-            gr.Markdown("### L13 — Contextual request position")
-            with gr.Row():
-                l13_sigma_sl = gr.Slider(0.01, 1.0, value=0.30, step=0.01,  label="sigma")
-                l13_floor_sl = gr.Slider(0.0,  0.5, value=0.04, step=0.005, label="floor")
-
-            with gr.Group() as l14_panel:
-                gr.Markdown("### L14 — Locked state index")
                 with gr.Row():
-                    l14_sigma_sl = gr.Slider(0.01, 1.0, value=0.25, step=0.01,  label="sigma")
-                    l14_floor_sl = gr.Slider(0.0,  0.5, value=0.03, step=0.005, label="floor")
+                    n_words_sl = gr.Slider(10, 500, value=100, step=5,
+                                           label="Words to generate")
+                    seed_box   = gr.Number(label="Random seed", value=42,
+                                           precision=0)
+
+                use_locked_cb = gr.Checkbox(
+                    label="Use LockedIsomorphismPipeline (enables L14)",
+                    value=True,
+                )
+
+                gr.Markdown("### Sentence preprocessor")
+                use_preproc_cb = gr.Checkbox(
+                    label=("Preload from uniform sentences (unique first/last "
+                           "words; arbitrary beginnings sampled from middle pool)"),
+                    value=True,
+                )
+                min_sent_len_sl = gr.Slider(2, 20, value=3, step=1,
+                                            label="Minimum sentence length")
+
+                gr.Markdown("### Core hyper-parameters")
                 with gr.Row():
-                    l14_ls_sl = gr.Slider(0.0,  1.0,  value=1.0, step=0.01, label="lock_strength")
-                    l14_ba_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01, label="blend_alpha")
+                    ngram_n_sl  = gr.Slider(2, 5, value=3, step=1,
+                                            label="n-gram order")
+                    lidstone_sl = gr.Slider(0.001, 1.0, value=0.1, step=0.001,
+                                            label="Lidstone gamma")
+                with gr.Row():
+                    temp_sl  = gr.Slider(0.1, 10.0, value=4.3, step=0.05,
+                                         label="Temperature (L1)")
+                    top_k_sl = gr.Slider(1, 500, value=100, step=1,
+                                         label="Top-K (L3)")
+                with gr.Row():
+                    top_p_sl = gr.Slider(0.01, 1.0, value=1.0, step=0.01,
+                                         label="Top-P (L3)")
+                    rep_sl   = gr.Slider(1.0, 5.0, value=1.13, step=0.01,
+                                         label="Rep. penalty (L0)")
+                with gr.Row():
+                    insight_sl   = gr.Slider(0.0, 10.0, value=3.95, step=0.05,
+                                             label="Insight penalty (L2)")
+                    l12_alpha_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01,
+                                             label="L12 blend alpha")
 
-            use_locked_cb.change(
-                fn=lambda v: gr.update(visible=v),
-                inputs=use_locked_cb,
-                outputs=l14_panel,
-            )
+                gr.Markdown("### L13 — Contextual request position")
+                with gr.Row():
+                    l13_sigma_sl = gr.Slider(0.01, 1.0, value=0.30, step=0.01,
+                                             label="sigma")
+                    l13_floor_sl = gr.Slider(0.0, 0.5, value=0.04, step=0.005,
+                                             label="floor")
 
-           
+                with gr.Group() as l14_panel:
+                    gr.Markdown("### L14 — Locked state index")
+                    with gr.Row():
+                        l14_sigma_sl = gr.Slider(0.01, 1.0, value=0.25, step=0.01,
+                                                 label="sigma")
+                        l14_floor_sl = gr.Slider(0.0, 0.5, value=0.03, step=0.005,
+                                                 label="floor")
+                    with gr.Row():
+                        l14_ls_sl = gr.Slider(0.0, 1.0, value=1.0, step=0.01,
+                                              label="lock_strength")
+                        l14_ba_sl = gr.Slider(0.01, 0.99, value=0.5, step=0.01,
+                                              label="blend_alpha")
 
-        # RIGHT panel
-        with gr.Column(scale=1, min_width=360):
+                use_locked_cb.change(
+                    fn=lambda v: gr.update(visible=v),
+                    inputs=use_locked_cb,
+                    outputs=l14_panel,
+                )
 
-            gr.Markdown("### Generated text")
-            output_text = gr.Textbox(label="Output", lines=10, interactive=False)
+            # ── RIGHT panel ──────────────────────────────────────────
+            with gr.Column(scale=1, min_width=360):
 
-            gr.Markdown("### Layer heatmap (P of chosen token per layer x step)")
-            heatmap_out = gr.Plot(label="Layer heatmap")
+                gr.Markdown("### Generated text")
+                output_text = gr.Textbox(label="Output", lines=10,
+                                         interactive=False)
 
-            gr.Markdown("### Step log (first 40 steps)")
-            step_log_box = gr.Textbox(label="Step log", lines=8,
-                                      interactive=False)
+                gr.Markdown("### Layer heatmap (P of chosen token per layer x step)")
+                heatmap_out = gr.Plot(label="Layer heatmap")
 
-            gr.Markdown("### Parameter summary")
-            param_box = gr.Textbox(label="Parameters", lines=12,
-                                   interactive=False)
+                gr.Markdown("### Step log (first 40 steps)")
+                step_log_box = gr.Textbox(label="Step log", lines=8,
+                                          interactive=False)
 
-    run_btn.click(
-        fn=run_generation,
-        inputs=[
-            corpus_file, prompt_box, n_words_sl, use_locked_cb, seed_box,
-            ngram_n_sl, lidstone_sl,
-            temp_sl, top_k_sl, top_p_sl,
-            rep_sl, insight_sl, l12_alpha_sl,
-            l13_sigma_sl, l13_floor_sl,
-            l14_sigma_sl, l14_floor_sl, l14_ls_sl, l14_ba_sl,
-        ],
-        outputs=[output_text, param_box, heatmap_out, step_log_box],
-    )
+                gr.Markdown("### Parameter / preprocessor summary")
+                param_box = gr.Textbox(label="Parameters", lines=18,
+                                       interactive=False)
 
+        run_btn.click(
+            fn=run_generation,
+            inputs=[
+                corpus_file, prompt_box, n_words_sl, use_locked_cb, seed_box,
+                ngram_n_sl, lidstone_sl,
+                temp_sl, top_k_sl, top_p_sl,
+                rep_sl, insight_sl, l12_alpha_sl,
+                l13_sigma_sl, l13_floor_sl,
+                l14_sigma_sl, l14_floor_sl, l14_ls_sl, l14_ba_sl,
+                use_preproc_cb, min_sent_len_sl,
+            ],
+            outputs=[output_text, param_box, heatmap_out, step_log_box],
+        )
+
+    return demo
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Entry point
+# ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    demo.launch(share=False)
+    if _HAS_GRADIO:
+        demo = build_demo()
+        demo.launch(share=False)
+    else:
+        print("gradio not installed; running self-test of the preprocessor instead.\n")
+        sample = (
+            "The cat napped quietly. A noisy parrot squawked twice. "
+            "Tiny mice scurried underground. Brilliant fireworks lit the sky. "
+            "Curious otters fished in the river."
+        )
+        pre = SentenceDatasetPreprocessor(sample, min_sentence_len=3)
+        print(pre.summary())
+        print("\nTraining stream (first 30 tokens):")
+        print(" ".join(pre.tokens[:30]))
+        print("\nArbitrary 'beginnings' sourced from the middle pool:")
+        rng = random.Random(0)
+        for _ in range(5):
+            print(" ", pre.sample_arbitrary(rng=rng))
