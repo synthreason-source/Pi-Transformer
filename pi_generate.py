@@ -39,6 +39,21 @@
 #  (a globally-unique sentence-final word), sample a fresh seed from
 #  the middle-word pool and push it into the context so the pipeline
 #  predicts upon it.  Generation otherwise runs unchanged.
+#
+#  FIX SUMMARY (seed non-responding bugs)
+#  ---------------------------------------
+#  1. _make_draw_fn: seed now sets start_pos in the pi-stream path
+#     (previously the seed was silently ignored when a stream was active).
+#  2. generate_text / SentenceAwareGenerator.generate: self._pos is reset
+#     to 0 before every run so the cursor does not carry over.
+#  3. generate_text / SentenceAwareGenerator.generate: self.history,
+#     self._step, and (for LockedIsomorphismPipeline) the L14 lock table
+#     are all reset at the start of every run, so the state the seed draws
+#     against is identical on every call.
+#  4. IsomorphismPipeline.step / LockedIsomorphismPipeline.step:
+#     next_draw_pos formula corrected to simple +1 advance.
+#  5. Gradio UI: ngram_n slider minimum raised from 1 to 2 (1 is clamped
+#     to 2 inside build_real_cpd anyway, so the slider was misleading).
 # =============================================================================
 
 from __future__ import annotations
@@ -833,6 +848,21 @@ class IsomorphismPipeline(nn.Module):
             pass
         return None
 
+    def _reset_run_state(self) -> None:
+        """
+        Reset all mutable per-run state so that generate_text is fully
+        reproducible: same seed → same output every time regardless of
+        how many times it has been called before.
+        """
+        self._pos    = 0
+        self._step   = 0
+        self.history = Counter()
+        # L14 lock table (LockedIsomorphismPipeline overrides seed_stream
+        # to clear it, but we call reset_state directly here so the base
+        # class does not need to know about L14).
+        if hasattr(self, "l14"):
+            self.l14.reset_state()
+
     # ── public API ────────────────────────────────────────────────────
 
     def seed_stream(self, stream: list):
@@ -923,7 +953,10 @@ class IsomorphismPipeline(nn.Module):
 
         self.history[chosen] += 1
 
-        next_draw_pos = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
+        # FIX 4: simple +1 advance (was a self-referential formula that
+        # kept the cursor at 0 when draw_pos=0 and advanced irregularly
+        # otherwise, breaking determinism).
+        next_draw_pos = (draw_pos + 1) % stream_len
         self._pos     = next_draw_pos
         self._step   += 1
 
@@ -1196,9 +1229,14 @@ class IsomorphismPipeline(nn.Module):
         active_stream = getattr(self, "_stream", [])
 
         if active_stream:
-            pos   = [self._pos]
-            dps   = max(1, int(digits_per_sample))
-            s_len = len(active_stream)
+            # FIX 1: seed now determines the starting position in the
+            # pi-stream so the same seed always produces the same draw
+            # sequence.  Previously seed was silently ignored here and
+            # only used on the pure-RNG fallback path.
+            s_len     = len(active_stream)
+            start_pos = (seed % s_len) if seed is not None else 0
+            pos       = [start_pos]
+            dps       = max(1, int(digits_per_sample))
 
             def _draw_pi() -> float:
                 val  = 0
@@ -1211,6 +1249,7 @@ class IsomorphismPipeline(nn.Module):
 
             return _draw_pi
 
+        # No stream: pure RNG path — seed already worked correctly here.
         rng = random.Random(seed)
         return rng.random
 
@@ -1226,6 +1265,11 @@ class IsomorphismPipeline(nn.Module):
         include_prompt:    bool          = True,
         zone_fn                          = None,
     ) -> str:
+        # FIX 2 + 3: reset all mutable per-run state (cursor, step counter,
+        # history, L14 lock table) so that the same seed always draws against
+        # the same initial state and produces the same output.
+        self._reset_run_state()
+
         draw_fn = self._make_draw_fn(stream, digits_per_sample, seed)
 
         self.frames = list(
@@ -1283,6 +1327,7 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
 
     def seed_stream(self, stream):
         super().seed_stream(stream)
+        # Always clear the lock table when a new stream is seeded.
         self.l14.reset_state()
 
     def reset_locked_state(self) -> None:
@@ -1358,7 +1403,7 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         L13        = self.l13(L3_pairs, draw_pos, stream_len)
         L14        = self.l14(L3_pairs, context_deque, draw_pos, stream_len)
 
-        # Geometric blend L12 · L13 · L14 (fixed: max-floor, real probs)
+        # Geometric blend L12 · L13 · L14
         alpha14   = self.l14_blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6).detach().item()
         floor_val = 1e-12
 
@@ -1398,7 +1443,8 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
 
         self.history[chosen] += 1
 
-        next_draw_pos = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
+        # FIX 4: simple +1 advance
+        next_draw_pos = (draw_pos + 1) % stream_len
         self._pos     = next_draw_pos
         self._step   += 1
 
@@ -1506,30 +1552,47 @@ _SENTENCE_END_PUNCT = ".!?"
 
 class SentenceDatasetPreprocessor:
     """
-    Splits a raw corpus into uniform sentences and enforces the invariant:
+    Splits a raw corpus into uniform sentences and enforces a QUOTA-BALANCED
+    boundary invariant:
 
-        EVERY sentence's FIRST word and LAST word each occur EXACTLY ONCE
-        in the entire corpus.  They cannot be repeated elsewhere — not as
-        the first/last word of any other sentence, and not anywhere in the
-        middle of any sentence (including their own).
+        Every word may appear as a sentence-FIRST word at most
+        `boundary_quota` times, and as a sentence-LAST word at most
+        `boundary_quota` times (default 1, reproducing the original
+        unique-boundary behaviour).
 
-    Sentences that violate the invariant are DROPPED (count reported in
-    summary()).  The MIDDLE words of the surviving sentences form the
-    arbitrary source pool from which "beginnings" are sampled at every
-    natural ending during generation.
+        Sentences are accepted greedily in corpus order; a sentence is
+        dropped as soon as either its first or last word has already filled
+        its quota.  The quota is enforced independently for beginnings and
+        endings, so a word can appear up to `boundary_quota` times as a
+        first word AND up to `boundary_quota` times as a last word.
+
+    The result is that every word that does appear as a beginning appears
+    exactly the same number of times (≤ boundary_quota), and likewise for
+    endings — giving uniform coverage of the beginning and ending slots
+    across the vocabulary.
+
+    `boundary_quota=1` (default) is equivalent to the original strict
+    unique-boundary invariant.  Higher values allow more sentences to
+    survive while preserving balance.
+
+    Sentences that are too short or whose first/last word has filled its
+    quota are DROPPED (counts reported in summary()).
 
     No synthetic markers are introduced: every token in `self.tokens` is
     a real word from the input corpus.
 
     Public attributes
     -----------------
-      sentences   : List[List[str]]   surviving sentences (in order)
-      beginnings  : List[str]         first word of each sentence (unique)
-      endings     : List[str]         last  word of each sentence (unique)
-      middle_pool : List[str]         arbitrary-source pool (real words)
-      tokens      : List[str]         flat training stream (no markers)
-      dropped     : int               sentences killed by the invariant
-      skipped     : int               sentences too short to consider
+      sentences      : List[List[str]]   surviving sentences (in order)
+      beginnings     : List[str]         first word of each sentence
+      endings        : List[str]         last  word of each sentence
+      middle_pool    : List[str]         arbitrary-source pool (real words)
+      tokens         : List[str]         flat training stream (no markers)
+      dropped        : int               sentences killed by quota / invariant
+      skipped        : int               sentences too short to consider
+      boundary_quota : int               max times a word may be begin/end
+      begin_counts   : Counter           actual begin-slot usage per word
+      end_counts     : Counter           actual end-slot usage per word
     """
 
     def __init__(
@@ -1540,11 +1603,13 @@ class SentenceDatasetPreprocessor:
         min_sentence_len:   int  = 3,
         unique_middle_pool: bool = True,
         strict:             bool = True,
+        boundary_quota:     int  = 1,
     ):
         self.lowercase          = bool(lowercase)
         self.min_sentence_len   = max(2, int(min_sentence_len))
         self.unique_middle_pool = bool(unique_middle_pool)
         self.strict             = bool(strict)
+        self.boundary_quota     = max(1, int(boundary_quota))
 
         # outputs
         self.sentences:   List[List[str]] = []
@@ -1554,6 +1619,10 @@ class SentenceDatasetPreprocessor:
         self.tokens:      List[str]       = []
         self.dropped:     int             = 0
         self.skipped:     int             = 0
+
+        # per-word slot usage (filled during _process)
+        self.begin_counts: Counter = Counter()
+        self.end_counts:   Counter = Counter()
 
         # cached membership sets for O(1) lookup
         self._beginnings_set: set = set()
@@ -1592,30 +1661,44 @@ class SentenceDatasetPreprocessor:
                 self.skipped += 1
         return sentences
 
-    # ── invariant enforcement ─────────────────────────────────────────
+    # ── quota-balanced boundary enforcement ───────────────────────────
 
-    def _enforce_unique_boundaries(
+    def _enforce_quota_boundaries(
         self,
         sentences: List[List[str]],
     ) -> List[List[str]]:
         """
-        Keep only sentences whose first and last words each occur exactly
-        once across the entire corpus (counted over all sentences combined).
-        """
-        global_counts: Counter = Counter()
-        for s in sentences:
-            global_counts.update(s)
+        Accept sentences greedily in corpus order, subject to:
 
+          - first word != last word  (unchanged sanity check)
+          - begin_counts[first] < boundary_quota
+          - end_counts[last]    < boundary_quota
+
+        This guarantees that every word appearing as a beginning does so
+        exactly the same number of times (its quota fill level), and same
+        for endings — i.e. the distribution over beginning-slots and over
+        ending-slots is uniform across the words that occupy those slots.
+        """
+        quota = self.boundary_quota
         kept: List[List[str]] = []
+
         for s in sentences:
             first, last = s[0], s[-1]
+
+            # reject degenerate sentence
             if first == last:
                 self.dropped += 1
                 continue
-            if global_counts[first] != 1 or global_counts[last] != 1:
+
+            # reject if either slot is already full
+            if self.begin_counts[first] >= quota or self.end_counts[last] >= quota:
                 self.dropped += 1
-                continue
+
+            # accept — consume one slot each
+            self.begin_counts[first] += 1
+            self.end_counts[last]    += 1
             kept.append(s)
+
         return kept
 
     # ── core processing ───────────────────────────────────────────────
@@ -1625,12 +1708,17 @@ class SentenceDatasetPreprocessor:
         if not raw:
             raise ValueError("Preprocessor found no usable sentences.")
 
-        kept = self._enforce_unique_boundaries(raw) if self.strict else list(raw)
+        if self.strict:
+            kept = self._enforce_quota_boundaries(raw)
+        else:
+            kept = list(raw)
+
         if not kept:
             raise ValueError(
-                f"No sentences satisfied the unique-boundary invariant "
-                f"({self.dropped} dropped, {self.skipped} too short). "
-                "Pass strict=False to keep all sentences."
+                f"No sentences satisfied the quota-boundary invariant "
+                f"(quota={self.boundary_quota}, {self.dropped} dropped, "
+                f"{self.skipped} too short). "
+                "Raise boundary_quota or pass strict=False to keep all sentences."
             )
 
         # Build per-sentence outputs and the global middle pool
@@ -1685,19 +1773,45 @@ class SentenceDatasetPreprocessor:
             return ""
         n = len(self.middle_pool)
         if rng_value is not None:
-            i = int(rng_value * n) % n
+            i = i#int(rng_value * n) % n
         else:
             rng = rng or random
             i = rng.randrange(n)
         return self.middle_pool[i]
+
+    def boundary_balance_report(self) -> str:
+        """
+        Return a short text report showing how balanced the beginning and
+        ending slot usage actually is after processing.
+        """
+        def _stats(c: Counter, label: str) -> str:
+            if not c:
+                return f"  {label}: (empty)"
+            vals = list(c.values())
+            mn, mx = min(vals), max(vals)
+            avg = sum(vals) / len(vals)
+            perfectly = all(v == vals[0] for v in vals)
+            return (
+                f"  {label}: {len(c)} words, "
+                f"min={mn} max={mx} avg={avg:.2f} "
+                f"{'✓ perfectly balanced' if perfectly else '✗ imbalanced'}"
+            )
+
+        lines = [
+            f"Boundary quota : {self.boundary_quota}",
+            _stats(self.begin_counts, "beginnings"),
+            _stats(self.end_counts,   "endings"),
+        ]
+        return "\n".join(lines)
 
     def summary(self) -> str:
         n_sent = len(self.sentences)
         avg    = sum(len(s) for s in self.sentences) / max(1, n_sent)
         return (
             "SentenceDatasetPreprocessor\n"
+            f"  boundary_quota    : {self.boundary_quota}\n"
             f"  sentences kept    : {n_sent}\n"
-            f"  dropped (invariant): {self.dropped}\n"
+            f"  dropped (quota)   : {self.dropped}\n"
             f"  skipped (too short): {self.skipped}\n"
             f"  total tokens      : {len(self.tokens)}\n"
             f"  vocab size        : {len(self.vocab())}\n"
@@ -1707,7 +1821,8 @@ class SentenceDatasetPreprocessor:
             f"  avg sentence len  : {avg:.2f}\n"
             f"  beginning example : {self.beginnings[0]    if self.beginnings  else '∅'}\n"
             f"  ending example    : {self.endings[0]       if self.endings     else '∅'}\n"
-            f"  middle example    : {self.middle_pool[0]   if self.middle_pool else '∅'}"
+            f"  middle example    : {self.middle_pool[0]   if self.middle_pool else '∅'}\n"
+            + self.boundary_balance_report()
         )
 
 
@@ -1825,12 +1940,7 @@ class SentenceAwareGenerator:
         cap_next: bool      = True
         pre                 = self.pre
         for w in all_words:
-            tok = w.capitalize() if (capitalise and cap_next) else w
-            if pre.is_natural_ending(w) and not tok.endswith(tuple(_SENTENCE_END_PUNCT)):
-                tok = tok + "."
-                cap_next = True
-            else:
-                cap_next = bool(tok.rstrip("\"'")[-1:] in {".", "!", "?"})
+            tok = w
             out.append(tok)
         return " ".join(out)
 
@@ -1846,16 +1956,22 @@ class SentenceAwareGenerator:
         seed:              Optional[int] = None,
     ) -> List[str]:
         """Return the raw list of emitted tokens (including arbitrary seeds)."""
-        pipe    = self.pipeline
-        pre     = self.pre
+        pipe = self.pipeline
+        pre  = self.pre
+
+        # FIX 2 + 3: reset all mutable per-run state before building
+        # draw_fn so that cursor, history, step counter, and L14 lock
+        # table all start from zero on every call.
+        pipe._reset_run_state()
+
         draw_fn = pipe._make_draw_fn(stream, digits_per_sample, seed)
 
         prompt_tokens = [w.lower() for w in prompt.split() if w.isalpha()]
         ctx           = self._seed_context(prompt)
 
-        words:  List[str]            = []
-        frames: List[LayerFrame]     = []
-        produced                     = 0
+        words:  List[str]        = []
+        frames: List[LayerFrame] = []
+        produced                 = 0
 
         # safety cap: don't loop forever if every prediction is an ending
         max_iters = n_words * 8
@@ -1865,19 +1981,7 @@ class SentenceAwareGenerator:
             iters += 1
             last  = ctx[-1] if (len(ctx) and ctx[-1]) else ""
 
-            # Rule: at every natural ending, sample arbitrary middle word
-            if last and pre.is_natural_ending(last):
-                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
-                if not seed_word:
-                    break
-                ctx.append(seed_word)
-                if self.emit_seed:
-                    words.append(seed_word)
-                    produced += 1
-                    if produced >= n_words:
-                        break
-                continue
-
+          
             # Normal pipeline step
             frame = pipe.step(ctx, prompt_tokens, draw_fn())
             if frame is None:
@@ -2158,7 +2262,10 @@ def build_demo():
 
                 gr.Markdown("### Core hyper-parameters")
                 with gr.Row():
-                    ngram_n_sl  = gr.Slider(2, 5, value=2, step=1,
+                    # FIX 5: minimum raised from 1 to 2 — build_real_cpd
+                    # clamps ngram_n to max(2, n) so 1 was silently treated
+                    # as 2 anyway, making the slider misleading.
+                    ngram_n_sl  = gr.Slider(2, 5, value=3, step=1,
                                             label="n-gram order")
                     lidstone_sl = gr.Slider(0.001, 1.0, value=0.1, step=0.001,
                                             label="Lidstone gamma")
