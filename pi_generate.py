@@ -1567,7 +1567,6 @@ class SentenceDatasetPreprocessor:
     def _tokenize_sentences(self, text: str) -> List[List[str]]:
         if self.lowercase:
             text = text.lower()
-        text = text.split()
 
         sentences: List[List[str]] = []
         current:   List[str]       = []
