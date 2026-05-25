@@ -472,7 +472,7 @@ class L11_TensorBlend(nn.Module):
         row_weights = F.softmax(self.zone_weights, dim=0)
 
         blended = (zone_matrix * row_weights.unsqueeze(1)).sum(dim=0)
-        blended = _normalise(blended.clamp(min=float(self.eps)))
+        blended = _normalise(blended.clamp(min=self.eps.detach().item()))
 
         words = [w for w, _ in candidates]
         return {
@@ -635,8 +635,8 @@ class L14_LockedStateIndex(nn.Module):
 
         if key and key in self._locked:
             locked_token = self._locked[key]
-            f = float(floor)
-            w = float(lockw)
+            f = floor.detach().item()
+            w = lockw.detach().item()
 
             weights = torch.full((n,), f, dtype=torch.float64)
             if locked_token in words:
@@ -1359,7 +1359,7 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         L14        = self.l14(L3_pairs, context_deque, draw_pos, stream_len)
 
         # Geometric blend L12 · L13 · L14 (fixed: max-floor, real probs)
-        alpha14   = float(self.l14_blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6))
+        alpha14   = self.l14_blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6).detach().item()
         floor_val = 1e-12
 
         l12_map = dict(L12_pairs)
