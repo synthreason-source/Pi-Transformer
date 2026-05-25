@@ -2158,7 +2158,7 @@ def build_demo():
 
                 gr.Markdown("### Core hyper-parameters")
                 with gr.Row():
-                    ngram_n_sl  = gr.Slider(2, 5, value=3, step=1,
+                    ngram_n_sl  = gr.Slider(2, 5, value=2, step=1,
                                             label="n-gram order")
                     lidstone_sl = gr.Slider(0.001, 1.0, value=0.1, step=0.001,
                                             label="Lidstone gamma")
