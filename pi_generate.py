@@ -46,7 +46,7 @@ except Exception:  # gradio is optional at import time
 
 from datasets import load_dataset, DatasetDict
 
-
+path = input("Filename: ")
 # ═══════════════════════════════════════════════════════════════════════════
 #  Field spec helpers (used by HFSentenceDatasetPreprocessor)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -222,7 +222,58 @@ HF_DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
     "openbookqa":        {"config_name": "main",
                           "text_fields": ["question_stem", "choices.text"]},
 }
+def build_textfile_pipeline(
+    path: str,
+    *,
+    locked: bool = True,
+    ngramn: int = 3,
+    lidstonegamma: float = 0.1,
+    sentence_split: str = "line",   # "line" | "sentence" | "none"
+    min_sentence_len: int = 3,
+    pipeline_kwargs: Optional[Dict] = None,
+) -> "IsomorphismPipeline":
+    """
+    Build a pipeline directly from a plain .txt file.
+    No HF dataset or preprocessor involved — corpus text feeds
+    straight into buildrealcpd + buildrealcontextindex.
 
+    sentence_split:
+        "line"     – each non-empty line is one sentence boundary
+        "sentence" – split on  .  !  ?  (simple regex)
+        "none"     – treat whole file as one token stream
+    """
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        raw = fh.read()
+    if not raw.strip():
+        raise ValueError(f"Text file is empty: {path!r}")
+
+    if sentence_split == "line":
+        corpus = " ".join(
+            line.strip() for line in raw.splitlines() if line.strip()
+        )
+    elif sentence_split == "sentence":
+        import re as _re
+        corpus = " ".join(
+            s.strip()
+            for s in _re.split(r"(?<=[.!?])\s+", raw)
+            if len(s.split()) >= min_sentence_len
+        )
+    else:
+        corpus = raw
+
+    cpd, vocab, tokens = buildrealcpd(
+        corpus, ngramn=int(ngramn), lidstonegamma=float(lidstonegamma)
+    )
+    ctxidx = buildrealcontextindex(vocab, cpd, tokens)
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs: Dict[str, Any] = dict(
+        cpd=cpd, contextindex=ctxidx, vocab=vocab, ngramn=int(ngramn)
+    )
+    if pipeline_kwargs:
+        kwargs.update(pipeline_kwargs)
+    pipe = cls(**kwargs)
+    pipe.source_text = corpus      # stash for save/reload
+    return pipe
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Generic HF dataset preprocessor with correlated unique-middle-pool
@@ -2496,7 +2547,9 @@ def build_hf_pipeline_from_preset(
         spec.update(preprocessor_overrides)
 
     pre = HFSentenceDatasetPreprocessor(minsentencelen=minsentencelen, **spec)
-    corpus = pre.tocorpus()
+    
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        corpus = fh.read()
     cpd, vocab, tokens = build_real_cpd(
         corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
     )
@@ -2563,89 +2616,6 @@ def _make_step_log(frames, limit=40):
     if len(frames) > limit:
         lines.append("... ({} more steps not shown)".format(len(frames) - limit))
     return "\n".join(lines)
-
-
-def run_generation(
-    corpus_file, prompt, n_words, use_locked, seed,
-    ngram_n, lidstone_gamma,
-    temperature, top_k, top_p,
-    rep_penalty, insight_penalty, l12_blend_alpha,
-    l13_sigma, l13_floor,
-    l14_sigma, l14_floor, l14_lock_strength, l14_blend_alpha,
-    progress=None,
-):
-    if gr is not None and progress is None:
-        progress = gr.Progress(track_tqdm=True)
-
-    if corpus_file is None:
-        return "Please upload a corpus .txt file.", "", None, ""
-    try:
-        path = corpus_file.name if hasattr(corpus_file, "name") else str(corpus_file)
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            corpus_text = fh.read()
-    except Exception as exc:
-        return "Could not read corpus file:\n{}".format(exc), "", None, ""
-
-    if not corpus_text.strip():
-        return "The uploaded corpus file is empty.", "", None, ""
-    if not str(prompt).strip():
-        return "Please enter a prompt.", "", None, ""
-
-    try:
-        if progress is not None:
-            progress(0.10, desc="Building CPD & context index ...")
-        cpd, vocab, tokens = build_real_cpd(
-            corpus_text, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma)
-        )
-        ctx_idx = build_real_context_index(vocab, cpd, tokens)
-
-        if progress is not None:
-            progress(0.40, desc="Constructing pipeline ...")
-        cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
-        kwargs = dict(
-            cpd=cpd, context_index=ctx_idx, vocab=vocab,
-            ngram_n=int(ngram_n),
-            temperature=float(temperature),
-            top_k=int(top_k), top_p=float(top_p),
-            rep_penalty=float(rep_penalty),
-            insight_penalty=float(insight_penalty),
-            l12_blend_alpha=float(l12_blend_alpha),
-            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
-        )
-        if bool(use_locked):
-            kwargs.update(
-                l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
-                l14_lock_strength=float(l14_lock_strength),
-                l14_blend_alpha=float(l14_blend_alpha),
-            )
-        pipe = cls(**kwargs)
-
-        if progress is not None:
-            progress(0.60, desc="Generating text ...")
-        seed_val = int(seed) if seed is not None else None
-        text = pipe.generate_text(
-            prompt=str(prompt).strip(),
-            n_words=int(n_words),
-            seed=seed_val,
-        )
-
-        if progress is not None:
-            progress(0.85, desc="Building heatmap ...")
-        frames = getattr(pipe, "frames", [])
-        heatmap = _make_heatmap(frames)
-        step_log = _make_step_log(frames)
-
-        param_summary = pipe.param_summary()
-        if bool(use_locked) and hasattr(pipe, "lock_table_summary"):
-            param_summary += "\n\n" + pipe.lock_table_summary()
-
-        if progress is not None:
-            progress(1.0, desc="Done!")
-        return text, param_summary, heatmap, step_log
-
-    except Exception:
-        return "Error:\n\n{}".format(traceback.format_exc()), "", None, ""
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Demo
