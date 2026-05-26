@@ -35,6 +35,7 @@ import torch.nn.functional as F
 import gradio as gr
 from datasets import load_dataset, Dataset, DatasetDict
 import re
+import random
 
 from dataclasses import dataclass, asdict
 @dataclass
@@ -71,7 +72,7 @@ class HFAnyDatasetPreprocessor:
         dataset_name: str,
         config_name: str | None = None,
         split_names: Sequence[str] = ("train",),
-        text_fields: Sequence[str] = ("text",),
+        text_fields: Sequence[str] = ("messages",),
         id_field: str | None = "id",
         lowercase: bool = True,
         minsentencelen: int = 3,
@@ -305,7 +306,7 @@ class HFAnyDatasetPreprocessor:
     def isnaturalending(self, token: str) -> bool:
         return token in self.endingsset
 
-    def samplearbitrary(
+    def sample_arbitrary(
         self,
         rngvalue: Optional[float] = None,
         rng: Optional[random.Random] = None,
@@ -487,7 +488,7 @@ class SentenceAwareGenerator:
                 # dead context — arbitrary restart from the middle pool
                 ctx.clear()
                 ctx.extend([""] * pipe.context_window)
-                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
+                seed_word = pre.sample_arbitrary()
                 if not seed_word:
                     break
                 ctx.append(seed_word)
@@ -2246,7 +2247,7 @@ def buildhfsquadpipeline(
     return pipe, pre
 if __name__ == "__main__":
     pipe, pre = buildhfsquadpipeline(
-        dataset_name="imdb",
+        dataset_name="angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k",
         locked=True,
         ngram_n=3,
         lidstone_gamma=0.1,
