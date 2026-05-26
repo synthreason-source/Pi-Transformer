@@ -495,7 +495,7 @@ class SentenceAwareGenerator:
         produced                 = 0
 
         # safety cap: don't loop forever if every prediction is an ending
-        max_iters = n_words * 8
+        max_iters = n_words * 80
         iters     = 0
 
         while produced < n_words and iters < max_iters:
@@ -2266,46 +2266,883 @@ def buildhfsquadpipeline(
     pipe = cls(**kwargs)
     pipe.preprocessor = pre
     return pipe, pre
-if __name__ == "__main__":
-    pipe, pre = buildhfsquadpipeline(
-        dataset_name="squad",
-        locked=True,
-        ngram_n=2,
-        lidstone_gamma=0.1,
-        minsentencelen=3,
-        pipelinekwargs=dict(
-            temperature=4.3,
-            top_k=100,
-            top_p=1.0,
-            rep_penalty=1.13,
-            insight_penalty=3.95,
-            l12_blend_alpha=0.5,
-            l13_sigma=0.30,
-            l13_floor=0.04,
-            l14_sigma=0.25,
-            l14_floor=0.03,
-            l14_lock_strength=1.0,
-            l14_blend_alpha=0.5,
-        ),
-        preprocessorkwargs=dict(
+# =============================================================================
+#  hf_dataset_preprocessor.py
+#
+#  Generic Hugging Face dataset preprocessor for the isomorphism pipeline.
+#
+#  Replaces (and supersedes) HFSquadSentenceDatasetPreprocessor with a
+#  schema-agnostic version that works on any dataset on the Hub.
+#
+#  Public API surface mirrors SentenceDatasetPreprocessor exactly enough
+#  that SentenceAwareGenerator, build_real_cpd, build_real_context_index,
+#  and the rest of layer_isomorphism_torch.py continue to work unchanged.
+#
+#  Drop this file next to layer_isomorphism_torch.py and import from it.
+# =============================================================================
+
+
+import random
+import re
+from collections import Counter
+from dataclasses import dataclass, asdict
+from typing import (
+    Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union,
+)
+
+from datasets import load_dataset
+
+
+# -----------------------------------------------------------------------------
+# Field spec
+# -----------------------------------------------------------------------------
+#
+# A field spec is either:
+#   * a dotted-path string:  "context"  /  "answers.text"  /  "translation.en"
+#       - supports list indexing: "answers.text[0]"
+#       - resolves to: a string, a list of strings, a number, or None
+#
+#   * a callable:  fn(example) -> str | list[str] | None
+#       - use this for anything the dotted-path syntax can't express
+#         (e.g. join a list of turns, format a label, conditional logic)
+#
+FieldSpec = Union[str, Callable[[Dict[str, Any]], Union[str, List[str], None]]]
+
+
+_INDEXED_PART_RE = re.compile(r"^([^\[]+)\[(\d+)\]$")
+
+
+def _resolve_path(obj: Any, path: str) -> Any:
+    """Walk a dotted path through nested dicts/lists. Returns None on miss."""
+    if obj is None:
+        return None
+    cur = obj
+    for part in path.split("."):
+        m = _INDEXED_PART_RE.match(part)
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            else:
+                return None
+            if not isinstance(cur, (list, tuple)) or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _extract_field(example: Dict, spec: FieldSpec) -> str:
+    """Resolve a FieldSpec into a single string."""
+    if callable(spec):
+        val = spec(example)
+    else:
+        val = _resolve_path(example, spec)
+
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (list, tuple)):
+        parts: List[str] = []
+        for v in val:
+            if isinstance(v, str) and v:
+                parts.append(v)
+            elif isinstance(v, (int, float, bool)):
+                parts.append(str(v))
+            elif isinstance(v, dict):
+                parts.append(" ".join(
+                    str(x) for x in v.values() if isinstance(x, (str, int, float))
+                ))
+        return " ".join(parts)
+    if isinstance(val, (int, float, bool)):
+        return str(val)
+    if isinstance(val, dict):
+        return " ".join(str(v) for v in val.values() if isinstance(v, (str, int, float)))
+    return str(val)
+
+
+# -----------------------------------------------------------------------------
+# Audit record
+# -----------------------------------------------------------------------------
+
+@dataclass
+class HFGenericRecord:
+    split: str
+    original_index: int
+    id: str
+    tokens: List[str]
+    first_token: str
+    last_token: str
+    kept: bool
+    drop_reason: str
+    raw_text: str
+
+
+# -----------------------------------------------------------------------------
+# Preset registry — common HF datasets in one line.
+# -----------------------------------------------------------------------------
+#
+# Each value is a dict of constructor kwargs.  Override anything you want
+# at call time, e.g.:
+#   HFSentenceDatasetPreprocessor.from_preset("cnn_dailymail", boundaryquota=2)
+#
+HF_DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
+    # ── Question answering ───────────────────────────────────────────
+    "squad":             {"text_fields": ["question", "context", "answers.text"]},
+    "squad_v2":          {"text_fields": ["question", "context", "answers.text"]},
+    "trivia_qa":         {"config_name": "rc",
+                          "text_fields": ["question", "answer.value"]},
+    "hotpot_qa":         {"config_name": "distractor",
+                          "text_fields": ["question", "answer"]},
+
+    # ── Text classification (single-text) ────────────────────────────
+    "imdb":              {"text_fields": ["text"]},
+    "ag_news":           {"text_fields": ["text"]},
+    "yelp_review_full":  {"text_fields": ["text"]},
+    "yelp_polarity":     {"text_fields": ["text"]},
+    "amazon_polarity":   {"text_fields": ["title", "content"]},
+    "dbpedia_14":        {"text_fields": ["title", "content"]},
+    "tweet_eval":        {"config_name": "emotion", "text_fields": ["text"]},
+
+    # ── GLUE family (override config_name to switch task) ────────────
+    "glue_sst2":         {"dataset_name": "glue", "config_name": "sst2",
+                          "text_fields": ["sentence"]},
+    "glue_cola":         {"dataset_name": "glue", "config_name": "cola",
+                          "text_fields": ["sentence"]},
+    "glue_mrpc":         {"dataset_name": "glue", "config_name": "mrpc",
+                          "text_fields": ["sentence1", "sentence2"]},
+    "glue_qqp":          {"dataset_name": "glue", "config_name": "qqp",
+                          "text_fields": ["question1", "question2"]},
+    "glue_mnli":         {"dataset_name": "glue", "config_name": "mnli",
+                          "text_fields": ["premise", "hypothesis"]},
+
+    # ── Summarisation ────────────────────────────────────────────────
+    "cnn_dailymail":     {"config_name": "3.0.0",
+                          "text_fields": ["article", "highlights"]},
+    "xsum":              {"text_fields": ["document", "summary"]},
+    "billsum":           {"text_fields": ["text", "summary"]},
+    "samsum":            {"text_fields": ["dialogue", "summary"]},
+    "multi_news":        {"text_fields": ["document", "summary"]},
+    "reddit_tifu":       {"config_name": "long",
+                          "text_fields": ["title", "documents", "tldr"]},
+
+    # ── Language modelling ───────────────────────────────────────────
+    "wikitext":          {"config_name": "wikitext-2-raw-v1",
+                          "text_fields": ["text"]},
+    "wikitext_103":      {"dataset_name": "wikitext",
+                          "config_name": "wikitext-103-raw-v1",
+                          "text_fields": ["text"]},
+    "bookcorpus":        {"text_fields": ["text"]},
+    "openwebtext":       {"text_fields": ["text"]},
+    "c4":                {"config_name": "en", "streaming": True,
+                          "text_fields": ["text"]},
+
+    # ── Dialogue ─────────────────────────────────────────────────────
+    "daily_dialog":      {"text_fields": [
+                              lambda ex: " ".join(ex.get("dialog", []) or [])
+                          ]},
+    "blended_skill_talk":{"text_fields": [
+                              lambda ex: " ".join(ex.get("free_messages", []) or []),
+                              lambda ex: " ".join(ex.get("guided_messages", []) or []),
+                          ]},
+    "empathetic_dialogues":{"text_fields": ["prompt", "utterance"]},
+
+    # ── Translation (English side; flip the lambda for other side) ───
+    "wmt14_de_en":       {"dataset_name": "wmt14", "config_name": "de-en",
+                          "text_fields": ["translation.en"]},
+    "wmt16_de_en":       {"dataset_name": "wmt16", "config_name": "de-en",
+                          "text_fields": ["translation.en"]},
+    "opus_books":        {"config_name": "en-fr",
+                          "text_fields": ["translation.en"]},
+
+    # ── NER / token classification (flatten the token list) ──────────
+    "conll2003":         {"text_fields": [
+                              lambda ex: " ".join(ex.get("tokens", []) or [])
+                          ]},
+    "wnut_17":           {"text_fields": [
+                              lambda ex: " ".join(ex.get("tokens", []) or [])
+                          ]},
+
+    # ── Common-sense / multiple choice ───────────────────────────────
+    "commonsense_qa":    {"text_fields": ["question", "choices.text"]},
+    "openbookqa":        {"config_name": "main",
+                          "text_fields": ["question_stem", "choices.text"]},
+}
+
+
+# -----------------------------------------------------------------------------
+# The generic preprocessor
+# -----------------------------------------------------------------------------
+
+class HFSentenceDatasetPreprocessor:
+    """
+    Generic HF-dataset preprocessor that enforces the same quota-balanced
+    boundary invariant as SentenceDatasetPreprocessor.
+
+    Each surviving dataset entity becomes one token sequence. Acceptance
+    is greedy in dataset order. With boundaryquota=1 you get globally
+    unique sequence beginnings AND endings, which is what the
+    L7/L14/SentenceAwareGenerator stack relies on.
+
+    Quick start
+    -----------
+        # Use a preset (one-liner)
+        pre = HFSentenceDatasetPreprocessor.from_preset("imdb")
+
+        # Custom — pick fields yourself
+        pre = HFSentenceDatasetPreprocessor(
+            "squad",
+            text_fields=["question", "context", "answers.text"],
             boundaryquota=1,
-            strict=True,
-            lowercase=True,
-            uniquemiddlepool=True,
-            qca_mode="question_context_answer",
-            sep_qc=None,
-            sep_ca=None,
-        ),
+        )
+
+        # Auto-detect text fields (good for simple single/dual-text datasets)
+        pre = HFSentenceDatasetPreprocessor("ag_news")
+
+        # Streaming for huge datasets — cap with max_examples_per_split
+        pre = HFSentenceDatasetPreprocessor(
+            "c4", config_name="en",
+            text_fields=["text"],
+            streaming=True,
+            max_examples_per_split=10_000,
+        )
+
+    Parameters
+    ----------
+    dataset_name : str
+        Dataset id on the HF Hub (e.g. "squad", "imdb", "cnn_dailymail").
+    config_name : str | None
+        Required for multi-config datasets (e.g. "wikitext-2-raw-v1").
+    text_fields : Sequence[FieldSpec] | None
+        Ordered list of dotted paths or callables. None = auto-detect.
+    split_names : Sequence[str] | None
+        Which splits to pull from. None = every split the dataset exposes.
+    field_sep : str | None
+        Optional separator token inserted between fields when joining.
+    lowercase : bool
+        Lowercase before tokenisation.
+    minsentencelen : int
+        Drop entities shorter than this (in tokens).
+    max_examples_per_split : int | None
+        Hard cap for streaming or just to keep things small.
+    uniquemiddlepool : bool
+        Deduplicate middle-pool tokens (matches SentenceDatasetPreprocessor).
+    strict : bool
+        Enforce the boundary quota.  Disable to keep every entity.
+    boundaryquota : int
+        Per-token cap on appearances as first/last token. 1 = globally unique.
+    streaming : bool
+        Pass through to load_dataset; auto-detect of fields is skipped.
+    trust_remote_code : bool
+        Some HF datasets require this in recent versions.
+    id_field : FieldSpec | None
+        Where to read a per-example id. Falls back to common keys, then split-idx.
+    token_pattern : str | None
+        Regex tokeniser; None = whitespace split.
+    keep_alpha_only : bool
+        Filter to alpha-only tokens after tokenisation.
+    exclude_auto_fields : Sequence[str]
+        When auto-detecting, skip columns with these names (ids, urls, ...).
+    """
+
+    DEFAULT_EXCLUDED_AUTO = (
+        "id", "uid", "_id", "example_id", "qid",
+        "url", "title", "source", "filename", "doc_id", "subset",
     )
 
-    print(pre.summary())
-    while True:
-        gen = SentenceAwareGenerator(pipe, pre)
-        text = gen.generate_text(
-            prompt=input("USER: "),
-            n_words=800,
-            seed=42,
-            capitalise=True,
+    # ─────────────────────────────────────────────────────────────────
+    # construction
+    # ─────────────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        dataset_name: str,
+        config_name: Optional[str] = None,
+        text_fields: Optional[Sequence[FieldSpec]] = None,
+        *,
+        split_names: Optional[Sequence[str]] = None,
+        field_sep: Optional[str] = None,
+        lowercase: bool = True,
+        minsentencelen: int = 3,
+        max_examples_per_split: Optional[int] = None,
+        uniquemiddlepool: bool = True,
+        strict: bool = True,
+        boundaryquota: int = 1,
+        streaming: bool = False,
+        trust_remote_code: bool = False,
+        id_field: Optional[FieldSpec] = None,
+        token_pattern: Optional[str] = None,
+        keep_alpha_only: bool = False,
+        exclude_auto_fields: Sequence[str] = DEFAULT_EXCLUDED_AUTO,
+    ):
+        self.dataset_name = dataset_name
+        self.config_name = config_name
+        self.text_fields: Optional[List[FieldSpec]] = (
+            list(text_fields) if text_fields else None
         )
-        print(text)
+        self.split_names = tuple(split_names) if split_names else None
+        self.field_sep = field_sep
+        self.lowercase = bool(lowercase)
+        self.minsentencelen = max(2, int(minsentencelen))
+        self.max_examples_per_split = max_examples_per_split
+        self.uniquemiddlepool = bool(uniquemiddlepool)
+        self.strict = bool(strict)
+        self.boundaryquota = max(1, int(boundaryquota))
+        self.streaming = bool(streaming)
+        self.trust_remote_code = bool(trust_remote_code)
+        self.id_field = id_field
+        self.token_pattern = token_pattern
+        self.keep_alpha_only = bool(keep_alpha_only)
+        self.exclude_auto_fields = set(exclude_auto_fields)
+
+        # outputs (match SentenceDatasetPreprocessor)
+        self.sentences: List[List[str]] = []
+        self.beginnings: List[str] = []
+        self.endings: List[str] = []
+        self.middlepool: List[str] = []
+        self.tokens: List[str] = []
+
+        self.records: List[HFGenericRecord] = []
+        self.keptrecords: List[HFGenericRecord] = []
+        self.droppedrecords: List[HFGenericRecord] = []
+
+        self.dropped = 0
+        self.skipped = 0
+        self.begincounts: Counter = Counter()
+        self.endcounts: Counter = Counter()
+
+        self.beginningsset: Set[str] = set()
+        self.endingsset: Set[str] = set()
+        self.middleset: Set[str] = set()
+
+        # bookkeeping
+        self._auto_detected_fields: List[str] = []
+        self._detected_splits: List[str] = []
+
+        self.process()
+
+    # ─────────────────────────────────────────────────────────────────
+    # preset constructor
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_preset(cls, preset_name: str, **overrides) -> "HFSentenceDatasetPreprocessor":
+        """Build from a registered preset; any kwargs override the preset."""
+        if preset_name not in HF_DATASET_PRESETS:
+            raise KeyError(
+                f"Unknown preset {preset_name!r}. "
+                f"Available: {sorted(HF_DATASET_PRESETS)}"
+            )
+        spec = dict(HF_DATASET_PRESETS[preset_name])
+        spec.setdefault("dataset_name", preset_name)
+        spec.update(overrides)
+        return cls(**spec)
+
+    # ─────────────────────────────────────────────────────────────────
+    # tokenisation
+    # ─────────────────────────────────────────────────────────────────
+
+    def _tokenize(self, text: str) -> List[str]:
+        if not text:
+            return []
+        if self.lowercase:
+            text = text.lower()
+        if self.token_pattern:
+            toks = re.findall(self.token_pattern, text)
+        else:
+            toks = text.split()
+        if self.keep_alpha_only:
+            toks = [t for t in toks if t.isalpha()]
+        return toks
+
+    # ─────────────────────────────────────────────────────────────────
+    # dataset loading
+    # ─────────────────────────────────────────────────────────────────
+
+    def _load(self):
+        kwargs: Dict[str, Any] = {"streaming": self.streaming}
+        if self.trust_remote_code:
+            kwargs["trust_remote_code"] = True
+        if self.config_name is None:
+            return load_dataset(self.dataset_name, **kwargs)
+        return load_dataset(self.dataset_name, self.config_name, **kwargs)
+
+    # ─────────────────────────────────────────────────────────────────
+    # auto-detect string-valued fields
+    # ─────────────────────────────────────────────────────────────────
+
+    def _autodetect_fields(self, dsd) -> List[str]:
+        """Pick every Value('string') / Sequence(Value('string')) feature."""
+        try:
+            from datasets import Value
+            from datasets import Sequence as HFSequence
+        except Exception:  # pragma: no cover - very old datasets versions
+            return []
+
+        # find the first split that exposes .features
+        feats = None
+        for name in dsd:
+            split_obj = dsd[name]
+            if hasattr(split_obj, "features") and split_obj.features is not None:
+                feats = split_obj.features
+                break
+        if feats is None:
+            return []
+
+        detected: List[str] = []
+        for name, feat in feats.items():
+            if name in self.exclude_auto_fields:
+                continue
+            try:
+                if isinstance(feat, Value) and feat.dtype == "string":
+                    detected.append(name)
+                elif isinstance(feat, HFSequence):
+                    inner = feat.feature
+                    if isinstance(inner, Value) and inner.dtype == "string":
+                        detected.append(name)
+                elif isinstance(feat, list) and feat:
+                    inner = feat[0]
+                    if isinstance(inner, Value) and inner.dtype == "string":
+                        detected.append(name)
+            except Exception:
+                continue
+        return detected
+
+    # ─────────────────────────────────────────────────────────────────
+    # text assembly
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_text(self, example: Dict) -> str:
+        parts: List[str] = []
+        for spec in self.text_fields or []:
+            chunk = _extract_field(example, spec)
+            if chunk:
+                if self.field_sep and parts:
+                    parts.append(self.field_sep)
+                parts.append(chunk)
+        return " ".join(parts).strip()
+
+    def _make_id(self, split: str, idx: int, example: Dict) -> str:
+        if self.id_field is not None:
+            v = _extract_field(example, self.id_field)
+            if v:
+                return v
+        for k in ("id", "uid", "_id", "example_id", "qid"):
+            if k in example and example[k] is not None:
+                return str(example[k])
+        return f"{split}-{idx}"
+
+    # ─────────────────────────────────────────────────────────────────
+    # iteration
+    # ─────────────────────────────────────────────────────────────────
+
+    def _iter(self):
+        dsd = self._load()
+
+        # discover splits
+        try:
+            all_splits = list(dsd.keys())
+        except Exception:
+            all_splits = ["train"]
+        self._detected_splits = list(all_splits)
+
+        splits = self.split_names or all_splits
+
+        # auto-detect fields if user didn't supply any
+        if not self.text_fields:
+            if self.streaming:
+                raise ValueError(
+                    "Auto-detection of text_fields is not supported in streaming "
+                    "mode. Pass text_fields=[...] explicitly."
+                )
+            self.text_fields = self._autodetect_fields(dsd)
+            self._auto_detected_fields = [
+                s for s in self.text_fields if isinstance(s, str)
+            ]
+            if not self.text_fields:
+                raise ValueError(
+                    f"Could not auto-detect any string-valued text fields in "
+                    f"{self.dataset_name!r}. Pass text_fields=[...] explicitly."
+                )
+
+        for split in splits:
+            if split not in dsd:
+                continue
+            ds = dsd[split]
+            limit = self.max_examples_per_split
+            for idx, ex in enumerate(ds):
+                if limit is not None and idx >= limit:
+                    break
+                yield split, idx, ex
+
+    # ─────────────────────────────────────────────────────────────────
+    # per-example record + quota enforcement
+    # ─────────────────────────────────────────────────────────────────
+
+    def _record(self, split: str, idx: int, ex: Dict) -> HFGenericRecord:
+        raw = self._build_text(ex)
+        toks = self._tokenize(raw)
+        rid = self._make_id(split, idx, ex)
+
+        if len(toks) < self.minsentencelen:
+            self.skipped += 1
+            return HFGenericRecord(
+                split=split, original_index=idx, id=rid, tokens=toks,
+                first_token=toks[0] if toks else "",
+                last_token=toks[-1] if toks else "",
+                kept=False, drop_reason=f"too_short_lt_{self.minsentencelen}",
+                raw_text=raw,
+            )
+
+        first, last = toks[0], toks[-1]
+
+        if self.strict:
+            if self.begincounts[first] >= self.boundaryquota:
+                self.dropped += 1
+                return HFGenericRecord(
+                    split=split, original_index=idx, id=rid, tokens=toks,
+                    first_token=first, last_token=last,
+                    kept=False, drop_reason=f"begin_quota_full:{first}",
+                    raw_text=raw,
+                )
+            if self.endcounts[last] >= self.boundaryquota:
+                self.dropped += 1
+                return HFGenericRecord(
+                    split=split, original_index=idx, id=rid, tokens=toks,
+                    first_token=first, last_token=last,
+                    kept=False, drop_reason=f"end_quota_full:{last}",
+                    raw_text=raw,
+                )
+            self.begincounts[first] += 1
+            self.endcounts[last] += 1
+
+        return HFGenericRecord(
+            split=split, original_index=idx, id=rid, tokens=toks,
+            first_token=first, last_token=last,
+            kept=True, drop_reason="", raw_text=raw,
+        )
+
+    def process(self) -> None:
+        orderedpool: List[str] = []
+        for split, idx, ex in self._iter():
+            rec = self._record(split, idx, ex)
+            self.records.append(rec)
+            if rec.kept:
+                self.keptrecords.append(rec)
+                s = rec.tokens
+                self.sentences.append(s)
+                self.beginnings.append(s[0])
+                self.endings.append(s[-1])
+                orderedpool.extend(s[1:-1])
+                self.tokens.extend(s)
+            else:
+                self.droppedrecords.append(rec)
+
+        if self.uniquemiddlepool:
+            seen: Set[str] = set()
+            self.middlepool = []
+            for w in orderedpool:
+                if w not in seen:
+                    seen.add(w)
+                    self.middlepool.append(w)
+        else:
+            self.middlepool = orderedpool
+
+        self.beginningsset = set(self.beginnings)
+        self.endingsset = set(self.endings)
+        self.middleset = set(self.middlepool)
+
+        if not self.sentences:
+            raise ValueError(
+                f"No entities from {self.dataset_name!r} survived the "
+                f"quota-boundary invariant (quota={self.boundaryquota}, "
+                f"dropped={self.dropped}, skipped={self.skipped}). "
+                f"Try loosening minsentencelen, raising boundaryquota, "
+                f"or widening text_fields."
+            )
+
+    # ─────────────────────────────────────────────────────────────────
+    # API surface (mirrors SentenceDatasetPreprocessor)
+    # ─────────────────────────────────────────────────────────────────
+
+    def tocorpus(self) -> str:
+        return " ".join(self.tokens)
+
+    def vocab(self) -> set:
+        return set(self.tokens)
+
+    def isbeginning(self, token: str) -> bool:
+        return token in self.beginningsset
+
+    def isnaturalending(self, token: str) -> bool:
+        return token in self.endingsset
+
+    def samplearbitrary(
+        self,
+        rngvalue: Optional[float] = None,
+        rng: Optional[random.Random] = None,
+    ) -> str:
+        if not self.middlepool:
+            return ""
+        n = len(self.middlepool)
+        if rngvalue is not None:
+            return self.middlepool[int(rngvalue * n) % n]
+        rng = rng or random
+        return self.middlepool[rng.randrange(n)]
+
+    # SentenceAwareGenerator in your file calls `sample_arbitrary`
+    # (with underscore). Keep both names alive.
+    sample_arbitrary = samplearbitrary
+    is_beginning = isbeginning
+    is_natural_ending = isnaturalending
+    to_corpus = tocorpus
+
+    def boundarybalancereport(self) -> str:
+        def stats(c: Counter, label: str) -> str:
+            if not c:
+                return f"{label}: empty"
+            vals = list(c.values())
+            mn, mx = min(vals), max(vals)
+            avg = sum(vals) / len(vals)
+            perfect = all(v == vals[0] for v in vals)
+            return (
+                f"{label}: {len(c)} words, min={mn} max={mx} avg={avg:.2f} "
+                f"{'perfectly balanced' if perfect else 'imbalanced'}"
+            )
+
+        return "\n".join([
+            f"Boundary quota {self.boundaryquota}",
+            stats(self.begincounts, "beginnings"),
+            stats(self.endcounts,  "endings"),
+        ])
+
+    def summary(self) -> str:
+        nsent = len(self.sentences)
+        avg = sum(len(s) for s in self.sentences) / max(1, nsent)
+        fields_repr = [
+            (s if isinstance(s, str) else "<callable>")
+            for s in (self.text_fields or [])
+        ]
+        return "\n".join([
+            "HFSentenceDatasetPreprocessor",
+            f"dataset {self.dataset_name}"
+            + (f"  config {self.config_name}" if self.config_name else ""),
+            f"detected splits {self._detected_splits}",
+            f"text fields {fields_repr}",
+            f"auto-detected {bool(self._auto_detected_fields)}",
+            f"boundaryquota {self.boundaryquota}",
+            f"entities kept {nsent}",
+            f"dropped (quota) {self.dropped}",
+            f"skipped (too short) {self.skipped}",
+            f"total tokens {len(self.tokens)}",
+            f"vocab size {len(self.vocab())}",
+            f"unique beginnings {len(self.beginningsset)}",
+            f"unique endings {len(self.endingsset)}",
+            f"middle-pool size {len(self.middlepool)}",
+            f"avg entity len {avg:.2f}",
+            f"beginning example {self.beginnings[0] if self.beginnings else ''}",
+            f"ending example {self.endings[0] if self.endings else ''}",
+            f"middle example {self.middlepool[0] if self.middlepool else ''}",
+            self.boundarybalancereport(),
+        ])
+
+    def auditrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.records]
+
+    def keptrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.keptrecords]
+
+    def droppedrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.droppedrecords]
+
+
+# -----------------------------------------------------------------------------
+# Back-compat: keep the old SQuAD class name as a thin specialisation.
+# -----------------------------------------------------------------------------
+
+class HFSquadSentenceDatasetPreprocessor(HFSentenceDatasetPreprocessor):
+    """
+    Drop-in replacement for the original SQuAD preprocessor. Keeps the old
+    qca_mode / include_* knobs working but delegates everything to the
+    generic class.
+    """
+
+    def __init__(
+        self,
+        dataset_name: str = "squad",
+        config_name: Optional[str] = None,
+        split_names: Sequence[str] = ("train", "validation"),
+        lowercase: bool = True,
+        minsentencelen: int = 3,
+        uniquemiddlepool: bool = True,
+        strict: bool = True,
+        boundaryquota: int = 1,
+        include_question: bool = True,
+        include_context: bool = True,
+        include_answer: bool = True,
+        qca_mode: str = "question_context_answer",
+        sep_qc: Optional[str] = None,
+        sep_ca: Optional[str] = None,
+        **kwargs,
+    ):
+        text_fields = self._squad_fields(
+            qca_mode, include_question, include_context, include_answer,
+        )
+        super().__init__(
+            dataset_name=dataset_name,
+            config_name=config_name,
+            text_fields=text_fields,
+            split_names=split_names,
+            lowercase=lowercase,
+            minsentencelen=minsentencelen,
+            uniquemiddlepool=uniquemiddlepool,
+            strict=strict,
+            boundaryquota=boundaryquota,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _squad_fields(
+        qca_mode: str,
+        include_question: bool,
+        include_context: bool,
+        include_answer: bool,
+    ) -> List[FieldSpec]:
+        mode = qca_mode.lower()
+        fields: List[FieldSpec] = []
+        if mode == "question_only":
+            if include_question: fields.append("question")
+        elif mode == "question_answer":
+            if include_question: fields.append("question")
+            if include_answer:   fields.append("answers.text")
+        elif mode == "question_context":
+            if include_question: fields.append("question")
+            if include_context:  fields.append("context")
+        else:  # question_context_answer
+            if include_question: fields.append("question")
+            if include_context:  fields.append("context")
+            if include_answer:   fields.append("answers.text")
+        return fields
+
+
+# -----------------------------------------------------------------------------
+# Generic pipeline builder
+# -----------------------------------------------------------------------------
+
+def build_hf_pipeline(
+    dataset_name: str,
+    config_name: Optional[str] = None,
+    text_fields: Optional[Sequence[FieldSpec]] = None,
+    *,
+    split_names: Optional[Sequence[str]] = None,
+    locked: bool = True,
+    ngram_n: int = 3,
+    lidstone_gamma: float = 0.1,
+    minsentencelen: int = 3,
+    pipelinekwargs: Optional[Dict] = None,
+    preprocessorkwargs: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, HFSentenceDatasetPreprocessor]:
+    """
+    Generic HF-dataset → CPD → context index → pipeline.
+
+    Anything you don't specify here can still be passed via
+    ``preprocessorkwargs`` (forwarded to HFSentenceDatasetPreprocessor)
+    and ``pipelinekwargs`` (forwarded to the pipeline class).
+    """
+    pre = HFSentenceDatasetPreprocessor(
+        dataset_name=dataset_name,
+        config_name=config_name,
+        text_fields=text_fields,
+        split_names=split_names,
+        minsentencelen=minsentencelen,
+        **(preprocessorkwargs or {}),
+    )
+
+    corpus = pre.tocorpus()
+    cpd, vocab, tokens = build_real_cpd(
+        corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
+    )
+    ctxidx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs: Dict[str, Any] = dict(
+        cpd=cpd, context_index=ctxidx, vocab=vocab, ngram_n=int(ngram_n),
+    )
+    if pipelinekwargs:
+        kwargs.update(pipelinekwargs)
+
+    pipe = cls(**kwargs)
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+def build_hf_pipeline_from_preset(
+    preset_name: str,
+    *,
+    locked: bool = True,
+    ngram_n: int = 3,
+    lidstone_gamma: float = 0.1,
+    minsentencelen: int = 3,
+    pipelinekwargs: Optional[Dict] = None,
+    preprocessor_overrides: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, HFSentenceDatasetPreprocessor]:
+    """One-liner: preset name -> ready pipeline + preprocessor."""
+    if preset_name not in HF_DATASET_PRESETS:
+        raise KeyError(
+            f"Unknown preset {preset_name!r}. "
+            f"Available: {sorted(HF_DATASET_PRESETS)}"
+        )
+    spec = dict(HF_DATASET_PRESETS[preset_name])
+    spec.setdefault("dataset_name", preset_name)
+    if preprocessor_overrides:
+        spec.update(preprocessor_overrides)
+
+    pre = HFSentenceDatasetPreprocessor(
+        minsentencelen=minsentencelen,
+        **spec,
+    )
+    corpus = pre.tocorpus()
+    cpd, vocab, tokens = build_real_cpd(
+        corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
+    )
+    ctxidx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs: Dict[str, Any] = dict(
+        cpd=cpd, context_index=ctxidx, vocab=vocab, ngram_n=int(ngram_n),
+    )
+    if pipelinekwargs:
+        kwargs.update(pipelinekwargs)
+    pipe = cls(**kwargs)
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+# -----------------------------------------------------------------------------
+# Demo
+# -----------------------------------------------------------------------------
+
+if __name__ == "__main__":
+
+    # Examples of each style — pick one:
+    pipe, pre = build_hf_pipeline(
+        "squad",
+        text_fields=["question", "context", "answers.text"],
+        locked=True, ngram_n=2,
+        preprocessorkwargs=dict(boundaryquota=1, uniquemiddlepool=True),
+    )
+    print(pre.summary())
+    gen = SentenceAwareGenerator(pipe, pre)
+    while True:
+        prompt = input("USER: ")
+        if not prompt.strip():
+            break
+        print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True))
         print()
