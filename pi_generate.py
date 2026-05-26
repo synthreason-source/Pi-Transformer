@@ -538,7 +538,7 @@ class HFSentenceDatasetPreprocessor:
                 self.keptrecords.append(rec)
                 s = rec.tokens
                 self.sentences.append(s)
-                self.beginnings.append(s[0])
+                self.beginnings.append(s[-2])
                 self.endings.append(s[-1])
                 self.tokens.extend(s)
 
