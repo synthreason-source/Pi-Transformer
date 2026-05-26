@@ -2638,7 +2638,5 @@ if __name__ == "__main__":
     gen = SentenceAwareGenerator(pipe, pre)
     while True:
         prompt = input("USER: ")
-        if not prompt.strip():
-            break
         print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True))
         print()
