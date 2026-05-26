@@ -2303,7 +2303,7 @@ if __name__ == "__main__":
         gen = SentenceAwareGenerator(pipe, pre)
         text = gen.generate_text(
             prompt=input("USER: "),
-            n_words=80,
+            n_words=800,
             seed=42,
             capitalise=True,
         )
