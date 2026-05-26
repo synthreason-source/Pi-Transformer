@@ -128,7 +128,7 @@ class HFSquadSentenceDatasetPreprocessor:
             return []
         if lowercase:
             text = text.lower()
-        return re.findall(r"[a-z0-9']+", text)
+        return text.split()
 
     def _load_dataset(self) -> DatasetDict:
         if self.config_name is None:
@@ -2270,7 +2270,7 @@ if __name__ == "__main__":
     pipe, pre = buildhfsquadpipeline(
         dataset_name="squad",
         locked=True,
-        ngram_n=3,
+        ngram_n=2,
         lidstone_gamma=0.1,
         minsentencelen=3,
         pipelinekwargs=dict(
@@ -2288,7 +2288,7 @@ if __name__ == "__main__":
             l14_blend_alpha=0.5,
         ),
         preprocessorkwargs=dict(
-            boundaryquota=1,
+            boundaryquota=10000000,
             strict=True,
             lowercase=True,
             uniquemiddlepool=True,
