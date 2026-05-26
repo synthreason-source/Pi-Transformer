@@ -72,7 +72,7 @@ class HFAnyDatasetPreprocessor:
         dataset_name: str,
         config_name: str | None = None,
         split_names: Sequence[str] = ("train",),
-        text_fields: Sequence[str] = ("messages",),
+        text_fields: Sequence[str] = ("inverted_reasoning",),
         id_field: str | None = "id",
         lowercase: bool = True,
         minsentencelen: int = 3,
@@ -2247,7 +2247,7 @@ def buildhfsquadpipeline(
     return pipe, pre
 if __name__ == "__main__":
     pipe, pre = buildhfsquadpipeline(
-        dataset_name="angrygiraffe/claude-opus-4.6-4.7-reasoning-8.7k",
+        dataset_name="Jackrong/Claude-opus-4.6-TraceInversion-9000x",
         locked=True,
         ngram_n=3,
         lidstone_gamma=0.1,
