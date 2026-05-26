@@ -509,7 +509,7 @@ class SentenceAwareGenerator:
                 # dead context — arbitrary restart from the middle pool
                 ctx.clear()
                 ctx.extend([""] * pipe.context_window)
-                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
+                seed_word = pre.sample_arbitrary()
                 if not seed_word:
                     break
                 ctx.append(seed_word)
@@ -3133,8 +3133,8 @@ if __name__ == "__main__":
 
     # Examples of each style — pick one:
     pipe, pre = build_hf_pipeline(
-        "squad",
-        text_fields=["question", "context", "answers.text"],
+        "microsoft/wiki_qa",
+        text_fields=["answer"],
         locked=True, ngram_n=2,
         preprocessorkwargs=dict(boundaryquota=1, uniquemiddlepool=True),
     )
@@ -3144,5 +3144,5 @@ if __name__ == "__main__":
         prompt = input("USER: ")
         if not prompt.strip():
             break
-        print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True))
+        print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True).split(".")[0] + ".")
         print()
