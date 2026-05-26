@@ -2299,12 +2299,12 @@ if __name__ == "__main__":
     )
 
     print(pre.summary())
-
-    gen = SentenceAwareGenerator(pipe, pre)
-    text = gen.generate_text(
-        prompt="what is",
-        n_words=80,
-        seed=42,
-        capitalise=True,
-    )
-    print(text)
+    while True:
+        gen = SentenceAwareGenerator(pipe, pre)
+        text = gen.generate_text(
+            prompt=input("USER: "),
+            n_words=80,
+            seed=42,
+            capitalise=True,
+        )
+        print(text)
