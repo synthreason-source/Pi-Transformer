@@ -2060,7 +2060,72 @@ class IsomorphismPipeline(nn.Module):
             include_prompt=include_prompt,
         )
 
+class LFatouRunningInfimum(nn.Module):
+    """
+    Fatou running-infimum layer.
+    g_n(w) = inf_{k >= n} p_k(w), zone-weighted by ci.ngram_zones.
 
+    MCT guarantees: integral of g_n increases to integral of liminf p_n.
+    Zone weighting lifts the floor for contextually relevant tokens,
+    matching the behaviour of L6/L7.
+    """
+    def __init__(self, sigma: float = 0.25, floor: float = 0.04):
+        super().__init__()
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
+        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
+        self.inf_tracker: Dict[str, float] = {}
+
+    def reset(self):
+        self.inf_tracker.clear()
+
+    def forward(
+        self,
+        pairs: List[Tuple[str, float]],
+        context_deque,          # deque of recent tokens
+        ngram_zones: Dict,      # ci.ngram_zones
+    ) -> Dict:
+        sigma = float(self.sigma.clamp(min=1e-6))
+        floor_val = float(self.floor.clamp(min=0.0, max=1.0 - 1e-6))
+
+        # Build zone set from last bigram in context (same as L7)
+        ctx = list(context_deque)
+        zone_set = set()
+        if len(ctx) >= 2:
+            zone_set = set(ngram_zones.get((ctx[-2], ctx[-1]), set()))
+        elif len(ctx) == 1:
+            zone_set = set(ngram_zones.get((ctx[-1],), set()))
+
+        n = len(pairs)
+        words = [w for w, _ in pairs]
+
+        # Zone gradient (same Gaussian as L6/L7)
+        zone_ranks = [i / max(1, n - 1) for i, w in enumerate(words)
+                      if w in zone_set]
+        centre = sum(zone_ranks) / len(zone_ranks) if zone_ranks else 0.5
+        indices = torch.arange(n, dtype=torch.float64) / max(1, n - 1)
+        gauss = torch.exp(-0.5 * ((indices - centre) / sigma) ** 2)
+        zone_weights = _normalise(floor_val + (1.0 - floor_val) * gauss)
+
+        # Running infimum: g_n(w) = min over all seen p_k(w)
+        g_n = []
+        for i, (w, p) in enumerate(pairs):
+            prev_inf = self.inf_tracker.get(w, p)
+            current_inf = min(prev_inf, p)
+            self.inf_tracker[w] = current_inf
+            # Lift floor for zone members via zone_weights
+            lifted = current_inf + float(zone_weights[i]) * (p - current_inf)
+            g_n.append((w, max(1e-12, lifted)))
+
+        # Normalise — MCT: sum(g_n) increases toward sum(liminf p_n)
+        total = sum(v for _, v in g_n) or 1.0
+        g_n_norm = [(w, v / total) for w, v in g_n]
+
+        return {
+            "name": "LFATOU",
+            "words": [w for w, _ in g_n_norm],
+            "probs": np.array([v for _, v in g_n_norm], dtype=np.float64),
+            "source": f"fatou_inf zone={len(zone_set)} centre={centre:.3f}",
+        }
 # ═══════════════════════════════════════════════════════════════════════════
 #  LockedIsomorphismPipeline – 15-layer variant including L14
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2168,7 +2233,7 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
                 ci.latent_sorted_keys, ci.latent_bos_data,
             )
             zone_layers = [L4, L5, L6, L7, L8, L9]
-
+       
         L10 = self.l10(L3_pairs, self.history)
         L11 = self.l11(zone_layers + [L10], L3_pairs)
         L12_pairs, L12 = self.l12(L3_pairs, L11)
@@ -2190,13 +2255,19 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         # and torch.argmax(...) which returned an INDEX, not a probability.
         # Correct behaviour: max(floor, value) and per-token dict lookup.
         blended = []
-        for w in l12_map.keys():
-            p12 = max(floor_val, l12_map.get(w, floor_val))
-            p13 = max(floor_val, l13_map.get(w, floor_val))
-            p14 = max(floor_val, l14_map.get(w, floor_val))
-            base = math.sqrt(p12 * p13)
-            merged = (base ** (1.0 - alpha14)) * (p14 ** alpha14)
-            blended.append((w, merged))
+         # In __init__
+        self.lfatou = LFatouRunningInfimum(sigma=0.25, floor=0.04)
+
+        LFATOU = self.lfatou(L3_pairs, context_deque, self.history)
+        # Blend into final: geometric mean with L12
+        fatou_map = dict(zip(LFATOU["words"], LFATOU["probs"]))
+        blended = [
+            (w, math.sqrt(
+                max(0.04, l12_map.get(w, 0.04)) *
+                max(0.04, fatou_map.get(w, 0.04))
+            ))
+            for w in l12_map.keys()
+        ]
 
         total = sum(p for _, p in blended)
         if total > 0:
