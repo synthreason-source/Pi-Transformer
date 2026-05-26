@@ -2288,7 +2288,7 @@ if __name__ == "__main__":
             l14_blend_alpha=0.5,
         ),
         preprocessorkwargs=dict(
-            boundaryquota=10000000,
+            boundaryquota=1,
             strict=True,
             lowercase=True,
             uniquemiddlepool=True,
