@@ -35,16 +35,17 @@ import torch.nn.functional as F
 import gradio as gr
 from datasets import load_dataset, Dataset, DatasetDict
 import re
-import random
-
 from dataclasses import dataclass, asdict
 @dataclass
-@dataclass
-class HFDatasetRecord:
+class HFSquadRecord:
     split: str
     original_index: int
     id: str
-    fields: Dict[str, str]
+    title: str
+    context: str
+    question: str
+    answer_text: str
+    answer_start: int | None
     tokens: List[str]
     first_token: str
     last_token: str
@@ -52,46 +53,53 @@ class HFDatasetRecord:
     drop_reason: str
 
 
-class HFAnyDatasetPreprocessor:
+class HFSquadSentenceDatasetPreprocessor:
     """
-    Generic Hugging Face dataset-backed analogue of SentenceDatasetPreprocessor.
+    Hugging Face SQuAD-backed analogue of SentenceDatasetPreprocessor.
 
-    Each dataset entity becomes one token sequence assembled from configurable fields.
-    We then enforce the same quota-balanced boundary invariant:
+    Each dataset entity becomes one token sequence. We then enforce the same
+    quota-balanced boundary invariant already used by SentenceDatasetPreprocessor:
       - a first token may appear at most boundaryquota times
       - a last token may appear at most boundaryquota times
       - acceptance is greedy in dataset order
       - boundaryquota=1 gives strict globally-unique beginnings and endings
 
-    The public attributes intentionally mirror SentenceDatasetPreprocessor enough
+    Public attributes intentionally mirror SentenceDatasetPreprocessor enough
     for SentenceAwareGenerator / buildsentencepipeline-style code to use them.
     """
 
     def __init__(
         self,
-        dataset_name: str,
+        dataset_name: str = "squad",
         config_name: str | None = None,
-        split_names: Sequence[str] = ("train",),
-        text_fields: Sequence[str] = ("inverted_reasoning",),
-        id_field: str | None = "id",
+        split_names: Sequence[str] = ("train", "validation"),
         lowercase: bool = True,
         minsentencelen: int = 3,
         uniquemiddlepool: bool = True,
         strict: bool = True,
         boundaryquota: int = 1,
-        field_sep: str | None = None,
+        include_question: bool = True,
+        include_context: bool = True,
+        include_answer: bool = True,
+        qca_mode: str = "question_context_answer",
+        sep_qc: str | None = None,
+        sep_ca: str | None = None,
     ):
         self.dataset_name = dataset_name
         self.config_name = config_name
         self.split_names = tuple(split_names)
-        self.text_fields = tuple(text_fields)
-        self.id_field = id_field
         self.lowercase = bool(lowercase)
         self.minsentencelen = max(2, int(minsentencelen))
         self.uniquemiddlepool = bool(uniquemiddlepool)
         self.strict = bool(strict)
         self.boundaryquota = max(1, int(boundaryquota))
-        self.field_sep = field_sep
+
+        self.include_question = bool(include_question)
+        self.include_context = bool(include_context)
+        self.include_answer = bool(include_answer)
+        self.qca_mode = str(qca_mode)
+        self.sep_qc = sep_qc
+        self.sep_ca = sep_ca
 
         self.sentences: List[List[str]] = []
         self.beginnings: List[str] = []
@@ -99,9 +107,9 @@ class HFAnyDatasetPreprocessor:
         self.middlepool: List[str] = []
         self.tokens: List[str] = []
 
-        self.records: List[HFDatasetRecord] = []
-        self.keptrecords: List[HFDatasetRecord] = []
-        self.droppedrecords: List[HFDatasetRecord] = []
+        self.records: List[HFSquadRecord] = []
+        self.keptrecords: List[HFSquadRecord] = []
+        self.droppedrecords: List[HFSquadRecord] = []
 
         self.dropped = 0
         self.skipped = 0
@@ -116,9 +124,8 @@ class HFAnyDatasetPreprocessor:
 
     @staticmethod
     def _word_tokenize(text: str, lowercase: bool = True) -> List[str]:
-        if text is None:
+        if not text:
             return []
-        text = str(text)
         if lowercase:
             text = text.lower()
         return re.findall(r"[a-z0-9']+", text)
@@ -128,60 +135,58 @@ class HFAnyDatasetPreprocessor:
             return load_dataset(self.dataset_name)
         return load_dataset(self.dataset_name, self.config_name)
 
-    def _extract_path(self, obj: Any, path: str) -> Any:
-        cur = obj
-        for part in path.split("."):
-            if cur is None:
-                return None
-            if isinstance(cur, dict):
-                cur = cur.get(part)
-            elif isinstance(cur, (list, tuple)):
-                if not part.isdigit():
-                    return None
-                idx = int(part)
-                if idx < 0 or idx >= len(cur):
-                    return None
-                cur = cur[idx]
-            else:
-                return None
-        return cur
+    @staticmethod
+    def _pick_answer(example: Dict) -> Tuple[str, int | None]:
+        ans = example.get("answers", {}) or {}
+        texts = ans.get("text", []) if isinstance(ans, dict) else []
+        starts = ans.get("answer_start", []) if isinstance(ans, dict) else []
+        text0 = texts[0] if texts else ""
+        start0 = starts[0] if starts else None
+        return text0, start0
 
-    def _flatten_to_text(self, value: Any) -> str:
-        if value is None:
-            return ""
-        if isinstance(value, str):
-            return value
-        if isinstance(value, (int, float, bool)):
-            return str(value)
-        if isinstance(value, (list, tuple)):
-            return " ".join(x for x in (self._flatten_to_text(v) for v in value) if x)
-        if isinstance(value, dict):
-            return " ".join(x for x in (self._flatten_to_text(v) for v in value.values()) if x)
-        return str(value)
+    def _build_entity_tokens(self, example: Dict) -> List[str]:
+        q = self._word_tokenize(example.get("question", ""), self.lowercase)
+        c = self._word_tokenize(example.get("context", ""), self.lowercase)
+        a_text, _ = self._pick_answer(example)
+        a = self._word_tokenize(a_text, self.lowercase)
 
-    def _build_entity_tokens(self, example: Dict[str, Any]) -> Tuple[List[str], Dict[str, str]]:
-        parts: List[str] = []
-        extracted: Dict[str, str] = {}
+        mode = self.qca_mode.lower()
 
-        for i, path in enumerate(self.text_fields):
-            raw = self._extract_path(example, path)
-            text = self._flatten_to_text(raw)
-            extracted[path] = text
-            toks = self._word_tokenize(text, self.lowercase)
-            if not toks:
-                continue
-            if parts and self.field_sep:
-                parts.append(self.field_sep)
-            parts.extend(toks)
+        if mode == "question_only":
+            parts = [q] if self.include_question else []
+        elif mode == "question_answer":
+            parts = []
+            if self.include_question:
+                parts.append(q)
+            if self.include_answer:
+                if self.sep_qc:
+                    parts.append([self.sep_qc])
+                parts.append(a)
+        elif mode == "question_context":
+            parts = []
+            if self.include_question:
+                parts.append(q)
+            if self.include_context:
+                if self.sep_qc:
+                    parts.append([self.sep_qc])
+                parts.append(c)
+        else:
+            parts = []
+            if self.include_question:
+                parts.append(q)
+            if self.include_context:
+                if parts and self.sep_qc:
+                    parts.append([self.sep_qc])
+                parts.append(c)
+            if self.include_answer:
+                if parts and self.sep_ca:
+                    parts.append([self.sep_ca])
+                parts.append(a)
 
-        return parts, extracted
-
-    def _make_id(self, split: str, idx: int, example: Dict[str, Any]) -> str:
-        if self.id_field:
-            raw = self._extract_path(example, self.id_field)
-            if raw is not None and str(raw) != "":
-                return str(raw)
-        return f"{split}-{idx}"
+        out: List[str] = []
+        for block in parts:
+            out.extend(block)
+        return out
 
     def _iter_entities(self):
         ds = self._load_dataset()
@@ -192,16 +197,21 @@ class HFAnyDatasetPreprocessor:
             for idx, ex in enumerate(split_ds):
                 yield split, idx, ex
 
-    def _record_from_example(self, split: str, idx: int, ex: Dict[str, Any]) -> HFDatasetRecord:
-        toks, extracted = self._build_entity_tokens(ex)
+    def _record_from_example(self, split: str, idx: int, ex: Dict) -> HFSquadRecord:
+        answer_text, answer_start = self._pick_answer(ex)
+        toks = self._build_entity_tokens(ex)
 
         if len(toks) < self.minsentencelen:
             self.skipped += 1
-            return HFDatasetRecord(
+            return HFSquadRecord(
                 split=split,
                 original_index=idx,
-                id=self._make_id(split, idx, ex),
-                fields=extracted,
+                id=str(ex.get("id", f"{split}-{idx}")),
+                title=str(ex.get("title", "")),
+                context=str(ex.get("context", "")),
+                question=str(ex.get("question", "")),
+                answer_text=answer_text,
+                answer_start=answer_start,
                 tokens=toks,
                 first_token=toks[0] if toks else "",
                 last_token=toks[-1] if toks else "",
@@ -215,25 +225,32 @@ class HFAnyDatasetPreprocessor:
         if self.strict:
             if self.begincounts[first] >= self.boundaryquota:
                 self.dropped += 1
-                return HFDatasetRecord(
+                return HFSquadRecord(
                     split=split,
                     original_index=idx,
-                    id=self._make_id(split, idx, ex),
-                    fields=extracted,
+                    id=str(ex.get("id", f"{split}-{idx}")),
+                    title=str(ex.get("title", "")),
+                    context=str(ex.get("context", "")),
+                    question=str(ex.get("question", "")),
+                    answer_text=answer_text,
+                    answer_start=answer_start,
                     tokens=toks,
                     first_token=first,
                     last_token=last,
                     kept=False,
                     drop_reason=f"begin_quota_full:{first}",
                 )
-
             if self.endcounts[last] >= self.boundaryquota:
                 self.dropped += 1
-                return HFDatasetRecord(
+                return HFSquadRecord(
                     split=split,
                     original_index=idx,
-                    id=self._make_id(split, idx, ex),
-                    fields=extracted,
+                    id=str(ex.get("id", f"{split}-{idx}")),
+                    title=str(ex.get("title", "")),
+                    context=str(ex.get("context", "")),
+                    question=str(ex.get("question", "")),
+                    answer_text=answer_text,
+                    answer_start=answer_start,
                     tokens=toks,
                     first_token=first,
                     last_token=last,
@@ -244,11 +261,15 @@ class HFAnyDatasetPreprocessor:
             self.begincounts[first] += 1
             self.endcounts[last] += 1
 
-        return HFDatasetRecord(
+        return HFSquadRecord(
             split=split,
             original_index=idx,
-            id=self._make_id(split, idx, ex),
-            fields=extracted,
+            id=str(ex.get("id", f"{split}-{idx}")),
+            title=str(ex.get("title", "")),
+            context=str(ex.get("context", "")),
+            question=str(ex.get("question", "")),
+            answer_text=answer_text,
+            answer_start=answer_start,
             tokens=toks,
             first_token=first,
             last_token=last,
@@ -290,7 +311,7 @@ class HFAnyDatasetPreprocessor:
 
         if not self.sentences:
             raise ValueError(
-                f"No dataset entities survived the quota-boundary invariant "
+                f"No SQuAD entities survived the quota-boundary invariant "
                 f"(quota={self.boundaryquota}, dropped={self.dropped}, skipped={self.skipped})."
             )
 
@@ -306,7 +327,7 @@ class HFAnyDatasetPreprocessor:
     def isnaturalending(self, token: str) -> bool:
         return token in self.endingsset
 
-    def sample_arbitrary(
+    def samplearbitrary(
         self,
         rngvalue: Optional[float] = None,
         rng: Optional[random.Random] = None,
@@ -347,9 +368,9 @@ class HFAnyDatasetPreprocessor:
         avg = sum(len(s) for s in self.sentences) / max(1, nsent)
         return "\n".join(
             [
-                "HFAnyDatasetPreprocessor",
+                "HFSquadSentenceDatasetPreprocessor",
                 f"dataset {self.dataset_name}",
-                f"text_fields {self.text_fields}",
+                f"mode {self.qca_mode}",
                 f"boundaryquota {self.boundaryquota}",
                 f"entities kept {nsent}",
                 f"dropped quota {self.dropped}",
@@ -367,13 +388,13 @@ class HFAnyDatasetPreprocessor:
             ]
         )
 
-    def auditrows(self) -> List[Dict[str, Any]]:
+    def auditrows(self) -> List[Dict]:
         return [asdict(r) for r in self.records]
 
-    def keptrows(self) -> List[Dict[str, Any]]:
+    def keptrows(self) -> List[Dict]:
         return [asdict(r) for r in self.keptrecords]
 
-    def droppedrows(self) -> List[Dict[str, Any]]:
+    def droppedrows(self) -> List[Dict]:
         return [asdict(r) for r in self.droppedrecords]
 
 
@@ -488,7 +509,7 @@ class SentenceAwareGenerator:
                 # dead context — arbitrary restart from the middle pool
                 ctx.clear()
                 ctx.extend([""] * pipe.context_window)
-                seed_word = pre.sample_arbitrary()
+                seed_word = pre.sample_arbitrary(rng_value=draw_fn())
                 if not seed_word:
                     break
                 ctx.append(seed_word)
@@ -2210,14 +2231,14 @@ def buildhfsquadpipeline(
     minsentencelen: int = 3,
     pipelinekwargs: Optional[Dict] = None,
     preprocessorkwargs: Optional[Dict] = None,
-) -> Tuple[IsomorphismPipeline, HFAnyDatasetPreprocessor]:
+) -> Tuple[IsomorphismPipeline, HFSquadSentenceDatasetPreprocessor]:
     """
     Hugging Face SQuAD -> HFSquadSentenceDatasetPreprocessor -> CPD/context index -> pipeline
 
     Mirrors buildsentencepipeline() but sources corpus entities from a HF SQuAD dataset
     instead of raw text sentence splitting.
     """
-    pre = HFAnyDatasetPreprocessor(
+    pre = HFSquadSentenceDatasetPreprocessor(
         dataset_name=dataset_name,
         config_name=config_name,
         split_names=split_names,
@@ -2247,7 +2268,7 @@ def buildhfsquadpipeline(
     return pipe, pre
 if __name__ == "__main__":
     pipe, pre = buildhfsquadpipeline(
-        dataset_name="Jackrong/Claude-opus-4.6-TraceInversion-9000x",
+        dataset_name="squad",
         locked=True,
         ngram_n=3,
         lidstone_gamma=0.1,
@@ -2271,6 +2292,9 @@ if __name__ == "__main__":
             strict=True,
             lowercase=True,
             uniquemiddlepool=True,
+            qca_mode="question_context_answer",
+            sep_qc=None,
+            sep_ca=None,
         ),
     )
 
