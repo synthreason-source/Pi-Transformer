@@ -1,0 +1,2785 @@
+"""
+layer_isomorphism_torch.py
+==========================
+
+Fixed version. Key changes vs. the previous file:
+
+* Consolidated imports (random, traceback, Any, Sequence, Callable, Union).
+* Removed the duplicate HFGenericRecord and HFSentenceDatasetPreprocessor
+  definitions. The merged class keeps the preset registry from the second
+  copy AND the sample_correlated() method from the first copy.
+* HFSentenceDatasetPreprocessor.__init__ now calls self.process() so
+  tocorpus()/vocab() are populated before downstream code runs.
+* Reordered: HFSquadSentenceDatasetPreprocessor is defined BEFORE
+  buildhfsquadpipeline references it.
+* LockedIsomorphismPipeline.step bug fixes:
+    - p12: min(floor, ...) -> max(floor, ...)
+    - p13/p14: torch.argmax(...) -> dict lookup by token (the previous
+      version blended an *index* into a probability product, which is
+      meaningless).
+* Demo block: max_examples_per_split==1000 -> = ; preprocessoroverrides
+  -> preprocessor_overrides.
+* Replaced literal "\\n" with "\n" in step-log / error formatting.
+"""
+
+from __future__ import annotations
+
+import math
+import random
+import re
+import traceback
+from collections import Counter, deque
+from dataclasses import dataclass, asdict
+from typing import (
+    Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union,
+)
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+try:
+    import gradio as gr
+except Exception:  # gradio is optional at import time
+    gr = None  # type: ignore
+
+from datasets import load_dataset, DatasetDict
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Field spec helpers (used by HFSentenceDatasetPreprocessor)
+# ═══════════════════════════════════════════════════════════════════════════
+
+FieldSpec = Union[str, Callable[[Dict[str, Any]], Union[str, List[str], None]]]
+
+_INDEXED_PART_RE = re.compile(r"^([^\[]+)\[(\d+)\]$")
+
+
+def _resolve_path(obj: Any, path: str) -> Any:
+    """Walk a dotted path through nested dicts/lists. Returns None on miss.
+
+    Supports list indexing via "key[idx]" segments, e.g. "answers.text[0]".
+    """
+    if obj is None:
+        return None
+    cur = obj
+    for part in path.split("."):
+        m = _INDEXED_PART_RE.match(part)
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            if isinstance(cur, dict):
+                cur = cur.get(key)
+            else:
+                return None
+            if not isinstance(cur, (list, tuple)) or idx >= len(cur):
+                return None
+            cur = cur[idx]
+        else:
+            if isinstance(cur, dict):
+                cur = cur.get(part)
+            else:
+                return None
+        if cur is None:
+            return None
+    return cur
+
+
+def _extract_field(example: Dict, spec: FieldSpec) -> str:
+    """Resolve a FieldSpec to a single string."""
+    if callable(spec):
+        val = spec(example)
+    else:
+        val = _resolve_path(example, spec)
+
+    if val is None:
+        return ""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, (list, tuple)):
+        parts: List[str] = []
+        for v in val:
+            if isinstance(v, str) and v:
+                parts.append(v)
+            elif isinstance(v, (int, float, bool)):
+                parts.append(str(v))
+            elif isinstance(v, dict):
+                parts.append(" ".join(
+                    str(x) for x in v.values()
+                    if isinstance(x, (str, int, float))
+                ))
+        return " ".join(parts)
+    if isinstance(val, (int, float, bool)):
+        return str(val)
+    if isinstance(val, dict):
+        return " ".join(
+            str(v) for v in val.values()
+            if isinstance(v, (str, int, float))
+        )
+    return str(val)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Audit record
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class HFGenericRecord:
+    split: str
+    original_index: int
+    id: str
+    tokens: List[str]
+    first_token: str
+    last_token: str
+    kept: bool
+    drop_reason: str
+    raw_text: str = ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Preset registry — common HF datasets in one line.
+# ═══════════════════════════════════════════════════════════════════════════
+
+HF_DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
+    # ── Question answering ───────────────────────────────────────────
+    "squad":             {"text_fields": ["question", "context", "answers.text"]},
+    "squad_v2":          {"text_fields": ["question", "context", "answers.text"]},
+    "trivia_qa":         {"config_name": "rc",
+                          "text_fields": ["question", "answer.value"]},
+    "hotpot_qa":         {"config_name": "distractor",
+                          "text_fields": ["question", "answer"]},
+
+    # ── Text classification (single-text) ────────────────────────────
+    "imdb":              {"text_fields": ["text"]},
+    "ag_news":           {"text_fields": ["text"]},
+    "yelp_review_full":  {"text_fields": ["text"]},
+    "yelp_polarity":     {"text_fields": ["text"]},
+    "amazon_polarity":   {"text_fields": ["title", "content"]},
+    "dbpedia_14":        {"text_fields": ["title", "content"]},
+    "tweet_eval":        {"config_name": "emotion", "text_fields": ["text"]},
+
+    # ── GLUE family (override config_name to switch task) ────────────
+    "glue_sst2":         {"dataset_name": "glue", "config_name": "sst2",
+                          "text_fields": ["sentence"]},
+    "glue_cola":         {"dataset_name": "glue", "config_name": "cola",
+                          "text_fields": ["sentence"]},
+    "glue_mrpc":         {"dataset_name": "glue", "config_name": "mrpc",
+                          "text_fields": ["sentence1", "sentence2"]},
+    "glue_qqp":          {"dataset_name": "glue", "config_name": "qqp",
+                          "text_fields": ["question1", "question2"]},
+    "glue_mnli":         {"dataset_name": "glue", "config_name": "mnli",
+                          "text_fields": ["premise", "hypothesis"]},
+
+    # ── Summarisation ────────────────────────────────────────────────
+    "cnn_dailymail":     {"config_name": "3.0.0",
+                          "text_fields": ["article", "highlights"]},
+    "xsum":              {"text_fields": ["document", "summary"]},
+    "billsum":           {"text_fields": ["text", "summary"]},
+    "samsum":            {"text_fields": ["dialogue", "summary"]},
+    "multi_news":        {"text_fields": ["document", "summary"]},
+    "reddit_tifu":       {"config_name": "long",
+                          "text_fields": ["title", "documents", "tldr"]},
+
+    # ── Language modelling ───────────────────────────────────────────
+    "wikitext":          {"config_name": "wikitext-2-raw-v1",
+                          "text_fields": ["text"]},
+    "wikitext_103":      {"dataset_name": "wikitext",
+                          "config_name": "wikitext-103-raw-v1",
+                          "text_fields": ["text"]},
+    "bookcorpus":        {"text_fields": ["text"]},
+    "openwebtext":       {"text_fields": ["text"]},
+    "c4":                {"config_name": "en", "streaming": True,
+                          "text_fields": ["text"]},
+
+    # ── Dialogue ─────────────────────────────────────────────────────
+    "daily_dialog":      {"text_fields": [
+                              lambda ex: " ".join(ex.get("dialog", []) or [])
+                          ]},
+    "blended_skill_talk":{"text_fields": [
+                              lambda ex: " ".join(ex.get("free_messages", []) or []),
+                              lambda ex: " ".join(ex.get("guided_messages", []) or []),
+                          ]},
+    "empathetic_dialogues":{"text_fields": ["prompt", "utterance"]},
+
+    # ── Translation ──────────────────────────────────────────────────
+    "wmt14_de_en":       {"dataset_name": "wmt14", "config_name": "de-en",
+                          "text_fields": ["translation.en"]},
+    "wmt16_de_en":       {"dataset_name": "wmt16", "config_name": "de-en",
+                          "text_fields": ["translation.en"]},
+    "opus_books":        {"config_name": "en-fr",
+                          "text_fields": ["translation.en"]},
+
+    # ── NER / token classification ───────────────────────────────────
+    "conll2003":         {"text_fields": [
+                              lambda ex: " ".join(ex.get("tokens", []) or [])
+                          ]},
+    "wnut_17":           {"text_fields": [
+                              lambda ex: " ".join(ex.get("tokens", []) or [])
+                          ]},
+
+    # ── Common-sense / multiple choice ───────────────────────────────
+    "commonsense_qa":    {"text_fields": ["question", "choices.text"]},
+    "openbookqa":        {"config_name": "main",
+                          "text_fields": ["question_stem", "choices.text"]},
+}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Generic HF dataset preprocessor with correlated unique-middle-pool
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HFSentenceDatasetPreprocessor:
+    """
+    Generic HF-dataset preprocessor that enforces a quota-balanced
+    boundary invariant.
+
+    Each surviving dataset entity becomes one token sequence. Acceptance
+    is greedy in dataset order. With boundaryquota=1 you get globally
+    unique sequence beginnings AND endings.
+
+    Features:
+      - uniquemiddlepool deduplicates middle tokens globally
+      - middlecorr keeps correlation back to (record_index, position)
+      - sample_correlated() can jump from a unique token back into a
+        real kept record
+    """
+
+    DEFAULT_EXCLUDED_AUTO = (
+        "id", "uid", "_id", "example_id", "qid",
+        "url", "title", "source", "filename", "doc_id", "subset",
+    )
+
+    # ─────────────────────────────────────────────────────────────────
+    # construction
+    # ─────────────────────────────────────────────────────────────────
+
+    def __init__(
+        self,
+        dataset_name: str,
+        config_name: Optional[str] = None,
+        text_fields: Optional[Sequence[FieldSpec]] = None,
+        *,
+        split_names: Optional[Sequence[str]] = None,
+        field_sep: Optional[str] = None,
+        lowercase: bool = True,
+        minsentencelen: int = 3,
+        max_examples_per_split: Optional[int] = None,
+        uniquemiddlepool: bool = True,
+        weight_by_spatial_sum: bool = True,
+        strict: bool = True,
+        boundaryquota: int = 1,
+        streaming: bool = False,
+        trust_remote_code: bool = False,
+        id_field: Optional[FieldSpec] = None,
+        token_pattern: Optional[str] = None,
+        keep_alpha_only: bool = False,
+        exclude_auto_fields: Sequence[str] = DEFAULT_EXCLUDED_AUTO,
+        auto_process: bool = True,
+    ):
+        self.dataset_name = dataset_name
+        self.config_name = config_name
+        self.text_fields: Optional[List[FieldSpec]] = (
+            list(text_fields) if text_fields else None
+        )
+        self.split_names = tuple(split_names) if split_names else None
+        self.field_sep = field_sep
+        self.lowercase = bool(lowercase)
+        self.minsentencelen = max(2, int(minsentencelen))
+        self.max_examples_per_split = max_examples_per_split
+        self.uniquemiddlepool = bool(uniquemiddlepool)
+        self.weight_by_spatial_sum = bool(weight_by_spatial_sum)
+        self.strict = bool(strict)
+        self.boundaryquota = max(1, int(boundaryquota))
+        self.streaming = bool(streaming)
+        self.trust_remote_code = bool(trust_remote_code)
+        self.id_field = id_field
+        self.token_pattern = token_pattern
+        self.keep_alpha_only = bool(keep_alpha_only)
+        self.exclude_auto_fields = set(exclude_auto_fields)
+
+        # outputs
+        self.sentences: List[List[str]] = []
+        self.beginnings: List[str] = []
+        self.endings: List[str] = []
+        self.middlepool: List[str] = []
+        self.tokens: List[str] = []
+
+        self.records: List[HFGenericRecord] = []
+        self.keptrecords: List[HFGenericRecord] = []
+        self.droppedrecords: List[HFGenericRecord] = []
+
+        self.dropped = 0
+        self.skipped = 0
+        self.begincounts: Counter = Counter()
+        self.endcounts: Counter = Counter()
+
+        self.beginningsset: Set[str] = set()
+        self.endingsset: Set[str] = set()
+        self.middleset: Set[str] = set()
+
+        # correlation index: middle-pool token -> [(kept_record_idx, pos), ...]
+        self.middlecorr: Dict[str, List[Tuple[int, int]]] = {}
+        self.middlecorr_counts: Counter = Counter()
+
+        # spatial-sum sampling, derived from popped (duplicate) occurrences in
+        # orderedpool. For each token w with occurrences at indices
+        # p_0 < p_1 < ... < p_k in orderedpool:
+        #   token_positions[w]  = [p_0, p_1, ..., p_k]
+        #   popped_positions[w] = [p_1, ..., p_k]              (everything dedup removed)
+        #   gaps[w]             = [p_1 - p_0, ..., p_k - p_{k-1}]
+        #   spatial_sum[w]      = sum(gaps[w])  == p_k - p_0   (telescopes to span)
+        # Singletons have spatial_sum 0. Sampling weight is spatial_sum + 1
+        # so singletons remain reachable but heavily downweighted.
+        self.token_positions: Dict[str, List[int]] = {}
+        self.popped_positions: Dict[str, List[int]] = {}
+        self.gaps: Dict[str, List[int]] = {}
+        self.spatial_sum: Dict[str, int] = {}
+        self.occ_weights: Dict[str, List[float]] = {}
+        self._occ_weights_cum: Dict[str, List[float]] = {}
+        self._occ_weights_total: Dict[str, float] = {}
+        self._sample_weights_cum: Optional[List[float]] = None
+        self._sample_weights_total: float = 0.0
+
+        # bookkeeping
+        self._auto_detected_fields: List[str] = []
+        self._detected_splits: List[str] = []
+
+        self._token_re = re.compile(token_pattern) if token_pattern else None
+
+        if auto_process:
+            self.process()
+
+    # ─────────────────────────────────────────────────────────────────
+    # preset constructor
+    # ─────────────────────────────────────────────────────────────────
+
+    @classmethod
+    def from_preset(cls, preset_name: str, **overrides) -> "HFSentenceDatasetPreprocessor":
+        if preset_name not in HF_DATASET_PRESETS:
+            raise KeyError(
+                f"Unknown preset {preset_name!r}. "
+                f"Available: {sorted(HF_DATASET_PRESETS)}"
+            )
+        spec = dict(HF_DATASET_PRESETS[preset_name])
+        spec.setdefault("dataset_name", preset_name)
+        spec.update(overrides)
+        return cls(**spec)
+
+    # ─────────────────────────────────────────────────────────────────
+    # tokenisation
+    # ─────────────────────────────────────────────────────────────────
+
+    def _tokenize(self, text: str) -> List[str]:
+        if not text:
+            return []
+        if self.lowercase:
+            text = text.lower()
+        if self._token_re is not None:
+            toks = self._token_re.findall(text)
+        else:
+            toks = text.split()
+        if self.keep_alpha_only:
+            toks = [t for t in toks if t.isalpha()]
+        return [t for t in toks if t]
+
+    # ─────────────────────────────────────────────────────────────────
+    # dataset loading
+    # ─────────────────────────────────────────────────────────────────
+
+    def _load(self):
+        kwargs: Dict[str, Any] = {"streaming": self.streaming}
+        if self.trust_remote_code:
+            kwargs["trust_remote_code"] = True
+        if self.config_name is None:
+            return load_dataset(self.dataset_name, **kwargs)
+        return load_dataset(self.dataset_name, self.config_name, **kwargs)
+
+    # ─────────────────────────────────────────────────────────────────
+    # auto-detect string-valued fields
+    # ─────────────────────────────────────────────────────────────────
+
+    def _autodetect_fields(self, dsd) -> List[str]:
+        try:
+            from datasets import Value
+            from datasets import Sequence as HFSequence
+        except Exception:
+            return []
+
+        feats = None
+        try:
+            for name in dsd:
+                split_obj = dsd[name]
+                if hasattr(split_obj, "features") and split_obj.features is not None:
+                    feats = split_obj.features
+                    break
+        except Exception:
+            return []
+        if feats is None:
+            return []
+
+        detected: List[str] = []
+        for name, feat in feats.items():
+            if name in self.exclude_auto_fields:
+                continue
+            try:
+                if isinstance(feat, Value) and feat.dtype == "string":
+                    detected.append(name)
+                elif isinstance(feat, HFSequence):
+                    inner = feat.feature
+                    if isinstance(inner, Value) and inner.dtype == "string":
+                        detected.append(name)
+                elif isinstance(feat, list) and feat:
+                    inner = feat[0]
+                    if isinstance(inner, Value) and inner.dtype == "string":
+                        detected.append(name)
+            except Exception:
+                continue
+        return detected
+
+    # ─────────────────────────────────────────────────────────────────
+    # text assembly
+    # ─────────────────────────────────────────────────────────────────
+
+    def _build_text(self, example: Dict) -> str:
+        parts: List[str] = []
+        for spec in self.text_fields or []:
+            chunk = _extract_field(example, spec)
+            if chunk:
+                if self.field_sep and parts:
+                    parts.append(self.field_sep)
+                parts.append(chunk)
+        return " ".join(parts).strip()
+
+    def _make_id(self, split: str, idx: int, example: Dict) -> str:
+        if self.id_field is not None:
+            v = _extract_field(example, self.id_field)
+            if v:
+                return v
+        for k in ("id", "uid", "_id", "example_id", "qid"):
+            if k in example and example[k] is not None:
+                return str(example[k])
+        return f"{split}-{idx}"
+
+    # ─────────────────────────────────────────────────────────────────
+    # iteration
+    # ─────────────────────────────────────────────────────────────────
+
+    def _iter(self):
+        dsd = self._load()
+        try:
+            all_splits = list(dsd.keys())
+        except Exception:
+            all_splits = ["train"]
+        self._detected_splits = list(all_splits)
+
+        splits = self.split_names or all_splits
+
+        if not self.text_fields:
+            if self.streaming:
+                raise ValueError(
+                    "Auto-detection of text_fields is not supported in streaming "
+                    "mode. Pass text_fields=[...] explicitly."
+                )
+            self.text_fields = self._autodetect_fields(dsd)
+            self._auto_detected_fields = [
+                s for s in self.text_fields if isinstance(s, str)
+            ]
+            if not self.text_fields:
+                raise ValueError(
+                    f"Could not auto-detect any string-valued text fields in "
+                    f"{self.dataset_name!r}. Pass text_fields=[...] explicitly."
+                )
+
+        for split in splits:
+            if split not in dsd:
+                continue
+            ds = dsd[split]
+            limit = self.max_examples_per_split
+            for idx, ex in enumerate(ds):
+                if limit is not None and idx >= limit:
+                    break
+                yield split, idx, ex
+
+    # ─────────────────────────────────────────────────────────────────
+    # per-example record + quota enforcement
+    # ─────────────────────────────────────────────────────────────────
+
+    def _record(self, split: str, idx: int, ex: Dict) -> HFGenericRecord:
+        raw = self._build_text(ex)
+        toks = self._tokenize(raw)
+        rid = self._make_id(split, idx, ex)
+
+        if len(toks) < self.minsentencelen:
+            self.skipped += 1
+            return HFGenericRecord(
+                split=split, original_index=idx, id=rid, tokens=toks,
+                first_token=toks[0] if toks else "",
+                last_token=toks[-1] if toks else "",
+                kept=False, drop_reason=f"too_short_lt_{self.minsentencelen}",
+                raw_text=raw,
+            )
+
+        first, last = toks[0], toks[-1]
+
+        if self.strict:
+            if self.begincounts[first] >= self.boundaryquota:
+                self.dropped += 1
+                return HFGenericRecord(
+                    split=split, original_index=idx, id=rid, tokens=toks,
+                    first_token=first, last_token=last,
+                    kept=False, drop_reason=f"begin_quota_full:{first}",
+                    raw_text=raw,
+                )
+            if self.endcounts[last] >= self.boundaryquota:
+                self.dropped += 1
+                return HFGenericRecord(
+                    split=split, original_index=idx, id=rid, tokens=toks,
+                    first_token=first, last_token=last,
+                    kept=False, drop_reason=f"end_quota_full:{last}",
+                    raw_text=raw,
+                )
+            self.begincounts[first] += 1
+            self.endcounts[last] += 1
+
+        return HFGenericRecord(
+            split=split, original_index=idx, id=rid, tokens=toks,
+            first_token=first, last_token=last,
+            kept=True, drop_reason="", raw_text=raw,
+        )
+
+    def process(self) -> None:
+        orderedpool: List[str] = []
+
+        for split, idx, ex in self._iter():
+            rec = self._record(split, idx, ex)
+            self.records.append(rec)
+
+            if rec.kept:
+                rec_idx = len(self.keptrecords)
+                self.keptrecords.append(rec)
+                s = rec.tokens
+                self.sentences.append(s)
+                self.beginnings.append(s[-2])
+                self.endings.append(s[-1])
+                self.tokens.extend(s)
+
+                if len(s) > 2:
+                    for pos in range(1, len(s) - 1):
+                        w = s[pos]
+                        orderedpool.append(w)
+                        self.middlecorr.setdefault(w, []).append((rec_idx, pos))
+                        self.middlecorr_counts[w] += 1
+            else:
+                self.droppedrecords.append(rec)
+
+        if self.uniquemiddlepool:
+            seen: Set[str] = set()
+            self.middlepool = []
+            for w in orderedpool:
+                if w not in seen:
+                    seen.add(w)
+                    self.middlepool.append(w)
+        else:
+            self.middlepool = orderedpool
+
+        # ── spatial-sum bookkeeping ──────────────────────────────────────
+        # Walk orderedpool once to record every token's positions, then
+        # derive popped positions, consecutive gaps, the per-token spatial
+        # sum, AND per-occurrence weights for biasing the within-anchor
+        # draw in sample_correlated.
+        #
+        # For each token w with positions [p_0, ..., p_{K-1}] in orderedpool:
+        #   gaps[w]            = [p_1-p_0, ..., p_{K-1}-p_{K-2}]
+        #   spatial_sum[w]     = sum(gaps[w])   (telescopes to span)
+        #   occ_weights[w][j]  = the gap that preceded occurrence j
+        #                        (j >= 1: gap[j-1]; j == 0: mean of the
+        #                        others, or 1.0 if K == 1).
+        # Sum(occ_weights[w]) = spatial_sum[w] + occ_weights[w][0], so the
+        # per-occurrence weighting literally redistributes the spatial sum
+        # across the token's jump targets.
+        #
+        # middlecorr[w] is appended in the exact same order as token_positions[w]
+        # (both populated in the same loop above), so weights line up by index.
+        self.token_positions = {}
+        for i, w in enumerate(orderedpool):
+            self.token_positions.setdefault(w, []).append(i)
+
+        self.popped_positions = {}
+        self.gaps = {}
+        self.spatial_sum = {}
+        self.occ_weights: Dict[str, List[float]] = {}
+        self._occ_weights_cum: Dict[str, List[float]] = {}
+        self._occ_weights_total: Dict[str, float] = {}
+
+        for w, positions in self.token_positions.items():
+            K = len(positions)
+            self.popped_positions[w] = positions[1:]
+            if K > 1:
+                gs = [positions[j + 1] - positions[j] for j in range(K - 1)]
+                mean_gap = sum(gs) / len(gs)
+                ow = [mean_gap] + [float(g) for g in gs]   # weight[0] = neutral
+            else:
+                gs = []
+                ow = [1.0]                                  # hapax: single jump target
+            self.gaps[w] = gs
+            self.spatial_sum[w] = sum(gs)
+            self.occ_weights[w] = ow
+            cum: List[float] = []
+            r = 0.0
+            for x in ow:
+                r += x
+                cum.append(r)
+            self._occ_weights_cum[w] = cum
+            self._occ_weights_total[w] = r
+
+        # Precompute cumulative weights for sampling the middlepool itself
+        # (only fires when the anchor isn't in middlecorr; still useful for
+        # sample_arbitrary / cold reseeds).
+        if self.weight_by_spatial_sum and self.middlepool:
+            cum = []
+            running = 0.0
+            for w in self.middlepool:
+                running += float(self.spatial_sum.get(w, 0)) + 1.0
+                cum.append(running)
+            self._sample_weights_cum = cum
+            self._sample_weights_total = running
+        else:
+            self._sample_weights_cum = None
+            self._sample_weights_total = 0.0
+
+        self.beginningsset = set(self.beginnings)
+        self.endingsset = set(self.endings)
+        self.middleset = set(self.middlepool)
+
+        if not self.sentences:
+            raise ValueError(
+                f"No entities from {self.dataset_name!r} survived the "
+                f"quota-boundary invariant (quota={self.boundaryquota}, "
+                f"dropped={self.dropped}, skipped={self.skipped}). "
+                f"Try loosening minsentencelen, raising boundaryquota, "
+                f"or widening text_fields."
+            )
+
+    # ─────────────────────────────────────────────────────────────────
+    # API surface
+    # ─────────────────────────────────────────────────────────────────
+
+    def tocorpus(self) -> str:
+        return " ".join(self.tokens)
+
+    def vocab(self) -> set:
+        return set(self.tokens)
+
+    def isbeginning(self, token: str) -> bool:
+        return token in self.beginningsset
+
+    def isnaturalending(self, token: str) -> bool:
+        return token in self.endingsset
+
+    def sample_correlated(
+        self,
+        anchor: Optional[str] = None,
+        rngvalue: Optional[float] = None,
+        rng: Optional[random.Random] = None,
+    ) -> Dict[str, Any]:
+        """Pick a middle-pool token, then jump to one of its (record, pos)
+        occurrences. Returns the tail (tokens from pos to end of record),
+        which the SentenceAwareGenerator uses to reseed dead contexts."""
+        if not self.middlepool:
+            return {
+                "token": "", "record_index": -1, "pos": -1,
+                "tokens": [], "tail": [], "id": "", "split": "",
+            }
+
+        rng = rng or random
+
+        if anchor and anchor in self.middlecorr:
+            key = anchor
+        else:
+            n = len(self.middlepool)
+            cum = self._sample_weights_cum
+            total = self._sample_weights_total
+            if self.weight_by_spatial_sum and cum and total > 0:
+                # Weighted draw against the spatial-sum CDF. Identical
+                # determinism contract as the uniform path: same rngvalue
+                # in [0,1) always picks the same key.
+                u = rngvalue if rngvalue is not None else rng.random()
+                # Defensive: clamp to [0,1) then scale to [0, total).
+                u = u - math.floor(u) if u >= 1.0 else max(0.0, u)
+                target = u * total
+                # Binary search for the first cum[i] > target.
+                lo, hi = 0, n - 1
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if cum[mid] <= target:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                key = self.middlepool[lo]
+            elif rngvalue is not None:
+                key = self.middlepool[int(rngvalue * n) % n]
+            else:
+                key = self.middlepool[rng.randrange(n)]
+
+        occs = self.middlecorr.get(key, [])
+        if not occs:
+            return {
+                "token": key, "record_index": -1, "pos": -1,
+                "tokens": [key], "tail": [key], "id": "", "split": "",
+            }
+
+        # Pick which occurrence of `key` to jump to.
+        # With weight_by_spatial_sum, each occurrence gets weight equal to
+        # the gap that preceded it in orderedpool, so the choice of jump
+        # target reflects the corpus's recurrence rhythm for this token.
+        occ_cum = self._occ_weights_cum.get(key)
+        occ_tot = self._occ_weights_total.get(key, 0.0)
+        if (self.weight_by_spatial_sum and occ_cum
+                and occ_tot > 0 and len(occ_cum) == len(occs)):
+            u = rngvalue if rngvalue is not None else rng.random()
+            u = u - math.floor(u) if u >= 1.0 else max(0.0, u)
+            target = u * occ_tot
+            lo, hi = 0, len(occs) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if occ_cum[mid] <= target:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            rec_idx, pos = occs[lo]
+        elif rngvalue is not None:
+            rec_idx, pos = occs[int(rngvalue * len(occs)) % len(occs)]
+        else:
+            rec_idx, pos = occs[rng.randrange(len(occs))]
+
+        rec = self.keptrecords[rec_idx]
+        toks = rec.tokens
+        tail = toks[pos:]
+
+        return {
+            "token": toks[pos],
+            "record_index": rec_idx,
+            "pos": pos,
+            "tokens": toks,
+            "tail": tail,
+            "id": rec.id,
+            "split": rec.split,
+        }
+
+    def sample_arbitrary(
+        self,
+        rngvalue: Optional[float] = None,
+        rng: Optional[random.Random] = None,
+    ) -> str:
+        info = self.sample_correlated(rngvalue=rngvalue, rng=rng)
+        return info["token"]
+
+    # underscore/no-underscore aliases for back-compat
+    samplearbitrary = sample_arbitrary
+    is_beginning = isbeginning
+    is_natural_ending = isnaturalending
+    to_corpus = tocorpus
+
+    def boundarybalancereport(self) -> str:
+        def stats(c: Counter, label: str) -> str:
+            if not c:
+                return f"{label}: empty"
+            vals = list(c.values())
+            mn, mx = min(vals), max(vals)
+            avg = sum(vals) / len(vals)
+            perfect = all(v == vals[0] for v in vals)
+            return (
+                f"{label}: {len(c)} words, min={mn} max={mx} avg={avg:.2f} "
+                f"{'perfectly balanced' if perfect else 'imbalanced'}"
+            )
+
+        return "\n".join([
+            f"Boundary quota {self.boundaryquota}",
+            stats(self.begincounts, "beginnings"),
+            stats(self.endcounts,  "endings"),
+            f"middlecorr keys {len(self.middlecorr)}",
+            f"middlecorr links {sum(len(v) for v in self.middlecorr.values())}",
+        ])
+
+    def summary(self) -> str:
+        nsent = len(self.sentences)
+        avg = sum(len(s) for s in self.sentences) / max(1, nsent)
+        fields_repr = [
+            (s if isinstance(s, str) else "<callable>")
+            for s in (self.text_fields or [])
+        ]
+        return "\n".join([
+            "HFSentenceDatasetPreprocessor",
+            f"dataset {self.dataset_name}"
+            + (f"  config {self.config_name}" if self.config_name else ""),
+            f"detected splits {self._detected_splits}",
+            f"text fields {fields_repr}",
+            f"auto-detected {bool(self._auto_detected_fields)}",
+            f"boundaryquota {self.boundaryquota}",
+            f"entities kept {nsent}",
+            f"dropped (quota) {self.dropped}",
+            f"skipped (too short) {self.skipped}",
+            f"total tokens {len(self.tokens)}",
+            f"vocab size {len(self.vocab())}",
+            f"unique beginnings {len(self.beginningsset)}",
+            f"unique endings {len(self.endingsset)}",
+            f"middle-pool size {len(self.middlepool)}",
+            f"middlecorr keys {len(self.middlecorr)}",
+            f"middlecorr links {sum(len(v) for v in self.middlecorr.values())}",
+            f"spatial-sum sampling {'on' if self.weight_by_spatial_sum else 'off'}"
+            + (f"  total-weight {self._sample_weights_total:.0f}"
+               if self._sample_weights_cum else ""),
+            f"spatial-sum max {max(self.spatial_sum.values()) if self.spatial_sum else 0}",
+            f"popped occurrences {sum(len(v) for v in self.popped_positions.values())}",
+            f"avg entity len {avg:.2f}",
+            f"beginning example {self.beginnings[0] if self.beginnings else ''}",
+            f"ending example {self.endings[0] if self.endings else ''}",
+            f"middle example {self.middlepool[0] if self.middlepool else ''}",
+            self.boundarybalancereport(),
+        ])
+
+    def auditrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.records]
+
+    def keptrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.keptrecords]
+
+    def droppedrows(self) -> List[Dict]:
+        return [asdict(r) for r in self.droppedrecords]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Back-compat: SQuAD-specific subclass
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HFSquadSentenceDatasetPreprocessor(HFSentenceDatasetPreprocessor):
+    """Drop-in replacement for the original SQuAD preprocessor."""
+
+    def __init__(
+        self,
+        dataset_name: str = "squad",
+        config_name: Optional[str] = None,
+        split_names: Sequence[str] = ("train", "validation"),
+        lowercase: bool = True,
+        minsentencelen: int = 3,
+        uniquemiddlepool: bool = True,
+        strict: bool = True,
+        boundaryquota: int = 1,
+        include_question: bool = True,
+        include_context: bool = True,
+        include_answer: bool = True,
+        qca_mode: str = "question_context_answer",
+        sep_qc: Optional[str] = None,
+        sep_ca: Optional[str] = None,
+        **kwargs,
+    ):
+        text_fields = self._squad_fields(
+            qca_mode, include_question, include_context, include_answer,
+        )
+        super().__init__(
+            dataset_name=dataset_name,
+            config_name=config_name,
+            text_fields=text_fields,
+            split_names=split_names,
+            lowercase=lowercase,
+            minsentencelen=minsentencelen,
+            uniquemiddlepool=uniquemiddlepool,
+            strict=strict,
+            boundaryquota=boundaryquota,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _squad_fields(
+        qca_mode: str,
+        include_question: bool,
+        include_context: bool,
+        include_answer: bool,
+    ) -> List[FieldSpec]:
+        mode = qca_mode.lower()
+        fields: List[FieldSpec] = []
+        if mode == "question_only":
+            if include_question: fields.append("question")
+        elif mode == "question_answer":
+            if include_question: fields.append("question")
+            if include_answer:   fields.append("answers.text")
+        elif mode == "question_context":
+            if include_question: fields.append("question")
+            if include_context:  fields.append("context")
+        else:  # question_context_answer
+            if include_question: fields.append("question")
+            if include_context:  fields.append("context")
+            if include_answer:   fields.append("answers.text")
+        return fields
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SentenceAwareGenerator with correlated dataset-item reseeding
+# ═══════════════════════════════════════════════════════════════════════════
+
+class SentenceAwareGenerator:
+    """Wraps a pipeline and reseeds dead contexts from the dataset middle
+    pool, using sample_correlated() to land back inside a real kept record."""
+
+    def __init__(
+        self,
+        pipeline,
+        preprocessor: Optional[HFSentenceDatasetPreprocessor] = None,
+        *,
+        emit_seed: bool = True,
+        reseed_window: Optional[int] = None,
+        emit_reseed_tail: bool = False,
+    ):
+        if preprocessor is None:
+            preprocessor = getattr(pipeline, "preprocessor", None)
+        if preprocessor is None:
+            raise ValueError(
+                "SentenceAwareGenerator needs a preprocessor — either pass "
+                "one in or use build_hf_pipeline()/build_hf_pipeline_from_preset() "
+                "which attaches it."
+            )
+        self.pipeline = pipeline
+        self.pre = preprocessor
+        self.emit_seed = bool(emit_seed)
+        self.reseed_window = reseed_window
+        self.emit_reseed_tail = bool(emit_reseed_tail)
+
+    # ── helpers ───────────────────────────────────────────────────────
+
+    def _seed_context(self, prompt: str) -> deque:
+        tokens = [w.lower() for w in prompt.split() if w.isalpha()]
+        vocab_tokens = [w for w in tokens if w in self.pipeline.vocab]
+        cw = self.pipeline.context_window
+        if len(vocab_tokens) >= cw:
+            init = vocab_tokens[-cw:]
+        else:
+            init = [""] * (cw - len(vocab_tokens)) + vocab_tokens
+        return deque(init, maxlen=cw)
+
+    def _format(self, words: List[str], prompt: str, capitalise: bool) -> str:
+        prompt_words = prompt.strip().split() if prompt.strip() else []
+        all_words = prompt_words + words
+        if not all_words:
+            return ""
+
+        out: List[str] = []
+        cap_next = bool(capitalise)
+        for w in all_words:
+            tok = w.capitalize() if cap_next and capitalise else w
+            out.append(tok)
+            cap_next = False
+        return " ".join(out)
+
+    def _pick_anchor(self, ctx: deque, prompt_tokens: List[str]) -> str:
+        ctx_words = [w for w in ctx if w]
+        if ctx_words:
+            return ctx_words[-1]
+        if prompt_tokens:
+            return prompt_tokens[-1]
+        return ""
+
+    def _reseed_from_correlation(
+        self,
+        ctx: deque,
+        prompt_tokens: List[str],
+        draw_fn,
+    ) -> Tuple[List[str], Dict[str, Any]]:
+        anchor = self._pick_anchor(ctx, prompt_tokens)
+        info = self.pre.sample_correlated(anchor=anchor, rngvalue=draw_fn())
+        tail = list(info.get("tail", []) or [])
+
+        if not tail:
+            return [], info
+
+        cw = self.pipeline.context_window
+        window = self.reseed_window if self.reseed_window is not None else max(1, cw)
+        seed_window = tail[: max(1, window)]
+
+        ctx.clear()
+        ctx.extend([""] * cw)
+        for w in seed_window[-cw:]:
+            ctx.append(w)
+
+        return seed_window, info
+
+    # ── main API ──────────────────────────────────────────────────────
+
+    def generate(
+        self,
+        prompt: str,
+        n_words: int,
+        *,
+        stream: Optional[List[int]] = None,
+        digits_per_sample: int = 3,
+        seed: Optional[int] = None,
+    ) -> List[str]:
+        pipe = self.pipeline
+
+        draw_fn = pipe._make_draw_fn(stream, digits_per_sample, seed)
+
+        prompt_tokens = [w.lower() for w in prompt.split() if w.isalpha()]
+        ctx = self._seed_context(prompt)
+
+        words: List[str] = []
+        frames = []
+        produced = 0
+
+        max_iters = max(1, n_words) * 80
+        iters = 0
+
+        while produced < n_words and iters < max_iters:
+            iters += 1
+            frame = pipe.step(ctx, prompt_tokens, draw_fn())
+            if frame is None:
+                seed_window, _info = self._reseed_from_correlation(
+                    ctx, prompt_tokens, draw_fn
+                )
+                if not seed_window:
+                    break
+                if self.emit_seed:
+                    emitted = seed_window if self.emit_reseed_tail else seed_window[:1]
+                    take = min(len(emitted), n_words - produced)
+                    words.extend(emitted[:take])
+                    produced += take
+                continue
+
+            frames.append(frame)
+            ctx.append(frame.chosen)
+            words.append(frame.chosen)
+            produced += 1
+
+        pipe.frames = frames
+        return words[:n_words]
+
+    def generate_text(
+        self,
+        prompt: str,
+        n_words: int,
+        *,
+        stream: Optional[List[int]] = None,
+        digits_per_sample: int = 3,
+        seed: Optional[int] = None,
+        capitalise: bool = True,
+    ) -> str:
+        words = self.generate(
+            prompt=prompt,
+            n_words=n_words,
+            stream=stream,
+            digits_per_sample=digits_per_sample,
+            seed=seed,
+        )
+        return self._format(words, prompt, capitalise)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shared utilities
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _to_tensor(probs, dtype=torch.float64) -> torch.Tensor:
+    if isinstance(probs, torch.Tensor):
+        return probs.to(dtype)
+    if isinstance(probs, np.ndarray):
+        return torch.from_numpy(probs.astype(np.float64)).to(dtype)
+    return torch.tensor(probs, dtype=dtype)
+
+
+def _normalise(t: torch.Tensor) -> torch.Tensor:
+    """Safe L1 normalisation."""
+    s = t.sum()
+    return t / s.clamp(min=1e-30)
+
+
+def _char_trigrams(word: str):
+    return {word[i:i + 3] for i in range(len(word) - 2)} if len(word) >= 3 else {word}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L0 – Raw distribution with repetition penalty
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L0_RawDist(nn.Module):
+    def __init__(self, rep_penalty: float = 1.13):
+        super().__init__()
+        self.rep_penalty = nn.Parameter(torch.tensor(rep_penalty, dtype=torch.float64))
+
+    def forward(self, dist, history: Counter) -> Tuple[List[Tuple[str, float]], Dict]:
+        pen = self.rep_penalty.clamp(min=1.0)
+
+        raw: List[Tuple[str, float]] = []
+        for s in dist.samples():
+            if not s:
+                continue
+            p = max(1e-12, float(dist.prob(s)))
+            cnt = history[s]
+            if cnt > 0:
+                p /= pen.detach().item() ** cnt
+            raw.append((s, p))
+
+        if not raw:
+            return raw, {}
+
+        raw.sort(key=lambda x: x[1], reverse=True)
+        probs_t = _normalise(_to_tensor([p for _, p in raw]))
+        words = [w for w, _ in raw]
+        pairs = list(zip(words, probs_t.tolist()))
+
+        layer = {
+            "name":   "L0_RAW_DIST",
+            "words":  words,
+            "probs":  probs_t.detach().numpy(),
+            "source": f"CPD posterior + rep_penalty={pen.detach().item():.4f}",
+        }
+        return pairs, layer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L1 – Temperature scaling
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L1_TempScaled(nn.Module):
+    def __init__(self, temperature: float = 4.3):
+        super().__init__()
+        self.temperature = nn.Parameter(torch.tensor(temperature, dtype=torch.float64))
+
+    def forward(self, pairs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], Dict]:
+        T = self.temperature.clamp(min=1e-3)
+        probs_t = _to_tensor([p for _, p in pairs])
+        scaled_t = _normalise(probs_t.pow(1.0 / T))
+        words = [w for w, _ in pairs]
+        out = list(zip(words, scaled_t.tolist()))
+
+        layer = {
+            "name":   "L1_TEMP_SCALED",
+            "words":  words,
+            "probs":  scaled_t.detach().numpy(),
+            "source": f"temperature={T.detach().item():.4f}",
+        }
+        return out, layer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L2 – Insight penalty
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L2_InsightPenalty(nn.Module):
+    def __init__(self, insight_penalty: float = 3.95):
+        super().__init__()
+        self.insight_penalty = nn.Parameter(
+            torch.tensor(insight_penalty, dtype=torch.float64)
+        )
+
+    def forward(self, pairs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], Dict]:
+        strength = self.insight_penalty.clamp(min=0.0)
+        probs_t = _to_tensor([p for _, p in pairs])
+        mean_p = probs_t.mean().clamp(min=1e-30)
+        excess = (probs_t - mean_p).clamp(min=0.0)
+        penalised = probs_t / (1.0 + strength * excess / mean_p)
+        penalised = _normalise(penalised.clamp(min=1e-12))
+
+        words = [w for w, _ in pairs]
+        out = list(zip(words, penalised.tolist()))
+        layer = {
+            "name":   "L2_INSIGHT",
+            "words":  words,
+            "probs":  penalised.detach().numpy(),
+            "source": f"insight_penalty={strength.detach().item():.4f}",
+        }
+        return out, layer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L3 – Top-K / Top-P truncation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L3_TopKTopP(nn.Module):
+    def __init__(self, top_k: int = 100, top_p: float = 1.0):
+        super().__init__()
+        self.register_buffer("top_k_buf", torch.tensor(top_k, dtype=torch.int64))
+        self.top_p = nn.Parameter(torch.tensor(top_p, dtype=torch.float64))
+
+    def forward(self, pairs: List[Tuple[str, float]]) -> Tuple[List[Tuple[str, float]], Dict]:
+        k = int(self.top_k_buf.item())
+        p_th = float(self.top_p.clamp(1e-3, 1.0).item())
+
+        truncated = pairs[:k]
+        kept, cumulative = [], 0.0
+        for w, p in truncated:
+            kept.append((w, p))
+            cumulative += p
+            if cumulative >= p_th:
+                break
+
+        probs_t = _normalise(_to_tensor([p for _, p in kept]))
+        words = [w for w, _ in kept]
+        out = list(zip(words, probs_t.tolist()))
+        layer = {
+            "name":   "L3_TOPK_TOPP",
+            "words":  words,
+            "probs":  probs_t.detach().numpy(),
+            "source": f"top_k={k} top_p={p_th:.4f}",
+        }
+        return out, layer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Shared Gaussian-gradient zone layer base (L4–L9, L13)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ZoneGradientBase(nn.Module):
+    def __init__(self, name: str, sigma: float, floor: float, source_hint: str = ""):
+        super().__init__()
+        self._layer_name = name
+        self._source_hint = source_hint
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
+        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
+
+    def _gradient(self, zone_set: set, candidates: List[Tuple[str, float]]) -> torch.Tensor:
+        n = len(candidates)
+        if n == 0:
+            return torch.zeros(0, dtype=torch.float64)
+
+        sigma = self.sigma.clamp(min=1e-6)
+        floor = self.floor.clamp(min=0.0, max=1.0 - 1e-6)
+
+        indices = torch.arange(n, dtype=torch.float64)
+        norm_idx = indices / max(1, n - 1)
+
+        zone_ranks = [
+            i / max(1, n - 1)
+            for i, (w, _) in enumerate(candidates)
+            if w in zone_set
+        ]
+        centre = float(torch.tensor(zone_ranks).mean()) if zone_ranks else 0.0
+
+        gauss = torch.exp(-0.5 * ((norm_idx - centre) / sigma) ** 2)
+        weights = floor + (1.0 - floor) * gauss
+        return _normalise(weights)
+
+    def _make_layer(self, weights: torch.Tensor, candidates, source_extra: str = "") -> Dict:
+        return {
+            "name":   self._layer_name,
+            "words":  [w for w, _ in candidates],
+            "probs":  weights.detach().numpy(),
+            "source": f"{self._source_hint} {source_extra}".strip(),
+        }
+
+
+class L4_ZoneFreq(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.50, floor: float = 0.05,
+                 freq_high_thresh: int = 10, freq_mid_thresh: int = 3):
+        super().__init__("L4_ZONE_FREQ", sigma, floor, "freq_zone")
+        self.register_buffer("freq_high_thresh",
+                             torch.tensor(freq_high_thresh, dtype=torch.int64))
+        self.register_buffer("freq_mid_thresh",
+                             torch.tensor(freq_mid_thresh, dtype=torch.int64))
+
+    def forward(self, candidates, prompt_words, freq_zones, token_freq):
+        mi_th = int(self.freq_mid_thresh.item())
+        high_set = set(freq_zones.get("high", []))
+        if any(w in high_set for w in prompt_words):
+            key = "high"
+        elif all(token_freq.get(w, 0) < mi_th for w in prompt_words):
+            key = "low"
+        else:
+            key = "mid"
+        zone_set = set(freq_zones.get(key, []))
+        weights = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, f"key={key}")
+
+
+class L5_ZoneAlpha(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.40, floor: float = 0.05):
+        super().__init__("L5_ZONE_ALPHA", sigma, floor, "alpha_zone")
+
+    def forward(self, candidates, prompt_words, alpha_zones):
+        alpha_words: set = set()
+        for w in prompt_words:
+            if w and w[0].isalpha():
+                alpha_words.update(alpha_zones.get(w[0], []))
+        weights = self._gradient(alpha_words, candidates)
+        keys = [w[0] for w in prompt_words if w]
+        return self._make_layer(weights, candidates, f"keys={keys}")
+
+
+class L6_ZoneBigram(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.25, floor: float = 0.04):
+        super().__init__("L6_ZONE_BIGRAM", sigma, floor, "ngram bigram context")
+
+    def forward(self, candidates, prompt_words, ngram_zones):
+        bigram_words: set = set()
+        for i in range(len(prompt_words) - 1):
+            bigram_words.update(
+                ngram_zones.get((prompt_words[i], prompt_words[i + 1]), [])
+            )
+        weights = self._gradient(bigram_words, candidates)
+        return self._make_layer(weights, candidates)
+
+
+class L7_ZoneTrigram(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.20, floor: float = 0.03):
+        super().__init__("L7_ZONE_TRIGRAM", sigma, floor, "live_ctx")
+
+    def forward(self, candidates, context_deque, ngram_zones):
+        ctx_list = list(context_deque)
+        if len(ctx_list) >= 2:
+            key = tuple(ctx_list[-2:])
+            zone_set = set(ngram_zones.get(key, []))
+            src = f"live_ctx={key}"
+        elif len(ctx_list) == 1:
+            key = (ctx_list[-1],)
+            zone_set = set(ngram_zones.get(key, []))
+            src = f"live_ctx=({ctx_list[-1]},)"
+        else:
+            zone_set = set()
+            src = "no live context"
+        weights = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, src)
+
+
+class L8_ZoneCharTrig(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.35, floor: float = 0.04):
+        super().__init__("L8_ZONE_CHAR_TRIG", sigma, floor, "char-trigram neighbours")
+
+    def forward(self, candidates, prompt_words, char_trig_idx):
+        prompt_tgs: set = set()
+        for w in prompt_words:
+            prompt_tgs |= _char_trigrams(w)
+        char_neighbours: set = set()
+        for tg in prompt_tgs:
+            char_neighbours |= char_trig_idx.get(tg, set())
+        weights = self._gradient(char_neighbours, candidates)
+        return self._make_layer(weights, candidates)
+
+
+class L9_ZoneLatent(_ZoneGradientBase):
+    def __init__(self, sigma: float = 0.30, floor: float = 0.04):
+        super().__init__("L9_ZONE_LATENT", sigma, floor, "latent_bos_quartile")
+
+    def forward(self, candidates, prompt_words, latent_sorted_keys, latent_bos_data):
+        n_keys = len(latent_sorted_keys)
+        q_key = "q0"
+        for ctx in latent_sorted_keys:
+            if any(w in ctx for w in prompt_words):
+                rank = latent_sorted_keys.index(ctx)
+                q_key = f"q{min(3, rank * 4 // max(1, n_keys))}"
+                break
+        zone_set = set(latent_bos_data.get(q_key, []))
+        weights = self._gradient(zone_set, candidates)
+        return self._make_layer(weights, candidates, f"quartile={q_key}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L10 – History repetition column
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L10_History(nn.Module):
+    def __init__(self, smoothing: float = 1.0):
+        super().__init__()
+        self.smoothing = nn.Parameter(torch.tensor(smoothing, dtype=torch.float64))
+
+    def forward(self, candidates, history):
+        smooth = self.smoothing.clamp(min=0.0)
+        counts = torch.tensor([history[w] for w, _ in candidates], dtype=torch.float64)
+        hist_vec = _normalise(1.0 / (smooth + counts))
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L10_HISTORY",
+            "words":  words,
+            "probs":  hist_vec.detach().numpy(),
+            "source": f"repetition history smoothing={smooth.detach().item():.4f}",
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L11 – Tensor blend of zone layers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L11_TensorBlend(nn.Module):
+    N_ROWS = 7  # L4..L10
+
+    def __init__(self, init_weights: Optional[List[float]] = None):
+        super().__init__()
+        if init_weights is None:
+            init_weights = [1.0] * self.N_ROWS
+        assert len(init_weights) == self.N_ROWS
+        self.zone_weights = nn.Parameter(torch.tensor(init_weights, dtype=torch.float64))
+        self.register_buffer("eps", torch.tensor(1e-12, dtype=torch.float64))
+
+    def forward(self, zone_layers, candidates):
+        n = len(candidates)
+        rows = []
+        for layer in zone_layers:
+            p = _to_tensor(layer["probs"])
+            if p.shape[0] != n:
+                p = F.pad(p, (0, n - p.shape[0]))[:n]
+            rows.append(p.unsqueeze(0))
+        zone_matrix = torch.cat(rows, dim=0)
+        row_weights = F.softmax(self.zone_weights, dim=0)
+        blended = (zone_matrix * row_weights.unsqueeze(1)).sum(dim=0)
+        blended = _normalise(blended.clamp(min=float(self.eps)))
+
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L11_TENSOR_BLEND",
+            "words":  words,
+            "probs":  blended.detach().numpy(),
+            "source": (
+                f"row-weighted blend of L4..L10 ({len(zone_layers)} rows) "
+                f"softmax_weights={row_weights.tolist()}"
+            ),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L12 – Final distribution (geometric mean of L3 and L11)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L12_Final(nn.Module):
+    def __init__(self, blend_alpha: float = 0.5):
+        super().__init__()
+        self.blend_alpha = nn.Parameter(torch.tensor(blend_alpha, dtype=torch.float64))
+
+    def forward(self, L3_pairs, L11):
+        alpha = self.blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6)
+        beta = 1.0 - alpha
+
+        p3 = _to_tensor([p for _, p in L3_pairs]).clamp(min=1e-24)
+        p11 = _to_tensor(L11["probs"]).clamp(min=1e-24)
+
+        blended = p3.pow(alpha) * p11.pow(beta)
+        blended = _normalise(blended)
+
+        sorted_idx = torch.argsort(blended, descending=True)
+        words_arr = [L3_pairs[i][0] for i in sorted_idx.tolist()]
+        probs_arr = blended[sorted_idx]
+
+        out = list(zip(words_arr, probs_arr.tolist()))
+        layer = {
+            "name":   "L12_FINAL",
+            "words":  words_arr,
+            "probs":  probs_arr.detach().numpy(),
+            "source": f"geo_mean(L3^{alpha.detach().item():.3f}, L11^{beta.detach().item():.3f})",
+        }
+        return out, layer
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L13 – Contextual requestor position
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L13_CtxReqPos(nn.Module):
+    def __init__(self, sigma: float = 0.30, floor: float = 0.04):
+        super().__init__()
+        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
+        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
+
+    def forward(self, candidates, draw_pos, stream_len):
+        n = len(candidates)
+        sigma = self.sigma.clamp(min=1e-6)
+        floor = self.floor.clamp(min=0.0, max=1.0 - 1e-6)
+        norm_pos = (draw_pos % max(1, stream_len)) / max(1, stream_len - 1)
+
+        indices = torch.arange(n, dtype=torch.float64) / max(1, n - 1)
+        gauss = torch.exp(-0.5 * ((indices - norm_pos) / sigma) ** 2)
+        weights = _normalise(floor + (1.0 - floor) * gauss)
+
+        words = [w for w, _ in candidates]
+        return {
+            "name":   "L13_CTX_REQ_POS",
+            "words":  words,
+            "probs":  weights.detach().numpy(),
+            "source": (
+                f"ctx_req_pos={draw_pos} norm={norm_pos:.4f} stream_len={stream_len}"
+            ),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  L14 – Locked state index
+# ═══════════════════════════════════════════════════════════════════════════
+
+class L14_LockedStateIndex(nn.Module):
+    """Previous-state-dependent index dimension with monotonic write-once
+    semantics — the "forbid altering" rule."""
+
+    LAYER_NAME = "L14_LOCKED_STATE_INDEX"
+
+    def __init__(
+        self,
+        sigma:         float = 0.25,
+        floor:         float = 0.03,
+        lock_strength: float = 1.0,
+    ):
+        super().__init__()
+        self.sigma         = nn.Parameter(torch.tensor(sigma,         dtype=torch.float64))
+        self.floor         = nn.Parameter(torch.tensor(floor,         dtype=torch.float64))
+        self.lock_strength = nn.Parameter(torch.tensor(lock_strength, dtype=torch.float64))
+
+        self._locked:   Dict[Tuple[str, ...], str] = {}
+        self._observed: Set[Tuple[str, ...]] = set()
+
+    def reset_state(self) -> None:
+        self._locked.clear()
+        self._observed.clear()
+
+    def commit(self, key: Tuple[str, ...], token: str) -> bool:
+        if not key or not token:
+            return False
+        if key in self._locked:
+            return False
+        self._locked[key] = token
+        self._observed.discard(key)
+        return True
+
+    @property
+    def n_locked(self) -> int:
+        return len(self._locked)
+
+    @property
+    def n_missing(self) -> int:
+        return len(self._observed)
+
+    @staticmethod
+    def key_from_ctx(context_deque: deque) -> Tuple[str, ...]:
+        ctx_list = [w for w in context_deque if w]
+        if len(ctx_list) >= 2:
+            return tuple(ctx_list[-2:])
+        if len(ctx_list) == 1:
+            return (ctx_list[-1],)
+        return ()
+
+    def forward(
+        self,
+        candidates:    List[Tuple[str, float]],
+        context_deque: deque,
+        draw_pos:      int,
+        stream_len:    int,
+    ) -> Dict:
+        n = len(candidates)
+        words = [w for w, _ in candidates]
+
+        if n == 0:
+            return {
+                "name":   self.LAYER_NAME,
+                "words":  [],
+                "probs":  np.zeros(0, dtype=np.float64),
+                "source": "empty candidates",
+                "key":    (),
+                "locked": False,
+            }
+
+        sigma = self.sigma.clamp(min=1e-6)
+        floor = self.floor.clamp(min=0.0, max=1.0 - 1e-6)
+        lockw = self.lock_strength.clamp(min=0.0, max=1.0)
+
+        key = self.key_from_ctx(context_deque)
+
+        if key and key in self._locked:
+            locked_token = self._locked[key]
+            f = float(floor)
+            w = float(lockw)
+
+            weights = torch.full((n,), f, dtype=torch.float64)
+            if locked_token in words:
+                idx = words.index(locked_token)
+                weights[idx] = f + w * (1.0 - f)
+            weights = _normalise(weights)
+
+            source = (
+                f"LOCKED key={key} -> '{locked_token}' "
+                f"(lock_strength={w:.3f}, n_locked={self.n_locked})"
+            )
+            locked_flag = True
+        else:
+            if key:
+                self._observed.add(key)
+
+            missing = self.n_missing
+            sl = max(1, int(stream_len))
+            offset_pos = (int(draw_pos) + missing) % sl
+            norm_pos = offset_pos / max(1, sl - 1)
+
+            indices = torch.arange(n, dtype=torch.float64) / max(1, n - 1)
+            gauss = torch.exp(-0.5 * ((indices - norm_pos) / sigma) ** 2)
+            weights = _normalise(floor + (1.0 - floor) * gauss)
+
+            source = (
+                f"UNLOCKED key={key or '∅'} "
+                f"draw_pos={draw_pos} missing={missing} "
+                f"offset={offset_pos} norm={norm_pos:.4f}"
+            )
+            locked_flag = False
+
+        return {
+            "name":   self.LAYER_NAME,
+            "words":  words,
+            "probs":  weights.detach().numpy(),
+            "source": source,
+            "key":    key,
+            "locked": locked_flag,
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LayerFrame
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LayerFrame:
+    __slots__ = (
+        "step", "layers", "chosen", "context_window",
+        "zone_name", "draw_pos", "next_draw_pos",
+    )
+
+    def __init__(
+        self,
+        step:           int,
+        layers:         List[Dict],
+        chosen:         str = "",
+        context_window: Tuple = (),
+        zone_name:      str = "",
+        draw_pos:       int = 0,
+        next_draw_pos:  int = 0,
+    ):
+        self.step = step
+        self.layers = layers
+        self.chosen = chosen
+        self.context_window = context_window
+        self.zone_name = zone_name
+        self.draw_pos = draw_pos
+        self.next_draw_pos = next_draw_pos
+
+    def get(self, name: str) -> Optional[Dict]:
+        for layer in self.layers:
+            if layer["name"] == name:
+                return layer
+        return None
+
+    def tensor(self) -> torch.Tensor:
+        rows = [_to_tensor(l["probs"]) for l in self.layers]
+        if not rows:
+            return torch.zeros(0, dtype=torch.float64)
+        max_len = max(r.shape[0] for r in rows)
+        padded = [F.pad(r, (0, max_len - r.shape[0])) for r in rows]
+        return torch.stack(padded)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  IsomorphismPipeline
+# ═══════════════════════════════════════════════════════════════════════════
+
+class IsomorphismPipeline(nn.Module):
+    """Full 14-layer isomorphic probability pipeline (L0..L13).
+    See LockedIsomorphismPipeline for the 15-layer variant that adds L14."""
+
+    SAVE_FORMAT_VERSION = 2
+
+    LAYER_NAMES = [
+        "L0_RAW_DIST",      "L1_TEMP_SCALED",   "L2_INSIGHT",
+        "L3_TOPK_TOPP",     "L4_ZONE_FREQ",     "L5_ZONE_ALPHA",
+        "L6_ZONE_BIGRAM",   "L7_ZONE_TRIGRAM",  "L8_ZONE_CHAR_TRIG",
+        "L9_ZONE_LATENT",   "L10_HISTORY",      "L11_TENSOR_BLEND",
+        "L12_FINAL",        "L13_CTX_REQ_POS",
+    ]
+
+    def __init__(
+        self,
+        cpd,
+        context_index,
+        vocab,
+        ngram_n:         int = 2,
+        temperature:     float = 4.3,
+        top_k:           int = 100,
+        top_p:           float = 1.0,
+        rep_penalty:     float = 1.13,
+        insight_penalty: float = 3.95,
+        history:         Optional[Counter] = None,
+        l4_sigma: float = 0.50,   l4_floor: float = 0.05,
+        l5_sigma: float = 0.40,   l5_floor: float = 0.05,
+        l6_sigma: float = 0.25,   l6_floor: float = 0.04,
+        l7_sigma: float = 0.20,   l7_floor: float = 0.03,
+        l8_sigma: float = 0.35,   l8_floor: float = 0.04,
+        l9_sigma: float = 0.30,   l9_floor: float = 0.04,
+        l10_smoothing:    float = 1.0,
+        l11_init_weights: Optional[List[float]] = None,
+        l12_blend_alpha:  float = 0.5,
+        l13_sigma: float = 0.30,  l13_floor: float = 0.04,
+        spatial_sum_alpha: float = 1.0,
+    ):
+        super().__init__()
+
+        self.cpd = cpd
+        self.ctx_idx = context_index
+        self.vocab = set(vocab)
+        self.ngram_n = max(2, int(ngram_n))
+        self.context_window = self.ngram_n - 1
+        self.history = Counter(history) if history else Counter()
+        self._step = 0
+        self._pos = 0
+        self._stream: List[int] = []
+        self._char_trig_index: Dict[str, set] = (
+            getattr(context_index, "_trig_index", {}) if context_index else {}
+        )
+
+        # Spatial-sum reweighting: strength of corpus-recurrence prior applied
+        # to per-step token probabilities. 0.0 disables; 1.0 doubles the
+        # weight of the highest-spatial-sum token relative to hapaxes.
+        # Reads from self.preprocessor.spatial_sum, which is attached by
+        # build_hf_pipeline / build_hf_pipeline_from_preset after construction.
+        self.spatial_sum_alpha = float(spatial_sum_alpha)
+        self._spatial_max_cached: Optional[float] = None
+        self._spatial_apply_count: int = 0
+        self._spatial_skip_count: int = 0
+
+        self._init_hparams: Dict = dict(
+            ngram_n=self.ngram_n,
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
+            rep_penalty=float(rep_penalty),
+            insight_penalty=float(insight_penalty),
+            l4_sigma=float(l4_sigma), l4_floor=float(l4_floor),
+            l5_sigma=float(l5_sigma), l5_floor=float(l5_floor),
+            l6_sigma=float(l6_sigma), l6_floor=float(l6_floor),
+            l7_sigma=float(l7_sigma), l7_floor=float(l7_floor),
+            l8_sigma=float(l8_sigma), l8_floor=float(l8_floor),
+            l9_sigma=float(l9_sigma), l9_floor=float(l9_floor),
+            l10_smoothing=float(l10_smoothing),
+            l11_init_weights=list(l11_init_weights) if l11_init_weights is not None else None,
+            l12_blend_alpha=float(l12_blend_alpha),
+            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+            spatial_sum_alpha=float(spatial_sum_alpha),
+        )
+
+        self.l0  = L0_RawDist(rep_penalty=rep_penalty)
+        self.l1  = L1_TempScaled(temperature=temperature)
+        self.l2  = L2_InsightPenalty(insight_penalty=insight_penalty)
+        self.l3  = L3_TopKTopP(top_k=top_k, top_p=top_p)
+        self.l4  = L4_ZoneFreq(sigma=l4_sigma, floor=l4_floor)
+        self.l5  = L5_ZoneAlpha(sigma=l5_sigma, floor=l5_floor)
+        self.l6  = L6_ZoneBigram(sigma=l6_sigma, floor=l6_floor)
+        self.l7  = L7_ZoneTrigram(sigma=l7_sigma, floor=l7_floor)
+        self.l8  = L8_ZoneCharTrig(sigma=l8_sigma, floor=l8_floor)
+        self.l9  = L9_ZoneLatent(sigma=l9_sigma, floor=l9_floor)
+        self.l10 = L10_History(smoothing=l10_smoothing)
+        self.l11 = L11_TensorBlend(init_weights=l11_init_weights)
+        self.l12 = L12_Final(blend_alpha=l12_blend_alpha)
+        self.l13 = L13_CtxReqPos(sigma=l13_sigma, floor=l13_floor)
+
+    def _dist_for_ctx(self, ctx_tuple):
+        for cut in range(len(ctx_tuple), 0, -1):
+            trial = ("",) * (self.context_window - cut) + ctx_tuple[-cut:]
+            try:
+                d = self.cpd[trial]
+                if list(d.samples()):
+                    return d
+            except Exception:
+                continue
+        try:
+            d = self.cpd[("",) * self.context_window]
+            if list(d.samples()):
+                return d
+        except Exception:
+            pass
+        return None
+
+    def seed_stream(self, stream: list):
+        self._stream = list(stream)
+        self._pos = 0
+
+    def _apply_spatial_sum_weights(
+        self, blended: List[Tuple[str, float]]
+    ) -> List[Tuple[str, float]]:
+        """Multiply each (word, prob) by (1 + spatial_sum[w] / max_spatial)**alpha,
+        then renormalise. Pulls spatial_sum off self.preprocessor when present.
+        No-op if alpha==0, no preprocessor attached, or no spatial_sum data.
+        Fires on every step — this is the hot-path injection of the
+        corpus-recurrence prior."""
+        alpha = self.spatial_sum_alpha
+        if alpha <= 0.0 or not blended:
+            self._spatial_skip_count += 1
+            return blended
+
+        pre = getattr(self, "preprocessor", None)
+        ssum = getattr(pre, "spatial_sum", None) if pre is not None else None
+        if not ssum:
+            self._spatial_skip_count += 1
+            return blended
+
+        if self._spatial_max_cached is None:
+            self._spatial_max_cached = float(max(ssum.values()) or 1.0)
+        smax = self._spatial_max_cached
+
+        reweighted: List[Tuple[str, float]] = []
+        for w, p in blended:
+            s = ssum.get(w, 0)
+            mult = (1.0 + (float(s) / smax)) ** alpha
+            reweighted.append((w, p * mult))
+
+        total = sum(p for _, p in reweighted)
+        if total > 0:
+            reweighted = [(w, p / total) for w, p in reweighted]
+        self._spatial_apply_count += 1
+        return reweighted
+
+    def step(
+        self,
+        context_deque: deque,
+        prompt_words:  List[str],
+        draw:          float,
+        zone_name:     str = "",
+    ) -> Optional[LayerFrame]:
+        dist = self._dist_for_ctx(tuple(context_deque))
+        if dist is None:
+            return None
+
+        L0_pairs, L0 = self.l0(dist, self.history)
+        if not L0_pairs:
+            return None
+
+        L1_pairs, L1 = self.l1(L0_pairs)
+        L2_pairs, L2 = self.l2(L1_pairs)
+        L3_pairs, L3 = self.l3(L2_pairs)
+        if not L3_pairs:
+            return None
+
+        ci = self.ctx_idx
+        if ci is None:
+            flat = _normalise(torch.ones(len(L3_pairs), dtype=torch.float64))
+            flat_np = flat.detach().numpy()
+            words = [w for w, _ in L3_pairs]
+            zone_layers = [
+                {"name": n, "words": words, "probs": flat_np.copy(),
+                 "source": "no context_index"}
+                for n in ["L4_ZONE_FREQ", "L5_ZONE_ALPHA", "L6_ZONE_BIGRAM",
+                          "L7_ZONE_TRIGRAM", "L8_ZONE_CHAR_TRIG", "L9_ZONE_LATENT"]
+            ]
+        else:
+            L4 = self.l4(L3_pairs, prompt_words, ci.freq_zones, ci.token_freq)
+            L5 = self.l5(L3_pairs, prompt_words, ci.alpha_zones)
+            L6 = self.l6(L3_pairs, prompt_words, ci.ngram_zones)
+            L7 = self.l7(L3_pairs, context_deque, ci.ngram_zones)
+            L8 = self.l8(L3_pairs, prompt_words, self._char_trig_index)
+            L9 = self.l9(
+                L3_pairs, prompt_words,
+                ci.latent_sorted_keys, ci.latent_bos_data,
+            )
+            zone_layers = [L4, L5, L6, L7, L8, L9]
+
+        L10 = self.l10(L3_pairs, self.history)
+        L11 = self.l11(zone_layers + [L10], L3_pairs)
+        L12_pairs, L12 = self.l12(L3_pairs, L11)
+
+        draw_pos = self._pos
+        stream_len = max(1, len(self._stream))
+        L13 = self.l13(L3_pairs, draw_pos, stream_len)
+
+        # Geometric blend of L12 and L13
+        l12_map = dict(L12_pairs)
+        l13_map = dict(zip(L13["words"], L13["probs"].tolist()))
+        all_words = list(l12_map.keys())
+        floor_val = 1e-12
+
+        blended = [
+            (w, math.sqrt(
+                max(floor_val, l12_map.get(w, floor_val)) *
+                max(floor_val, l13_map.get(w, floor_val))
+            ))
+            for w in all_words
+        ]
+        bt = sum(p for _, p in blended)
+        blended = [(w, p / bt) for w, p in blended] if bt > 0 else blended
+
+        # Spatial-sum reweighting (hot-path corpus-recurrence prior).
+        blended = self._apply_spatial_sum_weights(blended)
+
+        unseen = [(w, p) for w, p in blended if self.history[w] == 0]
+        pool = unseen if unseen else blended
+        t = sum(p for _, p in pool)
+        pool = [(w, p / t) for w, p in pool] if t > 0 else pool
+
+        chosen, cumulative = pool[-1][0], 0.0
+        for w, p in pool:
+            cumulative += p
+            if draw < cumulative:
+                chosen = w
+                break
+
+        self.history[chosen] += 1
+
+        next_draw_pos = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
+        self._pos = next_draw_pos
+        self._step += 1
+
+        return LayerFrame(
+            step=self._step - 1,
+            layers=[L0, L1, L2, L3] + zone_layers + [L10, L11, L12, L13],
+            chosen=chosen,
+            context_window=tuple(context_deque),
+            zone_name=zone_name,
+            draw_pos=draw_pos,
+            next_draw_pos=next_draw_pos,
+        )
+
+    def generate(self, prompt: str, n_words: int, draw_fn, zone_fn=None):
+        tokens = [w.lower() for w in prompt.split() if w.isalpha()]
+        vocab_tokens = [w for w in tokens if w in self.vocab]
+
+        if len(vocab_tokens) >= self.context_window:
+            init = vocab_tokens[-self.context_window:]
+        else:
+            init = [""] * (self.context_window - len(vocab_tokens)) + vocab_tokens
+
+        ctx = deque(init, maxlen=self.context_window)
+
+        for _ in range(n_words):
+            zone_name = zone_fn(draw_fn()) if zone_fn is not None else ""
+            draw = draw_fn()
+            frame = self.step(ctx, tokens, draw, zone_name=zone_name)
+            if frame is None:
+                ctx.clear()
+                ctx.extend([""] * self.context_window)
+                continue
+            ctx.append(frame.chosen)
+            yield frame
+
+    def param_summary(self) -> str:
+        lines = [f"{'Parameter':<45} {'Value':>14}"]
+        lines.append("-" * 61)
+        for name, param in self.named_parameters():
+            v = param.data
+            if v.numel() == 1:
+                lines.append(f"  {name:<43} {v.item():>14.6f}")
+            else:
+                lines.append(
+                    f"  {name:<43} shape={list(v.shape)}  "
+                    f"mean={v.mean().item():.4f}"
+                )
+        return "\n".join(lines)
+
+    # ── SAVE / LOAD ───────────────────────────────────────────────────
+
+    def _extract_cfd_counts(self) -> Dict[Tuple[str, ...], Dict[str, int]]:
+        counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
+        for ctx in self.cpd.conditions():
+            dist = self.cpd[ctx]
+            fd = getattr(dist, "freqdist", lambda: None)()
+            if fd is None:
+                continue
+            ctx_counts = {str(w): int(c) for w, c in fd.items()}
+            if ctx_counts:
+                counts[tuple(ctx)] = ctx_counts
+        return counts
+
+    def _build_save_payload(
+        self,
+        kind:           str,
+        corpus_text:    Optional[str] = None,
+        lidstone_gamma: Optional[float] = None,
+        tokens:         Optional[List[str]] = None,
+        include_history: bool = True,
+    ) -> Dict:
+        payload: Dict = {
+            "format_version": self.SAVE_FORMAT_VERSION,
+            "kind":           kind,
+            "state_dict":     self.state_dict(),
+            "hparams":        dict(self._init_hparams),
+            "class_name":     type(self).__name__,
+        }
+        if include_history:
+            payload["history"] = dict(self.history)
+
+        if kind == "full":
+            if corpus_text is None:
+                raise ValueError("full save requires corpus_text")
+            payload["corpus_text"] = corpus_text
+            payload["lidstone_gamma"] = float(lidstone_gamma) if lidstone_gamma is not None else 0.1
+            payload["tokens"] = list(tokens) if tokens else []
+            payload["vocab"] = sorted(self.vocab)
+        elif kind == "midstate":
+            payload["lidstone_gamma"] = float(lidstone_gamma) if lidstone_gamma is not None else 0.1
+            payload["vocab"] = sorted(self.vocab)
+            payload["tokens"] = list(tokens) if tokens else []
+            payload["cfd_counts"] = self._extract_cfd_counts()
+        return payload
+
+    def save(
+        self,
+        path:           str,
+        *,
+        kind:           str = "full",
+        corpus_text:    Optional[str] = None,
+        lidstone_gamma: Optional[float] = None,
+        tokens:         Optional[List[str]] = None,
+        include_history: bool = True,
+    ) -> str:
+        if kind not in ("full", "weights", "midstate"):
+            raise ValueError(
+                f"kind must be 'full', 'midstate' or 'weights', got {kind!r}"
+            )
+        payload = self._build_save_payload(
+            kind=kind,
+            corpus_text=corpus_text,
+            lidstone_gamma=lidstone_gamma,
+            tokens=tokens,
+            include_history=include_history,
+        )
+        torch.save(payload, path)
+        return path
+
+    @classmethod
+    def _construct_from_payload(cls, payload, cpd, ctx_idx, vocab, ngram_n):
+        hparams = dict(payload.get("hparams", {}))
+        init_kwargs = dict(hparams)
+        init_kwargs.pop("ngram_n", None)
+
+        saved_class = payload.get("class_name", cls.__name__)
+        target_cls = cls
+        if saved_class == "LockedIsomorphismPipeline" and cls is IsomorphismPipeline:
+            target_cls = LockedIsomorphismPipeline
+
+        return target_cls(
+            cpd=cpd,
+            context_index=ctx_idx,
+            vocab=vocab,
+            ngram_n=ngram_n,
+            **init_kwargs,
+        )
+
+    @classmethod
+    def load(
+        cls,
+        path:           str,
+        *,
+        rebuild_context_index: bool = True,
+    ) -> "IsomorphismPipeline":
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > cls.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({cls.SAVE_FORMAT_VERSION})."
+            )
+        if payload.get("kind") != "full":
+            raise ValueError(
+                "load() requires a 'full' snapshot. For weights-only files "
+                "use IsomorphismPipeline.load_into(existing_pipeline, path)."
+            )
+
+        corpus_text = payload["corpus_text"]
+        gamma = float(payload.get("lidstone_gamma", 0.1))
+        ngram_n = int(payload.get("hparams", {}).get("ngram_n", 2))
+
+        cpd, vocab, tokens = build_real_cpd(corpus_text, ngram_n, gamma)
+        ctx_idx = build_real_context_index(vocab, cpd, tokens) if rebuild_context_index else None
+
+        pipeline = cls._construct_from_payload(payload, cpd, ctx_idx, vocab, ngram_n)
+
+        missing, unexpected = pipeline.load_state_dict(payload["state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"  [load] missing keys: {list(missing)}")
+            print(f"  [load] unexpected keys: {list(unexpected)}")
+
+        if "history" in payload and isinstance(payload["history"], dict):
+            pipeline.history = Counter(payload["history"])
+
+        return pipeline
+
+    @classmethod
+    def load_midstate(
+        cls,
+        path:                  str,
+        *,
+        rebuild_context_index: bool = True,
+    ) -> "IsomorphismPipeline":
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > cls.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({cls.SAVE_FORMAT_VERSION})."
+            )
+        if payload.get("kind") != "midstate":
+            raise ValueError(
+                f"load_midstate() requires a 'midstate' snapshot; got "
+                f"kind={payload.get('kind')!r}."
+            )
+
+        cfd_counts = payload.get("cfd_counts")
+        if cfd_counts is None:
+            raise ValueError(
+                "Midstate file is missing 'cfd_counts' — was it written "
+                "by an older version of the code?"
+            )
+
+        ngram_n = int(payload.get("hparams", {}).get("ngram_n", 2))
+        gamma = float(payload.get("lidstone_gamma", 0.1))
+        vocab = set(payload.get("vocab") or [])
+        tokens = list(payload.get("tokens") or [])
+
+        cpd = _cpd_from_counts(cfd_counts, vocab, gamma)
+        ctx_idx = (
+            build_real_context_index(vocab, cpd, tokens)
+            if rebuild_context_index and tokens
+            else None
+        )
+
+        pipeline = cls._construct_from_payload(payload, cpd, ctx_idx, vocab, ngram_n)
+        missing, unexpected = pipeline.load_state_dict(payload["state_dict"], strict=False)
+        if missing or unexpected:
+            print(f"  [load_midstate] missing keys: {list(missing)}")
+            print(f"  [load_midstate] unexpected keys: {list(unexpected)}")
+
+        if "history" in payload and isinstance(payload["history"], dict):
+            pipeline.history = Counter(payload["history"])
+
+        return pipeline
+
+    def load_into(self, path: str, *, strict: bool = False) -> Dict:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+
+        fmt = payload.get("format_version", 0)
+        if fmt > self.SAVE_FORMAT_VERSION:
+            raise ValueError(
+                f"Snapshot format version {fmt} is newer than supported "
+                f"({self.SAVE_FORMAT_VERSION})."
+            )
+
+        sd = payload.get("state_dict", payload)
+        result = self.load_state_dict(sd, strict=strict)
+
+        missing = list(getattr(result, "missing_keys", []) or [])
+        unexpected = list(getattr(result, "unexpected_keys", []) or [])
+
+        if "history" in payload and isinstance(payload["history"], dict):
+            self.history = Counter(payload["history"])
+
+        return {
+            "missing":        missing,
+            "unexpected":     unexpected,
+            "kind":           payload.get("kind", "weights"),
+            "format_version": fmt,
+        }
+
+    # ── last-run frame store ──────────────────────────────────────────
+    frames: List[LayerFrame] = []
+
+    @staticmethod
+    def _frames_to_text(
+        frames:         List[LayerFrame],
+        prompt:         str = "",
+        capitalise:     bool = True,
+        include_prompt: bool = True,
+    ) -> str:
+        gen_words = [f.chosen for f in frames if f.chosen]
+        prompt_words: List[str] = (
+            prompt.strip().split()
+            if include_prompt and prompt.strip()
+            else []
+        )
+        all_words = prompt_words + gen_words
+        if not all_words:
+            return ""
+        if not capitalise:
+            return " ".join(all_words)
+
+        result: List[str] = []
+        cap_next = True
+        for w in all_words:
+            result.append(w.capitalize() if cap_next else w)
+            cap_next = bool(w.rstrip("\"'")[-1:] in {".", "!", "?"})
+        return " ".join(result)
+
+    def _make_draw_fn(self, stream, digits_per_sample, seed):
+        if stream is not None:
+            self.seed_stream(stream)
+
+        active_stream = getattr(self, "_stream", [])
+
+        if active_stream:
+            pos = [self._pos]
+            dps = max(1, int(digits_per_sample))
+            s_len = len(active_stream)
+
+            def _draw_pi() -> float:
+                val = 0
+                base = 26 ** dps
+                for _ in range(dps):
+                    val = val * 26 + active_stream[pos[0] % s_len]
+                    pos[0] = (pos[0] + 1) % s_len
+                self._pos = pos[0]
+                return val / base
+
+            return _draw_pi
+
+        rng = random.Random(seed)
+        return rng.random
+
+    def generate_text(
+        self,
+        prompt:     str,
+        n_words:    int,
+        stream:     Optional[List[int]] = None,
+        *,
+        digits_per_sample: int = 3,
+        seed:              Optional[int] = None,
+        capitalise:        bool = True,
+        include_prompt:    bool = True,
+        zone_fn = None,
+    ) -> str:
+        draw_fn = self._make_draw_fn(stream, digits_per_sample, seed)
+        self.frames = list(
+            self.generate(prompt=prompt, n_words=n_words, draw_fn=draw_fn, zone_fn=zone_fn)
+        )
+        return self._frames_to_text(
+            self.frames,
+            prompt=prompt,
+            capitalise=capitalise,
+            include_prompt=include_prompt,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  LockedIsomorphismPipeline – 15-layer variant including L14
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LockedIsomorphismPipeline(IsomorphismPipeline):
+    """IsomorphismPipeline + L14_LockedStateIndex.
+
+    Adds a previous-state-dependent index dimension keyed by trigram
+    prefix. Once a key is committed during generation it is locked —
+    higher transient indexes (later steps) cannot alter the state.
+    """
+
+    LAYER_NAMES = IsomorphismPipeline.LAYER_NAMES + ["L14_LOCKED_STATE_INDEX"]
+
+    def __init__(
+        self,
+        *args,
+        l14_sigma:         float = 0.25,
+        l14_floor:         float = 0.03,
+        l14_lock_strength: float = 1.0,
+        l14_blend_alpha:   float = 0.5,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+
+        self.l14 = L14_LockedStateIndex(
+            sigma=l14_sigma,
+            floor=l14_floor,
+            lock_strength=l14_lock_strength,
+        )
+        self.l14_blend_alpha = nn.Parameter(
+            torch.tensor(l14_blend_alpha, dtype=torch.float64)
+        )
+
+        self._init_hparams.update(
+            l14_sigma=float(l14_sigma),
+            l14_floor=float(l14_floor),
+            l14_lock_strength=float(l14_lock_strength),
+            l14_blend_alpha=float(l14_blend_alpha),
+        )
+
+    def seed_stream(self, stream):
+        super().seed_stream(stream)
+        self.l14.reset_state()
+
+    def reset_locked_state(self) -> None:
+        self.l14.reset_state()
+
+    def lock_table_summary(self, limit: int = 50) -> str:
+        items = list(self.l14._locked.items())
+        if not items:
+            return "(lock table empty)"
+        lines = [
+            f"Locked: {len(items)}   Missing/observed: {self.l14.n_missing}",
+            "-" * 60,
+        ]
+        for k, v in items[:limit]:
+            lines.append(f"  {str(k):<40} -> {v}")
+        if len(items) > limit:
+            lines.append(f"  ... and {len(items) - limit} more")
+        return "\n".join(lines)
+
+    def step(
+        self,
+        context_deque: deque,
+        prompt_words:  List[str],
+        draw:          float,
+        zone_name:     str = "",
+    ) -> Optional[LayerFrame]:
+        dist = self._dist_for_ctx(tuple(context_deque))
+        if dist is None:
+            return None
+
+        L0_pairs, L0 = self.l0(dist, self.history)
+        if not L0_pairs:
+            return None
+
+        L1_pairs, L1 = self.l1(L0_pairs)
+        L2_pairs, L2 = self.l2(L1_pairs)
+        L3_pairs, L3 = self.l3(L2_pairs)
+        if not L3_pairs:
+            return None
+
+        ci = self.ctx_idx
+        if ci is None:
+            flat = _normalise(torch.ones(len(L3_pairs), dtype=torch.float64))
+            flat_np = flat.detach().numpy()
+            words = [w for w, _ in L3_pairs]
+            zone_layers = [
+                {"name": n, "words": words, "probs": flat_np.copy(),
+                 "source": "no context_index"}
+                for n in (
+                    "L4_ZONE_FREQ", "L5_ZONE_ALPHA", "L6_ZONE_BIGRAM",
+                    "L7_ZONE_TRIGRAM", "L8_ZONE_CHAR_TRIG", "L9_ZONE_LATENT",
+                )
+            ]
+        else:
+            L4 = self.l4(L3_pairs, prompt_words, ci.freq_zones, ci.token_freq)
+            L5 = self.l5(L3_pairs, prompt_words, ci.alpha_zones)
+            L6 = self.l6(L3_pairs, prompt_words, ci.ngram_zones)
+            L7 = self.l7(L3_pairs, context_deque, ci.ngram_zones)
+            L8 = self.l8(L3_pairs, prompt_words, self._char_trig_index)
+            L9 = self.l9(
+                L3_pairs, prompt_words,
+                ci.latent_sorted_keys, ci.latent_bos_data,
+            )
+            zone_layers = [L4, L5, L6, L7, L8, L9]
+
+        L10 = self.l10(L3_pairs, self.history)
+        L11 = self.l11(zone_layers + [L10], L3_pairs)
+        L12_pairs, L12 = self.l12(L3_pairs, L11)
+
+        draw_pos = self._pos
+        stream_len = max(1, len(self._stream))
+        L13 = self.l13(L3_pairs, draw_pos, stream_len)
+        L14 = self.l14(L3_pairs, context_deque, draw_pos, stream_len)
+
+        # Geometric blend L12 · L13 · L14
+        alpha14 = float(self.l14_blend_alpha.clamp(min=1e-6, max=1.0 - 1e-6))
+        floor_val = 1e-12
+
+        l12_map = dict(L12_pairs)
+        l13_map = dict(zip(L13["words"], L13["probs"].tolist()))
+        l14_map = dict(zip(L14["words"], L14["probs"].tolist()))
+
+        # FIXED: previous version used min() (collapsed everything to floor)
+        # and torch.argmax(...) which returned an INDEX, not a probability.
+        # Correct behaviour: max(floor, value) and per-token dict lookup.
+        blended = []
+        for w in l12_map.keys():
+            p12 = max(floor_val, l12_map.get(w, floor_val))
+            p13 = max(floor_val, l13_map.get(w, floor_val))
+            p14 = max(floor_val, l14_map.get(w, floor_val))
+            base = math.sqrt(p12 * p13)
+            merged = (base ** (1.0 - alpha14)) * (p14 ** alpha14)
+            blended.append((w, merged))
+
+        total = sum(p for _, p in blended)
+        if total > 0:
+            blended = [(w, p / total) for w, p in blended]
+
+        # Spatial-sum reweighting (hot-path corpus-recurrence prior).
+        blended = self._apply_spatial_sum_weights(blended)
+
+        unseen = [(w, p) for w, p in blended if self.history[w] == 0]
+        pool = unseen if unseen else blended
+        t = sum(p for _, p in pool)
+        pool = [(w, p / t) for w, p in pool] if t > 0 else pool
+
+        chosen, cumulative = (pool[-1][0] if pool else ""), 0.0
+        for w, p in pool:
+            cumulative += p
+            if draw < cumulative:
+                chosen = w
+                break
+
+        # COMMIT — write-once
+        key = L14_LockedStateIndex.key_from_ctx(context_deque)
+        if key and chosen:
+            self.l14.commit(key, chosen)
+
+        self.history[chosen] += 1
+
+        next_draw_pos = (draw_pos + (draw_pos % max(1, stream_len))) % stream_len
+        self._pos = next_draw_pos
+        self._step += 1
+
+        return LayerFrame(
+            step=self._step - 1,
+            layers=[L0, L1, L2, L3] + zone_layers + [L10, L11, L12, L13, L14],
+            chosen=chosen,
+            context_window=tuple(context_deque),
+            zone_name=zone_name,
+            draw_pos=draw_pos,
+            next_draw_pos=next_draw_pos,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Real corpus builder (NLTK)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _cpd_from_counts(
+    cfd_counts:     Dict[Tuple[str, ...], Dict[str, int]],
+    vocab:          set,
+    lidstone_gamma: float = 0.1,
+):
+    from nltk.probability import (
+        ConditionalFreqDist, ConditionalProbDist, LidstoneProbDist, FreqDist,
+    )
+
+    cfd = ConditionalFreqDist()
+    for ctx, counts in cfd_counts.items():
+        ctx_key = tuple(ctx)
+        fd = FreqDist()
+        for word, c in counts.items():
+            fd[word] = int(c)
+        cfd[ctx_key] = fd
+
+    class _LidFactory:
+        def __init__(self, gamma, bins):
+            self.gamma = gamma
+            self.bins = bins
+        def __call__(self, fd):
+            return LidstoneProbDist(fd, gamma=self.gamma, bins=self.bins)
+
+    return ConditionalProbDist(
+        cfd,
+        _LidFactory(gamma=float(lidstone_gamma), bins=max(1, len(vocab))),
+    )
+
+
+def build_real_cpd(corpus: str, ngram_n: int = 2, lidstone_gamma: float = 0.1):
+    import os
+    import nltk
+    from nltk.util import ngrams as nltk_ngrams
+
+    NLTK_DATA_DIR = os.environ.get("NLTK_DATA", "/tmp/nltk_data")
+    os.makedirs(NLTK_DATA_DIR, exist_ok=True)
+    if NLTK_DATA_DIR not in nltk.data.path:
+        nltk.data.path.insert(0, NLTK_DATA_DIR)
+    for pkg, path in [("punkt", "tokenizers/punkt"),
+                      ("punkt_tab", "tokenizers/punkt_tab")]:
+        try:
+            nltk.data.find(path)
+        except LookupError:
+            try:
+                nltk.download(pkg, download_dir=NLTK_DATA_DIR, quiet=True)
+            except Exception:
+                pass
+
+    tokens = corpus.lower().split()
+    if not tokens:
+        raise ValueError("Corpus produced zero tokens.")
+
+    ngram_n = max(2, int(ngram_n))
+    padded = [""] * (ngram_n - 1) + tokens + [""]
+    all_ng = list(nltk_ngrams(padded, ngram_n))
+
+    cfd_counts: Dict[Tuple[str, ...], Dict[str, int]] = {}
+    for ng in all_ng:
+        ctx, word = tuple(ng[:-1]), ng[-1]
+        cfd_counts.setdefault(ctx, {})
+        cfd_counts[ctx][word] = cfd_counts[ctx].get(word, 0) + 1
+
+    vocab = set(tokens) | {""}
+    cpd = _cpd_from_counts(cfd_counts, vocab, lidstone_gamma)
+    return cpd, vocab, tokens
+
+
+def build_real_context_index(vocab, cpd, tokens):
+    """Build a ContextZoneIndex from real corpus tokens (if app.py is available)."""
+    try:
+        import sys, os
+        _here = os.path.dirname(os.path.abspath(__file__))
+        if _here not in sys.path:
+            sys.path.insert(0, _here)
+        from app import ContextZoneIndex
+        return ContextZoneIndex(vocab, cpd, Counter(tokens))
+    except Exception as e:
+        print(f"  [context_index] not available ({e}); zone layers will use uniform weights.")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Generic pipeline builders (defined AFTER all the class definitions)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def buildhfsquadpipeline(
+    dataset_name: str = "squad",
+    config_name: Optional[str] = None,
+    split_names: Sequence[str] = ("train", "validation"),
+    *,
+    locked: bool = True,
+    ngram_n: int = 3,
+    lidstone_gamma: float = 0.1,
+    minsentencelen: int = 3,
+    pipelinekwargs: Optional[Dict] = None,
+    preprocessorkwargs: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, HFSquadSentenceDatasetPreprocessor]:
+    """HF SQuAD → CPD/context index → pipeline."""
+    pre = HFSquadSentenceDatasetPreprocessor(
+        dataset_name=dataset_name,
+        config_name=config_name,
+        split_names=split_names,
+        minsentencelen=minsentencelen,
+        **(preprocessorkwargs or {}),
+    )
+    corpustext = pre.tocorpus()
+    cpd, vocab, tokens = build_real_cpd(
+        corpustext, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
+    )
+    ctxidx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs = dict(cpd=cpd, context_index=ctxidx, vocab=vocab, ngram_n=int(ngram_n))
+    if pipelinekwargs:
+        kwargs.update(pipelinekwargs)
+
+    pipe = cls(**kwargs)
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+def build_hf_pipeline(
+    dataset_name: str,
+    config_name: Optional[str] = None,
+    text_fields: Optional[Sequence[FieldSpec]] = None,
+    *,
+    split_names: Optional[Sequence[str]] = None,
+    locked: bool = True,
+    ngram_n: int = 3,
+    lidstone_gamma: float = 0.1,
+    minsentencelen: int = 3,
+    pipelinekwargs: Optional[Dict] = None,
+    preprocessorkwargs: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, HFSentenceDatasetPreprocessor]:
+    """Generic HF-dataset → CPD → context index → pipeline."""
+    pre = HFSentenceDatasetPreprocessor(
+        dataset_name=dataset_name,
+        config_name=config_name,
+        text_fields=text_fields,
+        split_names=split_names,
+        minsentencelen=minsentencelen,
+        **(preprocessorkwargs or {}),
+    )
+
+    corpus = pre.tocorpus()
+    cpd, vocab, tokens = build_real_cpd(
+        corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
+    )
+    ctxidx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs: Dict[str, Any] = dict(
+        cpd=cpd, context_index=ctxidx, vocab=vocab, ngram_n=int(ngram_n),
+    )
+    if pipelinekwargs:
+        kwargs.update(pipelinekwargs)
+
+    pipe = cls(**kwargs)
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+def build_hf_pipeline_from_preset(
+    preset_name: str,
+    *,
+    locked: bool = True,
+    ngram_n: int = 3,
+    lidstone_gamma: float = 0.1,
+    minsentencelen: int = 3,
+    pipelinekwargs: Optional[Dict] = None,
+    preprocessor_overrides: Optional[Dict] = None,
+) -> Tuple[IsomorphismPipeline, HFSentenceDatasetPreprocessor]:
+    """One-liner: preset name → ready pipeline + preprocessor."""
+    if preset_name not in HF_DATASET_PRESETS:
+        raise KeyError(
+            f"Unknown preset {preset_name!r}. "
+            f"Available: {sorted(HF_DATASET_PRESETS)}"
+        )
+    spec = dict(HF_DATASET_PRESETS[preset_name])
+    spec.setdefault("dataset_name", preset_name)
+    if preprocessor_overrides:
+        spec.update(preprocessor_overrides)
+
+    pre = HFSentenceDatasetPreprocessor(minsentencelen=minsentencelen, **spec)
+    corpus = pre.tocorpus()
+    cpd, vocab, tokens = build_real_cpd(
+        corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
+    )
+    ctxidx = build_real_context_index(vocab, cpd, tokens)
+
+    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
+    kwargs: Dict[str, Any] = dict(
+        cpd=cpd, context_index=ctxidx, vocab=vocab, ngram_n=int(ngram_n),
+    )
+    if pipelinekwargs:
+        kwargs.update(pipelinekwargs)
+    pipe = cls(**kwargs)
+    pipe.preprocessor = pre
+    return pipe, pre
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Gradio helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _make_heatmap(frames):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    if not frames:
+        return None
+
+    layer_names = [layer["name"] for layer in frames[0].layers]
+    n_layers = len(layer_names)
+    n_steps = len(frames)
+
+    mat = np.zeros((n_layers, n_steps))
+    for s, frame in enumerate(frames):
+        for r, layer in enumerate(frame.layers):
+            words = layer.get("words", [])
+            probs = layer.get("probs", np.array([]))
+            if frame.chosen in words and len(probs):
+                idx = words.index(frame.chosen)
+                if idx < len(probs):
+                    mat[r, s] = float(probs[idx])
+
+    fig, ax = plt.subplots(figsize=(max(8, n_steps * 0.30), max(4, n_layers * 0.45)))
+    im = ax.imshow(mat, aspect="auto", interpolation="nearest",
+                   cmap="viridis", origin="upper")
+    ax.set_yticks(range(n_layers))
+    ax.set_yticklabels(layer_names, fontsize=7)
+    ax.set_xlabel("Generation step")
+    ax.set_ylabel("Layer")
+    ax.set_title("P(chosen token) — per layer x step", fontsize=9)
+    fig.colorbar(im, ax=ax, label="probability", shrink=0.8)
+    fig.tight_layout()
+    return fig
+
+
+def _make_step_log(frames, limit=40):
+    if not frames:
+        return ""
+    header = "{:>4}  {:<18} {:>9}  {:>9}".format("Step", "Chosen", "draw_pos", "next_pos")
+    lines = [header, "-" * len(header)]
+    for i, f in enumerate(frames[:limit]):
+        lines.append("{:>4}  {:<18} {:>9}  {:>9}".format(
+            i, f.chosen, f.draw_pos, f.next_draw_pos))
+    if len(frames) > limit:
+        lines.append("... ({} more steps not shown)".format(len(frames) - limit))
+    return "\n".join(lines)
+
+
+def run_generation(
+    corpus_file, prompt, n_words, use_locked, seed,
+    ngram_n, lidstone_gamma,
+    temperature, top_k, top_p,
+    rep_penalty, insight_penalty, l12_blend_alpha,
+    l13_sigma, l13_floor,
+    l14_sigma, l14_floor, l14_lock_strength, l14_blend_alpha,
+    progress=None,
+):
+    if gr is not None and progress is None:
+        progress = gr.Progress(track_tqdm=True)
+
+    if corpus_file is None:
+        return "Please upload a corpus .txt file.", "", None, ""
+    try:
+        path = corpus_file.name if hasattr(corpus_file, "name") else str(corpus_file)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            corpus_text = fh.read()
+    except Exception as exc:
+        return "Could not read corpus file:\n{}".format(exc), "", None, ""
+
+    if not corpus_text.strip():
+        return "The uploaded corpus file is empty.", "", None, ""
+    if not str(prompt).strip():
+        return "Please enter a prompt.", "", None, ""
+
+    try:
+        if progress is not None:
+            progress(0.10, desc="Building CPD & context index ...")
+        cpd, vocab, tokens = build_real_cpd(
+            corpus_text, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma)
+        )
+        ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+        if progress is not None:
+            progress(0.40, desc="Constructing pipeline ...")
+        cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
+        kwargs = dict(
+            cpd=cpd, context_index=ctx_idx, vocab=vocab,
+            ngram_n=int(ngram_n),
+            temperature=float(temperature),
+            top_k=int(top_k), top_p=float(top_p),
+            rep_penalty=float(rep_penalty),
+            insight_penalty=float(insight_penalty),
+            l12_blend_alpha=float(l12_blend_alpha),
+            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+        )
+        if bool(use_locked):
+            kwargs.update(
+                l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
+                l14_lock_strength=float(l14_lock_strength),
+                l14_blend_alpha=float(l14_blend_alpha),
+            )
+        pipe = cls(**kwargs)
+
+        if progress is not None:
+            progress(0.60, desc="Generating text ...")
+        seed_val = int(seed) if seed is not None else None
+        text = pipe.generate_text(
+            prompt=str(prompt).strip(),
+            n_words=int(n_words),
+            seed=seed_val,
+        )
+
+        if progress is not None:
+            progress(0.85, desc="Building heatmap ...")
+        frames = getattr(pipe, "frames", [])
+        heatmap = _make_heatmap(frames)
+        step_log = _make_step_log(frames)
+
+        param_summary = pipe.param_summary()
+        if bool(use_locked) and hasattr(pipe, "lock_table_summary"):
+            param_summary += "\n\n" + pipe.lock_table_summary()
+
+        if progress is not None:
+            progress(1.0, desc="Done!")
+        return text, param_summary, heatmap, step_log
+
+    except Exception:
+        return "Error:\n\n{}".format(traceback.format_exc()), "", None, ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Demo
+# ═══════════════════════════════════════════════════════════════════════════
+
+if __name__ == "__main__":
+    # FIXED: was preprocessoroverrides= (typo) and max_examples_per_split==1000 (double =)
+    pipe, pre = build_hf_pipeline_from_preset(
+        "blended_skill_talk",  # or imdb, squad, c4, dbpedia_14, etc.
+        locked=True,
+        ngram_n=3,
+        minsentencelen=2,
+        preprocessor_overrides=dict(
+            strict=False,
+            boundaryquota=8,
+            max_examples_per_split=1000,
+        ),
+    )
+    print(pre.summary())
+    gen = SentenceAwareGenerator(pipe, pre)
+    while True:
+        prompt = input("USER: ")
+        if not prompt.strip():
+            break
+        print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True))
+        print()
