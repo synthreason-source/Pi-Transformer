@@ -46,7 +46,7 @@ except Exception:  # gradio is optional at import time
 
 from datasets import load_dataset, DatasetDict
 
-path = input("Filename: ")
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Field spec helpers (used by HFSentenceDatasetPreprocessor)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -222,58 +222,7 @@ HF_DATASET_PRESETS: Dict[str, Dict[str, Any]] = {
     "openbookqa":        {"config_name": "main",
                           "text_fields": ["question_stem", "choices.text"]},
 }
-def build_textfile_pipeline(
-    path: str,
-    *,
-    locked: bool = True,
-    ngramn: int = 3,
-    lidstonegamma: float = 0.1,
-    sentence_split: str = "line",   # "line" | "sentence" | "none"
-    min_sentence_len: int = 3,
-    pipeline_kwargs: Optional[Dict] = None,
-) -> "IsomorphismPipeline":
-    """
-    Build a pipeline directly from a plain .txt file.
-    No HF dataset or preprocessor involved — corpus text feeds
-    straight into buildrealcpd + buildrealcontextindex.
 
-    sentence_split:
-        "line"     – each non-empty line is one sentence boundary
-        "sentence" – split on  .  !  ?  (simple regex)
-        "none"     – treat whole file as one token stream
-    """
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        raw = fh.read()
-    if not raw.strip():
-        raise ValueError(f"Text file is empty: {path!r}")
-
-    if sentence_split == "line":
-        corpus = " ".join(
-            line.strip() for line in raw.splitlines() if line.strip()
-        )
-    elif sentence_split == "sentence":
-        import re as _re
-        corpus = " ".join(
-            s.strip()
-            for s in _re.split(r"(?<=[.!?])\s+", raw)
-            if len(s.split()) >= min_sentence_len
-        )
-    else:
-        corpus = raw
-
-    cpd, vocab, tokens = buildrealcpd(
-        corpus, ngramn=int(ngramn), lidstonegamma=float(lidstonegamma)
-    )
-    ctxidx = buildrealcontextindex(vocab, cpd, tokens)
-    cls = LockedIsomorphismPipeline if locked else IsomorphismPipeline
-    kwargs: Dict[str, Any] = dict(
-        cpd=cpd, contextindex=ctxidx, vocab=vocab, ngramn=int(ngramn)
-    )
-    if pipeline_kwargs:
-        kwargs.update(pipeline_kwargs)
-    pipe = cls(**kwargs)
-    pipe.source_text = corpus      # stash for save/reload
-    return pipe
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Generic HF dataset preprocessor with correlated unique-middle-pool
@@ -316,6 +265,7 @@ class HFSentenceDatasetPreprocessor:
         minsentencelen: int = 3,
         max_examples_per_split: Optional[int] = None,
         uniquemiddlepool: bool = True,
+        weight_by_spatial_sum: bool = True,
         strict: bool = True,
         boundaryquota: int = 1,
         streaming: bool = False,
@@ -337,6 +287,7 @@ class HFSentenceDatasetPreprocessor:
         self.minsentencelen = max(2, int(minsentencelen))
         self.max_examples_per_split = max_examples_per_split
         self.uniquemiddlepool = bool(uniquemiddlepool)
+        self.weight_by_spatial_sum = bool(weight_by_spatial_sum)
         self.strict = bool(strict)
         self.boundaryquota = max(1, int(boundaryquota))
         self.streaming = bool(streaming)
@@ -369,6 +320,25 @@ class HFSentenceDatasetPreprocessor:
         # correlation index: middle-pool token -> [(kept_record_idx, pos), ...]
         self.middlecorr: Dict[str, List[Tuple[int, int]]] = {}
         self.middlecorr_counts: Counter = Counter()
+
+        # spatial-sum sampling, derived from popped (duplicate) occurrences in
+        # orderedpool. For each token w with occurrences at indices
+        # p_0 < p_1 < ... < p_k in orderedpool:
+        #   token_positions[w]  = [p_0, p_1, ..., p_k]
+        #   popped_positions[w] = [p_1, ..., p_k]              (everything dedup removed)
+        #   gaps[w]             = [p_1 - p_0, ..., p_k - p_{k-1}]
+        #   spatial_sum[w]      = sum(gaps[w])  == p_k - p_0   (telescopes to span)
+        # Singletons have spatial_sum 0. Sampling weight is spatial_sum + 1
+        # so singletons remain reachable but heavily downweighted.
+        self.token_positions: Dict[str, List[int]] = {}
+        self.popped_positions: Dict[str, List[int]] = {}
+        self.gaps: Dict[str, List[int]] = {}
+        self.spatial_sum: Dict[str, int] = {}
+        self.occ_weights: Dict[str, List[float]] = {}
+        self._occ_weights_cum: Dict[str, List[float]] = {}
+        self._occ_weights_total: Dict[str, float] = {}
+        self._sample_weights_cum: Optional[List[float]] = None
+        self._sample_weights_total: float = 0.0
 
         # bookkeeping
         self._auto_detected_fields: List[str] = []
@@ -612,6 +582,71 @@ class HFSentenceDatasetPreprocessor:
         else:
             self.middlepool = orderedpool
 
+        # ── spatial-sum bookkeeping ──────────────────────────────────────
+        # Walk orderedpool once to record every token's positions, then
+        # derive popped positions, consecutive gaps, the per-token spatial
+        # sum, AND per-occurrence weights for biasing the within-anchor
+        # draw in sample_correlated.
+        #
+        # For each token w with positions [p_0, ..., p_{K-1}] in orderedpool:
+        #   gaps[w]            = [p_1-p_0, ..., p_{K-1}-p_{K-2}]
+        #   spatial_sum[w]     = sum(gaps[w])   (telescopes to span)
+        #   occ_weights[w][j]  = the gap that preceded occurrence j
+        #                        (j >= 1: gap[j-1]; j == 0: mean of the
+        #                        others, or 1.0 if K == 1).
+        # Sum(occ_weights[w]) = spatial_sum[w] + occ_weights[w][0], so the
+        # per-occurrence weighting literally redistributes the spatial sum
+        # across the token's jump targets.
+        #
+        # middlecorr[w] is appended in the exact same order as token_positions[w]
+        # (both populated in the same loop above), so weights line up by index.
+        self.token_positions = {}
+        for i, w in enumerate(orderedpool):
+            self.token_positions.setdefault(w, []).append(i)
+
+        self.popped_positions = {}
+        self.gaps = {}
+        self.spatial_sum = {}
+        self.occ_weights: Dict[str, List[float]] = {}
+        self._occ_weights_cum: Dict[str, List[float]] = {}
+        self._occ_weights_total: Dict[str, float] = {}
+
+        for w, positions in self.token_positions.items():
+            K = len(positions)
+            self.popped_positions[w] = positions[1:]
+            if K > 1:
+                gs = [positions[j + 1] - positions[j] for j in range(K - 1)]
+                mean_gap = sum(gs) / len(gs)
+                ow = [mean_gap] + [float(g) for g in gs]   # weight[0] = neutral
+            else:
+                gs = []
+                ow = [1.0]                                  # hapax: single jump target
+            self.gaps[w] = gs
+            self.spatial_sum[w] = sum(gs)
+            self.occ_weights[w] = ow
+            cum: List[float] = []
+            r = 0.0
+            for x in ow:
+                r += x
+                cum.append(r)
+            self._occ_weights_cum[w] = cum
+            self._occ_weights_total[w] = r
+
+        # Precompute cumulative weights for sampling the middlepool itself
+        # (only fires when the anchor isn't in middlecorr; still useful for
+        # sample_arbitrary / cold reseeds).
+        if self.weight_by_spatial_sum and self.middlepool:
+            cum = []
+            running = 0.0
+            for w in self.middlepool:
+                running += float(self.spatial_sum.get(w, 0)) + 1.0
+                cum.append(running)
+            self._sample_weights_cum = cum
+            self._sample_weights_total = running
+        else:
+            self._sample_weights_cum = None
+            self._sample_weights_total = 0.0
+
         self.beginningsset = set(self.beginnings)
         self.endingsset = set(self.endings)
         self.middleset = set(self.middlepool)
@@ -662,7 +697,26 @@ class HFSentenceDatasetPreprocessor:
             key = anchor
         else:
             n = len(self.middlepool)
-            if rngvalue is not None:
+            cum = self._sample_weights_cum
+            total = self._sample_weights_total
+            if self.weight_by_spatial_sum and cum and total > 0:
+                # Weighted draw against the spatial-sum CDF. Identical
+                # determinism contract as the uniform path: same rngvalue
+                # in [0,1) always picks the same key.
+                u = rngvalue if rngvalue is not None else rng.random()
+                # Defensive: clamp to [0,1) then scale to [0, total).
+                u = u - math.floor(u) if u >= 1.0 else max(0.0, u)
+                target = u * total
+                # Binary search for the first cum[i] > target.
+                lo, hi = 0, n - 1
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if cum[mid] <= target:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                key = self.middlepool[lo]
+            elif rngvalue is not None:
                 key = self.middlepool[int(rngvalue * n) % n]
             else:
                 key = self.middlepool[rng.randrange(n)]
@@ -674,7 +728,26 @@ class HFSentenceDatasetPreprocessor:
                 "tokens": [key], "tail": [key], "id": "", "split": "",
             }
 
-        if rngvalue is not None:
+        # Pick which occurrence of `key` to jump to.
+        # With weight_by_spatial_sum, each occurrence gets weight equal to
+        # the gap that preceded it in orderedpool, so the choice of jump
+        # target reflects the corpus's recurrence rhythm for this token.
+        occ_cum = self._occ_weights_cum.get(key)
+        occ_tot = self._occ_weights_total.get(key, 0.0)
+        if (self.weight_by_spatial_sum and occ_cum
+                and occ_tot > 0 and len(occ_cum) == len(occs)):
+            u = rngvalue if rngvalue is not None else rng.random()
+            u = u - math.floor(u) if u >= 1.0 else max(0.0, u)
+            target = u * occ_tot
+            lo, hi = 0, len(occs) - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if occ_cum[mid] <= target:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            rec_idx, pos = occs[lo]
+        elif rngvalue is not None:
             rec_idx, pos = occs[int(rngvalue * len(occs)) % len(occs)]
         else:
             rec_idx, pos = occs[rng.randrange(len(occs))]
@@ -753,6 +826,11 @@ class HFSentenceDatasetPreprocessor:
             f"middle-pool size {len(self.middlepool)}",
             f"middlecorr keys {len(self.middlecorr)}",
             f"middlecorr links {sum(len(v) for v in self.middlecorr.values())}",
+            f"spatial-sum sampling {'on' if self.weight_by_spatial_sum else 'off'}"
+            + (f"  total-weight {self._sample_weights_total:.0f}"
+               if self._sample_weights_cum else ""),
+            f"spatial-sum max {max(self.spatial_sum.values()) if self.spatial_sum else 0}",
+            f"popped occurrences {sum(len(v) for v in self.popped_positions.values())}",
             f"avg entity len {avg:.2f}",
             f"beginning example {self.beginnings[0] if self.beginnings else ''}",
             f"ending example {self.endings[0] if self.endings else ''}",
@@ -838,10 +916,19 @@ class HFSquadSentenceDatasetPreprocessor(HFSentenceDatasetPreprocessor):
 # ═══════════════════════════════════════════════════════════════════════════
 #  SentenceAwareGenerator with correlated dataset-item reseeding
 # ═══════════════════════════════════════════════════════════════════════════
-
 class SentenceAwareGenerator:
-    """Wraps a pipeline and reseeds dead contexts from the dataset middle
-    pool, using sample_correlated() to land back inside a real kept record."""
+    """
+    Wraps a pipeline and reseeds dead contexts from the dataset middle pool.
+
+    This version:
+      - Accepts `hidden_items` (popped dataset rows).
+      - On every reseed (when pipeline.step(...) returns None), injects
+        tokens from those items into the prompt_words list so zone layers
+        L4–L9 see them.
+      - Hidden items are never shown in the returned text.
+      - Provides generate_text(prompt, n_words, ...) for compatibility
+        with run_generation and the __main__ demo.
+    """
 
     def __init__(
         self,
@@ -851,118 +938,196 @@ class SentenceAwareGenerator:
         emit_seed: bool = True,
         reseed_window: Optional[int] = None,
         emit_reseed_tail: bool = False,
+        hidden_items: Optional[List[str]] = None,
     ):
         if preprocessor is None:
             preprocessor = getattr(pipeline, "preprocessor", None)
         if preprocessor is None:
             raise ValueError(
-                "SentenceAwareGenerator needs a preprocessor — either pass "
-                "one in or use build_hf_pipeline()/build_hf_pipeline_from_preset() "
-                "which attaches it."
+                "SentenceAwareGenerator needs a preprocessor: either pass one in "
+                "or use build_hf_pipeline_from_preset(...) which attaches it."
             )
+
         self.pipeline = pipeline
         self.pre = preprocessor
         self.emit_seed = bool(emit_seed)
         self.reseed_window = reseed_window
         self.emit_reseed_tail = bool(emit_reseed_tail)
 
-    # ── helpers ───────────────────────────────────────────────────────
+        # Hidden items and their tokenised form.
+        self.hidden_items: List[str] = hidden_items or []
+        self.hidden_tokens: List[str] = []
+        self._retokenise_hidden()
 
-    def _seed_context(self, prompt: str) -> deque:
-        tokens = [w.lower() for w in prompt.split() if w.isalpha()]
-        vocab_tokens = [w for w in tokens if w in self.pipeline.vocab]
+    # ─────────────────────────────────────────────────────────────────
+    # Hidden items management
+    # ─────────────────────────────────────────────────────────────────
+
+    def _retokenise_hidden(self) -> None:
+        """Tokenise hidden_items into lowercased tokens."""
+        toks: List[str] = []
+        for item in self.hidden_items:
+            toks.extend([w.lower() for w in str(item).split() if w.isalpha()])
+        self.hidden_tokens = toks
+
+    def set_hidden_items(self, items: List[str]) -> None:
+        """Update hidden_items at runtime."""
+        self.hidden_items = list(items)
+        self._retokenise_hidden()
+
+    # ─────────────────────────────────────────────────────────────────
+    # Context and formatting
+    # ─────────────────────────────────────────────────────────────────
+
+    def _seed_context(self, prompt_tokens: List[str]) -> deque:
+        """
+        Build the initial context deque from *visible* prompt tokens only.
+
+        Hidden tokens do not go directly into the context window; they are
+        added to prompt_words on reseed so L4–L9 see them there.
+        """
+        vocabtokens = [w for w in prompt_tokens if w in self.pipeline.vocab]
         cw = self.pipeline.context_window
-        if len(vocab_tokens) >= cw:
-            init = vocab_tokens[-cw:]
+        if len(vocabtokens) <= cw:
+            init = vocabtokens
         else:
-            init = [""] * (cw - len(vocab_tokens)) + vocab_tokens
+            init = vocabtokens[-cw:]
         return deque(init, maxlen=cw)
 
     def _format(self, words: List[str], prompt: str, capitalise: bool) -> str:
-        prompt_words = prompt.strip().split() if prompt.strip() else []
-        all_words = prompt_words + words
-        if not all_words:
+        """
+        Stitch prompt + generated words into a final string.
+
+        Hidden items are never rendered.
+        """
+        promptwords = prompt.strip().split() if str(prompt).strip() else []
+        allwords = promptwords + words
+        if not allwords:
             return ""
 
+        if not capitalise:
+            return " ".join(allwords)
+
         out: List[str] = []
-        cap_next = bool(capitalise)
-        for w in all_words:
-            tok = w.capitalize() if cap_next and capitalise else w
+        capnext = True
+        for w in allwords:
+            tok = w.capitalize() if capnext and capitalise else w
             out.append(tok)
-            cap_next = False
+            capnext = bool(w.rstrip()[-1:] in [".", "!", "?"])
         return " ".join(out)
 
-    def _pick_anchor(self, ctx: deque, prompt_tokens: List[str]) -> str:
-        ctx_words = [w for w in ctx if w]
-        if ctx_words:
-            return ctx_words[-1]
-        if prompt_tokens:
-            return prompt_tokens[-1]
+    def _pick_anchor(self, ctx: deque, prompt_words: List[str]) -> str:
+        """
+        Anchor selection for correlated reseed.
+
+        Uses last non-empty ctx token if available, else last prompt word.
+        """
+        ctxwords = [w for w in ctx if w]
+        if ctxwords:
+            return ctxwords[-1]
+        if prompt_words:
+            return prompt_words[-1]
         return ""
 
     def _reseed_from_correlation(
         self,
         ctx: deque,
-        prompt_tokens: List[str],
-        draw_fn,
+        prompt_words: List[str],
+        drawfn: Callable[[], float],
     ) -> Tuple[List[str], Dict[str, Any]]:
-        anchor = self._pick_anchor(ctx, prompt_tokens)
-        info = self.pre.sample_correlated(anchor=anchor, rngvalue=draw_fn())
-        tail = list(info.get("tail", []) or [])
+        """
+        Reseed context from the preprocessor's middle-pool correlation.
 
+        Returns (seed_window_words, info).
+        """
+        anchor = self._pick_anchor(ctx, prompt_words)
+        info = self.pre.sample_correlated(anchor=anchor, rngvalue=drawfn())
+        tail = list(info.get("tail") or [])
         if not tail:
             return [], info
 
         cw = self.pipeline.context_window
         window = self.reseed_window if self.reseed_window is not None else max(1, cw)
-        seed_window = tail[: max(1, window)]
+        seedwindow = tail[:max(1, window)]
 
         ctx.clear()
-        ctx.extend([""] * cw)
-        for w in seed_window[-cw:]:
+        backfill = seedwindow[-cw:]
+        for w in backfill:
             ctx.append(w)
 
-        return seed_window, info
+        return seedwindow, info
 
-    # ── main API ──────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────
+    # Core generation
+    # ─────────────────────────────────────────────────────────────────
 
     def generate(
         self,
         prompt: str,
-        n_words: int,
+        nwords: int,
         *,
         stream: Optional[List[int]] = None,
         digits_per_sample: int = 3,
         seed: Optional[int] = None,
     ) -> List[str]:
+        """
+        Generate a sequence of words (no formatting).
+
+        Behaviour:
+          - At start, prompt_words = visible prompt tokens.
+          - On every reseed (step(...) returns None), hidden_tokens are
+            appended to prompt_words so zone layers L4–L9 see them.
+        """
         pipe = self.pipeline
 
-        draw_fn = pipe._make_draw_fn(stream, digits_per_sample, seed)
+        # IMPORTANT: match your pipeline API: _make_draw_fn(stream, digits_per_sample, seed)
+        drawfn = pipe._make_draw_fn(
+            stream=stream,
+            digits_per_sample=digits_per_sample,
+            seed=seed,
+        )
 
-        prompt_tokens = [w.lower() for w in prompt.split() if w.isalpha()]
-        ctx = self._seed_context(prompt)
+        # Visible prompt tokens.
+        prompt_tokens = [w.lower() for w in str(prompt).split() if w.isalpha()]
+
+        # This is what is passed into pipe.step(...).
+        prompt_words: List[str] = list(prompt_tokens)
+
+        ctx = self._seed_context(prompt_tokens)
 
         words: List[str] = []
-        frames = []
-        produced = 0
+        frames: List[Any] = []
 
-        max_iters = max(1, n_words) * 80
+        produced = 0
+        maxiters = max(1, nwords * 80)
         iters = 0
 
-        while produced < n_words and iters < max_iters:
+        while produced < nwords and iters < maxiters:
             iters += 1
-            frame = pipe.step(ctx, prompt_tokens, draw_fn())
+
+            frame = pipe.step(ctx, prompt_words, drawfn)
             if frame is None:
-                seed_window, _info = self._reseed_from_correlation(
-                    ctx, prompt_tokens, draw_fn
+                # Reseed: inject hidden tokens into prompt_words so that
+                # L4–L9 see popped items as part of the prompt signal.
+                if self.hidden_tokens:
+                    prompt_words.extend(self.hidden_tokens)
+
+                seedwindow, info = self._reseed_from_correlation(
+                    ctx, prompt_words, drawfn
                 )
-                if not seed_window:
+                if not seedwindow:
                     break
+
                 if self.emit_seed:
-                    emitted = seed_window if self.emit_reseed_tail else seed_window[:1]
-                    take = min(len(emitted), n_words - produced)
+                    emitted = (
+                        seedwindow if self.emit_reseed_tail
+                        else seedwindow[:1]
+                    )
+                    take = min(len(emitted), nwords - produced)
                     words.extend(emitted[:take])
                     produced += take
+                    continue
+
                 continue
 
             frames.append(frame)
@@ -970,8 +1135,13 @@ class SentenceAwareGenerator:
             words.append(frame.chosen)
             produced += 1
 
+        # For heatmap / logging helpers.
         pipe.frames = frames
-        return words[:n_words]
+        return words[:nwords]
+
+    # ─────────────────────────────────────────────────────────────────
+    # Public text API (compatible with run_generation & __main__)
+    # ─────────────────────────────────────────────────────────────────
 
     def generate_text(
         self,
@@ -979,15 +1149,22 @@ class SentenceAwareGenerator:
         n_words: int,
         *,
         stream: Optional[List[int]] = None,
-        digits_per_sample: int = 3,
         seed: Optional[int] = None,
         capitalise: bool = True,
     ) -> str:
+        """
+        External text-generation entry point, matching the existing
+        run_generation / __main__ call pattern:
+
+            gen.generate_text(prompt=..., n_words=..., seed=..., capitalise=...)
+
+        Hidden items only affect internal sampling; they are never
+        included in the returned text.
+        """
         words = self.generate(
             prompt=prompt,
-            n_words=n_words,
+            nwords=int(n_words),
             stream=stream,
-            digits_per_sample=digits_per_sample,
             seed=seed,
         )
         return self._format(words, prompt, capitalise)
@@ -1040,7 +1217,6 @@ class L0_RawDist(nn.Module):
         if not raw:
             return raw, {}
 
-        raw.sort(key=lambda x: x[1], reverse=True)
         probs_t = _normalise(_to_tensor([p for _, p in raw]))
         words = [w for w, _ in raw]
         pairs = list(zip(words, probs_t.tolist()))
@@ -1625,6 +1801,7 @@ class IsomorphismPipeline(nn.Module):
         l11_init_weights: Optional[List[float]] = None,
         l12_blend_alpha:  float = 0.5,
         l13_sigma: float = 0.30,  l13_floor: float = 0.04,
+        spatial_sum_alpha: float = 1.0,
     ):
         super().__init__()
 
@@ -1640,6 +1817,16 @@ class IsomorphismPipeline(nn.Module):
         self._char_trig_index: Dict[str, set] = (
             getattr(context_index, "_trig_index", {}) if context_index else {}
         )
+
+        # Spatial-sum reweighting: strength of corpus-recurrence prior applied
+        # to per-step token probabilities. 0.0 disables; 1.0 doubles the
+        # weight of the highest-spatial-sum token relative to hapaxes.
+        # Reads from self.preprocessor.spatial_sum, which is attached by
+        # build_hf_pipeline / build_hf_pipeline_from_preset after construction.
+        self.spatial_sum_alpha = float(spatial_sum_alpha)
+        self._spatial_max_cached: Optional[float] = None
+        self._spatial_apply_count: int = 0
+        self._spatial_skip_count: int = 0
 
         self._init_hparams: Dict = dict(
             ngram_n=self.ngram_n,
@@ -1658,6 +1845,7 @@ class IsomorphismPipeline(nn.Module):
             l11_init_weights=list(l11_init_weights) if l11_init_weights is not None else None,
             l12_blend_alpha=float(l12_blend_alpha),
             l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+            spatial_sum_alpha=float(spatial_sum_alpha),
         )
 
         self.l0  = L0_RawDist(rep_penalty=rep_penalty)
@@ -1695,6 +1883,41 @@ class IsomorphismPipeline(nn.Module):
     def seed_stream(self, stream: list):
         self._stream = list(stream)
         self._pos = 0
+
+    def _apply_spatial_sum_weights(
+        self, blended: List[Tuple[str, float]]
+    ) -> List[Tuple[str, float]]:
+        """Multiply each (word, prob) by (1 + spatial_sum[w] / max_spatial)**alpha,
+        then renormalise. Pulls spatial_sum off self.preprocessor when present.
+        No-op if alpha==0, no preprocessor attached, or no spatial_sum data.
+        Fires on every step — this is the hot-path injection of the
+        corpus-recurrence prior."""
+        alpha = self.spatial_sum_alpha
+        if alpha <= 0.0 or not blended:
+            self._spatial_skip_count += 1
+            return blended
+
+        pre = getattr(self, "preprocessor", None)
+        ssum = getattr(pre, "spatial_sum", None) if pre is not None else None
+        if not ssum:
+            self._spatial_skip_count += 1
+            return blended
+
+        if self._spatial_max_cached is None:
+            self._spatial_max_cached = float(max(ssum.values()) or 1.0)
+        smax = self._spatial_max_cached
+
+        reweighted: List[Tuple[str, float]] = []
+        for w, p in blended:
+            s = ssum.get(w, 0)
+            mult = (1.0 + (float(s) / smax)) ** alpha
+            reweighted.append((w, p * mult))
+
+        total = sum(p for _, p in reweighted)
+        if total > 0:
+            reweighted = [(w, p / total) for w, p in reweighted]
+        self._spatial_apply_count += 1
+        return reweighted
 
     def step(
         self,
@@ -1763,6 +1986,9 @@ class IsomorphismPipeline(nn.Module):
         ]
         bt = sum(p for _, p in blended)
         blended = [(w, p / bt) for w, p in blended] if bt > 0 else blended
+
+        # Spatial-sum reweighting (hot-path corpus-recurrence prior).
+        blended = self._apply_spatial_sum_weights(blended)
 
         unseen = [(w, p) for w, p in blended if self.history[w] == 0]
         pool = unseen if unseen else blended
@@ -2111,72 +2337,7 @@ class IsomorphismPipeline(nn.Module):
             include_prompt=include_prompt,
         )
 
-class LFatouRunningInfimum(nn.Module):
-    """
-    Fatou running-infimum layer.
-    g_n(w) = inf_{k >= n} p_k(w), zone-weighted by ci.ngram_zones.
 
-    MCT guarantees: integral of g_n increases to integral of liminf p_n.
-    Zone weighting lifts the floor for contextually relevant tokens,
-    matching the behaviour of L6/L7.
-    """
-    def __init__(self, sigma: float = 0.25, floor: float = 0.04):
-        super().__init__()
-        self.sigma = nn.Parameter(torch.tensor(sigma, dtype=torch.float64))
-        self.floor = nn.Parameter(torch.tensor(floor, dtype=torch.float64))
-        self.inf_tracker: Dict[str, float] = {}
-
-    def reset(self):
-        self.inf_tracker.clear()
-
-    def forward(
-        self,
-        pairs: List[Tuple[str, float]],
-        context_deque,          # deque of recent tokens
-        ngram_zones: Dict,      # ci.ngram_zones
-    ) -> Dict:
-        sigma = float(self.sigma.clamp(min=1e-6))
-        floor_val = float(self.floor.clamp(min=0.0, max=1.0 - 1e-6))
-
-        # Build zone set from last bigram in context (same as L7)
-        ctx = list(context_deque)
-        zone_set = set()
-        if len(ctx) >= 2:
-            zone_set = set(ngram_zones.get((ctx[-2], ctx[-1]), set()))
-        elif len(ctx) == 1:
-            zone_set = set(ngram_zones.get((ctx[-1],), set()))
-
-        n = len(pairs)
-        words = [w for w, _ in pairs]
-
-        # Zone gradient (same Gaussian as L6/L7)
-        zone_ranks = [i / max(1, n - 1) for i, w in enumerate(words)
-                      if w in zone_set]
-        centre = sum(zone_ranks) / len(zone_ranks) if zone_ranks else 0.5
-        indices = torch.arange(n, dtype=torch.float64) / max(1, n - 1)
-        gauss = torch.exp(-0.5 * ((indices - centre) / sigma) ** 2)
-        zone_weights = _normalise(floor_val + (1.0 - floor_val) * gauss)
-
-        # Running infimum: g_n(w) = min over all seen p_k(w)
-        g_n = []
-        for i, (w, p) in enumerate(pairs):
-            prev_inf = self.inf_tracker.get(w, p)
-            current_inf = min(prev_inf, p)
-            self.inf_tracker[w] = current_inf
-            # Lift floor for zone members via zone_weights
-            lifted = current_inf + float(zone_weights[i]) * (p - current_inf)
-            g_n.append((w, max(1e-12, lifted)))
-
-        # Normalise — MCT: sum(g_n) increases toward sum(liminf p_n)
-        total = sum(v for _, v in g_n) or 1.0
-        g_n_norm = [(w, v / total) for w, v in g_n]
-
-        return {
-            "name": "LFATOU",
-            "words": [w for w, _ in g_n_norm],
-            "probs": np.array([v for _, v in g_n_norm], dtype=np.float64),
-            "source": f"fatou_inf zone={len(zone_set)} centre={centre:.3f}",
-        }
 # ═══════════════════════════════════════════════════════════════════════════
 #  LockedIsomorphismPipeline – 15-layer variant including L14
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2284,7 +2445,7 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
                 ci.latent_sorted_keys, ci.latent_bos_data,
             )
             zone_layers = [L4, L5, L6, L7, L8, L9]
-       
+
         L10 = self.l10(L3_pairs, self.history)
         L11 = self.l11(zone_layers + [L10], L3_pairs)
         L12_pairs, L12 = self.l12(L3_pairs, L11)
@@ -2306,23 +2467,20 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         # and torch.argmax(...) which returned an INDEX, not a probability.
         # Correct behaviour: max(floor, value) and per-token dict lookup.
         blended = []
-         # In __init__
-        self.lfatou = LFatouRunningInfimum(sigma=0.25, floor=0.04)
-
-        LFATOU = self.lfatou(L3_pairs, context_deque, self.history)
-        # Blend into final: geometric mean with L12
-        fatou_map = dict(zip(LFATOU["words"], LFATOU["probs"]))
-        blended = [
-            (w, math.sqrt(
-                max(0.04, l12_map.get(w, 0.04)) *
-                max(0.04, fatou_map.get(w, 0.04))
-            ))
-            for w in l12_map.keys()
-        ]
+        for w in l12_map.keys():
+            p12 = max(floor_val, l12_map.get(w, floor_val))
+            p13 = max(floor_val, l13_map.get(w, floor_val))
+            p14 = max(floor_val, l14_map.get(w, floor_val))
+            base = math.sqrt(p12 * p13)
+            merged = (base ** (1.0 - alpha14)) * (p14 ** alpha14)
+            blended.append((w, merged))
 
         total = sum(p for _, p in blended)
         if total > 0:
             blended = [(w, p / total) for w, p in blended]
+
+        # Spatial-sum reweighting (hot-path corpus-recurrence prior).
+        blended = self._apply_spatial_sum_weights(blended)
 
         unseen = [(w, p) for w, p in blended if self.history[w] == 0]
         pool = unseen if unseen else blended
@@ -2332,9 +2490,8 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         chosen, cumulative = (pool[-1][0] if pool else ""), 0.0
         for w, p in pool:
             cumulative += p
-            if draw < cumulative:
-                chosen = w
-                break
+            chosen = w
+            break
 
         # COMMIT — write-once
         key = L14_LockedStateIndex.key_from_ctx(context_deque)
@@ -2547,9 +2704,7 @@ def build_hf_pipeline_from_preset(
         spec.update(preprocessor_overrides)
 
     pre = HFSentenceDatasetPreprocessor(minsentencelen=minsentencelen, **spec)
-    
-    with open(path, "r", encoding="utf-8", errors="replace") as fh:
-        corpus = fh.read()
+    corpus = pre.tocorpus()
     cpd, vocab, tokens = build_real_cpd(
         corpus, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma),
     )
@@ -2617,16 +2772,98 @@ def _make_step_log(frames, limit=40):
         lines.append("... ({} more steps not shown)".format(len(frames) - limit))
     return "\n".join(lines)
 
+
+def run_generation(
+    corpus_file, prompt, n_words, use_locked, seed,
+    ngram_n, lidstone_gamma,
+    temperature, top_k, top_p,
+    rep_penalty, insight_penalty, l12_blend_alpha,
+    l13_sigma, l13_floor,
+    l14_sigma, l14_floor, l14_lock_strength, l14_blend_alpha,
+    progress=None,
+):
+    if gr is not None and progress is None:
+        progress = gr.Progress(track_tqdm=True)
+
+    if corpus_file is None:
+        return "Please upload a corpus .txt file.", "", None, ""
+    try:
+        path = corpus_file.name if hasattr(corpus_file, "name") else str(corpus_file)
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            corpus_text = fh.read()
+    except Exception as exc:
+        return "Could not read corpus file:\n{}".format(exc), "", None, ""
+
+    if not corpus_text.strip():
+        return "The uploaded corpus file is empty.", "", None, ""
+    if not str(prompt).strip():
+        return "Please enter a prompt.", "", None, ""
+
+    try:
+        if progress is not None:
+            progress(0.10, desc="Building CPD & context index ...")
+        cpd, vocab, tokens = build_real_cpd(
+            corpus_text, ngram_n=int(ngram_n), lidstone_gamma=float(lidstone_gamma)
+        )
+        ctx_idx = build_real_context_index(vocab, cpd, tokens)
+
+        if progress is not None:
+            progress(0.40, desc="Constructing pipeline ...")
+        cls = LockedIsomorphismPipeline if bool(use_locked) else IsomorphismPipeline
+        kwargs = dict(
+            cpd=cpd, context_index=ctx_idx, vocab=vocab,
+            ngram_n=int(ngram_n),
+            temperature=float(temperature),
+            top_k=int(top_k), top_p=float(top_p),
+            rep_penalty=float(rep_penalty),
+            insight_penalty=float(insight_penalty),
+            l12_blend_alpha=float(l12_blend_alpha),
+            l13_sigma=float(l13_sigma), l13_floor=float(l13_floor),
+        )
+        if bool(use_locked):
+            kwargs.update(
+                l14_sigma=float(l14_sigma), l14_floor=float(l14_floor),
+                l14_lock_strength=float(l14_lock_strength),
+                l14_blend_alpha=float(l14_blend_alpha),
+            )
+        pipe = cls(**kwargs)
+
+        if progress is not None:
+            progress(0.60, desc="Generating text ...")
+        seed_val = int(seed) if seed is not None else None
+        text = pipe.generate_text(
+            prompt=str(prompt).strip(),
+            n_words=int(n_words),
+            seed=seed_val,
+        )
+
+        if progress is not None:
+            progress(0.85, desc="Building heatmap ...")
+        frames = getattr(pipe, "frames", [])
+        heatmap = _make_heatmap(frames)
+        step_log = _make_step_log(frames)
+
+        param_summary = pipe.param_summary()
+        if bool(use_locked) and hasattr(pipe, "lock_table_summary"):
+            param_summary += "\n\n" + pipe.lock_table_summary()
+
+        if progress is not None:
+            progress(1.0, desc="Done!")
+        return text, param_summary, heatmap, step_log
+
+    except Exception:
+        return "Error:\n\n{}".format(traceback.format_exc()), "", None, ""
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 #  Demo
 # ═══════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    # FIXED: was preprocessoroverrides= (typo) and max_examples_per_split==1000 (double =)
     pipe, pre = build_hf_pipeline_from_preset(
         "blended_skill_talk",  # or imdb, squad, c4, dbpedia_14, etc.
         locked=True,
-        ngram_n=3,
+        ngram_n=1,
         minsentencelen=2,
         preprocessor_overrides=dict(
             strict=False,
@@ -2635,8 +2872,22 @@ if __name__ == "__main__":
         ),
     )
     print(pre.summary())
-    gen = SentenceAwareGenerator(pipe, pre)
+
+    # --- define popped_texts BEFORE constructing SentenceAwareGenerator ---
+    # Example: take the first K kept records as our "popped items"
+    K = 32
+    kept_rows = pre.keptrows()            # list of dicts with raw_text etc.[file:1]
+    popped_texts = [row["raw_text"] for row in kept_rows[:K]]
+
+    gen = SentenceAwareGenerator(
+        pipe,
+        preprocessor=pre,
+        hidden_items=popped_texts,        # now defined
+    )
+
     while True:
         prompt = input("USER: ")
+        if not prompt.strip():
+            break
         print(gen.generate_text(prompt=prompt, n_words=800, seed=42, capitalise=True))
         print()
