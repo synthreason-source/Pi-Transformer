@@ -752,7 +752,7 @@ class L13_CtxReqPos(nn.Module):
         norm_pos = (draw_pos % max(1,stream_len)) / max(1, stream_len-1)
         idx      = torch.arange(n, dtype=torch.float64) / max(1, n-1)
         w        = _norm(fl + (1-fl)*torch.exp(-0.5*((idx-norm_pos)/sig)**2))
-        words    = [x for x,_ in cands]
+        words    = sorted([x for x,_ in cands])
         return _layer_dict("L13_CTX_REQ_POS", words, w,
                            draw_pos=draw_pos, stream_len=stream_len)
 
@@ -780,7 +780,7 @@ class L14_LockedStateIndex(nn.Module):
     def key_from_ctx(ctx): return tuple(w for w in ctx if w) or ()
 
     def forward(self, cands, ctx, draw_pos, stream_len):
-        n = len(cands); words = [w for w,_ in cands]
+        n = len(cands); words = sorted([w for w,_ in cands])
         fl = self.floor.clamp(0, 1-1e-6); lw = self.lock_strength.clamp(0,1)
         sig = self.sigma.clamp(min=1e-6); key = self.key_from_ctx(ctx)
         if key and key in self._locked:
