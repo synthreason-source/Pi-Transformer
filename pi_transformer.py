@@ -1145,7 +1145,7 @@ def build_pipeline(dataset_name: str, config_name: Optional[str] = None,
                    ) -> Tuple["IsomorphismPipeline", Preprocessor]:
     pre = Preprocessor(dataset_name, config_name, text_fields,
                        minlen=minlen, **(preprocessor_kw or {}))
-    with open(input("filename: "), "r", encoding="utf-8") as file:
+    with open(input("Filename: "), "r", encoding="utf-8") as file:
         content = file.read()              
     
     #cpd, vocab, tokens = build_cpd(pre.tocorpus(), ngram_n, lidstone_gamma)
