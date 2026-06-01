@@ -738,7 +738,7 @@ class L12_Final(nn.Module):
         raw     = _norm(_t([p for _,p in cands]))
         l11     = _p(L11)   # GRAD-2: live tensor from L11
         blended = _norm(raw**(1-a) * l11**a)
-        words   = [w for w,_ in cands]
+        words   = sorted([w for w,_ in cands])
         return list(zip(words, blended.tolist())), _layer_dict("L12_FINAL", words, blended)
 
 class L13_CtxReqPos(nn.Module):
