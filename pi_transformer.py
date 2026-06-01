@@ -848,6 +848,7 @@ class IsomorphismPipeline(nn.Module):
                 val=0
                 for _ in range(dps): val=val*26+self._stream[pos[0]%sl]; pos[0]=(pos[0]+1)%sl
                 self._pos=pos[0]; return val/(26**dps)
+                
             return _draw
         return random.Random(seed).random
 
@@ -877,9 +878,9 @@ class IsomorphismPipeline(nn.Module):
             losses.append(layer_loss(
                 name, pb, p,
                 blend_ref  = blend_ref,
-                draw_pos   = layer.get("draw_pos",   self._pos),
+                draw_pos   = layer.get("draw_pos",   self.ctx_idx), 
                 stream_len = layer.get("stream_len", max(1, len(self._stream))),
-            ))
+            ))#custom, obvious change
             prev_p = p
 
         return torch.stack(losses).sum() if losses else torch.zeros(1, dtype=torch.float64)
@@ -1147,6 +1148,8 @@ def build_pipeline(dataset_name: str, config_name: Optional[str] = None,
                         **(preprocessor_kw or {}))
     
     cpd, vocab, tokens = build_cpd(pre.tocorpus(), ngram_n, lidstone_gamma)
+
+    cpd, vocab, tokens = build_cpd(content, ngram_n, lidstone_gamma)
     ctx_idx = build_context_index(vocab, cpd, tokens)
     cls  = LockedIsomorphismPipeline if locked else IsomorphismPipeline
     pipe = cls(cpd, ctx_idx, vocab, ngram_n=ngram_n, **(pipeline_kw or {}))
