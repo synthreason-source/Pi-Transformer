@@ -1139,12 +1139,12 @@ class AutomorphismTrainer:
 
 def build_pipeline(dataset_name: str, config_name: Optional[str] = None,
                    text_fields: Optional[Sequence] = None, *, locked=True,
-                   ngram_n=3, lidstone_gamma=0.1, minlen=3,
+                   ngram_n=3, lidstone_gamma=0.1,
                    preprocessor_kw: Optional[Dict] = None,
                    pipeline_kw: Optional[Dict] = None,
                    ) -> Tuple["IsomorphismPipeline", Preprocessor]:
     pre = Preprocessor(dataset_name, config_name, text_fields,
-                       minlen=minlen, **(preprocessor_kw or {}))
+                        **(preprocessor_kw or {}))
     with open(input("Filename: "), "r", encoding="utf-8") as file:
         content = file.read()              
     
