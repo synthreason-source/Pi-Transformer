@@ -1994,9 +1994,9 @@ def _corpus_from_file(txt_path: str) -> str:
 
 def _build(cfg: dict, corpus_text: Optional[str] = None):
     """Build (or retrieve cached) pipeline from config + optional corpus."""
-    cache_key = json.dumps(cfg, sort_keys=True, default=str) + str(bool(corpus_text))
-    if cache_key in _pipeline_cache:
-        return _pipeline_cache[cache_key]
+    #cache_key = json.dumps(cfg, sort_keys=True, default=str) + str(bool(corpus_text))
+    #if cache_key in _pipeline_cache:
+        #return _pipeline_cache[cache_key]
 
     pipe_kw = {k: cfg[k] for k in (
         "temperature", "top_k", "top_p", "rep_penalty",
@@ -2054,7 +2054,7 @@ def _build(cfg: dict, corpus_text: Optional[str] = None):
                 pipeline_kw=pipe_kw,
             )
 
-    _pipeline_cache[cache_key] = (pipe, pre)
+    #_pipeline_cache[cache_key] = (pipe, pre)
     return pipe, pre
 
 
