@@ -764,35 +764,36 @@ class IsomorphismPipeline(nn.Module):
             return _draw
         return random.Random(seed).random
 
-    def _run_assertions(self, layer_sequence: List[Dict],
-                        zone_layers: List[Dict]) -> torch.Tensor:
-        """GRAD-3: collect into list → stack → sum. Graph never severed."""
-        by_name = {l.get("name",""): l for l in layer_sequence if l.get("name")}
-        losses:  List[torch.Tensor] = []
-        prev_p:  Optional[torch.Tensor] = None
+    def _run_assertions(self, layer_sequence, zone_layers) -> torch.Tensor:
+        # Normalise: unwrap any (pairs, layer_dict) tuples
+        layer_sequence = [
+            l[1] if isinstance(l, tuple) else l
+            for l in layer_sequence
+        ]
+
+        by_name = {l.get("name", ""): l for l in layer_sequence if l.get("name")}
+        losses: List[torch.Tensor] = []
+        prev_p: Optional[torch.Tensor] = None   # ← initialise before loop
 
         for layer in layer_sequence:
             name = layer.get("name", "")
-            p    = _p(layer)   # GRAD-2: live tensor
+            _pt = layer.get("probst")
+            p = norm(_pt) if _pt is not None else norm(t(layer["probs"]))   
             pb   = prev_p if prev_p is not None else p
-
-            blend_ref = None
-            if name == "L11_TENSOR_BLEND":
-                zps = [_p(by_name[k]) for k in
-                       ("L4_ZONE_FREQ","L5_ZONE_ALPHA","L6_ZONE_BIGRAM",
-                        "L7_ZONE_TRIGRAM","L8_ZONE_CHAR_TRIG","L9_ZONE_LATENT",
-                        "L10_HISTORY") if k in by_name]
-                blend_ref = _norm(torch.stack(zps).mean(0)) if zps else None
-            elif name == "L12_FINAL":
-                blend_ref = (_p(by_name["L11_TENSOR_BLEND"])
-                             if "L11_TENSOR_BLEND" in by_name else None)
-
+            blendref = None
+            if name == L11_TENSOR_BLEND:
+                zps = [pd(by_name[k]) for k in (
+                    L4_ZONE_FREQ, L5_ZONE_ALPHA, L6_ZONE_BIGRAM,
+                    L7_ZONE_TRIGRAM, L8_ZONE_CHARTRIG, L9_ZONE_LATENT,
+                    L10_HISTORY) if k in by_name]
+                blendref = norm(torch.stack(zps).mean(0)) if zps else None
+            elif name == L12_FINAL:
+                blendref = pd(by_name[L11_TENSOR_BLEND]) if L11_TENSOR_BLEND in by_name else None
             losses.append(layer_loss(
-                name, pb, p,
-                blend_ref  = blend_ref,
-                draw_pos   = layer.get("draw_pos",   self.ctx_idx), 
-                stream_len = layer.get("stream_len", max(1, len(self._stream))),
-            ))#custom, obvious change
+                name, pb, p, blendref=blendref,
+                drawpos=layer.get("drawpos", 0),
+                streamlen=layer.get("streamlen", max(1, len(self.stream))),
+            ))
             prev_p = p
 
         return torch.stack(losses).sum() if losses else torch.zeros(1, dtype=torch.float64)
@@ -916,7 +917,11 @@ class LockedIsomorphismPipeline(IsomorphismPipeline):
         L13 = self.l13(L3_pairs, self._pos, sl)
         L14 = self.l14(L3_pairs, ctx, self._pos, sl)
 
-        all_layers = [L0,L1,L2,L3]+zone_layers+[L10,L11,L12,L13,L14]
+        all_layers = (
+            L0, L1, L2, L3,
+            *(zl[1] if isinstance(zl, tuple) else zl for zl in zone_layers),
+            L10, L11, L12, L13, L14
+        )
         self._step_loss = self._run_assertions(all_layers, zone_layers)
 
         a    = float(self.l14_blend_alpha.clamp(1e-6,1-1e-6)); fl = 1e-12
