@@ -1,3 +1,28 @@
+"""
+Generative Kripke System: A Markov-style text generator grounded in a semantic "world graph".
+
+This module implements a lightweight generative language system inspired by:
+- Kripke semantics (modal logic): worlds = nodes, accessibility = edges
+- Markov chains: next word predicted from (word_i, word_{i+1}) pairs
+- Semantic clustering: texts sharing tokens are linked into a "dense matrix"
+
+The system:
+1. Tokenizes input texts into nodes (called "worlds")
+2. Builds a semantic graph: nodes overlap if they share non-stop-word tokens
+3. For a given prompt:
+   - Finds the most relevant starting world (node)
+   - Collects its neighborhood (accessible worlds)
+   - Builds a 2nd-order Markov model from token sequences in that neighborhood
+   - Generates text by walking the Markov chain until token limit or dead end
+
+Use case:
+- Prototype for generative knowledge bases
+- Stylized text generation from domain-specific corpora
+- Exploratory "memory" system where each node is a memory fragment
+
+Author: George W (AI developer, Melbourne)
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -7,11 +32,22 @@ import os
 import math
 import random
 
+# Alias for world identifiers in the Kripke-style graph
 WorldId = str
 
 
 def _tok(text: str) -> List[str]:
-    """Cleans and tokenizes text into lowercase words."""
+    """
+    Cleans and tokenizes text into lowercase words.
+    
+    Steps:
+    1. Lowercase the input
+    2. Split on whitespace
+    3. Strip non-alphanumeric characters except '-' and "'"
+    4. Drop empty tokens
+    
+    Returns a list of cleaned tokens.
+    """
     t = text.lower()
     words = [w for w in t.split() if w]
     out = []
@@ -23,6 +59,11 @@ def _tok(text: str) -> List[str]:
 
 
 def _cap(text: str) -> str:
+    """
+    Capitalizes the first character of a string, leaving the rest unchanged.
+    
+    Used to ensure generated prose starts with a capital letter.
+    """
     text = text
     if not text:
         return text
@@ -30,6 +71,19 @@ def _cap(text: str) -> str:
 
 
 def load_txt_file(path: str) -> List[str]:
+    """
+    Loads a text file and splits it into "sentences" using '.' as delimiter.
+    
+    Note:
+    - This is a simple splitter; it does not handle abbreviations, quotes, etc.
+    - Each element in the returned list is one "segment" from the original text.
+    
+    Parameters:
+        path: Path to the .txt file
+    
+    Returns:
+        List of text segments (roughly "sentences")
+    """
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
     return [ln for ln in raw.split(".")]
@@ -37,6 +91,16 @@ def load_txt_file(path: str) -> List[str]:
 
 @dataclass
 class MemoryNode:
+    """
+    Represents a single "world" in the Kripke-style semantic graph.
+    
+    Each node is a memory fragment / text snippet with:
+    - id: unique world identifier
+    - text: original raw text
+    - tokens: cleaned token list
+    - token_set: set of tokens for fast overlap checks
+    - weight: semantic importance score derived from metrics
+    """
     id: WorldId
     text: str
     tokens: List[str]
@@ -45,19 +109,71 @@ class MemoryNode:
 
 
 class GenerativeKripkeSystem:
+    """
+    A generative text system built on a semantic graph of "worlds".
+    
+    Conceptual model:
+    - Worlds: MemoryNode instances, each representing a text fragment
+    - Accessibility relation: edges between worlds that share content
+    - Generation: Markov chain walk over tokens in the accessible neighborhood
+    
+    Key methods:
+    - add_node: insert a new world with text and metrics
+    - build_dense_matrix: connect worlds that share any non-stop-word token
+    - find_entry: choose the best starting world for a given prompt
+    - generate: produce new text using a 2nd-order Markov model from the neighborhood
+    """
+
     def __init__(self):
+        """
+        Initialize the system with:
+        - Empty node graph (worlds)
+        - Empty edge graph (accessibility relation)
+        - Random number generator for stochastic generation
+        - Stop-word set to filter out common, low-information tokens
+        """
         self.nodes: Dict[WorldId, MemoryNode] = {}
         self.edges: Dict[WorldId, List[WorldId]] = defaultdict(list)
         self.rng = random.Random()
-        self.stop_words = {"the", "a", "an", "and", "or", "but", "of", "to", "in", "is", "it", "that", "was", "for", "on", "as", "with", "this"}
+        self.stop_words = {
+            "the", "a", "an", "and", "or", "but", "of", "to", "in",
+            "is", "it", "that", "was", "for", "on", "as", "with", "this"
+        }
 
     def add_node(self, node_id: WorldId, text: str, metrics: Tuple[float, float, float]):
+        """
+        Add a new world (node) to the system.
+        
+        Parameters:
+            node_id: Unique identifier for this world (e.g. "w0", "w1")
+            text: Raw text content of this memory fragment
+            metrics: Tuple (desire, emotion, salience) used to compute weight
+            
+        Weight computation:
+            weight = log(1 + desire + 0.5*emotion + 0.25*salience) + 1
+        This gives higher weight to fragments with stronger desire/emotion/salience.
+        """
         toks = _tok(text)
         weight = math.log(1.0 + metrics[0] + 0.5 * metrics[1] + 0.25 * metrics[2]) + 1.0
-        self.nodes[node_id] = MemoryNode(id=node_id, text=text, tokens=toks, token_set=set(toks), weight=weight)
+        self.nodes[node_id] = MemoryNode(
+            id=node_id,
+            text=text,
+            tokens=toks,
+            token_set=set(toks),
+            weight=weight
+        )
 
     def build_dense_matrix(self):
-        """Builds a semantic web. If sentences share ANY non-stop-word, they link."""
+        """
+        Build the semantic web (accessibility relation) between worlds.
+        
+        Rule:
+        - Two worlds are linked if they share ANY non-stop-word token.
+        - Each world is also linked to itself (reflexive accessibility).
+        
+        This creates a "dense" graph where semantically related fragments
+        form clusters, enabling localized generation.
+        """
         node_ids = list(self.nodes.keys())
         for i, id1 in enumerate(node_ids):
             n1 = self.nodes[id1]
@@ -75,7 +191,16 @@ class GenerativeKripkeSystem:
                     self.edges[id2].append(id1)
 
     def find_entry(self, prompt: str) -> WorldId:
-        """Finds the most relevant cluster starting point."""
+        """
+        Find the most relevant starting world for a given prompt.
+        
+        Strategy:
+        - Tokenize the prompt
+        - For each world, count how many prompt tokens appear in its token set
+        - Return the world with the highest overlap score
+        
+        If no tokens or no nodes, return the first node (or empty string).
+        """
         ptoks = set(_tok(prompt))
         if not ptoks:
             return next(iter(self.nodes.keys())) if self.nodes else ""
@@ -91,6 +216,29 @@ class GenerativeKripkeSystem:
         return best_id
 
     def generate(self, prompt: str, max_words: int = 150) -> str:
+        """
+        Generate new text based on a prompt using a Markov-Kripke approach.
+        
+        Pipeline:
+        1. Find the best starting world (node) for the prompt.
+        2. Gather all accessible worlds (neighbors in the graph).
+        3. Build a 2nd-order Markov table from token sequences in those worlds:
+           - Key: (word_i, word_{i+1})
+           - Value: list of possible word_{i+2}
+        4. Initialize with a random starting pair from the neighborhood.
+        5. Walk the Markov chain until:
+           - max_words reached, or
+           - no continuation for current pair (dead end)
+        6. Append a metadata clause with top keywords from the cluster.
+        7. Truncate to max_words if needed.
+        
+        Parameters:
+            prompt: User input to guide generation
+            max_words: Maximum number of words in generated output
+        
+        Returns:
+            Generated prose string, capitalized and punctuated.
+        """
         start_id = self.find_entry(prompt)
         if not start_id or start_id not in self.edges:
             return "The system network is uninitialized or isolated."
@@ -158,6 +306,26 @@ class GenerativeKripkeSystem:
 
 
 def build_system_from_texts(texts: List[str]) -> GenerativeKripkeSystem:
+    """
+    Build a GenerativeKripkeSystem from a list of text fragments.
+    
+    For each text:
+    - Tokenize
+    - Skip if too short (< 3 tokens)
+    - Compute metrics:
+        desire: frequency of desire-related words (want, desire, need, seek)
+        emotion: frequency of emotion-related words (love, fear, dark, joy, sad)
+        salience: ratio of unique tokens to total tokens (diversity)
+    - Add as a node with id "w{i}"
+    
+    Then build the dense semantic matrix (connect overlapping worlds).
+    
+    Parameters:
+        texts: List of text fragments (e.g. sentences, paragraphs)
+    
+    Returns:
+        A fully built GenerativeKripkeSystem
+    """
     sys = GenerativeKripkeSystem()
     for i, txt in enumerate(texts):
         toks = _tok(txt)
@@ -174,6 +342,27 @@ def build_system_from_texts(texts: List[str]) -> GenerativeKripkeSystem:
 
 
 if __name__ == "__main__":
+    """
+    Interactive CLI demo for the Generative Kripke System.
+    
+    Behavior:
+    - If 'singlekb.txt' exists:
+        - Load its contents as text fragments
+        - Build the system
+        - Enter an interactive loop:
+            - Ask USER for a prompt
+            - Generate and print text
+    - If 'singlekb.txt' does not exist:
+        - Run in mock mode with a small example corpus
+        - Print one generated example
+    
+    Example usage:
+        $ python your_script.py
+        GPU/Kripke: Initializing Markov-Kripke synthesis framework from xaa.txt...
+        Graph locked with 42 responsive logic nodes.
+        USER: heavy dark frameworks
+        Generated text: Dark frameworks reveal heavy data streams and dark structures...
+    """
     if os.path.exists("singlekb.txt"):
         print("Initializing Markov-Kripke synthesis framework from xaa.txt...")
         lines = load_txt_file("singlekb.txt")
