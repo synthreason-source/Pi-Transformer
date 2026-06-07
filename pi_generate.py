@@ -174,9 +174,9 @@ def build_system_from_texts(texts: List[str]) -> GenerativeKripkeSystem:
 
 
 if __name__ == "__main__":
-    if os.path.exists("x.txt"):
+    if os.path.exists("singlekb.txt"):
         print("Initializing Markov-Kripke synthesis framework from xaa.txt...")
-        lines = load_txt_file("x.txt")
+        lines = load_txt_file("singlekb.txt")
         system = build_system_from_texts(lines)
         print(f"Graph locked with {len(system.nodes)} responsive logic nodes.")
         while True:
