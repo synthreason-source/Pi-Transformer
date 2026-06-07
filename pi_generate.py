@@ -9,7 +9,7 @@ from functools import reduce
 
 def tokenize(text):
     """Pure function: text → tokens"""
-    return re.findall(r"[a-zA-Z'-]+", text.lower())
+    return text.lower().split()
 
 
 def World(world_id, text):
