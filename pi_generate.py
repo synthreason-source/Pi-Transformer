@@ -2,7 +2,32 @@ import re
 import random
 from functools import reduce
 
+from typing import List, Tuple
 
+def dedupe_by_start_end(sentences: List[str]) -> List[str]:
+    """
+    Keeps only sentences whose (first_token, last_token) pair is unique.
+    If duplicates exist, later ones are discarded ("popped").
+    """
+    seen = set()
+    result = []
+
+    for s in sentences:
+        tokens = tokenize(s)
+        if not tokens:
+            continue
+
+        key = (tokens[0], tokens[-1])
+
+        if key in seen:
+            # "pop" behavior: skip duplicate sentence
+            continue
+
+        seen.add(key)
+        result.append(s)
+
+    return result
+    
 # =========================
 # 🧩 PURE LAMBDA UTILITIES
 # =========================
@@ -172,11 +197,12 @@ class LambdaKripkeSystem:
 # =========================
 # 🧪 DEMO EXECUTION
 # =========================
-
 def load_txt_file(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
-    return [ln for ln in raw.split(".")]
+
+    sentences = [ln.strip() for ln in raw.split(".") if ln.strip()]
+    return dedupe_by_start_end(sentences)
 
 if __name__ == "__main__":
 
