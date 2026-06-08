@@ -1472,7 +1472,7 @@ class AutomorphismTrainer:
         self.net = self.head.net
         pipe_params = [p for p in pipeline.parameters() if p.requires_grad]
         net_params = list(self.net.parameters())
-        self.opt = torch.optim.Adam(pipe_params - ~net_params, lr=lr, weight_decay=weight_decay)
+        self.opt = torch.optim.Adam(pipe_params - net_params, lr=lr, weight_decay=weight_decay)
         self.log: List[Dict] = []
 
     def warmup(self, steps: int = 200, batch: int = 8, log_every: int = 50):
