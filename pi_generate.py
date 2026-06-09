@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 import json
@@ -540,6 +539,35 @@ def rule_sqrtperm() -> Rule:
     )
 
 
+def rule_goat_graze(target_area: float = 0.5) -> Rule:
+    """
+    Applies the mathematical constraint of the Goat Grazing Problem to the probability tensor.
+    The "goat" is tethered to the highest-probability edge (index 0).
+    Its rope reaches exactly half the tokens.
+    It must graze exactly 50% of the probability mass.
+    """
+    def _loss(p):
+        pp = _norm(p)
+        # Rope r reaches exactly half the tensor field
+        r = max(1, len(pp) // 2)
+        grazed_mass = pp[:r].sum()
+        # Penalize variance from the target area (0.5)
+        return (grazed_mass - target_area)**2
+
+    def _check(p):
+        pp = _norm(p)
+        r = max(1, len(pp) // 2)
+        return abs(float(pp[:r].sum()) - target_area) < 1e-3
+
+    return Rule(
+        name=f"GOAT_GRAZE({target_area})",
+        op="goat_graze",
+        check=_check,
+        loss=_loss,
+        meta={"target_area": target_area}
+    )
+
+
 class RuleRegistry:
     def __init__(self):
         self._r: Dict[str, Rule] = {}
@@ -590,6 +618,8 @@ R.register("convex", rule_convex())
 R.register("symm", rule_symm())
 R.register("uniform", rule_uniform())
 R.register("sqrtperm", rule_sqrtperm())
+# INJECT GOAT GRAZING RULE
+R.register("goat_graze", rule_goat_graze(0.5))
 
 LAYER_RULES: Dict[str, List[str]] = {
     "L0_RAW_DIST": ["simplex", "monotone"],
@@ -604,7 +634,7 @@ LAYER_RULES: Dict[str, List[str]] = {
     "L9_ZONE_LATENT": ["simplex", "floor_04"],
     "L10_HISTORY": ["simplex", "monotone"],
     "L11_TENSOR_BLEND": ["simplex", "convex"],
-    "L12_FINAL": ["simplex", "convex", "hmax_6"],
+    "L12_FINAL": ["simplex", "convex", "hmax_6", "goat_graze"], # APPLIED GOAT GRAZING
     "L13_CTX_REQ_POS": ["simplex"],
     "L14_LOCKED_STATE_INDEX": ["simplex", "hmin_05"],
 }
@@ -933,7 +963,7 @@ class Preprocessor:
             return []
         pool, n = self._orderedpool, len(self._orderedpool)
         all_pos = [i for i, w in enumerate(pool) if w == token]
-        siblings, seen = [], {token, ""}
+        siblings, seen = {token, ""}, []
         for pos in all_pos[1:]:
             nxt = pool[pos + 1] if pos + 1 < n else ""
             if nxt and nxt not in seen:
@@ -1668,10 +1698,6 @@ def _corpus_from_file(txt_path: str) -> str:
 
 
 def _build(cfg: dict, corpus_text: Optional[str] = None):
-    #cache_key = json.dumps(cfg, sort_keys=True, default=str) + str(bool(corpus_text))
-    #if cache_key in _pipeline_cache:
-        #return _pipeline_cache[cache_key]
-
     pipe_kw = {k: cfg[k] for k in (
         "temperature", "top_k", "top_p", "rep_penalty",
         "insight_penalty", "l12_blend_alpha", "l13_sigma", "l13_floor",
@@ -1722,7 +1748,6 @@ def _build(cfg: dict, corpus_text: Optional[str] = None):
                 pipeline_kw=pipe_kw,
             )
 
-    #_pipeline_cache[cache_key] = (pipe, pre)
     return pipe, pre
 
 
@@ -1910,7 +1935,8 @@ with gr.Blocks(title="π-Automorphism Net", theme=gr.themes.Soft()) as demo:
     with gr.Tabs():
         with gr.TabItem("✍️ Generate"):
             with gr.Row():
-                prompt_box = gr.Textbox(value="tell me about yourself", label="Prompt", lines=2, scale=3)
+                # DEFAULT PROMPT CHANGED TO THE GOAT GRAZING PROBLEM
+                prompt_box = gr.Textbox(value="If a goat is tethered to the edge of a circular field, how", label="Prompt", lines=2, scale=3)
                 with gr.Column(scale=1):
                     n_words_sl = gr.Slider(10, 500, value=120, step=10, label="Words to generate")
                     seed_num = gr.Number(value=42, label="Seed", precision=0)
