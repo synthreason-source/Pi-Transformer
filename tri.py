@@ -327,6 +327,5 @@ if __name__ == "__main__":
         print("\n================== PARALLEL GEOMETRIC REALIZATION ==================")
         for i, seed in enumerate(sample_seeds):
             print(f"\nSTREAM {i+1} SEED Context: '{seed}'")
-            print(f"GENERATED PATHS  : {'\n'.join(outputs[i])}")
-            print(f"DYNAMIC CHOICE LANES    : {metrics[i][:3]}")
+            print(f"DYNAMIC CHOICE LANES    : {metrics[i]}")
         print("====================================================================")
