@@ -1,48 +1,3 @@
-Hugging Face's logo
-Hugging Face
-Models
-Datasets
-Spaces
-Buckets
-new
-Docs
-Enterprise
-Pricing
-
-Website
-Community
-Solutions
-Log In
-Sign Up
-Spaces:
-trainman999
-/
-Pi-Transformer
-
-
-like
-0
-App
-Files
-Community
-Pi-Transformer
-/
-app.py
-
-trainman999's picture
-trainman999
-Update app.py
-47facc0
-verified
-3 days ago
-raw
-
-Copy download link
-history
-blame
-contribute
-delete
-77.8 kB
 from __future__ import annotations
 
 import json
@@ -2037,4 +1992,3 @@ with gr.Blocks(title="π-Automorphism Net", theme=gr.themes.Soft()) as demo:
 
 if __name__ == "__main__":
     demo.launch(share=False)
-
