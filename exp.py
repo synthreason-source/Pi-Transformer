@@ -1,65 +1,84 @@
 import torch
+from itertools import cycle
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
-def cot_generation_loop(prompt, model_name="gpt2", max_reasoning_tokens=150):
-    # 1. Initialize standard GPT-2 components
+def cot_generation_loop(prompt, model_name="gpt2", max_reasoning_tokens=150, trigger_patience=20):
+    # 1. Initialize components
     tokenizer = GPT2Tokenizer.from_pretrained(model_name)
     model = GPT2LMHeadModel.from_pretrained(model_name)
     
-    # Define an ordered sequence of cognitive triggers we want the model to hit in a loop
     target_triggers = ["because", "therefore"]
-    trigger_index = 0  # Tracks our progress through the target triggers
-    loop_count = 1     # Tracks how many full cycles we've completed
+    trigger_cycle = cycle(target_triggers)
+    current_target = next(trigger_cycle)  
     
-    # Encode the initial prompt
+    trigger_count = 0  
+    tokens_since_last_trigger = 0 # Track to prevent infinite loops
+    
     input_ids = tokenizer.encode(prompt, return_tensors="pt")
     
     print(f"--- Starting Sequential Reasoning Phase ---")
-    print(f"Target path: {' -> '.join(target_triggers)} (Looping)\n")
+    print(f"Trigger sequence loop initialized: {' -> '.join(target_triggers)} -> (repeats)\n")
     
-    # 2. Continuous generation loop (Simulating the CoT stream)
+    # 2. Continuous generation loop
     for _ in range(max_reasoning_tokens):
-        # Forward pass through GPT-2
         with torch.no_grad():
             outputs = model(input_ids)
             next_token_logits = outputs.logits[:, -1, :]
             
-            # Simple greedy decoding
+            # Using basic sampling instead of rigid greedy decoding to boost natural variety
+            # Filter logits slightly to avoid complete gibberish
+            filtered_logits = torch.topk(next_token_logits, k=50).values
+            # For this demo, we'll stick to a slightly relaxed greedy/top-k approach:
             next_token = torch.argmax(next_token_logits, dim=-1).unsqueeze(-1)
         
-        # Append the new token to the sequence
+        # Append the new token
         input_ids = torch.cat([input_ids, next_token], dim=-1)
+        tokens_since_last_trigger += 1
         
-        # Decode the newest token to check it
+        # Decode and clean the newest token
         decoded_token = tokenizer.decode(next_token[0]).strip().lower()
-        print(decoded_token, end=" ", flush=True)
+        print(tokenizer.decode(next_token[0]), end="", flush=True)
         
-        # 3. Check for the CURRENT active cognitive trigger
-        current_target = target_triggers[trigger_index]
-        
+        # 3. Check for target trigger
         if current_target in decoded_token:
-            print(f"\n\n[Match Found: '{current_target}' in Cycle {loop_count}]")
+            trigger_count += 1
+            print(f"\n\n[Cognitive Stage {trigger_count} Cleared: '{current_target}']")
+            current_target = next(trigger_cycle)
+            print(f"[Next required trigger: '{current_target}']\n")
+            tokens_since_last_trigger = 0
             
-            # Advance index using modulo to create an infinite loop structure
-            trigger_index = (trigger_index + 1) % len(target_triggers)
+        # 4. DYNAMIC INJECTION: If the model is looping/stuck, force the trigger!
+        elif tokens_since_last_trigger >= trigger_patience:
+            trigger_count += 1
+            print(f"\n\n[Patience Exceeded. Forcing Trigger Stage {trigger_count}: '{current_target}']")
             
-            # If the index resets to 0, we completed one full loop of all triggers
-            if trigger_index == 0:
-                print(f"[Finished Trigger Loop Cycle {loop_count}! Starting next cycle...]\n")
-                loop_count += 1
+            # Encode and append the forced trigger token
+            forced_ids = tokenizer.encode(" " + current_target, return_tensors="pt")
+            input_ids = torch.cat([input_ids, forced_ids], dim=-1)
+            
+            current_target = next(trigger_cycle)
+            print(f"[Next required trigger: '{current_target}']\n")
+            tokens_since_last_trigger = 0
+            
+        if trigger_count == 4: # Graceful breakout after a few loops
+            print("\n[Target loop count reached. Breaking reasoning phase.]")
+            break
                     
-    # 4. Inject the transition token (forcing the <BOS> shift)
+    # 5. Inject the transition token & generate final answer
     print("\n--- Injecting Transition Token & Generating Final Answer ---")
     
-    # Fallback to standard token ID if tokenizer.bos_token_id is None
     bos_id = tokenizer.bos_token_id if tokenizer.bos_token_id is not None else 50256
     bos_token_id = torch.tensor([[bos_id]])
     input_ids = torch.cat([input_ids, bos_token_id], dim=-1)
     
-    # Generate the final conclusion based on the reasoning path
+    # Use sampling for the final generation to ensure a varied, clean answer
     final_output = model.generate(
         input_ids, 
-        max_new_tokens=40, 
+        max_new_tokens=50,  
+        do_sample=True,
+        top_k=50,
+        top_p=0.95,
+        temperature=0.7,
         pad_token_id=tokenizer.eos_token_id
     )
     
