@@ -340,9 +340,6 @@ def generate(model, vocab, prompt, device, iso_processor, bench_processor, strea
         next_id = torch.multinomial(probs, 1).item()
         ids.append(next_id)
 
-        if (step + 1) % 20 == 0:
-            print(f"  [{step+1:3d} tokens] {streak_tracker.status}")
-
     return vocab.decode(ids)
 
 
