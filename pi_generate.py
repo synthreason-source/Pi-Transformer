@@ -195,4 +195,4 @@ def main(txt_path="corpus.txt", n=5):
 
 
 if __name__ == "__main__":
-    main(input("Filename: "), n=5)
+    main(input("Filename: "), n=3)
