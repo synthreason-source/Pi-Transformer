@@ -192,7 +192,7 @@ def main(txt_path="corpus.txt", n=5):
         )
 
         print(output)
-
+        print()
 
 if __name__ == "__main__":
     main(input("Filename: "), n=2)
