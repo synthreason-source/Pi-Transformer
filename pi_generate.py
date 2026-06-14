@@ -96,7 +96,17 @@ def train(model, loader, opt, device):
         x, y = x.to(device), y.to(device)
 
         logits = model(x)
-        loss = F.cross_entropy(logits, y)
+        batch_size = y.size(0)
+        vocab_size = logits.size(1)
+
+        target = torch.zeros(
+            batch_size,
+            vocab_size,
+            device=device
+        )
+
+        target.scatter_(1, y.unsqueeze(1), 1.0)
+        loss = F.cross_entropy(logits, target)
 
         opt.zero_grad()
         loss.backward()
@@ -158,6 +168,7 @@ def generate(model, vocab, prompt, device, processor, max_len=300):
         next_id = torch.multinomial(probs, 1).item()
 
         ids.append(next_id)
+        
 
     return vocab.decode(ids)
 
@@ -179,7 +190,7 @@ def main(txt_path="corpus.txt", n=5):
         loss = train(model, loader, opt, device)
         print(f"\nEpoch {epoch} | loss {loss:.4f}\n")
 
-    processor = IsomorphismLogitsProcessor(target_mass=0.005)
+    processor = IsomorphismLogitsProcessor(target_mass=0.00005)
 
     print("🧠 Generating...\n")
     while True:
