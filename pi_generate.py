@@ -5,14 +5,14 @@ from torch.utils.data import Dataset, DataLoader
 
 
 # =========================
-# 1. VOCAB BUILDER
+# 1. VOCAB
 # =========================
 class Vocab:
-    def __init__(self, tokens):
+    def __init__(self, words):
         self.word2idx = {}
         self.idx2word = []
 
-        for w in tokens:
+        for w in words:
             if w not in self.word2idx:
                 self.word2idx[w] = len(self.idx2word)
                 self.idx2word.append(w)
@@ -23,37 +23,39 @@ class Vocab:
     def encode(self, words):
         return [self.word2idx[w] for w in words if w in self.word2idx]
 
-    def decode(self, idxs):
-        return " ".join(self.idx2word[i] for i in idxs)
+    def decode(self, ids):
+        return " ".join(self.idx2word[i] for i in ids)
 
 
 # =========================
-# 2. DATASET (TRIGRAMS)
+# 2. N-GRAM DATASET
 # =========================
-class TrigramDataset(Dataset):
-    def __init__(self, path):
-        text = open(path, "r", encoding="utf-8").read().lower()
+class NGramDataset(Dataset):
+    def __init__(self, file_path, n=5):
+        text = open(file_path, "r", encoding="utf-8").read().lower()
         words = text.split()
 
         self.vocab = Vocab(words)
+        self.n = n
+
         ids = self.vocab.encode(words)
 
-        if len(ids) < 3:
-            raise ValueError("Corpus too small")
+        if len(ids) < n + 1:
+            raise ValueError("Corpus too small for given n")
 
         self.data = []
-        for i in range(len(ids) - 2):
-            self.data.append((ids[i], ids[i+1], ids[i+2]))
+        for i in range(len(ids) - n):
+            self.data.append((
+                ids[i:i+n],     # context
+                ids[i+n]        # target
+            ))
 
     def __len__(self):
         return len(self.data)
 
     def __getitem__(self, idx):
-        w1, w2, w3 = self.data[idx]
-        return (
-            torch.tensor([w1, w2], dtype=torch.long),
-            torch.tensor(w3, dtype=torch.long)
-        )
+        x, y = self.data[idx]
+        return torch.tensor(x), torch.tensor(y)
 
 
 def collate(batch):
@@ -63,24 +65,24 @@ def collate(batch):
 
 
 # =========================
-# 3. TRIGRAM MODEL
+# 3. N-GRAM MODEL
 # =========================
-class TrigramModel(nn.Module):
-    def __init__(self, vocab_size, d=128):
+class NGramModel(nn.Module):
+    def __init__(self, vocab_size, n=5, d=128):
         super().__init__()
+        self.n = n
 
         self.emb = nn.Embedding(vocab_size, d)
-        self.fc1 = nn.Linear(d * 2, 256)
+        self.fc1 = nn.Linear(n * d, 256)
         self.fc2 = nn.Linear(256, vocab_size)
 
     def forward(self, x):
-        e = self.emb(x)              # (B, 2, d)
-        e = e.view(x.size(0), -1)    # (B, 2d)
+        # x: (B, n)
+        e = self.emb(x)                 # (B, n, d)
+        e = e.reshape(x.size(0), -1)    # (B, n*d)
 
         h = F.relu(self.fc1(e))
-        logits = self.fc2(h)
-
-        return logits
+        return self.fc2(h)
 
 
 # =========================
@@ -88,7 +90,7 @@ class TrigramModel(nn.Module):
 # =========================
 def train(model, loader, opt, device):
     model.train()
-    total = 0
+    total_loss = 0
 
     for step, (x, y) in enumerate(loader):
         x, y = x.to(device), y.to(device)
@@ -100,16 +102,16 @@ def train(model, loader, opt, device):
         loss.backward()
         opt.step()
 
-        total += loss.item()
+        total_loss += loss.item()
 
         if step % 50 == 0:
             print(f"step {step} | loss {loss.item():.4f}")
 
-    return total / len(loader)
+    return total_loss / len(loader)
 
 
 # =========================
-# 5. LOGITS CONSTRAINT ENGINE (TRIGRAM VERSION)
+# 5. LOGITS CONSTRAINT ENGINE
 # =========================
 class IsomorphismLogitsProcessor:
     def __init__(self, target_mass=0.5):
@@ -117,6 +119,7 @@ class IsomorphismLogitsProcessor:
 
     def __call__(self, logits):
         logits = logits.clone()
+
         probs = F.softmax(logits, dim=-1)
 
         half = logits.size(-1) // 2
@@ -131,25 +134,22 @@ class IsomorphismLogitsProcessor:
 
 
 # =========================
-# 6. GENERATION (TRIGRAM SAMPLING)
+# 6. GENERATION (USING ids[-n:])
 # =========================
 @torch.no_grad()
-def generate(model, vocab, prompt, device, processor, max_len=200):
+def generate(model, vocab, prompt, device, processor, max_len=300):
     model.eval()
 
     words = prompt.lower().split()
-
-    # ensure at least 2 words
-    if len(words) < 2:
-        words = ["<s>", words[0] if words else "<s>"]
-
     ids = vocab.encode(words)
 
-    if len(ids) < 2:
-        ids = [0, 0]
+    if len(ids) < model.n:
+        ids = [0] * model.n
 
     for _ in range(max_len):
-        x = torch.tensor(ids[-2:], dtype=torch.long, device=device).unsqueeze(0)
+        context = ids[-model.n:]   # 🔥 THIS is the corrected sliding window
+
+        x = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
 
         logits = model(x)
         logits = processor(logits)
@@ -165,34 +165,34 @@ def generate(model, vocab, prompt, device, processor, max_len=200):
 # =========================
 # 7. MAIN
 # =========================
-def main(txt_path="corpus.txt"):
+def main(txt_path="corpus.txt", n=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    dataset = TrigramDataset(txt_path)
+    dataset = NGramDataset(txt_path, n=n)
     loader = DataLoader(dataset, batch_size=64, shuffle=True, collate_fn=collate)
 
-    model = TrigramModel(len(dataset.vocab)).to(device)
+    model = NGramModel(len(dataset.vocab), n=n).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    print("🚀 Training trigram model...")
-    for epoch in range(2):
+    print("🚀 Training n-gram model...")
+    for epoch in range(5):
         loss = train(model, loader, opt, device)
         print(f"\nEpoch {epoch} | loss {loss:.4f}\n")
 
-    processor = IsomorphismLogitsProcessor(target_mass=0.01)
+    processor = IsomorphismLogitsProcessor(target_mass=0.5)
 
     print("🧠 Generating...\n")
-    while True:
-        out = generate(
-            model,
-            dataset.vocab,
-            input("USER: "),
-            device,
-            processor
-        )
 
-        print(out)
+    output = generate(
+        model,
+        dataset.vocab,
+        input("USER: "),
+        device,
+        processor
+    )
+
+    print(output)
 
 
 if __name__ == "__main__":
-    main(input("Filename: "))
+    main(input("Filename: "), n=5)
