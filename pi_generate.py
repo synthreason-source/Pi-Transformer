@@ -105,7 +105,7 @@ def train(model, loader, opt, device):
             device=device
         )
 
-        target.scatter_(1, y.unsqueeze(1), 1.0)
+        target.scatter_(1, y.unsqueeze(1), 0.5)
         loss = F.cross_entropy(logits, target)
 
         opt.zero_grad()
@@ -206,4 +206,4 @@ def main(txt_path="corpus.txt", n=5):
         print()
 
 if __name__ == "__main__":
-    main(input("Filename: "), n=2)
+    main(input("Filename: "), n=3)
