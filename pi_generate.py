@@ -365,9 +365,9 @@ def main(txt_path="corpus.txt", n=5):
     ]
 
     benchmark     = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
-    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.3, max_boost=5.0)
+    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.1, max_boost=1.0)
     iso_processor    = IsomorphismLogitsProcessor(target_mass=10.00005)
-    streak_tracker   = StreakTracker(threshold=0.5, alpha=0.08, max_streak=8)
+    streak_tracker   = StreakTracker(threshold=0.1, alpha=0.01, max_streak=8)
 
     print("Training n-gram model...")
     for epoch in range(2):
