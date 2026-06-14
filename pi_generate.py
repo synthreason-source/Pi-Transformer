@@ -36,7 +36,7 @@ class NGramDataset(Dataset):
         text = open(file_path, "r", encoding="utf-8").read().lower()
 
         # Strip punctuation before building vocab and data
-        words = re.sub(r"[^\w\s]", "", text).split()
+        words = text.split()
 
         self.vocab = Vocab(words)
         self.n = n
