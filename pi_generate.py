@@ -175,11 +175,11 @@ def main(txt_path="corpus.txt", n=5):
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     print("🚀 Training n-gram model...")
-    for epoch in range(5):
+    for epoch in range(2):
         loss = train(model, loader, opt, device)
         print(f"\nEpoch {epoch} | loss {loss:.4f}\n")
 
-    processor = IsomorphismLogitsProcessor(target_mass=0.5)
+    processor = IsomorphismLogitsProcessor(target_mass=0.005)
 
     print("🧠 Generating...\n")
     while True:
@@ -195,4 +195,4 @@ def main(txt_path="corpus.txt", n=5):
 
 
 if __name__ == "__main__":
-    main(input("Filename: "), n=3)
+    main(input("Filename: "), n=2)
