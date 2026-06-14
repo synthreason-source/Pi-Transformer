@@ -182,16 +182,16 @@ def main(txt_path="corpus.txt", n=5):
     processor = IsomorphismLogitsProcessor(target_mass=0.5)
 
     print("🧠 Generating...\n")
+    while True:
+        output = generate(
+            model,
+            dataset.vocab,
+            input("USER: "),
+            device,
+            processor
+        )
 
-    output = generate(
-        model,
-        dataset.vocab,
-        input("USER: "),
-        device,
-        processor
-    )
-
-    print(output)
+        print(output)
 
 
 if __name__ == "__main__":
