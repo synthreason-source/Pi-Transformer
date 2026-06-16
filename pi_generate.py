@@ -333,7 +333,7 @@ class IsomorphismLogitsProcessor:
 # 7. BENCHMARK LOGITS PROCESSOR
 # =========================
 class BenchmarkLogitsProcessor:
-    def __init__(self, token_loss_map, alpha=0.3, max_boost=5.0):
+    def __init__(self, token_loss_map, alpha=0.1, max_boost=5.0):
         self.token_loss_map = token_loss_map
         self.alpha = alpha
         self.max_boost = max_boost
@@ -355,7 +355,7 @@ class BenchmarkLogitsProcessor:
 # 8. STREAK TRACKER
 # =========================
 class StreakTracker:
-    def __init__(self, threshold=0.5, alpha=0.08, max_streak=8):
+    def __init__(self, threshold=0.15, alpha=0.018, max_streak=8):
         self.threshold = threshold
         self.alpha = alpha
         self.max_streak = max_streak
@@ -526,9 +526,9 @@ def main(txt_path="corpus.txt", n=5):
     ]
 
     benchmark     = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
-    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.1, max_boost=1.0)
-    iso_processor    = IsomorphismLogitsProcessor(target_mass=0.5)
-    streak_tracker   = StreakTracker(threshold=0.5, alpha=0.08, max_streak=8)
+    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.001, max_boost=1.0)
+    iso_processor    = IsomorphismLogitsProcessor(target_mass=0.005)
+    streak_tracker   = StreakTracker(threshold=0.005, alpha=0.0008, max_streak=118)
     
     # Create super probability mini-generators
     super_gen = SuperProbMiniGenerators(
@@ -537,7 +537,7 @@ def main(txt_path="corpus.txt", n=5):
         base_d=128,
         num_mini_generators=5  # 5 mini-generators in ensemble
     )
-    super_gen.set_super_temperature(0.9)  # Slightly sharper super probability
+    super_gen.set_super_temperature(0.1)  # Slightly sharper super probability
 
     print("Training base n-gram model...")
     for epoch in range(2):
