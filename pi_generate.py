@@ -34,8 +34,6 @@ class Vocab:
 class NGramDataset(Dataset):
     def __init__(self, file_path, n=5):
         text = open(file_path, "r", encoding="utf-8").read().lower()
-
-        # Strip punctuation before building vocab and data
         words = text.split()
 
         self.vocab = Vocab(words)
@@ -115,10 +113,11 @@ def train(model, loader, opt, device):
 
 
 # =========================
-# 5. LOGITS CONSTRAINT ENGINE
+# 5. LOGITS CONSTRAINT ENGINE (FIXED)
 # =========================
 class IsomorphismLogitsProcessor:
     def __init__(self, target_mass=0.5):
+        # target_mass must be in [0, 1] because it's a probability mass
         self.target_mass = target_mass
 
     def __call__(self, logits):
@@ -126,10 +125,12 @@ class IsomorphismLogitsProcessor:
 
         probs = F.softmax(logits, dim=-1)
         half = logits.size(-1) // 2
-        mass = probs[:, :half].sum()
-        diff = float(mass - self.target_mass)
+        # Per-row mass over the first half of vocab
+        mass = probs[:, :half].sum(dim=-1, keepdim=True)
+        diff = mass - self.target_mass
 
-        if abs(diff) > 1e-3:
+        # Only adjust if we're significantly off
+        if diff.abs().max() > 1e-3:
             logits[:, :half] -= diff * 1.5
 
         return logits
@@ -139,24 +140,12 @@ class IsomorphismLogitsProcessor:
 # 6. BENCHMARK LOGITS PROCESSOR
 # =========================
 class BenchmarkLogitsProcessor:
-    """
-    At generation time, boosts logits of tokens that scored high loss
-    on the held-out benchmark. Loss is used directly as the boost
-    magnitude, scaled by `alpha`, so tokens the model was most wrong
-    about get the strongest upward nudge within the existing distribution.
-
-    Args:
-        token_loss_map : dict of {vocab_id: cumulative_loss} from TestBenchmark
-        alpha          : scales how strongly loss maps to a logit boost
-        max_boost      : clamps the boost so no single token dominates
-    """
     def __init__(self, token_loss_map, alpha=0.3, max_boost=5.0):
         self.token_loss_map = token_loss_map
         self.alpha = alpha
         self.max_boost = max_boost
 
     def update(self, token_loss_map):
-        """Call after each epoch with the fresh map from benchmark.evaluate."""
         self.token_loss_map = token_loss_map
 
     def __call__(self, logits):
@@ -173,20 +162,6 @@ class BenchmarkLogitsProcessor:
 # 7. STREAK TRACKER
 # =========================
 class StreakTracker:
-    """
-    Gamifies generation: when consecutive tokens are predicted with high
-    confidence (top-1 prob >= threshold), a streak builds up.
-    The streak sharpens the logit distribution by a multiplier,
-    rewarding coherent runs by making future confident predictions
-    even more dominant — staying within the model's learned probs.
-    A single low-confidence token resets the streak.
-
-    Args:
-        threshold   : min top-1 prob to count as a confident step (>0.5)
-        alpha       : how aggressively each streak step sharpens logits
-                      (logits *= 1 + streak * alpha)
-        max_streak  : cap so the distribution doesn't collapse to argmax
-    """
     def __init__(self, threshold=0.5, alpha=0.08, max_streak=8):
         self.threshold = threshold
         self.alpha = alpha
@@ -223,24 +198,6 @@ class StreakTracker:
 # 8. TEST BENCHMARK
 # =========================
 class TestBenchmark:
-    """
-    Holds a list of (question, answer) string pairs.
-    After each epoch, evaluates model loss over every answer token
-    using a sliding n-gram window seeded by the question, and streams
-    a cumulative sum of per-token losses to stdout.
-
-    The cumsum lets you see at a glance whether the model is improving
-    on held-out content: a steeply rising cumsum = high loss = poor fit;
-    a flatter cumsum = model assigns more probability to answer tokens.
-
-    Also returns a token_loss_map {vocab_id: cumulative_loss} which
-    BenchmarkLogitsProcessor uses to boost high-loss tokens at generation.
-
-    Args:
-        qa_pairs : list of (question_str, answer_str)
-        vocab    : Vocab instance (shared with the dataset)
-        n        : n-gram context size (must match model)
-    """
     def __init__(self, qa_pairs, vocab, n):
         self.qa_pairs = qa_pairs
         self.vocab = vocab
@@ -252,15 +209,13 @@ class TestBenchmark:
         print(f"\n── Benchmark after epoch {epoch} ──")
 
         all_token_losses = []
-        token_loss_map = {}   # vocab_id → cumulative loss, for generation boosting
+        token_loss_map = {}
 
         for q_str, a_str in self.qa_pairs:
-            # Strip punctuation, encode question as seed context
             q_ids = self.vocab.encode(re.sub(r"[^\w\s]", "", q_str.lower()).split())
             if len(q_ids) < self.n:
                 q_ids = [0] * (self.n - len(q_ids)) + q_ids
 
-            # Encode answer tokens — these are what we measure loss over
             a_ids = self.vocab.encode(re.sub(r"[^\w\s]", "", a_str.lower()).split())
             if not a_ids:
                 continue
@@ -275,13 +230,10 @@ class TestBenchmark:
                 loss = F.cross_entropy(logits, target).item()
                 token_losses.append(loss)
 
-                # Accumulate loss per vocab id — high loss = model struggled here
                 token_loss_map[target_id] = token_loss_map.get(target_id, 0.0) + loss
 
-                # Slide window: consume target as next context token
                 context = context[1:] + [target_id]
 
-            # Stream cumsum for this QA pair
             cumsum = 0.0
             tokens = re.sub(r"[^\w\s]", "", a_str.lower()).split()
             print(f"  Q: {q_str!r}")
@@ -293,7 +245,6 @@ class TestBenchmark:
 
             all_token_losses.extend(token_losses)
 
-        # Global cumsum across all QA pairs
         if all_token_losses:
             global_cumsum = 0.0
             print(f"\n  Global cumsum stream ({len(all_token_losses)} tokens):")
@@ -324,17 +275,18 @@ def generate(model, vocab, prompt, device, iso_processor, bench_processor, strea
     words = re.sub(r"[^\w\s]", "", prompt.lower()).split()
     ids = vocab.encode(words)
 
+    # Pad with zeros only if we have fewer than n tokens
     if len(ids) < model.n:
-        ids = [0] * model.n
+        ids = [0] * (model.n - len(ids)) + ids
 
     for step in range(max_len):
         context = ids[-model.n:]
         x = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
 
         logits = model(x)
-        logits = iso_processor(logits)      # 1. mass constraint
-        logits = bench_processor(logits)    # 2. boost high-loss benchmark tokens
-        logits = streak_tracker(logits)     # 3. sharpen on confident streaks
+        logits = iso_processor(logits)
+        logits = bench_processor(logits)
+        logits = streak_tracker(logits)
 
         probs = F.softmax(logits, dim=-1)
         next_id = torch.multinomial(probs, 1).item()
@@ -355,9 +307,6 @@ def main(txt_path="corpus.txt", n=5):
     model = NGramModel(len(dataset.vocab), n=n).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
-    # ── Define your held-out test questions here ──────────────────────────
-    # Questions seed the context; answers are scored token-by-token.
-    # Use vocabulary words from your corpus for best results.
     qa_pairs = [
         ("what is the meaning of", "life is a journey full of purpose"),
         ("the quick brown fox",    "jumps over the lazy dog"),
@@ -366,15 +315,15 @@ def main(txt_path="corpus.txt", n=5):
 
     benchmark     = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
     bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.1, max_boost=1.0)
-    iso_processor    = IsomorphismLogitsProcessor(target_mass=10.00005)
-    streak_tracker   = StreakTracker(threshold=0.1, alpha=0.01, max_streak=8)
+    # Fixed: target_mass must be in [0, 1]
+    iso_processor    = IsomorphismLogitsProcessor(target_mass=0.5)
+    streak_tracker   = StreakTracker(threshold=0.5, alpha=0.08, max_streak=8)
 
     print("Training n-gram model...")
     for epoch in range(2):
         loss = train(model, loader, opt, device)
         print(f"\nEpoch {epoch} | train loss {loss:.4f}")
 
-        # Evaluate benchmark and feed losses back into generation processor
         _, token_loss_map = benchmark.evaluate(model, device, epoch)
         bench_processor.update(token_loss_map)
 
@@ -394,4 +343,5 @@ def main(txt_path="corpus.txt", n=5):
 
 
 if __name__ == "__main__":
-    main(input("Filename: "), n=2)
+    filepath = input("Filename: ")
+    main(filepath, n=2)  # Use n=5 as default; change if you want n=2
