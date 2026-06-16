@@ -64,7 +64,206 @@ def collate(batch):
 
 
 # =========================
-# 3. N-GRAM MODEL
+# 3. SUPER PROB MINI-GENERATORS
+# =========================
+class SuperProbMiniGenerators:
+    """
+    Creates multiple mini-generators (small models) that run in parallel
+    and vote on the final output probability distribution.
+    
+    How it works:
+    1. Create N mini-models with different random initializations
+    2. Each mini-generator produces its own probability distribution
+    3. Combine probabilities via weighted averaging (ensemble)
+    4. The "super probability" is the combined distribution
+    
+    This creates a more robust probability surface by averaging
+    multiple perspectives on the same context.
+    """
+    
+    def __init__(self, vocab_size, n=5, base_d=128, num_mini_generators=5):
+        self.vocab_size = vocab_size
+        self.n = n
+        self.base_d = base_d
+        self.num_mini_generators = num_mini_generators
+        
+        # Create mini-generators with different initializations
+        self.mini_generators = []
+        for i in range(num_mini_generators):
+            mini = NGramModel(vocab_size, n, d=base_d)
+            # Different random init for each
+            self._random_init(mini, seed=i)
+            self.mini_generators.append(mini)
+        
+        # Weights for each mini-generator (can be learned or fixed)
+        self.generator_weights = torch.ones(num_mini_generators) / num_mini_generators
+        
+        # Temperature for super probability smoothing
+        self.super_temperature = 1.0
+    
+    def _random_init(self, model, seed):
+        """Random initialization with different seed for diversity."""
+        torch.manual_seed(seed)
+        for param in model.parameters():
+            param.data = torch.randn_like(param) * 0.1
+    
+    def set_generator_weight(self, generator_idx, weight):
+        """Set weight for a specific mini-generator."""
+        self.generator_weights[generator_idx] = weight
+    
+    def set_super_temperature(self, temp):
+        """Control sharpness of super probability (lower = sharper)."""
+        self.super_temperature = temp
+    
+    @torch.no_grad()
+    def get_super_probs(self, context_tensor, device):
+        """
+        Get super probability from all mini-generators.
+        
+        Args:
+            context_tensor: (1, n) context tensor
+            device: torch device
+        
+        Returns:
+            super_probs: Combined probability distribution (vocab_size,)
+            all_probs: List of individual probs from each mini-generator
+        """
+        all_probs = []
+        all_logits = []
+        
+        # Run each mini-generator
+        for i, mini in enumerate(self.mini_generators):
+            mini.eval()
+            logits = mini(context_tensor)
+            all_logits.append(logits)
+            
+            # Get probabilities
+            probs = F.softmax(logits, dim=-1)
+            all_probs.append(probs[0])  # (vocab_size,)
+        
+        # Normalize weights
+        weights = F.softmax(self.generator_weights, dim=-1).to(device)
+        
+        # Weighted average of probabilities (super probability)
+        super_probs = torch.zeros(self.vocab_size, device=device)
+        for i, probs in enumerate(all_probs):
+            super_probs += weights[i] * probs
+        
+        # Apply temperature smoothing
+        super_probs = super_probs / self.super_temperature
+        super_probs = F.softmax(super_probs, dim=-1)
+        
+        return super_probs, all_probs
+    
+    def get_super_logits(self, context_tensor, device):
+        """
+        Get super logits (before softmax) from ensemble.
+        Useful for combining with other logits processors.
+        """
+        all_logits = []
+        
+        for mini in self.mini_generators:
+            mini.eval()
+            logits = mini(context_tensor)
+            all_logits.append(logits[0])
+        
+        # Weighted average of logits
+        weights = F.softmax(self.generator_weights, dim=-1).to(device)
+        super_logits = torch.zeros(self.vocab_size, device=device)
+        
+        for i, logits in enumerate(all_logits):
+            super_logits += weights[i] * logits
+        
+        return super_logits
+    
+    @torch.no_grad()
+    def get_top_k_consensus(self, context_tensor, device, k=5):
+        """
+        Get top-k tokens that multiple mini-generators agree on.
+        
+        Returns:
+            consensus_tokens: List of (token_id, agreement_score)
+        """
+        all_probs = []
+        
+        for mini in self.mini_generators:
+            mini.eval()
+            logits = mini(context_tensor)
+            probs = F.softmax(logits, dim=-1)
+            all_probs.append(probs[0])
+        
+        # Count how many generators agree on top-k
+        token_agreement = torch.zeros(self.vocab_size, device=device)
+        
+        for probs in all_probs:
+            top_k_ids = probs.topk(k).indices
+            for tid in top_k_ids:
+                token_agreement[tid] += 1
+        
+        # Normalize to agreement score (0-1)
+        token_agreement = token_agreement / len(self.mini_generators)
+        
+        # Get tokens with high agreement
+        consensus = []
+        for tid, score in enumerate(token_agreement):
+            if score >= 0.5:  # At least 50% agreement
+                consensus.append((tid, score.item()))
+        
+        consensus.sort(key=lambda x: x[1], reverse=True)
+        return consensus[:k]
+    
+    def status(self, super_probs):
+        """Return status string."""
+        top_id = super_probs.max(dim=-1).indices.item()
+        top_prob = super_probs.max(dim=-1).values.item()
+        
+        # Check agreement across mini-generators
+        agreement_scores = self.get_top_k_consensus(
+            torch.arange(1, self.n + 1, dtype=torch.long).unsqueeze(0), 
+            super_probs.device, 
+            k=1
+        )
+        
+        if agreement_scores:
+            agreement = agreement_scores[0][1]
+            return f"super_prob: top={top_id} prob={top_prob:.3f} agreement={agreement:.2f}"
+        else:
+            return f"super_prob: top={top_id} prob={top_prob:.3f}"
+    
+    def train_mini_generators(self, loader, opt_base, device, epochs=1):
+        """Train all mini-generators on the dataset."""
+        for epoch in range(epochs):
+            total_loss = 0
+            
+            for step, (x, y) in enumerate(loader):
+                x, y = x.to(device), y.to(device)
+                
+                # Average loss across all mini-generators
+                total_logits_loss = 0
+                for mini in self.mini_generators:
+                    mini.train()
+                    logits = mini(x)
+                    loss = F.cross_entropy(logits, y)
+                    total_logits_loss += loss
+                
+                avg_loss = total_logits_loss / len(self.mini_generators)
+                
+                # Update all mini-generators
+                for mini in self.mini_generators:
+                    opt_base.zero_grad()
+                    avg_loss.backward()
+                    opt_base.step()
+                
+                total_loss += avg_loss.item()
+                
+                if step % 50 == 0:
+                    print(f"  super_gen step {step} | loss {avg_loss.item():.4f}")
+            
+            print(f"  Epoch {epoch} | super_gen loss {total_loss / len(loader):.4f}")
+
+
+# =========================
+# 4. N-GRAM MODEL
 # =========================
 class NGramModel(nn.Module):
     def __init__(self, vocab_size, n=5, d=128):
@@ -76,7 +275,6 @@ class NGramModel(nn.Module):
         self.fc2 = nn.Linear(256, vocab_size)
 
     def forward(self, x):
-        # x: (B, n)
         e = self.emb(x)                 # (B, n, d)
         e = e.reshape(x.size(0), -1)    # (B, n*d)
         h = F.relu(self.fc1(e))
@@ -84,7 +282,7 @@ class NGramModel(nn.Module):
 
 
 # =========================
-# 4. TRAIN LOOP
+# 5. TRAIN LOOP
 # =========================
 def train(model, loader, opt, device):
     model.train()
@@ -98,7 +296,6 @@ def train(model, loader, opt, device):
         probs = F.softmax(logits, dim=-1)
         entropy = -(probs * torch.log(probs + 1e-8)).sum(dim=-1).mean()
 
-        # Small entropy bonus
         loss = ce_loss - 0.001 * entropy
         opt.zero_grad()
         loss.backward()
@@ -113,23 +310,19 @@ def train(model, loader, opt, device):
 
 
 # =========================
-# 5. LOGITS CONSTRAINT ENGINE (FIXED)
+# 6. LOGITS CONSTRAINT ENGINE
 # =========================
 class IsomorphismLogitsProcessor:
     def __init__(self, target_mass=0.5):
-        # target_mass must be in [0, 1] because it's a probability mass
         self.target_mass = target_mass
 
     def __call__(self, logits):
         logits = logits.clone()
-
         probs = F.softmax(logits, dim=-1)
         half = logits.size(-1) // 2
-        # Per-row mass over the first half of vocab
         mass = probs[:, :half].sum(dim=-1, keepdim=True)
         diff = mass - self.target_mass
 
-        # Only adjust if we're significantly off
         if diff.abs().max() > 1e-3:
             logits[:, :half] -= diff * 1.5
 
@@ -137,7 +330,7 @@ class IsomorphismLogitsProcessor:
 
 
 # =========================
-# 6. BENCHMARK LOGITS PROCESSOR
+# 7. BENCHMARK LOGITS PROCESSOR
 # =========================
 class BenchmarkLogitsProcessor:
     def __init__(self, token_loss_map, alpha=0.3, max_boost=5.0):
@@ -159,7 +352,7 @@ class BenchmarkLogitsProcessor:
 
 
 # =========================
-# 7. STREAK TRACKER
+# 8. STREAK TRACKER
 # =========================
 class StreakTracker:
     def __init__(self, threshold=0.5, alpha=0.08, max_streak=8):
@@ -173,7 +366,6 @@ class StreakTracker:
 
     def __call__(self, logits):
         logits = logits.clone()
-
         probs = F.softmax(logits, dim=-1)
         top_prob = probs.max(dim=-1).values.item()
 
@@ -195,7 +387,7 @@ class StreakTracker:
 
 
 # =========================
-# 8. TEST BENCHMARK
+# 9. TEST BENCHMARK
 # =========================
 class TestBenchmark:
     def __init__(self, qa_pairs, vocab, n):
@@ -265,17 +457,17 @@ class TestBenchmark:
 
 
 # =========================
-# 9. GENERATION
+# 10. GENERATION WITH SUPER PROB MINI-GENERATORS
 # =========================
 @torch.no_grad()
-def generate(model, vocab, prompt, device, iso_processor, bench_processor, streak_tracker, max_len=300):
+def generate(model, vocab, prompt, device, iso_processor, bench_processor, streak_tracker, 
+             super_gen=None, use_super_probs=False, max_len=300):
     model.eval()
     streak_tracker.reset()
 
     words = re.sub(r"[^\w\s]", "", prompt.lower()).split()
     ids = vocab.encode(words)
 
-    # Pad with zeros only if we have fewer than n tokens
     if len(ids) < model.n:
         ids = [0] * (model.n - len(ids)) + ids
 
@@ -283,20 +475,40 @@ def generate(model, vocab, prompt, device, iso_processor, bench_processor, strea
         context = ids[-model.n:]
         x = torch.tensor(context, dtype=torch.long, device=device).unsqueeze(0)
 
-        logits = model(x)
-        logits = iso_processor(logits)
-        logits = bench_processor(logits)
-        logits = streak_tracker(logits)
+        if use_super_probs and super_gen is not None:
+            # Use super probability from mini-generators instead of base model
+            super_probs, all_probs = super_gen.get_super_probs(x, device)
+            
+            # Show super prob status
+            if step % 50 == 0:
+                print(f"  {super_gen.status(super_probs)}")
+            
+            # Apply other processors to super_probs (convert back to logits)
+            super_logits = super_probs.log()
+            super_logits = iso_processor(super_logits.unsqueeze(0))
+            super_logits = bench_processor(super_logits)
+            super_logits = streak_tracker(super_logits)
+            
+            # Convert back to probs and sample
+            probs = F.softmax(super_logits, dim=-1)[0]
+            next_id = torch.multinomial(probs, 1).item()
+        else:
+            # Normal generation from base model
+            logits = model(x)
+            logits = iso_processor(logits)
+            logits = bench_processor(logits)
+            logits = streak_tracker(logits)
 
-        probs = F.softmax(logits, dim=-1)
-        next_id = torch.multinomial(probs, 1).item()
+            probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, 1).item()
+        
         ids.append(next_id)
 
     return vocab.decode(ids)
 
 
 # =========================
-# 10. MAIN
+# 11. MAIN
 # =========================
 def main(txt_path="corpus.txt", n=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -315,11 +527,19 @@ def main(txt_path="corpus.txt", n=5):
 
     benchmark     = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
     bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.1, max_boost=1.0)
-    # Fixed: target_mass must be in [0, 1]
     iso_processor    = IsomorphismLogitsProcessor(target_mass=0.5)
     streak_tracker   = StreakTracker(threshold=0.5, alpha=0.08, max_streak=8)
+    
+    # Create super probability mini-generators
+    super_gen = SuperProbMiniGenerators(
+        vocab_size=len(dataset.vocab),
+        n=n,
+        base_d=128,
+        num_mini_generators=5  # 5 mini-generators in ensemble
+    )
+    super_gen.set_super_temperature(0.9)  # Slightly sharper super probability
 
-    print("Training n-gram model...")
+    print("Training base n-gram model...")
     for epoch in range(2):
         loss = train(model, loader, opt, device)
         print(f"\nEpoch {epoch} | train loss {loss:.4f}")
@@ -327,16 +547,31 @@ def main(txt_path="corpus.txt", n=5):
         _, token_loss_map = benchmark.evaluate(model, device, epoch)
         bench_processor.update(token_loss_map)
 
-    print("\nGenerating...\n")
+    print("\nOptional: Train mini-generators for super probability...")
+    print("  (Uncomment to train: super_gen.train_mini_generators(loader, opt, device, epochs=2))")
+    
+    print("\nGenerating with super probability mini-generators...\n")
+    print("Use use_super_probs=True to enable ensemble generation")
+    print()
+    
     while True:
+        user_input = input("USER: ")
+        
+        # Check for flag
+        use_super = "--super" in user_input
+        if use_super:
+            user_input = user_input.replace("--super", "").strip()
+        
         output = generate(
             model,
             dataset.vocab,
-            input("USER: "),
+            user_input,
             device,
             iso_processor,
             bench_processor,
             streak_tracker,
+            super_gen=super_gen,
+            use_super_probs=use_super,
         )
         print(output)
         print()
@@ -344,4 +579,4 @@ def main(txt_path="corpus.txt", n=5):
 
 if __name__ == "__main__":
     filepath = input("Filename: ")
-    main(filepath, n=2)  # Use n=5 as default; change if you want n=2
+    main(filepath, n=2)
