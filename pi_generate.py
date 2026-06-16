@@ -526,16 +526,16 @@ def main(txt_path="corpus.txt", n=5):
     ]
 
     benchmark     = TestBenchmark(qa_pairs, vocab=dataset.vocab, n=n)
-    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.001, max_boost=1.0)
-    iso_processor    = IsomorphismLogitsProcessor(target_mass=0.005)
-    streak_tracker   = StreakTracker(threshold=0.005, alpha=0.0008, max_streak=118)
+    bench_processor  = BenchmarkLogitsProcessor(token_loss_map={}, alpha=0.000000008, max_boost=1.0)
+    iso_processor    = IsomorphismLogitsProcessor(target_mass=0.000000008)
+    streak_tracker   = StreakTracker(threshold=0.000000008, alpha=0.000000008, max_streak=118)
     
     # Create super probability mini-generators
     super_gen = SuperProbMiniGenerators(
         vocab_size=len(dataset.vocab),
         n=n,
         base_d=128,
-        num_mini_generators=5  # 5 mini-generators in ensemble
+        num_mini_generators=55  # 5 mini-generators in ensemble
     )
     super_gen.set_super_temperature(0.1)  # Slightly sharper super probability
 
