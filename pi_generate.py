@@ -199,11 +199,7 @@ def generate_text(corpus_file, prompt):
 
     text = " ".join(output_words)
 
-    if "." in text:
-        return text.split(".")[0] + "."
-
     return text
-
 
 demo = gr.Interface(
     fn=generate_text,
