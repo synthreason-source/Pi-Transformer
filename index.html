@@ -1,537 +1,894 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Trigram Zigzag Markov</title>
-  <style>
-    :root {
-      --bg0: #050816;
-      --bg1: #0b1020;
-      --panel: rgba(12, 18, 34, 0.84);
-      --panel2: rgba(8, 14, 28, 0.9);
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --cyan: #22d3ee;
-      --fuchsia: #d946ef;
-      --rose: #fb7185;
-      --blue: #3b82f6;
-      --border: rgba(34, 211, 238, 0.22);
-      --border2: rgba(217, 70, 239, 0.22);
-      --glow: 0 0 18px rgba(34, 211, 238, 0.18), 0 0 36px rgba(217, 70, 239, 0.10);
-    }
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trigram Zigzag — Markov Text Generator</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:ital,opsz,wght@0,8..60,400;0,8..60,600;0,8..60,700;1,8..60,500&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper: #F7F4EC;
+    --paper-dim: #EFEADC;
+    --ink: #1B1A17;
+    --ink-soft: #5B564B;
+    --leather: #8A6E4B;
+    --leather-dim: #C9B79A;
+    --trigram-green: #3D5A4A;
+    --rust: #B5402C;
+    --rule: #D8D1BE;
+    --shadow: rgba(27,26,23,0.08);
+  }
 
-    * { box-sizing: border-box; }
+  *{ box-sizing: border-box; }
 
-    body {
-      margin: 0;
-      min-height: 100vh;
-      color: var(--text);
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background:
-        radial-gradient(circle at 10% 10%, rgba(34, 211, 238, 0.14), transparent 28%),
-        radial-gradient(circle at 90% 12%, rgba(217, 70, 239, 0.16), transparent 26%),
-        radial-gradient(circle at 50% 100%, rgba(251, 113, 133, 0.10), transparent 30%),
-        linear-gradient(180deg, var(--bg0), var(--bg1));
-      overflow-x: hidden;
-    }
+  body{
+    margin:0;
+    background: var(--paper);
+    background-image:
+      linear-gradient(var(--rule) 1px, transparent 1px);
+    background-size: 100% 32px;
+    color: var(--ink);
+    font-family: 'Source Serif 4', serif;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
 
-    body::before {
-      content: "";
-      position: fixed;
-      inset: 0;
-      pointer-events: none;
-      background:
-        linear-gradient(transparent 0 97%, rgba(255,255,255,0.03) 100%),
-        linear-gradient(90deg, transparent 0 97%, rgba(255,255,255,0.03) 100%);
-      background-size: 100% 28px, 28px 100%;
-      opacity: 0.18;
-      mix-blend-mode: screen;
-    }
+  .mono{ font-family: 'IBM Plex Mono', monospace; }
 
-    .wrap {
-      width: min(1280px, calc(100% - 24px));
-      margin: 0 auto;
-      padding: 22px 0 40px;
-    }
+  .wrap{
+    max-width: 920px;
+    margin: 0 auto;
+    padding: 56px 28px 100px;
+  }
 
-    .hero {
-      position: relative;
-      padding: 26px 24px;
-      border: 1px solid var(--border);
-      border-radius: 22px;
-      background: linear-gradient(180deg, rgba(10,15,30,0.92), rgba(7,11,22,0.88));
-      box-shadow: var(--glow);
-      overflow: hidden;
-    }
+  header.masthead{
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 18px;
+    margin-bottom: 36px;
+    display:flex;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
 
-    .hero::after {
-      content: "";
-      position: absolute;
-      inset: -2px;
-      background: linear-gradient(90deg, transparent, rgba(34,211,238,0.12), rgba(217,70,239,0.18), transparent);
-      filter: blur(24px);
-      opacity: 0.6;
-      pointer-events: none;
-    }
+  header.masthead h1{
+    font-size: 2.1rem;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  header.masthead h1 em{
+    font-style: italic;
+    color: var(--leather);
+  }
 
-    .title {
-      position: relative;
-      z-index: 1;
-      margin: 0;
-      font-size: clamp(28px, 4vw, 52px);
-      line-height: 1;
-      letter-spacing: 0.03em;
-      text-shadow: 0 0 14px rgba(34, 211, 238, 0.25);
-    }
+  .masthead-meta{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-soft);
+    text-align: right;
+    line-height: 1.7;
+  }
 
-    .subtitle {
-      position: relative;
-      z-index: 1;
-      max-width: 880px;
-      margin: 12px 0 0;
-      color: var(--muted);
-      line-height: 1.6;
-    }
+  section{
+    margin-bottom: 38px;
+  }
 
-    .pillrow {
-      position: relative;
-      z-index: 1;
-      margin-top: 16px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
+  .eyebrow{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--leather);
+    margin: 0 0 10px;
+    display:flex;
+    align-items:center;
+    gap: 10px;
+  }
+  .eyebrow::after{
+    content:"";
+    flex:1;
+    height:1px;
+    background: var(--rule);
+  }
 
-    .pill {
-      padding: 7px 11px;
-      border-radius: 999px;
-      border: 1px solid rgba(34, 211, 238, 0.22);
-      background: rgba(12, 18, 34, 0.75);
-      color: #dbeafe;
-      font-size: 12px;
-      letter-spacing: 0.03em;
-      box-shadow: 0 0 10px rgba(34, 211, 238, 0.08);
-    }
+  /* Corpus input */
+  .corpus-box{
+    border: 1.5px solid var(--ink);
+    background: #FCFAF3;
+    padding: 18px;
+    position: relative;
+  }
 
-    .grid {
-      display: grid;
-      grid-template-columns: 1.1fr 0.9fr;
-      gap: 18px;
-      margin-top: 18px;
-    }
+  textarea#corpusText{
+    width:100%;
+    min-height: 130px;
+    resize: vertical;
+    border: none;
+    background: transparent;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+    line-height: 1.6;
+    color: var(--ink);
+    outline:none;
+  }
+  textarea#corpusText::placeholder{ color: var(--ink-soft); opacity: 0.55; }
 
-    .card {
-      border: 1px solid rgba(148, 163, 184, 0.18);
-      border-radius: 20px;
-      background: linear-gradient(180deg, var(--panel), var(--panel2));
-      box-shadow: 0 16px 48px rgba(0,0,0,0.26);
-      padding: 18px;
-      backdrop-filter: blur(12px);
-    }
+  .corpus-actions{
+    display:flex;
+    justify-content: space-between;
+    align-items:center;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 10px;
+    border-top: 1px dashed var(--rule);
+    padding-top: 10px;
+  }
 
-    h2 {
-      margin: 0 0 10px;
-      font-size: 20px;
-      letter-spacing: 0.02em;
-    }
+  .file-pill{
+    display:inline-flex;
+    align-items:center;
+    gap:8px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--ink-soft);
+  }
 
-    .hint {
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.45;
-      margin-bottom: 12px;
-    }
+  input[type="file"]{ display:none; }
 
-    label {
-      display: block;
-      margin: 12px 0 8px;
-      color: #dbeafe;
-      font-weight: 700;
-      font-size: 13px;
-      letter-spacing: 0.04em;
-      text-transform: uppercase;
-    }
+  .btn{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.74rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    border: 1.5px solid var(--ink);
+    background: var(--paper);
+    color: var(--ink);
+    padding: 9px 16px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, transform 0.06s;
+  }
+  .btn:hover{ background: var(--ink); color: var(--paper); }
+  .btn:active{ transform: translateY(1px); }
+  .btn.primary{
+    background: var(--leather);
+    border-color: var(--leather);
+    color: #FCFAF3;
+  }
+  .btn.primary:hover{ background: #6E5638; border-color:#6E5638; }
+  .btn.primary:disabled{
+    background: var(--leather-dim);
+    border-color: var(--leather-dim);
+    color: #fff;
+    cursor: not-allowed;
+  }
+  .btn-row{ display:flex; gap:10px; flex-wrap: wrap; }
 
-    textarea, input, select, button {
-      width: 100%;
-      border-radius: 14px;
-      border: 1px solid rgba(148, 163, 184, 0.22);
-      background: rgba(6, 12, 24, 0.92);
-      color: var(--text);
-      padding: 12px 14px;
-      font-size: 15px;
-      outline: none;
-    }
+  .sample-link{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    color: var(--leather);
+    text-decoration: underline;
+    text-decoration-color: var(--leather-dim);
+    background:none;
+    border:none;
+    cursor:pointer;
+    padding:0;
+  }
 
-    textarea {
-      min-height: 150px;
-      resize: vertical;
-      line-height: 1.5;
-    }
+  /* stats strip */
+  .stats-strip{
+    display:grid;
+    grid-template-columns: repeat(4, 1fr);
+    border: 1px solid var(--rule);
+    background: var(--paper-dim);
+  }
+  .stat{
+    padding: 12px 14px;
+    border-right: 1px solid var(--rule);
+  }
+  .stat:last-child{ border-right:none; }
+  .stat .num{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 1.25rem;
+    font-weight:600;
+    color: var(--trigram-green);
+    display:block;
+  }
+  .stat .lbl{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--ink-soft);
+  }
 
-    textarea:focus, input:focus, select:focus {
-      border-color: rgba(34, 211, 238, 0.5);
-      box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.10);
-    }
+  /* controls grid */
+  .controls-grid{
+    display:grid;
+    grid-template-columns: 1.3fr 1fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 680px){
+    .controls-grid{ grid-template-columns: 1fr; }
+    .stats-strip{ grid-template-columns: repeat(2,1fr); }
+    .stat:nth-child(2){ border-right:none; }
+  }
 
-    button {
-      cursor: pointer;
-      border: none;
-      font-weight: 800;
-      letter-spacing: 0.04em;
-      background: linear-gradient(90deg, var(--cyan), var(--fuchsia), var(--rose));
-      color: #020617;
-      transition: transform 0.15s ease, filter 0.15s ease;
-      text-transform: uppercase;
-      box-shadow: 0 10px 30px rgba(217, 70, 239, 0.15);
-    }
+  .field{
+    display:flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .field label{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft);
+    display:flex;
+    justify-content: space-between;
+  }
+  .field label .val{ color: var(--trigram-green); font-weight:600; }
 
-    button:hover {
-      transform: translateY(-1px);
-      filter: brightness(1.06);
-    }
+  input[type="text"]{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.9rem;
+    padding: 9px 10px;
+    border: 1.5px solid var(--ink);
+    background: #FCFAF3;
+    color: var(--ink);
+    outline: none;
+  }
+  input[type="text"]:focus{ border-color: var(--leather); }
 
-    button.secondary {
-      background: rgba(15, 23, 42, 0.95);
-      color: var(--text);
-      border: 1px solid rgba(34, 211, 238, 0.28);
-    }
+  input[type="range"]{
+    -webkit-appearance:none;
+    appearance:none;
+    width:100%;
+    height: 4px;
+    background: var(--rule);
+    outline:none;
+    margin: 8px 0;
+  }
+  input[type="range"]::-webkit-slider-thumb{
+    -webkit-appearance:none;
+    width: 14px; height:14px;
+    border-radius:0;
+    background: var(--leather);
+    border: 2px solid var(--ink);
+    cursor:pointer;
+    margin-top:-1px;
+  }
+  input[type="range"]::-moz-range-thumb{
+    width: 12px; height:12px;
+    border-radius:0;
+    background: var(--leather);
+    border: 2px solid var(--ink);
+    cursor:pointer;
+  }
 
-    .row {
-      display: grid;
-      grid-template-columns: repeat(4, 1fr);
-      gap: 12px;
-    }
+  /* Output */
+  .output-box{
+    border: 1.5px solid var(--ink);
+    background: #FCFAF3;
+    padding: 22px;
+    min-height: 110px;
+    font-family: 'Source Serif 4', serif;
+    font-size: 1.05rem;
+    line-height: 1.7;
+  }
+  .output-box.empty{
+    color: var(--ink-soft);
+    font-style: italic;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.85rem;
+  }
+  .tok{
+    transition: color 0.2s, opacity 0.2s;
+  }
+  .tok.live{
+    color: var(--trigram-green);
+    font-weight: 600;
+  }
 
-    .buttons {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 12px;
-      margin-top: 12px;
-    }
+  /* Zigzag trace — signature element */
+  .zigzag-wrap{
+    margin-top: 14px;
+    border: 1px solid var(--rule);
+    background: var(--paper-dim);
+    padding: 10px 14px 4px;
+  }
+  .zigzag-caption{
+    display:flex;
+    justify-content: space-between;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+    color: var(--ink-soft);
+    margin-bottom: 4px;
+  }
+  .zigzag-caption .dir-tag{
+    color: var(--rust);
+    font-weight: 600;
+  }
+  svg#zigzagSvg{ display:block; width:100%; height:46px; }
 
-    .output {
-      min-height: 260px;
-      white-space: pre-wrap;
-      background:
-        linear-gradient(180deg, rgba(2, 6, 23, 0.94), rgba(9, 14, 28, 0.96));
-      border: 1px solid rgba(34, 211, 238, 0.20);
-      border-radius: 16px;
-      padding: 16px;
-      overflow: auto;
-      box-shadow: inset 0 0 30px rgba(34, 211, 238, 0.03);
-      line-height: 1.6;
-    }
+  /* table / source */
+  .table-row{
+    display:flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 12px;
+  }
+  .table-row .btn{ padding: 7px 12px; }
 
-    .status {
-      margin-top: 10px;
-      font-size: 13px;
-      color: var(--muted);
-    }
+  details.table-detail{
+    margin-top: 10px;
+    border: 1px solid var(--rule);
+    background: var(--paper-dim);
+  }
+  details.table-detail summary{
+    cursor:pointer;
+    padding: 10px 14px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-soft);
+  }
+  .table-content{
+    padding: 0 14px 14px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .ngram-line{
+    display:flex;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--rule);
+    color: var(--ink-soft);
+  }
+  .ngram-line .key{ color: var(--ink); }
+  .ngram-line .next-list{ color: var(--trigram-green); text-align:right; }
 
-    .status.good { color: #4ade80; }
-    .status.bad { color: #fb7185; }
+  footer{
+    margin-top: 50px;
+    padding-top: 16px;
+    border-top: 1px solid var(--rule);
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.68rem;
+    color: var(--ink-soft);
+    letter-spacing: 0.03em;
+  }
 
-    .stats {
-      margin-top: 12px;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
-    }
+  .error-msg{
+    font-family:'IBM Plex Mono', monospace;
+    font-size: 0.78rem;
+    color: var(--rust);
+    margin-top: 8px;
+  }
 
-    .chip {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 7px 10px;
-      border-radius: 999px;
-      background: rgba(8, 15, 31, 0.85);
-      border: 1px solid rgba(34, 211, 238, 0.18);
-      font-size: 12px;
-      color: #dbeafe;
-    }
-
-    .mono {
-      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    }
-
-    @media (max-width: 980px) {
-      .grid, .row, .buttons { grid-template-columns: 1fr; }
-    }
-  </style>
+  @media (prefers-reduced-motion: reduce){
+    .tok, .tok.live{ transition: none; }
+  }
+</style>
 </head>
 <body>
-  <div class="wrap">
-    <section class="hero">
-      <h1 class="title">Trigram Zigzag Markov</h1>
-      <p class="subtitle">
-        Upload a corpus or paste one, build the model live in your browser, then generate text with a cyberpunk UI.
-        The generator uses trigram transitions first, then falls back to bigram and unigram counts.
-      </p>
-      <div class="pillrow">
-        <span class="pill">Static Space Ready</span>
-        <span class="pill">Live File Upload</span>
-        <span class="pill">Browser-Only</span>
-        <span class="pill">Zigzag Traversal</span>
-        <span class="pill">Cyberpunk Theme</span>
+<div class="wrap">
+
+  <header class="masthead">
+    <h1>Trigram <em>Zigzag</em><br>Markov Generator</h1>
+    <div class="masthead-meta">
+      n-gram order: trigram → bigram → unigram backoff<br>
+      sampling: softmax(log-count / temperature)<br>
+      state: alternating step direction
+    </div>
+  </header>
+
+  <section id="corpusSection">
+    <p class="eyebrow">01 — Corpus</p>
+    <div class="corpus-box">
+      <textarea id="corpusText" placeholder="Paste your corpus text here, or load a .txt file below. The model is rebuilt from this text every time you generate."></textarea>
+      <div class="corpus-actions">
+        <div class="btn-row">
+          <button class="btn" id="loadFileBtn">Load .txt file</button>
+          <input type="file" id="fileInput" accept=".txt">
+          <button class="sample-link" id="sampleBtn">Use sample corpus</button>
+        </div>
+        <span class="file-pill mono" id="fileStatus">No file loaded — using pasted text</span>
       </div>
-    </section>
-
-    <div class="grid">
-      <section class="card">
-        <h2>Corpus input</h2>
-        <div class="hint">Drop a .txt file or paste text below. The model rebuilds from whatever corpus you load.</div>
-
-        <label for="file">Upload text file</label>
-        <input id="file" type="file" accept=".txt,text/plain" />
-
-        <label for="corpus">Paste corpus</label>
-        <textarea id="corpus" placeholder="Paste your training text here..."></textarea>
-
-        <div class="buttons">
-          <button id="build">Build model</button>
-          <button id="loadSample" class="secondary">Load sample</button>
-        </div>
-
-        <div id="buildStatus" class="status">No model built yet.</div>
-        <div class="stats" id="stats"></div>
-      </section>
-
-      <section class="card">
-        <h2>Generator</h2>
-        <div class="hint">Enter a prompt and tune the sampling controls. Top-k limits candidate tokens; temperature reshapes probability sharpness.</div>
-
-        <label for="prompt">Prompt</label>
-        <textarea id="prompt" placeholder="Enter a seed phrase...">the</textarea>
-
-        <div class="row">
-          <div>
-            <label for="length">Length</label>
-            <input id="length" type="number" min="5" max="500" value="120" />
-          </div>
-          <div>
-            <label for="temperature">Temp</label>
-            <input id="temperature" type="number" min="0.1" max="3.0" step="0.1" value="0.9" />
-          </div>
-          <div>
-            <label for="topk">Top-k</label>
-            <input id="topk" type="number" min="1" max="2000" value="80" />
-          </div>
-          <div>
-            <label for="mode">Mode</label>
-            <select id="mode">
-              <option value="linear">Linear</option>
-              <option value="zigzag">Zigzag</option>
-            </select>
-          </div>
-        </div>
-
-        <button id="generate">Generate</button>
-        <div id="genStatus" class="status">Waiting for a model.</div>
-      </section>
     </div>
 
-    <section class="card" style="margin-top:18px;">
-      <h2>Output</h2>
-      <div id="output" class="output mono">Build a model, then generate text.</div>
-    </section>
-  </div>
+    <div class="stats-strip" id="statsStrip" style="margin-top:14px;">
+      <div class="stat"><span class="num" id="statTokens">—</span><span class="lbl">Tokens</span></div>
+      <div class="stat"><span class="num" id="statVocab">—</span><span class="lbl">Vocabulary</span></div>
+      <div class="stat"><span class="num" id="statBigram">—</span><span class="lbl">Bigram keys</span></div>
+      <div class="stat"><span class="num" id="statTrigram">—</span><span class="lbl">Trigram keys</span></div>
+    </div>
+  </section>
 
-  <script>
-    class Vocab {
-      constructor(words) {
-        this.word2idx = new Map();
-        this.idx2word = [];
-        for (const w of words) {
-          if (!this.word2idx.has(w)) {
-            this.word2idx.set(w, this.idx2word.length);
-            this.idx2word.push(w);
-          }
+  <section id="controlsSection">
+    <p class="eyebrow">02 — Generation</p>
+    <div class="controls-grid">
+      <div class="field">
+        <label for="promptInput">Prompt / seed words</label>
+        <input type="text" id="promptInput" placeholder="e.g. the">
+      </div>
+      <div class="field">
+        <label for="tempSlider">Temperature <span class="val" id="tempVal">0.90</span></label>
+        <input type="range" id="tempSlider" min="0.10" max="2.00" step="0.05" value="0.90">
+      </div>
+      <div class="field">
+        <label for="topkSlider">Top-k <span class="val" id="topkVal">800</span></label>
+        <input type="range" id="topkSlider" min="1" max="2000" step="1" value="800">
+      </div>
+    </div>
+
+    <div class="controls-grid" style="margin-top:14px;">
+      <div class="field">
+        <label for="lengthSlider">Generation length (tokens) <span class="val" id="lengthVal">400</span></label>
+        <input type="range" id="lengthSlider" min="10" max="1000" step="10" value="400">
+      </div>
+      <div class="field">
+        <label for="seedNumber">Random seed (optional)</label>
+        <input type="text" id="seedNumber" placeholder="blank = random each run">
+      </div>
+      <div class="field" style="justify-content:flex-end;">
+        <button class="btn primary" id="generateBtn" style="width:100%;">Generate ▸</button>
+      </div>
+    </div>
+    <div class="error-msg" id="errorMsg" style="display:none;"></div>
+  </section>
+
+  <section id="outputSection">
+    <p class="eyebrow">03 — Output <span class="mono" style="font-size:0.65rem; color:var(--ink-soft); text-transform:none; letter-spacing:0;">(first sentence, truncated at the first period — matches the reference implementation)</span></p>
+    <div class="output-box empty" id="outputBox">Nothing generated yet. Load a corpus and press Generate.</div>
+
+    <div class="zigzag-wrap">
+      <div class="zigzag-caption">
+        <span>ZigZagState trace — direction flips every 2 steps</span>
+        <span class="dir-tag" id="dirTag">direction: +1</span>
+      </div>
+      <svg id="zigzagSvg" viewBox="0 0 800 46" preserveAspectRatio="none"></svg>
+    </div>
+
+    <div class="table-row">
+      <span class="mono" style="font-size:0.72rem; color:var(--ink-soft);">Full generated sequence (before truncation) and n-gram tables below.</span>
+      <button class="btn" id="copyBtn">Copy output</button>
+    </div>
+
+    <details class="table-detail" id="fullSeqDetail">
+      <summary>Full generated token sequence</summary>
+      <div class="table-content" id="fullSeqContent">—</div>
+    </details>
+
+    <details class="table-detail">
+      <summary>Trigram table sample (context → next-word counts)</summary>
+      <div class="table-content" id="trigramSample">Build a model to inspect its trigram table.</div>
+    </details>
+  </section>
+
+  <footer>
+    Runs entirely in your browser — corpus text is never uploaded anywhere.
+    Logic mirrors a Python reference: Vocab → TrigramZigzagMarkov (trigram/bigram/unigram backoff,
+    temperature + top-k softmax sampling) → generate_linear with an alternating ZigZagState.
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---------- Vocab ----------
+  class Vocab{
+    constructor(words){
+      this.word2idx = new Map();
+      this.idx2word = [];
+      for(const w of words){
+        if(!this.word2idx.has(w)){
+          this.word2idx.set(w, this.idx2word.length);
+          this.idx2word.push(w);
         }
       }
-      size() { return this.idx2word.length; }
-      encode(words) {
-        return words.map(w => this.word2idx.get(w)).filter(v => v !== undefined);
+    }
+    get length(){ return this.idx2word.length; }
+    encode(words){
+      const out = [];
+      for(const w of words){
+        if(this.word2idx.has(w)) out.push(this.word2idx.get(w));
       }
-      decode(ids) {
-        return ids.map(i => this.idx2word[i]).join(" ");
+      return out;
+    }
+    decode(ids){
+      return ids.map(i => this.idx2word[i]).join(" ");
+    }
+  }
+
+  // ---------- seeded RNG (so "random seed" field is meaningful) ----------
+  function mulberry32(seed){
+    return function(){
+      seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // ---------- ZigZagState ----------
+  class ZigZagState{
+    constructor(direction = 1, step = 0){
+      this.direction = direction;
+      this.step = step;
+    }
+  }
+
+  // ---------- TrigramZigzagMarkov ----------
+  class TrigramZigzagMarkov{
+    constructor(words, { lowercase = true } = {}){
+      if(lowercase) words = words.map(w => w.toLowerCase());
+      this.vocab = new Vocab(words);
+      this.wordIds = this.vocab.encode(words);
+      this.trigram = new Map(); // key "a,b" -> Map(nextId -> count)
+      this.bigram = new Map();  // key "a" -> Map(nextId -> count)
+      this.unigram = new Map(); // id -> count
+      this._buildTables();
+    }
+
+    _bump(map, key, id){
+      let inner = map.get(key);
+      if(!inner){ inner = new Map(); map.set(key, inner); }
+      inner.set(id, (inner.get(id) || 0) + 1);
+    }
+
+    _buildTables(){
+      const ids = this.wordIds;
+      for(let i = 0; i < ids.length; i++){
+        this.unigram.set(ids[i], (this.unigram.get(ids[i]) || 0) + 1);
+        if(i >= 1){
+          this._bump(this.bigram, String(ids[i-1]), ids[i]);
+        }
+        if(i >= 2){
+          this._bump(this.trigram, ids[i-2] + "," + ids[i-1], ids[i]);
+        }
       }
     }
 
-    function tokenize(text) {
-      return (text || "")
-        .toLowerCase()
-        .replace(/[^\w\s]/g, " ")
-        .split(/\s+/)
-        .filter(Boolean);
-    }
+    _sampleFromCounter(counterMap, temperature, topK, rng){
+      if(!counterMap || counterMap.size === 0) return null;
+      let items = Array.from(counterMap.entries()); // [id, count]
+      const temp = Math.max(temperature, 1e-6);
+      let logits = items.map(([id, c]) => Math.log(c + 1e-9) / temp);
 
-    function weightedPick(items, temperature = 1.0, topK = null) {
-      if (!items || items.length === 0) return null;
-      const arr = items.map(([token, count]) => ({ token, count }));
-      arr.sort((a, b) => b.count - a.count);
-      const use = (topK && topK > 0 && arr.length > topK) ? arr.slice(0, topK) : arr;
-      const tau = Math.max(Number(temperature), 1e-6);
-      const logits = use.map(x => Math.log(x.count + 1e-9) / tau);
+      if(topK != null && topK > 0 && items.length > topK){
+        const idxSorted = logits.map((v, i) => i)
+          .sort((a, b) => logits[b] - logits[a])
+          .slice(0, topK);
+        items = idxSorted.map(i => items[i]);
+        logits = idxSorted.map(i => logits[i]);
+      }
+
       const maxLogit = Math.max(...logits);
-      const probs = logits.map(l => Math.exp(l - maxLogit));
-      const sum = probs.reduce((a, b) => a + b, 0);
-      let r = Math.random() * sum;
-      for (let i = 0; i < use.length; i++) {
-        r -= probs[i];
-        if (r <= 0) return use[i].token;
+      const exps = logits.map(l => Math.exp(l - maxLogit));
+      const sumExp = exps.reduce((a, b) => a + b, 0);
+      const probs = exps.map(e => e / sumExp);
+
+      let r = rng();
+      let acc = 0;
+      for(let i = 0; i < probs.length; i++){
+        acc += probs[i];
+        if(r <= acc) return items[i][0];
       }
-      return use[use.length - 1].token;
+      return items[items.length - 1][0];
     }
 
-    class TrigramZigzagMarkov {
-      constructor(words) {
-        this.vocab = new Vocab(words);
-        const ids = this.vocab.encode(words);
-        this.unigram = new Map();
-        this.bigram = new Map();
-        this.trigram = new Map();
-
-        for (let i = 0; i < ids.length; i++) {
-          this._inc(this.unigram, ids[i]);
-          if (i >= 1) this._incNested(this.bigram, ids[i - 1], ids[i]);
-          if (i >= 2) this._incTriple(this.trigram, ids[i - 2], ids[i - 1], ids[i]);
+    nextToken(context, temperature, topK, rng){
+      if(context.length >= 2){
+        const key = context[context.length - 2] + "," + context[context.length - 1];
+        const tri = this.trigram.get(key);
+        if(tri && tri.size > 0){
+          return this._sampleFromCounter(tri, temperature, topK, rng);
         }
       }
-
-      _inc(map, key) {
-        map.set(key, (map.get(key) || 0) + 1);
-      }
-
-      _incNested(map, a, b) {
-        if (!map.has(a)) map.set(a, new Map());
-        const sub = map.get(a);
-        sub.set(b, (sub.get(b) || 0) + 1);
-      }
-
-      _incTriple(map, a, b, c) {
-        if (!map.has(a)) map.set(a, new Map());
-        const sub = map.get(a);
-        if (!sub.has(b)) sub.set(b, new Map());
-        const sub2 = sub.get(b);
-        sub2.set(c, (sub2.get(c) || 0) + 1);
-      }
-
-      nextToken(context, temperature = 1.0, topK = 50) {
-        if (context.length >= 2) {
-          const a = context[context.length - 2];
-          const b = context[context.length - 1];
-          const sub = this.trigram.get(a);
-          if (sub && sub.get(b)) {
-            return weightedPick(Array.from(sub.get(b).entries()), temperature, topK);
-          }
+      if(context.length >= 1){
+        const key = String(context[context.length - 1]);
+        const bi = this.bigram.get(key);
+        if(bi && bi.size > 0){
+          return this._sampleFromCounter(bi, temperature, topK, rng);
         }
-        if (context.length >= 1) {
-          const a = context[context.length - 1];
-          const sub = this.bigram.get(a);
-          if (sub) {
-            return weightedPick(Array.from(sub.entries()), temperature, topK);
-          }
-        }
-        return weightedPick(Array.from(this.unigram.entries()), temperature, topK);
       }
-
-      zigzagIndices(length) {
-        let left = 0, right = length - 1;
-        const out = [];
-        while (left <= right) {
-          out.push(left++);
-          if (left <= right) out.push(right--);
-        }
-        return out;
-      }
-
-      generate(prompt, length = 120, temperature = 0.9, topK = 80, mode = "linear") {
-        let ids = this.vocab.encode(tokenize(prompt));
-        if (ids.length < 2 && this.vocab.size() > 0) {
-          while (ids.length < 2) ids.unshift(Math.floor(Math.random() * this.vocab.size()));
-        }
-        const out = ids.slice();
-
-        if (mode === "zigzag") {
-          void this.zigzagIndices(length);
-        }
-
-        while (out.length < length) {
-          const nxt = this.nextToken(out.slice(-2), temperature, topK);
-          if (nxt === null || nxt === undefined) break;
-          out.push(nxt);
-        }
-        return this.vocab.decode(out);
-      }
+      const uni = new Map(this.unigram); // unigram already id->count
+      return this._sampleFromCounter(uni, temperature, topK, rng);
     }
 
-    let generator = null;
-
-    const el = id => document.getElementById(id);
-
-    function setStatus(node, msg, kind = "") {
-      node.textContent = msg;
-      node.className = "status" + (kind ? ` ${kind}` : "");
+    generateLinear(seedWords, { length = 400, temperature = 0.9, topK = 800, rng, onStep } = {}){
+      let ids = this.vocab.encode(seedWords.map(w => w.toLowerCase()));
+      while(ids.length < 2){
+        ids = [Math.floor(rng() * this.vocab.length), ...ids];
+      }
+      const out = ids.slice();
+      const state = new ZigZagState(1, 0);
+      let guard = 0;
+      while(out.length < length && guard < length * 4){
+        guard++;
+        const nxt = this.nextToken(out.slice(-2), temperature, topK, rng);
+        if(nxt == null) break;
+        out.push(nxt);
+        state.step += 1;
+        if(state.step % 2 === 0){
+          state.direction *= -1;
+        }
+        if(onStep) onStep(state, out.length);
+      }
+      return { text: this.vocab.decode(out), ids: out, finalState: state };
     }
+  }
 
-    function renderStats(words, vocabSize) {
-      el("stats").innerHTML = `
-        <span class="chip">Tokens: <b>${words}</b></span>
-        <span class="chip">Vocabulary: <b>${vocabSize}</b></span>
-      `;
-    }
+  // ---------- DOM wiring ----------
+  const corpusText = document.getElementById("corpusText");
+  const fileInput = document.getElementById("fileInput");
+  const loadFileBtn = document.getElementById("loadFileBtn");
+  const sampleBtn = document.getElementById("sampleBtn");
+  const fileStatus = document.getElementById("fileStatus");
 
-    el("file").addEventListener("change", async (e) => {
-      const file = e.target.files[0];
-      if (!file) return;
-      el("corpus").value = await file.text();
-      setStatus(el("buildStatus"), `Loaded file: ${file.name}`, "good");
-    });
+  const statTokens = document.getElementById("statTokens");
+  const statVocab = document.getElementById("statVocab");
+  const statBigram = document.getElementById("statBigram");
+  const statTrigram = document.getElementById("statTrigram");
 
-    el("loadSample").addEventListener("click", () => {
-      el("corpus").value = [
-        "the city hums with neon rain and static dreams",
-        "signals bloom through chrome streets and violet haze",
-        "machines whisper in the dark between electric towers",
-        "every pulse becomes a map of light and shadow"
-      ].join(". ") + ".";
-      setStatus(el("buildStatus"), "Loaded sample corpus.", "good");
-    });
+  const promptInput = document.getElementById("promptInput");
+  const tempSlider = document.getElementById("tempSlider");
+  const tempVal = document.getElementById("tempVal");
+  const topkSlider = document.getElementById("topkSlider");
+  const topkVal = document.getElementById("topkVal");
+  const lengthSlider = document.getElementById("lengthSlider");
+  const lengthVal = document.getElementById("lengthVal");
+  const seedNumber = document.getElementById("seedNumber");
+  const generateBtn = document.getElementById("generateBtn");
+  const errorMsg = document.getElementById("errorMsg");
 
-    el("build").addEventListener("click", () => {
-      const corpus = el("corpus").value.trim();
-      const words = tokenize(corpus);
-      if (words.length < 3) {
-        generator = null;
-        renderStats(0, 0);
-        setStatus(el("buildStatus"), "Corpus too small. Add more text.", "bad");
+  const outputBox = document.getElementById("outputBox");
+  const fullSeqContent = document.getElementById("fullSeqContent");
+  const trigramSample = document.getElementById("trigramSample");
+  const copyBtn = document.getElementById("copyBtn");
+  const dirTag = document.getElementById("dirTag");
+  const zigzagSvg = document.getElementById("zigzagSvg");
+
+  const SAMPLE_CORPUS = `the old lighthouse stood above the grey water and the wind came in from the north every night the keeper climbed the narrow stair and lit the lamp the sea below moved like a slow grey animal and the gulls called above the rocks the keeper had kept the light for thirty years and he knew the water the way a farmer knows a field he watched the ships pass in the dark and counted their lanterns one by one the storms came in the autumn and the rain struck the glass like small stones the keeper would sit by the stove and read old letters from a woman who had once lived in the village below the lighthouse was the last one on the coast and the keeper was the last keeper and when the light came on each night the village below could see it from every window and the children would say there is the light there is the light and the old keeper smiled and said the light will burn as long as I do and longer than that if the wind allows it`;
+
+  tempVal.textContent = tempSlider.value;
+  topkVal.textContent = topkSlider.value;
+  lengthVal.textContent = lengthSlider.value;
+
+  tempSlider.addEventListener("input", () => tempVal.textContent = parseFloat(tempSlider.value).toFixed(2));
+  topkSlider.addEventListener("input", () => topkVal.textContent = topkSlider.value);
+  lengthSlider.addEventListener("input", () => lengthVal.textContent = lengthSlider.value);
+
+  loadFileBtn.addEventListener("click", () => fileInput.click());
+
+  fileInput.addEventListener("change", () => {
+    const f = fileInput.files[0];
+    if(!f) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      corpusText.value = e.target.result;
+      fileStatus.textContent = `Loaded: ${f.name} (${e.target.result.split(/\s+/).filter(Boolean).length} tokens)`;
+      buildModelFromTextarea();
+    };
+    reader.onerror = () => {
+      fileStatus.textContent = "Could not read file.";
+    };
+    reader.readAsText(f);
+  });
+
+  sampleBtn.addEventListener("click", () => {
+    corpusText.value = SAMPLE_CORPUS;
+    fileStatus.textContent = "Using sample corpus — no file loaded";
+    buildModelFromTextarea();
+  });
+
+  corpusText.addEventListener("input", () => {
+    fileStatus.textContent = "No file loaded — using pasted text";
+    buildModelFromTextarea();
+  });
+
+  let currentModel = null;
+  let buildDebounce = null;
+
+  function buildModelFromTextarea(){
+    clearTimeout(buildDebounce);
+    buildDebounce = setTimeout(() => {
+      const raw = corpusText.value.trim();
+      if(!raw){
+        currentModel = null;
+        statTokens.textContent = "—";
+        statVocab.textContent = "—";
+        statBigram.textContent = "—";
+        statTrigram.textContent = "—";
+        trigramSample.textContent = "Build a model to inspect its trigram table.";
         return;
       }
-      generator = new TrigramZigzagMarkov(words);
-      renderStats(words.length, generator.vocab.size());
-      setStatus(el("buildStatus"), `Model built from ${words.length} tokens.`, "good");
-      setStatus(el("genStatus"), "Model ready.", "good");
-    });
-
-    el("generate").addEventListener("click", () => {
-      if (!generator) {
-        setStatus(el("genStatus"), "Build a model first.", "bad");
-        el("output").textContent = "No model yet.";
-        return;
+      const words = raw.split(/\s+/).filter(Boolean);
+      try{
+        currentModel = new TrigramZigzagMarkov(words);
+        statTokens.textContent = words.length.toLocaleString();
+        statVocab.textContent = currentModel.vocab.length.toLocaleString();
+        statBigram.textContent = currentModel.bigram.size.toLocaleString();
+        statTrigram.textContent = currentModel.trigram.size.toLocaleString();
+        renderTrigramSample();
+        errorMsg.style.display = "none";
+      }catch(err){
+        errorMsg.textContent = "Error building model: " + err.message;
+        errorMsg.style.display = "block";
       }
+    }, 180);
+  }
 
-      const prompt = el("prompt").value;
-      const length = parseInt(el("length").value, 10) || 120;
-      const temperature = parseFloat(el("temperature").value) || 0.9;
-      const topK = parseInt(el("topk").value, 10) || 80;
-      const mode = el("mode").value;
-
-      const text = generator.generate(prompt, length, temperature, topK, mode);
-      el("output").textContent = text;
-      setStatus(el("genStatus"), `Generated ${length} tokens in ${mode} mode.`, "good");
+  function renderTrigramSample(){
+    if(!currentModel || currentModel.trigram.size === 0){
+      trigramSample.textContent = "No trigrams found (corpus too short).";
+      return;
+    }
+    const keys = Array.from(currentModel.trigram.keys()).slice(0, 25);
+    const lines = keys.map(key => {
+      const [a, b] = key.split(",").map(Number);
+      const ctxWords = currentModel.vocab.decode([a, b]);
+      const counter = currentModel.trigram.get(key);
+      const nexts = Array.from(counter.entries())
+        .sort((x, y) => y[1] - x[1])
+        .slice(0, 4)
+        .map(([id, c]) => `${currentModel.vocab.idx2word[id]}(${c})`)
+        .join(", ");
+      return `<div class="ngram-line"><span class="key">"${escapeHtml(ctxWords)}"</span><span class="next-list">${escapeHtml(nexts)}</span></div>`;
     });
-  </script>
+    trigramSample.innerHTML = lines.join("") +
+      `<div style="margin-top:6px; color:var(--ink-soft); font-size:0.7rem;">Showing ${keys.length} of ${currentModel.trigram.size.toLocaleString()} trigram contexts.</div>`;
+  }
+
+  function escapeHtml(s){
+    return s.replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+  }
+
+  // ---------- Zigzag SVG trace ----------
+  function drawZigzagTrace(states){
+    // states: array of {direction, step} captured at each generation step
+    const w = 800, h = 46, mid = h / 2;
+    if(!states.length){
+      zigzagSvg.innerHTML = "";
+      return;
+    }
+    const n = states.length;
+    const stepW = w / Math.max(n, 1);
+    let path = `M 0 ${mid}`;
+    let x = 0;
+    for(let i = 0; i < n; i++){
+      const amp = 14;
+      const y = mid - states[i].direction * amp;
+      x += stepW;
+      path += ` L ${x.toFixed(2)} ${y.toFixed(2)}`;
+    }
+    const lastDir = states[states.length - 1].direction;
+    zigzagSvg.innerHTML = `
+      <line x1="0" y1="${mid}" x2="${w}" y2="${mid}" stroke="var(--rule)" stroke-width="1" />
+      <path d="${path}" fill="none" stroke="var(--trigram-green)" stroke-width="2" stroke-linejoin="round" />
+    `;
+    dirTag.textContent = "direction: " + (lastDir > 0 ? "+1" : "-1");
+  }
+
+  function animateOutput(words, finalStates){
+    outputBox.classList.remove("empty");
+    outputBox.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    words.forEach((w, i) => {
+      const span = document.createElement("span");
+      span.className = "tok";
+      span.textContent = w + (i < words.length - 1 ? " " : "");
+      frag.appendChild(span);
+    });
+    outputBox.appendChild(frag);
+
+    const spans = outputBox.querySelectorAll(".tok");
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if(reduceMotion || spans.length > 120){
+      drawZigzagTrace(finalStates);
+      return;
+    }
+    let i = 0;
+    const partialStates = [];
+    const tick = () => {
+      if(i < spans.length){
+        spans[i].classList.add("live");
+        setTimeout(() => spans[i] && spans[i].classList.remove("live"), 220);
+        if(finalStates[i]) partialStates.push(finalStates[i]);
+        drawZigzagTrace(partialStates);
+        i++;
+        requestAnimationFrame(() => setTimeout(tick, 14));
+      }
+    };
+    tick();
+  }
+
+  function setError(msg){
+    if(msg){
+      errorMsg.textContent = msg;
+      errorMsg.style.display = "block";
+    }else{
+      errorMsg.style.display = "none";
+    }
+  }
+
+  generateBtn.addEventListener("click", () => {
+    setError(null);
+    if(!currentModel){
+      buildModelFromTextarea();
+    }
+    if(!currentModel){
+      setError("Load or paste a corpus first.");
+      return;
+    }
+
+    const promptRaw = promptInput.value.trim();
+    const seedWords = (promptRaw || "the").split(/\s+/);
+    const temperature = parseFloat(tempSlider.value);
+    const topK = parseInt(topkSlider.value, 10);
+    const length = parseInt(lengthSlider.value, 10);
+
+    let seedVal = seedNumber.value.trim();
+    let rng;
+    if(seedVal !== "" && !isNaN(Number(seedVal))){
+      rng = mulberry32(Number(seedVal) >>> 0);
+    }else{
+      rng = mulberry32((Date.now() ^ (Math.random() * 0xffffffff)) >>> 0);
+    }
+
+    const states = [];
+    let result;
+    try{
+      result = currentModel.generateLinear(seedWords, {
+        length, temperature, topK, rng,
+        onStep: (state) => states.push({ direction: state.direction, step: state.step })
+      });
+    }catch(err){
+      setError("Generation error: " + err.message);
+      return;
+    }
+
+    const fullText = result.text;
+    fullSeqContent.textContent = fullText;
+
+    // mirror reference: generated_text.split(".")[0] + "."
+    let display = fullText.split(".")[0] + ".";
+    const words = display.split(/\s+/).filter(Boolean);
+
+    animateOutput(words, states);
+  });
+
+  copyBtn.addEventListener("click", async () => {
+    const text = outputBox.textContent.trim();
+    if(!text || outputBox.classList.contains("empty")) return;
+    try{
+      await navigator.clipboard.writeText(text);
+      const orig = copyBtn.textContent;
+      copyBtn.textContent = "Copied ✓";
+      setTimeout(() => copyBtn.textContent = orig, 1200);
+    }catch(e){
+      /* clipboard unavailable; ignore silently */
+    }
+  });
+
+  // init empty zigzag baseline
+  drawZigzagTrace([{direction:1, step:0}]);
+})();
+</script>
 </body>
 </html>
