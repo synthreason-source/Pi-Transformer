@@ -191,8 +191,8 @@ def generate_text(corpus_file, prompt):
     if len(output_words) < 2:
         output_words.insert(0, random.choice(corpus_words).lower())
 
-    refresh_interval = 25
-    trailing_tokens = 20
+    refresh_interval = 15
+    trailing_tokens = 5
     target_length = 400
 
     while len(output_words) < target_length:
