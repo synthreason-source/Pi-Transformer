@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Trigram Zigzag Markov</title>
+  <style>
+    :root {
+      --bg0: #050816;
+      --bg1: #0b1020;
+      --panel: rgba(12, 18, 34, 0.84);
+      --panel2: rgba(8, 14, 28, 0.9);
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --cyan: #22d3ee;
+      --fuchsia: #d946ef;
+      --rose: #fb7185;
+      --blue: #3b82f6;
+      --border: rgba(34, 211, 238, 0.22);
+      --border2: rgba(217, 70, 239, 0.22);
+      --glow: 0 0 18px rgba(34, 211, 238, 0.18), 0 0 36px rgba(217, 70, 239, 0.10);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      background:
+        radial-gradient(circle at 10% 10%, rgba(34, 211, 238, 0.14), transparent 28%),
+        radial-gradient(circle at 90% 12%, rgba(217, 70, 239, 0.16), transparent 26%),
+        radial-gradient(circle at 50% 100%, rgba(251, 113, 133, 0.10), transparent 30%),
+        linear-gradient(180deg, var(--bg0), var(--bg1));
+      overflow-x: hidden;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background:
+        linear-gradient(transparent 0 97%, rgba(255,255,255,0.03) 100%),
+        linear-gradient(90deg, transparent 0 97%, rgba(255,255,255,0.03) 100%);
+      background-size: 100% 28px, 28px 100%;
+      opacity: 0.18;
+      mix-blend-mode: screen;
+    }
+
+    .wrap {
+      width: min(1280px, calc(100% - 24px));
+      margin: 0 auto;
+      padding: 22px 0 40px;
+    }
+
+    .hero {
+      position: relative;
+      padding: 26px 24px;
+      border: 1px solid var(--border);
+      border-radius: 22px;
+      background: linear-gradient(180deg, rgba(10,15,30,0.92), rgba(7,11,22,0.88));
+      box-shadow: var(--glow);
+      overflow: hidden;
+    }
+
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: -2px;
+      background: linear-gradient(90deg, transparent, rgba(34,211,238,0.12), rgba(217,70,239,0.18), transparent);
+      filter: blur(24px);
+      opacity: 0.6;
+      pointer-events: none;
+    }
+
+    .title {
+      position: relative;
+      z-index: 1;
+      margin: 0;
+      font-size: clamp(28px, 4vw, 52px);
+      line-height: 1;
+      letter-spacing: 0.03em;
+      text-shadow: 0 0 14px rgba(34, 211, 238, 0.25);
+    }
+
+    .subtitle {
+      position: relative;
+      z-index: 1;
+      max-width: 880px;
+      margin: 12px 0 0;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .pillrow {
+      position: relative;
+      z-index: 1;
+      margin-top: 16px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .pill {
+      padding: 7px 11px;
+      border-radius: 999px;
+      border: 1px solid rgba(34, 211, 238, 0.22);
+      background: rgba(12, 18, 34, 0.75);
+      color: #dbeafe;
+      font-size: 12px;
+      letter-spacing: 0.03em;
+      box-shadow: 0 0 10px rgba(34, 211, 238, 0.08);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    .card {
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      border-radius: 20px;
+      background: linear-gradient(180deg, var(--panel), var(--panel2));
+      box-shadow: 0 16px 48px rgba(0,0,0,0.26);
+      padding: 18px;
+      backdrop-filter: blur(12px);
+    }
+
+    h2 {
+      margin: 0 0 10px;
+      font-size: 20px;
+      letter-spacing: 0.02em;
+    }
+
+    .hint {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+      margin-bottom: 12px;
+    }
+
+    label {
+      display: block;
+      margin: 12px 0 8px;
+      color: #dbeafe;
+      font-weight: 700;
+      font-size: 13px;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    textarea, input, select, button {
+      width: 100%;
+      border-radius: 14px;
+      border: 1px solid rgba(148, 163, 184, 0.22);
+      background: rgba(6, 12, 24, 0.92);
+      color: var(--text);
+      padding: 12px 14px;
+      font-size: 15px;
+      outline: none;
+    }
+
+    textarea {
+      min-height: 150px;
+      resize: vertical;
+      line-height: 1.5;
+    }
+
+    textarea:focus, input:focus, select:focus {
+      border-color: rgba(34, 211, 238, 0.5);
+      box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.10);
+    }
+
+    button {
+      cursor: pointer;
+      border: none;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      background: linear-gradient(90deg, var(--cyan), var(--fuchsia), var(--rose));
+      color: #020617;
+      transition: transform 0.15s ease, filter 0.15s ease;
+      text-transform: uppercase;
+      box-shadow: 0 10px 30px rgba(217, 70, 239, 0.15);
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      filter: brightness(1.06);
+    }
+
+    button.secondary {
+      background: rgba(15, 23, 42, 0.95);
+      color: var(--text);
+      border: 1px solid rgba(34, 211, 238, 0.28);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+    }
+
+    .buttons {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .output {
+      min-height: 260px;
+      white-space: pre-wrap;
+      background:
+        linear-gradient(180deg, rgba(2, 6, 23, 0.94), rgba(9, 14, 28, 0.96));
+      border: 1px solid rgba(34, 211, 238, 0.20);
+      border-radius: 16px;
+      padding: 16px;
+      overflow: auto;
+      box-shadow: inset 0 0 30px rgba(34, 211, 238, 0.03);
+      line-height: 1.6;
+    }
+
+    .status {
+      margin-top: 10px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    .status.good { color: #4ade80; }
+    .status.bad { color: #fb7185; }
+
+    .stats {
+      margin-top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      background: rgba(8, 15, 31, 0.85);
+      border: 1px solid rgba(34, 211, 238, 0.18);
+      font-size: 12px;
+      color: #dbeafe;
+    }
+
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    @media (max-width: 980px) {
+      .grid, .row, .buttons { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="hero">
+      <h1 class="title">Trigram Zigzag Markov</h1>
+      <p class="subtitle">
+        Upload a corpus or paste one, build the model live in your browser, then generate text with a cyberpunk UI.
+        The generator uses trigram transitions first, then falls back to bigram and unigram counts.
+      </p>
+      <div class="pillrow">
+        <span class="pill">Static Space Ready</span>
+        <span class="pill">Live File Upload</span>
+        <span class="pill">Browser-Only</span>
+        <span class="pill">Zigzag Traversal</span>
+        <span class="pill">Cyberpunk Theme</span>
+      </div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>Corpus input</h2>
+        <div class="hint">Drop a .txt file or paste text below. The model rebuilds from whatever corpus you load.</div>
+
+        <label for="file">Upload text file</label>
+        <input id="file" type="file" accept=".txt,text/plain" />
+
+        <label for="corpus">Paste corpus</label>
+        <textarea id="corpus" placeholder="Paste your training text here..."></textarea>
+
+        <div class="buttons">
+          <button id="build">Build model</button>
+          <button id="loadSample" class="secondary">Load sample</button>
+        </div>
+
+        <div id="buildStatus" class="status">No model built yet.</div>
+        <div class="stats" id="stats"></div>
+      </section>
+
+      <section class="card">
+        <h2>Generator</h2>
+        <div class="hint">Enter a prompt and tune the sampling controls. Top-k limits candidate tokens; temperature reshapes probability sharpness.</div>
+
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" placeholder="Enter a seed phrase...">the</textarea>
+
+        <div class="row">
+          <div>
+            <label for="length">Length</label>
+            <input id="length" type="number" min="5" max="500" value="120" />
+          </div>
+          <div>
+            <label for="temperature">Temp</label>
+            <input id="temperature" type="number" min="0.1" max="3.0" step="0.1" value="0.9" />
+          </div>
+          <div>
+            <label for="topk">Top-k</label>
+            <input id="topk" type="number" min="1" max="2000" value="80" />
+          </div>
+          <div>
+            <label for="mode">Mode</label>
+            <select id="mode">
+              <option value="linear">Linear</option>
+              <option value="zigzag">Zigzag</option>
+            </select>
+          </div>
+        </div>
+
+        <button id="generate">Generate</button>
+        <div id="genStatus" class="status">Waiting for a model.</div>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:18px;">
+      <h2>Output</h2>
+      <div id="output" class="output mono">Build a model, then generate text.</div>
+    </section>
+  </div>
+
+  <script>
+    class Vocab {
+      constructor(words) {
+        this.word2idx = new Map();
+        this.idx2word = [];
+        for (const w of words) {
+          if (!this.word2idx.has(w)) {
+            this.word2idx.set(w, this.idx2word.length);
+            this.idx2word.push(w);
+          }
+        }
+      }
+      size() { return this.idx2word.length; }
+      encode(words) {
+        return words.map(w => this.word2idx.get(w)).filter(v => v !== undefined);
+      }
+      decode(ids) {
+        return ids.map(i => this.idx2word[i]).join(" ");
+      }
+    }
+
+    function tokenize(text) {
+      return (text || "")
+        .toLowerCase()
+        .replace(/[^\w\s]/g, " ")
+        .split(/\s+/)
+        .filter(Boolean);
+    }
+
+    function weightedPick(items, temperature = 1.0, topK = null) {
+      if (!items || items.length === 0) return null;
+      const arr = items.map(([token, count]) => ({ token, count }));
+      arr.sort((a, b) => b.count - a.count);
+      const use = (topK && topK > 0 && arr.length > topK) ? arr.slice(0, topK) : arr;
+      const tau = Math.max(Number(temperature), 1e-6);
+      const logits = use.map(x => Math.log(x.count + 1e-9) / tau);
+      const maxLogit = Math.max(...logits);
+      const probs = logits.map(l => Math.exp(l - maxLogit));
+      const sum = probs.reduce((a, b) => a + b, 0);
+      let r = Math.random() * sum;
+      for (let i = 0; i < use.length; i++) {
+        r -= probs[i];
+        if (r <= 0) return use[i].token;
+      }
+      return use[use.length - 1].token;
+    }
+
+    class TrigramZigzagMarkov {
+      constructor(words) {
+        this.vocab = new Vocab(words);
+        const ids = this.vocab.encode(words);
+        this.unigram = new Map();
+        this.bigram = new Map();
+        this.trigram = new Map();
+
+        for (let i = 0; i < ids.length; i++) {
+          this._inc(this.unigram, ids[i]);
+          if (i >= 1) this._incNested(this.bigram, ids[i - 1], ids[i]);
+          if (i >= 2) this._incTriple(this.trigram, ids[i - 2], ids[i - 1], ids[i]);
+        }
+      }
+
+      _inc(map, key) {
+        map.set(key, (map.get(key) || 0) + 1);
+      }
+
+      _incNested(map, a, b) {
+        if (!map.has(a)) map.set(a, new Map());
+        const sub = map.get(a);
+        sub.set(b, (sub.get(b) || 0) + 1);
+      }
+
+      _incTriple(map, a, b, c) {
+        if (!map.has(a)) map.set(a, new Map());
+        const sub = map.get(a);
+        if (!sub.has(b)) sub.set(b, new Map());
+        const sub2 = sub.get(b);
+        sub2.set(c, (sub2.get(c) || 0) + 1);
+      }
+
+      nextToken(context, temperature = 1.0, topK = 50) {
+        if (context.length >= 2) {
+          const a = context[context.length - 2];
+          const b = context[context.length - 1];
+          const sub = this.trigram.get(a);
+          if (sub && sub.get(b)) {
+            return weightedPick(Array.from(sub.get(b).entries()), temperature, topK);
+          }
+        }
+        if (context.length >= 1) {
+          const a = context[context.length - 1];
+          const sub = this.bigram.get(a);
+          if (sub) {
+            return weightedPick(Array.from(sub.entries()), temperature, topK);
+          }
+        }
+        return weightedPick(Array.from(this.unigram.entries()), temperature, topK);
+      }
+
+      zigzagIndices(length) {
+        let left = 0, right = length - 1;
+        const out = [];
+        while (left <= right) {
+          out.push(left++);
+          if (left <= right) out.push(right--);
+        }
+        return out;
+      }
+
+      generate(prompt, length = 120, temperature = 0.9, topK = 80, mode = "linear") {
+        let ids = this.vocab.encode(tokenize(prompt));
+        if (ids.length < 2 && this.vocab.size() > 0) {
+          while (ids.length < 2) ids.unshift(Math.floor(Math.random() * this.vocab.size()));
+        }
+        const out = ids.slice();
+
+        if (mode === "zigzag") {
+          void this.zigzagIndices(length);
+        }
+
+        while (out.length < length) {
+          const nxt = this.nextToken(out.slice(-2), temperature, topK);
+          if (nxt === null || nxt === undefined) break;
+          out.push(nxt);
+        }
+        return this.vocab.decode(out);
+      }
+    }
+
+    let generator = null;
+
+    const el = id => document.getElementById(id);
+
+    function setStatus(node, msg, kind = "") {
+      node.textContent = msg;
+      node.className = "status" + (kind ? ` ${kind}` : "");
+    }
+
+    function renderStats(words, vocabSize) {
+      el("stats").innerHTML = `
+        <span class="chip">Tokens: <b>${words}</b></span>
+        <span class="chip">Vocabulary: <b>${vocabSize}</b></span>
+      `;
+    }
+
+    el("file").addEventListener("change", async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      el("corpus").value = await file.text();
+      setStatus(el("buildStatus"), `Loaded file: ${file.name}`, "good");
+    });
+
+    el("loadSample").addEventListener("click", () => {
+      el("corpus").value = [
+        "the city hums with neon rain and static dreams",
+        "signals bloom through chrome streets and violet haze",
+        "machines whisper in the dark between electric towers",
+        "every pulse becomes a map of light and shadow"
+      ].join(". ") + ".";
+      setStatus(el("buildStatus"), "Loaded sample corpus.", "good");
+    });
+
+    el("build").addEventListener("click", () => {
+      const corpus = el("corpus").value.trim();
+      const words = tokenize(corpus);
+      if (words.length < 3) {
+        generator = null;
+        renderStats(0, 0);
+        setStatus(el("buildStatus"), "Corpus too small. Add more text.", "bad");
+        return;
+      }
+      generator = new TrigramZigzagMarkov(words);
+      renderStats(words.length, generator.vocab.size());
+      setStatus(el("buildStatus"), `Model built from ${words.length} tokens.`, "good");
+      setStatus(el("genStatus"), "Model ready.", "good");
+    });
+
+    el("generate").addEventListener("click", () => {
+      if (!generator) {
+        setStatus(el("genStatus"), "Build a model first.", "bad");
+        el("output").textContent = "No model yet.";
+        return;
+      }
+
+      const prompt = el("prompt").value;
+      const length = parseInt(el("length").value, 10) || 120;
+      const temperature = parseFloat(el("temperature").value) || 0.9;
+      const topK = parseInt(el("topk").value, 10) || 80;
+      const mode = el("mode").value;
+
+      const text = generator.generate(prompt, length, temperature, topK, mode);
+      el("output").textContent = text;
+      setStatus(el("genStatus"), `Generated ${length} tokens in ${mode} mode.`, "good");
+    });
+  </script>
+</body>
+</html>
