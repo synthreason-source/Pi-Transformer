@@ -128,7 +128,7 @@ class ClusterSteerer:
         self.cluster_scores = scores
         return scores
 
-    def allowed_words(self, top_clusters=2):
+    def allowed_words(self, top_clusters=12):
         if self.cluster_scores is None:
             return None
         top_clusters = max(1, int(top_clusters))
@@ -277,7 +277,7 @@ cognitive_words = [
 ]
 
 
-def generate_text(corpus_file, dataset_object_file, prompt, baseline_weight=0.3, object_gate=0.15, prox_breadth=5, temperature=0.9, target_length=400, cluster_count=4, top_clusters=2):
+def generate_text(corpus_file, dataset_object_file, prompt, baseline_weight=0.3, object_gate=0.15, prox_breadth=5, temperature=0.9, target_length=400, cluster_count=42, top_clusters=12):
     corpus_path = corpus_file.name if corpus_file else "corpus.txt"
     object_path = dataset_object_file.name if dataset_object_file else "dataset_object.txt"
 
