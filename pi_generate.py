@@ -307,8 +307,8 @@ def generate_text(corpus_file, dataset_object_file, prompt, baseline_weight=0.3,
 demo = gr.Interface(
     fn=generate_text,
     inputs=[
-        gr.File(label="Upload corpus.txt", file_types=[".txt"]),
-        gr.File(label="Upload dataset_object.txt", file_types=[".txt"]),
+        gr.File(label="Upload corpus.txt", file_types=[]),
+        gr.File(label="Upload dataset_object.txt", file_types=[]),
         gr.Textbox(label="Prompt"),
         gr.Slider(minimum=0.0, maximum=1.0, value=0.8, step=0.05, label="Baseline weight"),
         gr.Slider(minimum=0.0, maximum=1.0, value=1.00, step=0.01, label="Object gate"),
