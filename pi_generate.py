@@ -74,7 +74,7 @@ class CorpusIndexer:
         for _, win in scored[:breadth]:
             for w, c in win["counter"].items():
                 if c >= min_count and w.isalpha() and len(w) > 2:
-                    prox[w.lower()] += c
+                    terms[w.lower()] += c
         return prox
 
 
@@ -90,7 +90,7 @@ class ClusterSteerer:
         v = np.zeros(3, dtype=np.float32)
         v[0] = len(word)
         v[1] = sum(ord(c) for c in word) % 1024
-        v[2] = sum(1 for c in word if c in "aeiou")
+        v[2] = v[1]-v[2]
         return v
 
     def fit_words(self, words, n_clusters=4):
