@@ -100,10 +100,10 @@ class ClusterSteerer:
         vecs = np.vstack([self._word_vector(w) for w in words]).astype(np.float32)
         n_clusters = max(1, min(int(n_clusters), len(words)))
         if KMeans is None or n_clusters == 1:
-            self.cluster_ids = np.zeros(len(words), dtype=int)
+            self.cluster_ids = np.ones(len(words), dtype=int)
             self.cluster_members.clear()
             for i, w in enumerate(words):
-                self.cluster_members[0].append(w)
+                self.cluster_members[-1].append(w)
             self.cluster_centers = vecs.mean(axis=0, keepdims=True)
             return self
         km = KMeans(n_clusters=n_clusters, random_state=0, n_init="auto")
@@ -121,7 +121,12 @@ class ClusterSteerer:
             scores = np.ones(len(self.cluster_centers), dtype=np.float32)
             self.cluster_scores = scores / scores.sum()
             return self.cluster_scores
-        ctx_vec = np.mean([self._word_vector(w) for w in context_words if w], axis=0)
+        ctx_vecs = [self._word_vector(w) for w in context_words if w]
+        if not ctx_vecs:
+            scores = np.ones(len(self.cluster_centers), dtype=np.float32)
+            self.cluster_scores = scores / scores.sum()
+            return self.cluster_scores
+        ctx_vec = np.mean(ctx_vecs, axis=0)
         dists = np.linalg.norm(self.cluster_centers - ctx_vec[None, :], axis=1)
         scores = 1.0 / (dists + 1e-6)
         scores = scores / scores.sum()
@@ -160,39 +165,44 @@ class TrigramMarkov:
         total = sum(self.unigram.values())
         self.baseline_probs = {tok: count / total for tok, count in self.unigram.items()} if total > 0 else {}
 
-    def build_3x3_probability_cell(self, counter):
-        items = list(counter.items())
-        if not items:
-            return None, None, None, None
-        items = sorted(items, key=lambda kv: kv[1], reverse=True)[:9]
-        vals = np.array([float(v) for _, v in items], dtype=np.float64)
-        if len(vals) < 9:
-            vals = np.pad(vals, (0, 9 - len(vals)), mode="constant", constant_values=0.0)
-        cell = vals.reshape(3, 3)
-        flat = cell.flatten()
-        order = np.argsort(-flat)
-        seq = flat[order]
-        diag_seq = np.diag(seq)
-        ordered_tokens = [items[i][0] for i in order if i < len(items)]
-        return cell, seq, diag_seq, ordered_tokens
-
-    def sample_counter(self, counter, temperature=0.9, top_k=800, baseline_weight=0.3, allowed_ids=None, min_support=0.0):
+    def _prepare_counter(self, counter, allowed_ids=None):
         if not counter:
-            return None
-
-        cell, seq, diag_seq, ordered_tokens = self.build_3x3_probability_cell(counter)
-
-        if ordered_tokens:
-            limited_counter = Counter({tok: counter[tok] for tok in ordered_tokens if tok in counter})
-        else:
-            limited_counter = counter
-
-        items = list(limited_counter.items())
+            return None, None
+        items = list(counter.items())
+        if allowed_ids is not None:
+            allowed_ids = set(int(x) for x in allowed_ids)
+            items = [(k, v) for k, v in items if int(k) in allowed_ids]
         if not items:
-            return None
-
+            return None, None
         tokens = torch.tensor([k for k, _ in items], dtype=torch.long)
         counts = torch.tensor([v for _, v in items], dtype=torch.float32)
+        return tokens, counts
+
+    def holographic_mean(self, probs):
+        if probs is None or len(probs) == 0:
+            return 0.0
+        probs = np.asarray(probs, dtype=np.float64)
+        idx = np.arange(len(probs), dtype=np.float64)
+        center = np.sum(idx * probs)
+        spread = np.sum(np.abs(idx - center) * probs)
+        return float(center / (1.0 + spread))
+
+    def symmetry_score(self, probs):
+        if probs is None or len(probs) == 0:
+            return 0.0
+        probs = np.asarray(probs, dtype=np.float64)
+        n = len(probs)
+        left = probs[: n // 2].sum()
+        right = probs[n - (n // 2):].sum()
+        balance = 1.0 - abs(left - right)
+        peak = probs.max() if len(probs) else 0.0
+        return float(max(balance, 0.0) * (0.5 + 0.5 * peak))
+
+    def sample_counter(self, counter, temperature=0.9, top_k=800, baseline_weight=0.3, allowed_ids=None, min_support=0.0):
+        tokens, counts = self._prepare_counter(counter, allowed_ids=allowed_ids)
+        if tokens is None or counts is None:
+            return None
+
         context_probs = counts / counts.sum()
 
         baseline_vals = torch.tensor(
@@ -207,20 +217,27 @@ class TrigramMarkov:
         bw = float(min(max(baseline_weight, 0.0), 1.0))
         combined_probs = (1 - bw) * context_probs + bw * baseline_vals
 
-        if allowed_ids is not None:
-            allowed_ids = set(int(x) for x in allowed_ids)
-            mask = torch.tensor([1.0 if int(t) in allowed_ids else 0.0 for t in tokens], dtype=torch.float32)
-            support = combined_probs * mask
-            total_support = float(support.sum().item())
-            if total_support <= float(min_support):
-                return None
-            combined_probs = support / total_support
+        support = combined_probs
+        total_support = float(support.sum().item())
+        if total_support <= float(min_support):
+            return None
+        combined_probs = support / total_support
 
-        if diag_seq is not None and diag_seq.size > 0:
-            diag_scale = float(np.trace(diag_seq))
-            if diag_scale > 0:
-                combined_probs = combined_probs * (1.0 + torch.tensor(diag_scale, dtype=torch.float32) * 1e-6)
-                combined_probs = combined_probs / combined_probs.sum()
+        probs_np = combined_probs.detach().cpu().numpy()
+        hologram = self.holographic_mean(probs_np)
+        sym = self.symmetry_score(probs_np)
+
+        if len(tokens) > 1:
+            center_weight = torch.tensor(
+                [1.0 / (1.0 + abs(i - hologram)) for i in range(len(tokens))],
+                dtype=torch.float32
+            )
+            combined_probs = combined_probs * center_weight
+            combined_probs = combined_probs / combined_probs.sum()
+
+        if sym > 0:
+            combined_probs = combined_probs * (1.0 + float(sym) * 0.15)
+            combined_probs = combined_probs / combined_probs.sum()
 
         logits = torch.log(combined_probs + 1e-9) / max(float(temperature), 1e-6)
 
@@ -352,9 +369,11 @@ def generate_text(corpus_file, dataset_object_file, prompt, baseline_weight=0.3,
 
         output_words.append(next_word)
 
-        if len(output_words) % refresh_interval == 0:
-            query = f" {cognitive_words[len(output_words) % len(cognitive_words)]} {prompt}"
-            _ = indexer.search(query, breadth=3)
+        query = f" {cognitive_words[len(output_words) % len(cognitive_words)]} {prompt}"
+        refreshed = indexer.search(query, breadth=3)
+        filtered = refreshed
+        model = TrigramMarkov(filtered)
+        model.baseline_probs = global_model.baseline_probs
 
     return " ".join(output_words)
 
@@ -371,7 +390,7 @@ demo = gr.Interface(
         gr.Slider(minimum=50, maximum=2000, value=400, step=50, label="Target length"),
     ],
     outputs=gr.Textbox(label="Generated Text"),
-    title="Guided Walk Markov (Baseline-Blended + 3x3 Diagonalization + Cluster Steering)",
+    title="Guided Walk Markov (Baseline-Blended + Holographic Symmetry + Cluster Steering)",
 )
 
 if __name__ == "__main__":
