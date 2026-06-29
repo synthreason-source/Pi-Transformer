@@ -14,17 +14,106 @@ except Exception:
     KMeans = None
 
 
-class Vocab:
-    def __init__(self, words):
+class FrequencyTapper:
+    """
+    Online word<->id vocab with O(1) frequency bumps.
+
+    Every time a word is seen, its frequency increments by one and it's
+    moved to the appropriate bucket - no re-sorting, no recomputation of
+    a global Counter. Internally this is the bucket-list structure used
+    in O(1) LFU caches: each integer frequency has a bucket (an ordered
+    set of word ids currently at that frequency), and buckets are tracked
+    in increasing order so "most/least frequent" queries are cheap.
+    """
+
+    def __init__(self):
         self.word2idx = {}
         self.idx2word = []
-        for w in words:
-            if w not in self.word2idx:
-                self.word2idx[w] = len(self.idx2word)
-                self.idx2word.append(w)
+        self.freq = {}              # id -> current frequency
+        self.buckets = {}           # freq -> dict(id -> None)  (ordered set)
+        self.bucket_order = []      # sorted list of frequencies currently in use
 
     def __len__(self):
         return len(self.idx2word)
+
+    # --- internal bucket management ---------------------------------
+
+    def _ensure_bucket(self, f):
+        if f not in self.buckets:
+            self.buckets[f] = {}
+            self.bucket_order.append(f)
+            self.bucket_order.sort()
+
+    def _drop_bucket_if_empty(self, f):
+        if f in self.buckets and not self.buckets[f]:
+            del self.buckets[f]
+            self.bucket_order.remove(f)
+
+    # --- core api ------------------------------------------------------
+
+    def bump(self, word):
+        """Register one occurrence of `word`. Returns its id."""
+        word = word.lower()
+        if word not in self.word2idx:
+            idx = len(self.idx2word)
+            self.word2idx[word] = idx
+            self.idx2word.append(word)
+            self.freq[idx] = 0
+        idx = self.word2idx[word]
+
+        old_f = self.freq[idx]
+        new_f = old_f + 1
+        self.freq[idx] = new_f
+
+        if old_f > 0:
+            self.buckets[old_f].pop(idx, None)
+            self._drop_bucket_if_empty(old_f)
+
+        self._ensure_bucket(new_f)
+        self.buckets[new_f][idx] = None
+
+        return idx
+
+    def bump_many(self, words):
+        return [self.bump(w) for w in words]
+
+    def register(self, word):
+        """Add a word with zero frequency if unseen, without bumping it."""
+        word = word.lower()
+        if word not in self.word2idx:
+            idx = len(self.idx2word)
+            self.word2idx[word] = idx
+            self.idx2word.append(word)
+            self.freq[idx] = 0
+        return self.word2idx[word]
+
+    # --- queries ---------------------------------------------------------
+
+    def frequency(self, word):
+        idx = self.word2idx.get(word.lower())
+        return self.freq.get(idx, 0)
+
+    def most_frequent(self, n=1):
+        """Top-n (word, freq) pairs, highest frequency first."""
+        out = []
+        for f in reversed(self.bucket_order):
+            for idx in self.buckets[f]:
+                out.append((self.idx2word[idx], f))
+                if len(out) >= n:
+                    return out
+        return out
+
+    def least_frequent(self, n=1):
+        """Top-n (word, freq) pairs, lowest frequency first."""
+        out = []
+        for f in self.bucket_order:
+            for idx in self.buckets[f]:
+                out.append((self.idx2word[idx], f))
+                if len(out) >= n:
+                    return out
+        return out
+
+    # --- compatibility with the original Vocab interface ------------------
 
     def encode(self, words):
         return [self.word2idx[w] for w in words if w in self.word2idx]
@@ -74,7 +163,7 @@ class CorpusIndexer:
         for _, win in scored[:breadth]:
             for w, c in win["counter"].items():
                 if c >= min_count and w.isalpha() and len(w) > 2:
-                    terms[w.lower()] += c
+                    prox[w.lower()] += c
         return prox
 
 
@@ -145,25 +234,42 @@ class ClusterSteerer:
 
 
 class TrigramMarkov:
+    """
+    Same trigram/bigram/unigram model as before, but now the vocab itself
+    (a FrequencyTapper) is the source of truth for unigram counts - every
+    word seen during the counting pass is "bumped" online, so there's no
+    separate self.unigram Counter to keep in sync.
+    """
+
     def __init__(self, words):
         words = [w.lower() for w in words]
 
-        self.vocab = Vocab(words)
-        ids = self.vocab.encode(words)
+        self.vocab = FrequencyTapper()
+        ids = []
+        for w in words:
+            ids.append(self.vocab.bump(w))
 
         self.trigram = defaultdict(Counter)
         self.bigram = defaultdict(Counter)
-        self.unigram = Counter()
 
         for i, tok in enumerate(ids):
-            self.unigram[tok] += 1
             if i >= 1:
                 self.bigram[(ids[i - 1],)][tok] += 1
             if i >= 2:
                 self.trigram[(ids[i - 2], ids[i - 1])][tok] += 1
 
-        total = sum(self.unigram.values())
-        self.baseline_probs = {tok: count / total for tok, count in self.unigram.items()} if total > 0 else {}
+        # unigram counts now live directly in vocab.freq (bumped online);
+        # baseline_probs is derived straight from that bucketed frequency table.
+        total = sum(self.vocab.freq.values())
+        self.baseline_probs = (
+            {tok: count / total for tok, count in self.vocab.freq.items()}
+            if total > 0 else {}
+        )
+
+    @property
+    def unigram(self):
+        """Backwards-compatible view: behaves like the old Counter."""
+        return Counter(self.vocab.freq)
 
     def _prepare_counter(self, counter, allowed_ids=None):
         if not counter:
@@ -368,6 +474,11 @@ def generate_text(corpus_file, dataset_object_file, prompt, baseline_weight=0.3,
             next_word = model.vocab.idx2word[nxt] if nxt is not None else random.choice(filtered).lower()
 
         output_words.append(next_word)
+
+        # Online bump: every word actually emitted into the output also
+        # bumps the *global* model's frequency tapper, so global_model's
+        # baseline distribution keeps adapting to what's being generated.
+        global_model.vocab.bump(next_word)
 
         query = f" {cognitive_words[len(output_words) % len(cognitive_words)]} {prompt}"
         refreshed = indexer.search(query, breadth=3)
