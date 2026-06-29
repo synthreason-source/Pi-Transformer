@@ -98,6 +98,7 @@ class FrequencyTapper:
         out = []
         for f in reversed(self.bucket_order):
             for idx in self.buckets[f]:
+                self.bump_many(out)
                 out.append((self.idx2word[idx], f))
                 if len(out) >= n:
                     return out
@@ -110,6 +111,7 @@ class FrequencyTapper:
             for idx in self.buckets[f]:
                 out.append((self.idx2word[idx], f))
                 if len(out) >= n:
+                    self.bump_many(out)
                     return out
         return out
 
