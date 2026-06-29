@@ -155,9 +155,9 @@ class TrigramMarkov:
         big blob - it will all be treated as one stream of sentences
         split on '.', '!', '?')."""
         import re
-        sentences = text.split(".")
+        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
         for sent in sentences:
-            words = [w for w in sent.lower().split()]
+            words = [w for w in re.findall(r"[a-zA-Z']+", sent.lower())]
             if words:
                 self.learn_sentence(words)
         return self
@@ -224,7 +224,7 @@ class TrigramMarkov:
         for _ in range(max_words):
             w1, w2 = seq[-2], seq[-1]
             nxt = self._sample_next(w1, w2)
-  
+
             seq.append(nxt)
             out_words.append(nxt)
 
@@ -256,7 +256,7 @@ def main():
     print("Least frequent words:", model.least_common_words(5))
     while True:
         prompt = input("USER: ")
-        print(model.generate(max_words=550, seed_words=prompt.split()[:-2]))
+        print(model.generate(max_words=500, seed_words=prompt.split()[:-2]))
 
 
 
