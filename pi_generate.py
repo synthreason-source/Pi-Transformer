@@ -102,7 +102,10 @@ def generate(prompt, max_tokens=20):
         tokens.append(next_tok)
     return " ".join([itos.get(i, "<unk>") for i in tokens if i > 3])
 
-while True:
-    p = input("\nPrompt: ")
-    if not p: break
-    print(generate(p).split(".")[0])
+
+with open("questions.conf", "r", encoding="UTF-8") as file:
+    content = file.readlines()
+    prompt = input("USER: ")
+for question in content:
+    print(question, generate(question).split(".")[0] + ".")
+    print()
