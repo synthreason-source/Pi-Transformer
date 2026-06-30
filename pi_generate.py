@@ -1,583 +1,118 @@
 import re
 import math
-import random
-import os
-from collections import Counter
-
-import numpy as np
 import torch
 import torch.nn as nn
+from collections import Counter
 from torch.utils.data import Dataset, DataLoader
+import numpy as np
+KB_LEN = 9999
+# ============================================================
+# POLYMORPHIC ROUTER: Arithmetic Logic Layer
+# ============================================================
+class PreprocessingRouter:
+    def __init__(self):
+        # Strategies define the specific arithmetic formula for context modulation
+        self.arithmetic_strategies = {
+            "sum_mod": lambda x: int(np.sum(x) % 10),
+            "max_mod": lambda x: int(np.max(x) % 15),
+            "mean_mod": lambda x: int(np.mean(x) % 5)
+        }
+
+    def select_strategy(self, features):
+        # Choose the arithmetic logic based on entropy/wc complexity
+        if features['entropy'] > 3.0: return self.arithmetic_strategies["max_mod"]
+        if features['wc'] < 5: return self.arithmetic_strategies["mean_mod"]
+        return self.arithmetic_strategies["sum_mod"]
 
 # ============================================================
-# CONFIG
+# UTILS & PREPROCESSING
 # ============================================================
-KB_LEN = 10000
-EMBED_DIM = 256
-HIDDEN_DIM = 512
-SEQ_LEN = 64
-BATCH_SIZE = 32
-EPOCHS = 10
-LR = 1e-3
+def tokenize(text): return re.findall(r"\{[^}]+\}|\w+|[^\w\s]", text.lower())
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-MODEL_FILE = "plaintext_feature_model.pt"
-
-if torch.cuda.is_available():
-    print("CUDA ENABLED")
-    print("GPU:", torch.cuda.get_device_name(0))
-    torch.backends.cudnn.benchmark = True
-else:
-    print("Running on CPU")
-
-# ============================================================
-# LOAD DATA
-# ============================================================
-
-filename = input("Filename: ")
-
-with open(filename, "r", encoding="utf-8") as f:
-    raw_text = f.read()[:KB_LEN]
-
-TEXTS = [
-    x.strip()
-    for x in raw_text.split(".")
-    if x.strip()
-]
-
-# ============================================================
-# TOKENIZER
-# ============================================================
-
-def tokenize(text):
-    return re.findall(
-        r"<[^>]+>|\w+|[^\w\s]",
-        text.lower()
-    )
-
-# ============================================================
-# FEATURE EXTRACTION
-# ============================================================
-
-def safe_entropy(text):
-    if not text:
-        return 0.0
-
-    counts = Counter(text)
-
-    total = len(text)
-
-    ent = 0.0
-
-    for count in counts.values():
-        p = count / total
-        ent -= p * math.log2(p)
-
-    return ent
-
-def sigmoid(x):
-    return 1.0 / (1.0 + math.exp(-x))
-
-def extract_feature_tokens(text):
-
+def get_features(text):
     words = re.findall(r"\w+", text)
-
-    chars = len(text)
-
-    word_count = len(words)
-
-    unique_words = len(
-        set(w.lower() for w in words)
-    )
-
-    avg_word_len = (
-        sum(len(w) for w in words)
-        / max(word_count, 1)
-    )
-
-    longest_word = max(
-        [len(w) for w in words] + [0]
-    )
-
-    shortest_word = min(
-        [len(w) for w in words] + [0]
-    )
-
-    punct_count = len(
-        re.findall(r"[^\w\s]", text)
-    )
-
-    digit_count = len(
-        re.findall(r"\d", text)
-    )
-
-    upper_count = sum(
-        1 for c in text if c.isupper()
-    )
-
-    lower_count = sum(
-        1 for c in text if c.islower()
-    )
-
-    vowels = sum(
-        1 for c in text.lower()
-        if c in "aeiou"
-    )
-
-    consonants = sum(
-        1 for c in text.lower()
-        if c.isalpha() and c not in "aeiou"
-    )
-
-    entropy = safe_entropy(text)
-
-    raw = np.array([
-        word_count,
-        unique_words,
-        avg_word_len,
-        longest_word,
-        shortest_word,
-        punct_count,
-        digit_count,
-        upper_count,
-        lower_count,
-        vowels,
-        consonants,
-        entropy
-    ], dtype=np.float32)
-
-    feature_names = [
-        "wc",
-        "uniq",
-        "avglen",
-        "maxlen",
-        "minlen",
-        "punct",
-        "digits",
-        "upper",
-        "lower",
-        "vowels",
-        "cons",
-        "entropy"
-    ]
-
-    transforms = {}
-
-    transforms["raw"] = raw
-
-    transforms["sig"] = np.array(
-        [sigmoid(float(x)) for x in raw],
-        dtype=np.float32
-    )
-
-    transforms["tanh"] = np.tanh(raw)
-
-    transforms["log"] = np.log1p(
-        np.maximum(raw, 0)
-    )
-
-    transforms["sqrt"] = np.sqrt(
-        np.maximum(raw, 0)
-    )
-
-    transforms["square"] = raw ** 2
-
-    transforms["cube"] = raw ** 3
-
-    clipped = np.clip(raw, -5, 5)
-
-    transforms["exp"] = np.exp(clipped)
-
-    soft = np.exp(raw - np.max(raw))
-    soft /= soft.sum()
-
-    transforms["soft"] = soft
-
-    mean = raw.mean()
-    std = raw.std() + 1e-8
-
-    transforms["z"] = (
-        raw - mean
-    ) / std
-
-    mn = raw.min()
-    mx = raw.max()
-
-    transforms["minmax"] = (
-        raw - mn
-    ) / (mx - mn + 1e-8)
-
-    transforms["sin"] = np.sin(raw)
-    transforms["cos"] = np.cos(raw)
-
-    feature_tokens = []
-
-    for transform_name, values in transforms.items():
-
-        for feature_name, value in zip(
-            feature_names,
-            values
-        ):
-            feature_tokens.append(
-                f"<{transform_name}_{feature_name}_{value:.4f}>"
-            )
-
-    return feature_tokens
+    wc = len(words)
+    entropy = -sum((c/len(text))*math.log2(c/len(text)) for c in Counter(text).values() if c > 0) if len(text) > 0 else 0
+    return {"wc": wc, "entropy": entropy, "raw_vec": np.array([wc, entropy, len(text)], dtype=np.float32)}
 
 # ============================================================
-# EMBED FEATURES INTO DATASET AS PLAINTEXT
+# DATASET: Polymorphic Context Window Modulation
 # ============================================================
-
-ENRICHED_TEXTS = []
-
-for text in TEXTS:
-
-    feature_tokens = extract_feature_tokens(text)
-
-    enriched = (
-        " ".join(feature_tokens)
-        + " "
-        + text
-    )
-
-    ENRICHED_TEXTS.append(enriched)
-
-TEXTS = ENRICHED_TEXTS
-
-print()
-print("Examples:")
-print(TEXTS[0][:500])
-print()
-
-# ============================================================
-# VOCAB
-# ============================================================
-
-SPECIAL = [
-    "<pad>",
-    "<unk>",
-    "<bos>",
-    "<eos>"
-]
-
-counter = Counter()
-
-for text in TEXTS:
-    counter.update(tokenize(text))
-
-vocab = SPECIAL + sorted(counter.keys())
-
-stoi = {
-    token: idx
-    for idx, token in enumerate(vocab)
-}
-
-itos = {
-    idx: token
-    for token, idx in stoi.items()
-}
-
-PAD = stoi["<pad>"]
-UNK = stoi["<unk>"]
-BOS = stoi["<bos>"]
-EOS = stoi["<eos>"]
-
-print("Vocabulary:", len(vocab))
-
-# ============================================================
-# DATASET
-# ============================================================
-
 class TextDataset(Dataset):
-
-    def __init__(self, texts):
-
+    def __init__(self, texts, stoi):
+        self.router = PreprocessingRouter()
         self.samples = []
-
-        for text in texts:
-
-            ids = [BOS]
-
-            ids.extend(
-                stoi.get(tok, UNK)
-                for tok in tokenize(text)
-            )
-
-            ids.append(EOS)
-
+        for t in texts:
+            feats = get_features(t)
+            # Strategy selection returns the arithmetic function to apply
+            arithmetic_func = self.router.select_strategy(feats)
+            
+            ids = [2] + [stoi.get(tok, 1) for tok in tokenize(t)] + [3]
             for i in range(1, len(ids)):
+                # Apply the polymorphic arithmetic directly to modulate context
+                context_mod = arithmetic_func(feats['raw_vec'])
+                start_idx = max(0, i - (64 - context_mod))
+                x = torch.tensor(ids[start_idx:i], dtype=torch.long)
+                y = torch.tensor(ids[i], dtype=torch.long)
+                self.samples.append((x, y))
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, i): return self.samples[i]
 
-                start = max(
-                    0,
-                    i - SEQ_LEN
-                )
-
-                x = ids[start:i]
-
-                y = ids[
-                    start + 1:
-                    i + 1
-                ]
-
-                self.samples.append(
-                    (x, y)
-                )
-
-    def __len__(self):
-        return len(self.samples)
-
-    def __getitem__(self, idx):
-        return self.samples[idx]
-
-def collate(batch):
-
+def collate_fn(batch):
     xs, ys = zip(*batch)
-
-    max_len = max(
-        len(x)
-        for x in xs
-    )
-
-    xpad = []
-    ypad = []
-
-    for x, y in zip(xs, ys):
-
-        pad = max_len - len(x)
-
-        xpad.append(
-            x + [PAD] * pad
-        )
-
-        ypad.append(
-            y + [PAD] * pad
-        )
-
-    return (
-        torch.tensor(xpad),
-        torch.tensor(ypad)
-    )
-
-dataset = TextDataset(TEXTS)
-
-loader = DataLoader(
-    dataset,
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    collate_fn=collate,
-    pin_memory=torch.cuda.is_available(),
-    num_workers=0
-)
+    max_len = max(len(x) for x in xs)
+    x_padded = torch.stack([torch.cat([x, torch.zeros(max_len - len(x), dtype=torch.long)]) for x in xs])
+    return x_padded, torch.stack(ys)
 
 # ============================================================
 # MODEL
 # ============================================================
-
-class PlaintextFeatureGRU(nn.Module):
-
-    def __init__(
-        self,
-        vocab_size
-    ):
+class GRUModel(nn.Module):
+    def __init__(self, vocab_size):
         super().__init__()
-
-        self.embedding = nn.Embedding(
-            vocab_size,
-            EMBED_DIM,
-            padding_idx=PAD
-        )
-
-        self.gru = nn.GRU(
-            EMBED_DIM,
-            HIDDEN_DIM,
-            batch_first=True
-        )
-
-        self.output = nn.Linear(
-            HIDDEN_DIM,
-            vocab_size
-        )
-
+        self.emb = nn.Embedding(vocab_size, 256, padding_idx=0)
+        self.gru = nn.GRU(256, 512, batch_first=True)
+        self.fc = nn.Linear(512, vocab_size)
     def forward(self, x):
-
-        emb = self.embedding(x)
-
-        out, _ = self.gru(emb)
-
-        return self.output(out)
-
-model = PlaintextFeatureGRU(
-    len(vocab)
-).to(DEVICE)
-
-criterion = nn.CrossEntropyLoss(
-    ignore_index=PAD
-)
-
-optimizer = torch.optim.Adam(
-    model.parameters(),
-    lr=LR
-)
+        _, h = self.gru(self.emb(x))
+        return self.fc(h.squeeze(0))
 
 # ============================================================
-# TRAINING
+# TRAINING LOOP & GENERATION
 # ============================================================
+filename = input("Filename: ")
+with open(filename, "r", encoding="utf-8") as f:
+    text_data = [x.strip() for x in f.read().split(".") if x.strip()][:KB_LEN]
 
-for epoch in range(EPOCHS):
+vocab = sorted(list(set(tok for t in text_data for tok in tokenize(t))))
+stoi = {t: i+4 for i, t in enumerate(vocab)}
+stoi.update({"<pad>": 0, "<unk>": 1, "<bos>": 2, "<eos>": 3})
+itos = {i: t for t, i in stoi.items()}
 
-    model.train()
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+dataset = TextDataset(text_data, stoi)
+loader = DataLoader(dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
+model = GRUModel(len(stoi)).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss(ignore_index=0)
 
-    total_loss = 0
-
+for epoch in range(5):
     for x, y in loader:
-
-        x = x.to(DEVICE)
-        y = y.to(DEVICE)
-
         optimizer.zero_grad()
-
-        logits = model(x)
-
-        loss = criterion(
-            logits.reshape(
-                -1,
-                len(vocab)
-            ),
-            y.reshape(-1)
-        )
-
+        loss = criterion(model(x.to(device)), y.to(device))
         loss.backward()
-
         optimizer.step()
+    print(f"Epoch {epoch+1} complete")
 
-        total_loss += loss.item()
-
-    print(
-        f"Epoch {epoch+1}/{EPOCHS} "
-        f"Loss={total_loss/len(loader):.4f}"
-    )
-
-torch.save(
-    {
-        "model": model.state_dict(),
-        "stoi": stoi,
-        "itos": itos
-    },
-    "plaintext_feature_model.pt"
-)
-
-print()
-print("Saved: plaintext_feature_model.pt")
-print()
-
-# ============================================================
-# GENERATION
-# ============================================================
-
-@torch.no_grad()
-def generate(
-    prompt,
-    max_tokens=100,
-    temperature=0.8
-):
-
-    model.eval()
-
-    features = extract_feature_tokens(
-        prompt
-    )
-
-    enriched_prompt = (
-        " ".join(features)
-        + " "
-        + prompt
-    )
-
-    current = [BOS]
-
-    current.extend(
-        stoi.get(tok, UNK)
-        for tok in tokenize(
-            enriched_prompt
-        )
-    )
-
+def generate(prompt, max_tokens=50):
+    tokens = [2] + [stoi.get(t, 1) for t in tokenize(prompt)]
     for _ in range(max_tokens):
-
-        x = torch.tensor(
-            [current[-SEQ_LEN:]],
-            device=DEVICE
-        )
-
-        logits = model(x)
-
-        logits = (
-            logits[0, -1]
-            / temperature
-        )
-
-        probs = torch.softmax(
-            logits,
-            dim=-1
-        )
-
-        next_token = torch.multinomial(
-            probs,
-            1
-        ).item()
-
-        if next_token == EOS:
-            break
-
-        current.append(
-            next_token
-        )
-
-    output_tokens = [
-        itos[i]
-        for i in current
-        if i in itos
-    ]
-
-    text = " ".join(output_tokens)
-
-    text = re.sub(
-        r"<[^>]+>",
-        "",
-        text
-    )
-
-    text = text.replace(
-        "<bos>",
-        ""
-    )
-
-    text = text.replace(
-        "<eos>",
-        ""
-    )
-
-    return text.strip()
-
-# ============================================================
-# INTERACTIVE
-# ============================================================
+        x = torch.tensor([tokens[-64:]], device=device)
+        next_tok = torch.multinomial(torch.softmax(model(x), dim=-1), 1).item()
+        tokens.append(next_tok)
+    return " ".join([itos[i] for i in tokens if i > 3])
 
 while True:
-
-    prompt = input(
-        "\nPrompt (blank quits): "
-    )
-
-    if not prompt.strip():
-        break
-
-    print()
-    print(
-        generate(
-            prompt,
-            max_tokens=100,
-            temperature=0.9
-        )
-    )
+    p = input("\nPrompt: ")
+    if not p: break
+    print(generate(p))
