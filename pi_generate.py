@@ -1,6 +1,7 @@
 import re
 import math
 import random
+import os
 from collections import Counter
 
 import numpy as np
@@ -11,7 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 # ============================================================
 # CONFIG
 # ============================================================
-
+KB_LEN = 10000
 EMBED_DIM = 256
 HIDDEN_DIM = 512
 SEQ_LEN = 64
@@ -19,7 +20,16 @@ BATCH_SIZE = 32
 EPOCHS = 10
 LR = 1e-3
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+MODEL_FILE = "plaintext_feature_model.pt"
+
+if torch.cuda.is_available():
+    print("CUDA ENABLED")
+    print("GPU:", torch.cuda.get_device_name(0))
+    torch.backends.cudnn.benchmark = True
+else:
+    print("Running on CPU")
 
 # ============================================================
 # LOAD DATA
@@ -28,11 +38,11 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 filename = input("Filename: ")
 
 with open(filename, "r", encoding="utf-8") as f:
-    raw_text = f.read()[:9999]
+    raw_text = f.read()[:KB_LEN]
 
 TEXTS = [
     x.strip()
-    for x in re.split(r"[.!?]+", raw_text)
+    for x in raw_text.split(".")
     if x.strip()
 ]
 
@@ -355,7 +365,9 @@ loader = DataLoader(
     dataset,
     batch_size=BATCH_SIZE,
     shuffle=True,
-    collate_fn=collate
+    collate_fn=collate,
+    pin_memory=torch.cuda.is_available(),
+    num_workers=0
 )
 
 # ============================================================
