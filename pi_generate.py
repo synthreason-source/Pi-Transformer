@@ -1,265 +1,571 @@
-"""
-trigram_markov.py
-------------------
-A word-level trigram language model, backed by an O(1) LFU-style
-vocabulary (FrequencyTapper).
-
-Two pieces:
-
-1. FrequencyTapper
-   An online word<->id vocab. Every time a word is seen its frequency
-   bumps by one and it's moved to the matching "bucket" in O(1) -
-   no re-sorting, no recomputation of a global counter. This is the
-   classic bucket-list structure used in O(1) LFU caches: each integer
-   frequency has a bucket (an ordered set of word ids at that
-   frequency), and the set of occupied frequencies is tracked in
-   sorted order so "most/least frequent" queries are cheap.
-
-2. TrigramMarkov
-   A standard trigram model (with bigram/unigram backoff) built on
-   top of a FrequencyTapper, so the vocabulary itself tracks word
-   frequency as it learns.
-
-Run directly for a demo:
-    python trigram_markov.py
-"""
-
+import re
+import math
 import random
-from bisect import insort
-from collections import defaultdict
+from collections import Counter
 
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-# --------------------------------------------------------------------------
-# FrequencyTapper: O(1) word<->id vocab with LFU-style frequency buckets
-# --------------------------------------------------------------------------
+# ============================================================
+# CONFIG
+# ============================================================
 
-class FrequencyTapper:
-    """Online word<->id vocab with O(1) frequency bumps."""
+EMBED_DIM = 256
+HIDDEN_DIM = 512
+SEQ_LEN = 64
+BATCH_SIZE = 32
+EPOCHS = 10
+LR = 1e-3
 
-    def __init__(self):
-        self.word2idx: dict[str, int] = {}
-        self.idx2word: list[str] = []
-        self.freq: dict[int, int] = {}            # idx -> current frequency
-        self.buckets: dict[int, dict[int, None]] = {}  # freq -> ordered set of idx (dict preserves insertion order)
-        self.bucket_order: list[int] = []          # sorted list of frequencies that have >=1 word
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # -- internal helpers ---------------------------------------------------
+# ============================================================
+# LOAD DATA
+# ============================================================
 
-    def _ensure_bucket(self, f: int):
-        if f not in self.buckets:
-            self.buckets[f] = {}
-            insort(self.bucket_order, f)
+filename = input("Filename: ")
 
-    def _drop_bucket_if_empty(self, f: int):
-        if f in self.buckets and not self.buckets[f]:
-            del self.buckets[f]
-            self.bucket_order.remove(f)
+with open(filename, "r", encoding="utf-8") as f:
+    raw_text = f.read()[:9999]
 
-    # -- public API -----------------------------------------------------------
+TEXTS = [
+    x.strip()
+    for x in re.split(r"[.!?]+", raw_text)
+    if x.strip()
+]
 
-    def bump(self, word: str) -> int:
-        """Register a single occurrence of `word`. Returns its id."""
-        word = word.lower()
+# ============================================================
+# TOKENIZER
+# ============================================================
 
-        if word not in self.word2idx:
-            idx = len(self.idx2word)
-            self.word2idx[word] = idx
-            self.idx2word.append(word)
-            self.freq[idx] = 0
-        else:
-            idx = self.word2idx[word]
+def tokenize(text):
+    return re.findall(
+        r"<[^>]+>|\w+|[^\w\s]",
+        text.lower()
+    )
 
-        old_f = self.freq[idx]
-        new_f = old_f + 1
-        self.freq[idx] = new_f
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
 
-        if old_f > 0:
-            self.buckets[old_f].pop(idx, None)
-            self._drop_bucket_if_empty(old_f)
+def safe_entropy(text):
+    if not text:
+        return 0.0
 
-        self._ensure_bucket(new_f)
-        self.buckets[new_f][idx] = None
-        return idx
+    counts = Counter(text)
 
-    def bump_many(self, words):
-        """Bump every word in an iterable. Returns the list of ids."""
-        if not words:
-            return []
-        return [self.bump(w) for w in words]
+    total = len(text)
 
-    def encode(self, words):
-        """Map known words to ids (does NOT register new words / bump freq)."""
-        return [self.word2idx[w.lower()] for w in words if w.lower() in self.word2idx]
+    ent = 0.0
 
-    def decode(self, ids):
-        return " ".join(self.idx2word[i] for i in ids)
+    for count in counts.values():
+        p = count / total
+        ent -= p * math.log2(p)
 
-    def most_frequent(self, n=1):
-        """Top-n (word, freq) pairs, highest frequency first."""
-        out = []
-        for f in reversed(self.bucket_order):
-            for idx in self.buckets[f]:
-                out.append((self.idx2word[idx], f))
-                if len(out) >= n:
-                    return out
-        return out
+    return ent
 
-    def least_frequent(self, n=1):
-        """Top-n (word, freq) pairs, lowest frequency first."""
-        out = []
-        for f in self.bucket_order:
-            for idx in self.buckets[f]:
-                out.append((self.idx2word[idx], f))
-                if len(out) >= n:
-                    return out
-        return out
+def sigmoid(x):
+    return 1.0 / (1.0 + math.exp(-x))
+
+def extract_feature_tokens(text):
+
+    words = re.findall(r"\w+", text)
+
+    chars = len(text)
+
+    word_count = len(words)
+
+    unique_words = len(
+        set(w.lower() for w in words)
+    )
+
+    avg_word_len = (
+        sum(len(w) for w in words)
+        / max(word_count, 1)
+    )
+
+    longest_word = max(
+        [len(w) for w in words] + [0]
+    )
+
+    shortest_word = min(
+        [len(w) for w in words] + [0]
+    )
+
+    punct_count = len(
+        re.findall(r"[^\w\s]", text)
+    )
+
+    digit_count = len(
+        re.findall(r"\d", text)
+    )
+
+    upper_count = sum(
+        1 for c in text if c.isupper()
+    )
+
+    lower_count = sum(
+        1 for c in text if c.islower()
+    )
+
+    vowels = sum(
+        1 for c in text.lower()
+        if c in "aeiou"
+    )
+
+    consonants = sum(
+        1 for c in text.lower()
+        if c.isalpha() and c not in "aeiou"
+    )
+
+    entropy = safe_entropy(text)
+
+    raw = np.array([
+        word_count,
+        unique_words,
+        avg_word_len,
+        longest_word,
+        shortest_word,
+        punct_count,
+        digit_count,
+        upper_count,
+        lower_count,
+        vowels,
+        consonants,
+        entropy
+    ], dtype=np.float32)
+
+    feature_names = [
+        "wc",
+        "uniq",
+        "avglen",
+        "maxlen",
+        "minlen",
+        "punct",
+        "digits",
+        "upper",
+        "lower",
+        "vowels",
+        "cons",
+        "entropy"
+    ]
+
+    transforms = {}
+
+    transforms["raw"] = raw
+
+    transforms["sig"] = np.array(
+        [sigmoid(float(x)) for x in raw],
+        dtype=np.float32
+    )
+
+    transforms["tanh"] = np.tanh(raw)
+
+    transforms["log"] = np.log1p(
+        np.maximum(raw, 0)
+    )
+
+    transforms["sqrt"] = np.sqrt(
+        np.maximum(raw, 0)
+    )
+
+    transforms["square"] = raw ** 2
+
+    transforms["cube"] = raw ** 3
+
+    clipped = np.clip(raw, -5, 5)
+
+    transforms["exp"] = np.exp(clipped)
+
+    soft = np.exp(raw - np.max(raw))
+    soft /= soft.sum()
+
+    transforms["soft"] = soft
+
+    mean = raw.mean()
+    std = raw.std() + 1e-8
+
+    transforms["z"] = (
+        raw - mean
+    ) / std
+
+    mn = raw.min()
+    mx = raw.max()
+
+    transforms["minmax"] = (
+        raw - mn
+    ) / (mx - mn + 1e-8)
+
+    transforms["sin"] = np.sin(raw)
+    transforms["cos"] = np.cos(raw)
+
+    feature_tokens = []
+
+    for transform_name, values in transforms.items():
+
+        for feature_name, value in zip(
+            feature_names,
+            values
+        ):
+            feature_tokens.append(
+                f"<{transform_name}_{feature_name}_{value:.4f}>"
+            )
+
+    return feature_tokens
+
+# ============================================================
+# EMBED FEATURES INTO DATASET AS PLAINTEXT
+# ============================================================
+
+ENRICHED_TEXTS = []
+
+for text in TEXTS:
+
+    feature_tokens = extract_feature_tokens(text)
+
+    enriched = (
+        " ".join(feature_tokens)
+        + " "
+        + text
+    )
+
+    ENRICHED_TEXTS.append(enriched)
+
+TEXTS = ENRICHED_TEXTS
+
+print()
+print("Examples:")
+print(TEXTS[0][:500])
+print()
+
+# ============================================================
+# VOCAB
+# ============================================================
+
+SPECIAL = [
+    "<pad>",
+    "<unk>",
+    "<bos>",
+    "<eos>"
+]
+
+counter = Counter()
+
+for text in TEXTS:
+    counter.update(tokenize(text))
+
+vocab = SPECIAL + sorted(counter.keys())
+
+stoi = {
+    token: idx
+    for idx, token in enumerate(vocab)
+}
+
+itos = {
+    idx: token
+    for token, idx in stoi.items()
+}
+
+PAD = stoi["<pad>"]
+UNK = stoi["<unk>"]
+BOS = stoi["<bos>"]
+EOS = stoi["<eos>"]
+
+print("Vocabulary:", len(vocab))
+
+# ============================================================
+# DATASET
+# ============================================================
+
+class TextDataset(Dataset):
+
+    def __init__(self, texts):
+
+        self.samples = []
+
+        for text in texts:
+
+            ids = [BOS]
+
+            ids.extend(
+                stoi.get(tok, UNK)
+                for tok in tokenize(text)
+            )
+
+            ids.append(EOS)
+
+            for i in range(1, len(ids)):
+
+                start = max(
+                    0,
+                    i - SEQ_LEN
+                )
+
+                x = ids[start:i]
+
+                y = ids[
+                    start + 1:
+                    i + 1
+                ]
+
+                self.samples.append(
+                    (x, y)
+                )
 
     def __len__(self):
-        return len(self.idx2word)
+        return len(self.samples)
 
-    def __contains__(self, word):
-        return word.lower() in self.word2idx
+    def __getitem__(self, idx):
+        return self.samples[idx]
 
+def collate(batch):
 
-# --------------------------------------------------------------------------
-# TrigramMarkov: trigram language model with bigram/unigram backoff
-# --------------------------------------------------------------------------
+    xs, ys = zip(*batch)
 
-_BOS = "<s>"   # sentence-start marker
-_EOS = "</s>"  # sentence-end marker
+    max_len = max(
+        len(x)
+        for x in xs
+    )
 
+    xpad = []
+    ypad = []
 
-class TrigramMarkov:
-    """
-    Trigram word model with bigram and unigram backoff, built on a
-    FrequencyTapper vocabulary (so the vocab itself tracks word
-    frequency as the model learns).
-    """
+    for x, y in zip(xs, ys):
 
-    def __init__(self):
-        self.vocab = FrequencyTapper()
+        pad = max_len - len(x)
 
-        # counts keyed by id-tuples, so lookups are cheap ints not strings
-        self.trigram_counts: dict[tuple[int, int, int], int] = defaultdict(int)
-        self.bigram_counts: dict[tuple[int, int], int] = defaultdict(int)
-        self.unigram_counts: dict[int, int] = defaultdict(int)
+        xpad.append(
+            x + [PAD] * pad
+        )
 
-        # trigram_next[(w1, w2)] -> {w3: count}, for fast sampling of continuations
-        self.trigram_next: dict[tuple[int, int], dict[int, int]] = defaultdict(lambda: defaultdict(int))
-        self.bigram_next: dict[int, dict[int, int]] = defaultdict(lambda: defaultdict(int))
+        ypad.append(
+            y + [PAD] * pad
+        )
 
-    # -- training ---------------------------------------------------------
+    return (
+        torch.tensor(xpad),
+        torch.tensor(ypad)
+    )
 
-    def fit(self, text: str):
-        """Train on a blob of text, one sentence per line (or just one
-        big blob - it will all be treated as one stream of sentences
-        split on '.', '!', '?')."""
-        import re
-        sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-        for sent in sentences:
-            words = [w for w in re.findall(r"[a-zA-Z']+", sent.lower())]
-            if words:
-                self.learn_sentence(words)
-        return self
+dataset = TextDataset(TEXTS)
 
-    def learn_sentence(self, words):
-        """Update counts and vocab frequencies from a single tokenized sentence."""
-        ids = self.vocab.bump_many(words)
-        bos = self.vocab.bump(_BOS)
-        eos = self.vocab.bump(_EOS)
+loader = DataLoader(
+    dataset,
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    collate_fn=collate
+)
 
-        seq = [bos, bos] + ids + [eos]
+# ============================================================
+# MODEL
+# ============================================================
 
-        for i in range(len(seq)):
-            self.unigram_counts[seq[i]] += 1
+class PlaintextFeatureGRU(nn.Module):
 
-        for i in range(len(seq) - 1):
-            w1, w2 = seq[i], seq[i + 1]
-            self.bigram_counts[(w1, w2)] += 1
-            self.bigram_next[w1][w2] += 1
+    def __init__(
+        self,
+        vocab_size
+    ):
+        super().__init__()
 
-        for i in range(len(seq) - 2):
-            w1, w2, w3 = seq[i], seq[i + 1], seq[i + 2]
-            self.trigram_counts[(w1, w2, w3)] += 1
-            self.trigram_next[(w1, w2)][w3] += 1
+        self.embedding = nn.Embedding(
+            vocab_size,
+            EMBED_DIM,
+            padding_idx=PAD
+        )
 
-    # -- generation ---------------------------------------------------------
+        self.gru = nn.GRU(
+            EMBED_DIM,
+            HIDDEN_DIM,
+            batch_first=True
+        )
 
-    def _sample_next(self, w1, w2):
-        """Sample the next word id given the previous two, backing off
-        trigram -> bigram -> unigram as needed."""
-        candidates = self.trigram_next.get((w1, w2))
-        if candidates:
-            return self._weighted_choice(candidates)
+        self.output = nn.Linear(
+            HIDDEN_DIM,
+            vocab_size
+        )
 
-        candidates = self.bigram_next.get(w2)
-        if candidates:
-            return self._weighted_choice(candidates)
+    def forward(self, x):
 
-        if self.unigram_counts:
-            return self._weighted_choice(self.unigram_counts)
+        emb = self.embedding(x)
 
-        return None
+        out, _ = self.gru(emb)
 
-    @staticmethod
-    def _weighted_choice(counts: dict[int, int]):
-        ids = list(counts.keys())
-        weights = list(counts.values())
-        return random.choices(ids, weights=weights, k=1)[0]
+        return self.output(out)
 
-    def generate(self, max_words=30, seed_words=None):
-        """Generate a sentence. Optionally seed it with the first one or
-        two words (as a list of strings)."""
-        bos = self.vocab.word2idx[_BOS]
-        eos = self.vocab.word2idx[_EOS]
+model = PlaintextFeatureGRU(
+    len(vocab)
+).to(DEVICE)
 
-        if seed_words:
-            seed_ids = [self.vocab.word2idx[w.lower()] for w in seed_words if w.lower() in self.vocab]
-        else:
-            seed_ids = []
+criterion = nn.CrossEntropyLoss(
+    ignore_index=PAD
+)
 
-        seq = [bos, bos] + seed_ids
-        out_words = list(seed_ids)
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=LR
+)
 
-        for _ in range(max_words):
-            w1, w2 = seq[-2], seq[-1]
-            nxt = self._sample_next(w1, w2)
+# ============================================================
+# TRAINING
+# ============================================================
 
-            seq.append(nxt)
-            out_words.append(nxt)
+for epoch in range(EPOCHS):
 
-        return self.vocab.decode(out_words)
+    model.train()
 
-    # -- introspection --------------------------------------------------------
+    total_loss = 0
 
-    def most_common_words(self, n=10):
-        return self.vocab.most_frequent(n)
+    for x, y in loader:
 
-    def least_common_words(self, n=10):
-        return self.vocab.least_frequent(n)
+        x = x.to(DEVICE)
+        y = y.to(DEVICE)
 
+        optimizer.zero_grad()
 
-# --------------------------------------------------------------------------
-# Demo
-# --------------------------------------------------------------------------
+        logits = model(x)
 
-with open(input("Filename: "), "r", encoding="utf-8") as file:
-    SAMPLE_TEXT = file.read()
+        loss = criterion(
+            logits.reshape(
+                -1,
+                len(vocab)
+            ),
+            y.reshape(-1)
+        )
 
+        loss.backward()
 
-def main():
-    model = TrigramMarkov()
-    model.fit(SAMPLE_TEXT)
+        optimizer.step()
 
-    print(f"Vocab size: {len(model.vocab)}")
-    print("Most frequent words:", model.most_common_words(5))
-    print("Least frequent words:", model.least_common_words(5))
-    while True:
-        prompt = input("USER: ")
-        print(model.generate(max_words=500, seed_words=prompt.split()[:-2]))
+        total_loss += loss.item()
 
+    print(
+        f"Epoch {epoch+1}/{EPOCHS} "
+        f"Loss={total_loss/len(loader):.4f}"
+    )
 
+torch.save(
+    {
+        "model": model.state_dict(),
+        "stoi": stoi,
+        "itos": itos
+    },
+    "plaintext_feature_model.pt"
+)
 
-if __name__ == "__main__":
-    main()
+print()
+print("Saved: plaintext_feature_model.pt")
+print()
 
+# ============================================================
+# GENERATION
+# ============================================================
+
+@torch.no_grad()
+def generate(
+    prompt,
+    max_tokens=100,
+    temperature=0.8
+):
+
+    model.eval()
+
+    features = extract_feature_tokens(
+        prompt
+    )
+
+    enriched_prompt = (
+        " ".join(features)
+        + " "
+        + prompt
+    )
+
+    current = [BOS]
+
+    current.extend(
+        stoi.get(tok, UNK)
+        for tok in tokenize(
+            enriched_prompt
+        )
+    )
+
+    for _ in range(max_tokens):
+
+        x = torch.tensor(
+            [current[-SEQ_LEN:]],
+            device=DEVICE
+        )
+
+        logits = model(x)
+
+        logits = (
+            logits[0, -1]
+            / temperature
+        )
+
+        probs = torch.softmax(
+            logits,
+            dim=-1
+        )
+
+        next_token = torch.multinomial(
+            probs,
+            1
+        ).item()
+
+        if next_token == EOS:
+            break
+
+        current.append(
+            next_token
+        )
+
+    output_tokens = [
+        itos[i]
+        for i in current
+        if i in itos
+    ]
+
+    text = " ".join(output_tokens)
+
+    text = re.sub(
+        r"<[^>]+>",
+        "",
+        text
+    )
+
+    text = text.replace(
+        "<bos>",
+        ""
+    )
+
+    text = text.replace(
+        "<eos>",
+        ""
+    )
+
+    return text.strip()
+
+# ============================================================
+# INTERACTIVE
+# ============================================================
+
+while True:
+
+    prompt = input(
+        "\nPrompt (blank quits): "
+    )
+
+    if not prompt.strip():
+        break
+
+    print()
+    print(
+        generate(
+            prompt,
+            max_tokens=100,
+            temperature=0.9
+        )
+    )
