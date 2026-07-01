@@ -123,23 +123,32 @@ class TrigramWordEngine:
         return self.cluster_fallback(current_word)
 
     def generate_response(self, prompt, length=30, temperature=0.8):
-        # Trigger linear remapping on each new prompt
+        # 1. Advance the linear vocabulary shift
         self._remap_vocab()
         
+        # 2. Get the current active vocabulary bucket
+        current_bucket = self.latent_curve[self.global_shift % len(self.latent_curve)]
+        
+        # 3. Prompt Remapping: Transform prompt tokens to match the current bucket
         prompt_tokens = self.tokenize(prompt)
-        seeds = []
+        remapped_seeds = []
         
-        if prompt_tokens:
+        if prompt_tokens and current_bucket:
+            # Map each prompt token to a relevant token from the current bucket
+            # If the token exists in the system, we align it; otherwise, we map to bucket content
             for token in prompt_tokens:
-                for key, words in self.bitshift_clusters.items():
-                    if token in words:
-                        seeds.append(token)
+                if token in current_bucket:
+                    remapped_seeds.append(token)
+                else:
+                    # Inject a token from the current remapped bucket to align the seed
+                    remapped_seeds.append(random.choice(list(current_bucket)))
         
-        if len(seeds) >= 2:
-            w1, w2 = seeds[0], seeds[1]
+        # 4. Use remapped_seeds to initialize the trigram generator
+        if len(remapped_seeds) >= 2:
+            w1, w2 = remapped_seeds[0], remapped_seeds[1]
         else:
-            w1 = np.random.choice(self.vocab)
-            w2 = np.random.choice(self.vocab)
+            w1 = random.choice(list(current_bucket)) if current_bucket else random.choice(self.vocab)
+            w2 = random.choice(list(current_bucket)) if current_bucket else random.choice(self.vocab)
 
         output = [w1, w2]
         for _ in range(length):
