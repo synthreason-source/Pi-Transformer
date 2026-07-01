@@ -13,7 +13,6 @@ class MemoryStore:
         if text:
             self.values.append(text)
 
-    # Note: retrieve is no longer used for generation seeding
     def retrieve(self, prompt):
         if not self.values:
             return ""
@@ -38,6 +37,9 @@ class TrigramWordEngine:
         self.cluster_signatures = {}
         self.cluster_words = defaultdict(set)
         self.bitshift_clusters = defaultdict(set)
+        # Added state for linear remapping
+        self.latent_curve = []
+        self.global_shift = 0
 
     def _build_clusters(self, contexts):
         total_occurrences = sum(sum(ctx.values()) for ctx in contexts.values())
@@ -49,11 +51,21 @@ class TrigramWordEngine:
             bucket = int(prob * 1024)
             bitshift_key = bucket << 2
             self.bitshift_clusters[bitshift_key].add(word)
+        
+        # Build linear curve for remapping
+        sorted_keys = sorted(self.bitshift_clusters.keys())
+        self.latent_curve = [self.bitshift_clusters[k] for k in sorted_keys]
+
+    def _remap_vocab(self):
+        # Linearly shift the vocabulary window
+        self.global_shift = (self.global_shift + 1) % len(self.latent_curve)
 
     def cluster_fallback(self, word):
-        for key, words in self.bitshift_clusters.items():
-            if word in words:
-                return np.random.choice(list(words))
+        # Use remapped vocab based on global shift
+        idx = self.global_shift % len(self.latent_curve)
+        words = self.latent_curve[idx]
+        if words:
+            return random.choice(list(words))
         return np.random.choice(self.vocab) if self.vocab else ""
 
     def tokenize(self, text):
@@ -111,12 +123,13 @@ class TrigramWordEngine:
         return self.cluster_fallback(current_word)
 
     def generate_response(self, prompt, length=30, temperature=0.8):
-        # Middle-layer seed generation: Find clusters matching the prompt
+        # Trigger linear remapping on each new prompt
+        self._remap_vocab()
+        
         prompt_tokens = self.tokenize(prompt)
         seeds = []
         
         if prompt_tokens:
-            # Attempt to find tokens that exist in our clusters
             for token in prompt_tokens:
                 for key, words in self.bitshift_clusters.items():
                     if token in words:
@@ -168,7 +181,6 @@ def main():
     while True:
         user_input = input("USER: ").strip()
         if not user_input: break
-        # No longer using MemoryStore for generation
         print("AI:", engine.generate_response(user_input, length=args.length, temperature=args.temperature))
 
 if __name__ == "__main__":
