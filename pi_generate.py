@@ -140,38 +140,46 @@ class TrigramWordEngine:
                 return nxt
 
         return self.cluster_fallback(w2)
-
+    def manifold_weight(self, t, d, a=6.0, b=1.0, c=4.0):
+        return (1 - t) * a + t * b + (1 - d) * c
     def generate_response(self, prompt, length=30, temperature=0.8):
-        current_bucket = self._remap_vocab()
-
-        if not current_bucket:
-            current_bucket = set(self.vocab)
-
         prompt_tokens = self.tokenize(prompt)
+        prompt_words = [t for t in prompt_tokens if re.fullmatch(r"\w+", t)]
 
-        remapped_seeds = []
-        for token in prompt_tokens:
-            mapped = self.remap_token(token, current_bucket)
-            remapped_seeds.append(mapped)
-            self.remap_memory[token][mapped] += 1
-
-        if not remapped_seeds:
-            remapped_seeds = [random.choice(list(current_bucket))]
-
-        self.seed_history.append({
-            "shift": self.global_shift,
-            "seeds": remapped_seeds
-        })
-
-        historical = random.choice(self.seed_history)["seeds"]
-
-        w1 = historical[0]
-        w2 = historical[1] if len(historical) > 1 else w1
+        if len(prompt_words) >= 2:
+            w1, w2 = prompt_words[-2], prompt_words[-1]
+        elif len(prompt_words) == 1:
+            w1 = w2 = prompt_words[0]
+        else:
+            w1 = w2 = random.choice(self.vocab) if self.vocab else ""
 
         output = [w1, w2]
+        prompt_set = set(prompt_words)
 
-        for _ in range(length):
-            nxt = self.next_word(w1, w2, temperature)
+        for i in range(length):
+            candidates = Counter()
+
+            if (w1, w2) in self.trigrams:
+                candidates.update(self.trigrams[(w1, w2)])
+            if w2 in self.bigrams:
+                candidates.update(self.bigrams[w2])
+
+            if candidates:
+                t = i / max(length - 1, 1)
+
+                for tok in list(candidates.keys()):
+                    if tok in prompt_set:
+                        d = 0.0
+                    else:
+                        d = 1.0
+
+                    boost = self.manifold_weight(t, d)
+                    candidates[tok] *= boost
+
+                nxt = self._sample(candidates, temperature)
+            else:
+                nxt = self.cluster_fallback(w2)
+
             if not nxt:
                 break
 
