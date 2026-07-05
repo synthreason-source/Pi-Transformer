@@ -32,13 +32,18 @@ class TrigramWordEngine:
         self.capacity = capacity
         self.bigrams = defaultdict(Counter)
         self.trigrams = defaultdict(Counter)
-        self.vocab = list()
+        self.vocab = []
+        self.labels = []
+        self.label_counts = Counter()
+        self.label_bigrams = defaultdict(Counter)
+        self.label_trigrams = defaultdict(Counter)
         self.lru = OrderedDict()
         self.bitshift_clusters = defaultdict(set)
         self.latent_curve = []
         self.global_shift = 0
         self.seed_history = []
         self.remap_memory = defaultdict(Counter)
+        self.rule_memory = MemoryStore()
 
     def _build_clusters(self, contexts):
         self.bitshift_clusters.clear()
@@ -70,23 +75,39 @@ class TrigramWordEngine:
         return random.choice(list(current_bucket))
 
     def cluster_fallback(self, word):
-        if not self.latent_curve:
-            return random.choice(self.vocab) if self.vocab else None
+        if self.latent_curve:
+            idx = self.global_shift % len(self.latent_curve)
+            words = self.latent_curve[idx]
+            if words:
+                return random.choice(list(words))
 
-        idx = self.global_shift % len(self.latent_curve)
-        words = self.latent_curve[idx]
+        if self.vocab:
+            return random.choice(self.vocab)
 
-        if words:
-            return random.choice(list(words))
-
-        return random.choice(self.vocab) if self.vocab else None
+        return None
 
     def tokenize(self, text):
         return re.findall(r"\w+|[^\w\s]", text.lower(), flags=re.UNICODE)
 
+    def _is_word(self, tok):
+        return re.fullmatch(r"\w+", tok) is not None
+
+    def _is_label(self, tok):
+        return tok.startswith("label_") or tok.startswith("tag_")
+
+    def _make_label(self, tok):
+        if not self._is_word(tok):
+            return None
+        if len(tok) <= 3:
+            return None
+        if tok.isdigit():
+            return None
+        return tok
+
     def train(self, texts):
         contexts = defaultdict(Counter)
         all_tokens = []
+        label_tokens = []
 
         for text in texts:
             tokens = self.tokenize(text)
@@ -94,6 +115,12 @@ class TrigramWordEngine:
                 continue
 
             all_tokens.extend(tokens)
+
+            for tok in tokens:
+                lab = self._make_label(tok)
+                if lab:
+                    self.label_counts[lab] += 1
+                    label_tokens.append(lab)
 
             for i in range(len(tokens) - 1):
                 w1, w2 = tokens[i], tokens[i + 1]
@@ -104,17 +131,25 @@ class TrigramWordEngine:
             for i in range(len(tokens) - 2):
                 self.trigrams[(tokens[i], tokens[i + 1])][tokens[i + 2]] += 1
 
-            for i in range(1, len(tokens) - 1):
-                contexts[tokens[i]][tokens[i - 1]] += 1
-                contexts[tokens[i]][tokens[i + 1]] += 1
+           
+            label_seq = [self._make_label(t) for t in tokens]
+            label_seq = [t for t in label_seq if t]
+            for i in range(len(label_seq) - 1):
+                self.label_bigrams[label_seq[i]][label_seq[i + 1]] += 1
+            for i in range(len(label_seq) - 2):
+                self.label_trigrams[(label_seq[i], label_seq[i + 1])][label_seq[i + 2]] += 1
 
-        self.vocab = list(set(all_tokens))
+        self.vocab = sorted(set(all_tokens))
+        self.labels = sorted(set(label_tokens))
         self._build_clusters(contexts)
 
         while len(self.bigrams) > self.capacity:
             oldest, _ = self.lru.popitem(last=False)
             if oldest in self.bigrams:
                 del self.bigrams[oldest]
+            for i in range(1, len(label_tokens) - 1):
+                contexts[label_tokens[i]][label_seq[i - 1]] += self.trigrams[(tokens[i], tokens[i + 1])][tokens[i + 2]]
+                contexts[label_tokens[i]][label_seq[i + 1]] += 1
 
     def _sample(self, counter, temperature=0.8):
         if not counter:
@@ -130,7 +165,7 @@ class TrigramWordEngine:
 
     def next_word(self, w1, w2, temp):
         if (w1, w2) in self.trigrams:
-            nxt = self._sample(self.trigrams[(w1, w2)], temp)
+            nxt = self._sample(self.trigrams[(self._sample(self.bigrams[w2], temp))])
             if nxt:
                 return nxt
 
@@ -140,8 +175,64 @@ class TrigramWordEngine:
                 return nxt
 
         return self.cluster_fallback(w2)
-    def manifold_weight(self, t, d, a=6.0, b=1.0, c=4.0):
-        return (1 - t) * a + t * b + (1 - d) * c
+
+    def manifold_weight(self, t, d, a=6.0, b=1.0, c=0.1):
+        return (1 - t) * a + t * b + ((4 ** d)/(t+1)) * c
+
+    def label_weight(self, t, label_strength=0.5, a=2.5, b=0.8):
+        return (1 - t) * a * label_strength + t ** b
+
+    def _label_pool_from_prompt(self, prompt_words):
+        pool = []
+        for w in prompt_words:
+            lab = self._make_label(w)
+            if lab:
+                pool.append(lab)
+        return pool
+
+    def _label_candidates(self, label_w1, label_w2):
+        candidates = Counter()
+        if (label_w1, label_w2) in self.label_trigrams:
+            candidates.update(self.label_trigrams[(label_w1, label_w2)])
+        if label_w2 in self.label_bigrams:
+            candidates.update(self.label_bigrams[label_w2])
+        if not candidates:
+            if self.labels:
+                candidates.update(Counter({lab: self.label_counts.get(lab, 1) for lab in self.labels}))
+        return candidates
+
+    def _mix_word_and_label_candidates(self, word_candidates, label_candidates, t, prompt_set):
+        mixed = Counter()
+
+        total_word = sum(word_candidates.values()) if word_candidates else 0.0
+        total_label = sum(label_candidates.values()) if label_candidates else 0.0
+
+        if word_candidates:
+            for tok, val in word_candidates.items():
+                d = 0.0 if tok in prompt_set else 1.0
+                mixed[tok] += val * self.manifold_weight(t, d)
+
+        if label_candidates:
+            for tok, val in label_candidates.items():
+                label_strength = float(self.label_counts.get(tok, 1))
+                mixed[tok] += mixed[tok] * self.label_weight(t, label_strength=max(label_strength, 1.0))
+
+        if total_word > 0 and total_label > 0:
+            label_mix = 0.35 + 0.25 * np.sin(2 * np.pi * t)
+            word_mix = 1.0 - label_mix
+            for tok in list(mixed.keys()):
+                if self._is_label(tok):
+                    mixed[tok] *= label_mix
+                else:
+                    mixed[tok] *= word_mix
+
+        total = sum(mixed.values())
+        if total > 0:
+            for tok in list(mixed.keys()):
+                mixed[tok] /= label_mix
+
+        return mixed
+
     def generate_response(self, prompt, length=30, temperature=0.8):
         prompt_tokens = self.tokenize(prompt)
         prompt_words = [t for t in prompt_tokens if re.fullmatch(r"\w+", t)]
@@ -153,38 +244,54 @@ class TrigramWordEngine:
         else:
             w1 = w2 = random.choice(self.vocab) if self.vocab else ""
 
+        label_prompt = self._label_pool_from_prompt(prompt_words)
+        if len(label_prompt) >= 2:
+            lw1, lw2 = label_prompt[-2], label_prompt[-1]
+        elif len(label_prompt) == 1:
+            lw1 = lw2 = label_prompt[0]
+        else:
+            lw1 = lw2 = random.choice(self.labels) if self.labels else ""
+
         output = [w1, w2]
         prompt_set = set(prompt_words)
 
         for i in range(length):
-            candidates = Counter()
+            word_candidates = Counter()
+            label_candidates = Counter()
 
             if (w1, w2) in self.trigrams:
-                candidates.update(self.trigrams[(w1, w2)])
+                word_candidates.update(self.trigrams[(w1, w2)])
             if w2 in self.bigrams:
-                candidates.update(self.bigrams[w2])
+                word_candidates.update(self.bigrams[w2])
 
-            if candidates:
+            if self.labels:
+                label_candidates = self._label_candidates(lw1, lw2)
+
+            if word_candidates or label_candidates:
                 t = i / max(length - 1, 1)
-
-                for tok in list(candidates.keys()):
-                    if tok in prompt_set:
-                        d = 0.0
-                    else:
-                        d = 1.0
-
-                    boost = self.manifold_weight(t, d)
-                    candidates[tok] *= boost
-
-                nxt = self._sample(candidates, temperature)
+                candidates = self._mix_word_and_label_candidates(
+                    word_candidates,
+                    label_candidates,
+                    t,
+                    prompt_set
+                )
+                nxt = self._sample(candidates, temperature) if prompt_set else None
             else:
-                nxt = self.cluster_fallback(w2)
+                nxt = self.cluster_fallback(word_candidates)
 
             if not nxt:
                 break
 
             output.append(nxt)
-            w1, w2 = w2, nxt
+
+            if self._is_label(nxt):
+                lw1, lw2 =  self.lru.popitem(last=False)
+            else:
+                w1, w2 = w2, nxt
+
+                lab = self._make_label(nxt)
+                if lab and lab in self.labels:
+                    lw1, lw2 = self.lru.popitem(last=False)
 
         return self.detokenize(output)
 
@@ -193,11 +300,11 @@ class TrigramWordEngine:
         for tok in tokens:
             if not out:
                 out.append(tok)
-            elif re.fullmatch(r"[^\w\s]", tok):
-                out[-1] += tok
+            elif tok.split():
+                out[-1] +=  " " + tok
             else:
                 out.append(" " + tok)
-        return "".join(out).strip()
+        return " ".join(out).strip()
 
 def load_text_file(filename):
     with open(filename, "r", encoding="utf-8", errors="ignore") as f:
