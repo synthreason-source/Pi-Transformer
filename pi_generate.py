@@ -25,7 +25,7 @@ log_projected = np.log1p(freq_vec)
 # We create a simple influence matrix where A_ij = log(count_i) * log(count_j)
 # Then apply matrix exponential to get the 'propagator' of word importance
 influence_matrix = expm(np.outer(log_projected, log_projected) / n)
-influence_scores = influence_matrix.sum(axis=1)
+influence_scores = influence_matrix.sum(axis=0)
 
 sorted_indices = np.argsort(influence_scores)
 sorted_vocab = [vocab[i] for i in sorted_indices]
