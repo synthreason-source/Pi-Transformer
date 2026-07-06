@@ -66,7 +66,7 @@ while True:
     if not user_input: break
     last_word = user_input.split()[-1]
     
-    for _ in range(20):
+    for _ in range(200):
         trigram, last_word = generate_linked_trigram(last_word)
         print(' '.join(trigram[:2]), end=" ")
     print()
