@@ -29,15 +29,23 @@ influence_scores = influence_matrix.sum(axis=1)
 
 sorted_indices = np.argsort(influence_scores)
 sorted_vocab = [vocab[i] for i in sorted_indices]
+# 1. Create a lookup for influence scores
+# Map each word to its calculated influence score
+influence_map = {sorted_vocab[i]: influence_scores[i] for i in range(n)}
 
-# 3. Markovian Linking Logic
+# 2. Markovian Linking with Influence Weighting
 transitions = defaultdict(Counter)
 for i in range(len(text) - 1):
-    transitions[text[i]][text[i+1]] += 1
+    curr_word = text[i]
+    next_word = text[i+1]
+    # Weight the transition by the influence of the next word
+    transitions[curr_word][next_word] += influence_map[next_word]
 
-markov_chain = {w: {next_w: count/sum(follows.values()) 
-                for next_w, count in follows.items()} 
-                for w, follows in transitions.items()}
+# 3. Normalize to probabilities
+markov_chain = {}
+for w, follows in transitions.items():
+    total_weight = sum(follows.values())
+    markov_chain[w] = {next_w: weight / total_weight for next_w, weight in follows.items()}
 
 # 4. Generative Engine
 def generate_linked_trigram(last_word=None):
