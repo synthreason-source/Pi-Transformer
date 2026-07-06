@@ -1,25 +1,34 @@
 import numpy as np
 import pandas as pd
 from collections import Counter, defaultdict
-import os
+from scipy.linalg import expm
 
 # 1. Setup and Preprocessing
 file_path = 'singlekb.txt'
+try:
+    with open(file_path, 'r', encoding="utf-8") as f:
+        text = f.read().lower().split()
+except:
+    text = ["the", "neural", "matrix", "is", "a", "projection", "of", "data"]
 
-
-with open(file_path, 'r', encoding="utf-8") as f:
-    text = f.read().lower().split()
-
-# 2. Matrix and Log-Sorting
+# 2. Matrix and Log-Sorting with Exponential Weighting
 word_counts = Counter(text)
 vocab = sorted(word_counts.keys())
-matrix_data = np.array([word_counts[word] for word in vocab], dtype=float).reshape(1, -1)
+v_map = {w: i for i, w in enumerate(vocab)}
+n = len(vocab)
 
-log_projected = np.log1p(matrix_data)
-log_indices = np.argsort(log_projected, axis=1)
+# Frequency Vector
+freq_vec = np.array([word_counts[w] for w in vocab], dtype=float)
+log_projected = np.log1p(freq_vec)
 
-sorted_vocab = [vocab[i] for i in log_indices[0]]
-sorted_log_values = np.take_along_axis(log_projected, log_indices, axis=1)[0]
+# Matrix Exponential Sort: Transforming the diagonal representation
+# We create a simple influence matrix where A_ij = log(count_i) * log(count_j)
+# Then apply matrix exponential to get the 'propagator' of word importance
+influence_matrix = expm(np.outer(log_projected, log_projected) / n)
+influence_scores = influence_matrix.sum(axis=1)
+
+sorted_indices = np.argsort(influence_scores)
+sorted_vocab = [vocab[i] for i in sorted_indices]
 
 # 3. Markovian Linking Logic
 transitions = defaultdict(Counter)
@@ -32,15 +41,13 @@ markov_chain = {w: {next_w: count/sum(follows.values())
 
 # 4. Generative Engine
 def generate_linked_trigram(last_word=None):
-    # Start with the highest weighted word if no history exists
     if last_word is None or last_word not in markov_chain:
+        # Use the highest influence word from our exponential sort as anchor
         current = sorted_vocab[-1] 
     else:
         current = last_word
     
     trigram = [current]
-    
-    # Generate 2 linked words based on transition probabilities
     for _ in range(2):
         if current in markov_chain:
             choices = list(markov_chain[current].keys())
@@ -50,13 +57,16 @@ def generate_linked_trigram(last_word=None):
             current = np.random.choice(sorted_vocab)
         trigram.append(current)
         
-    return " ".join(trigram), current
+    return trigram, trigram[-1]
 
 # 5. Output
-print("--- Linked Markovian Trigram Sequence ---")
+print("--- Exponentially Weighted Markovian Engine ---")
 while True:
-    last_word = input("USER: ")[:-1]
-    for _ in range(100):
+    user_input = input("USER: ")
+    if not user_input: break
+    last_word = user_input.split()[-1]
+    
+    for _ in range(20):
         trigram, last_word = generate_linked_trigram(last_word)
-        print(' '.join(trigram.split()[:2]), end=" ")
+        print(' '.join(trigram[:2]), end=" ")
     print()
