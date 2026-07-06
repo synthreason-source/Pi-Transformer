@@ -9,7 +9,7 @@ class InfluenceSpaceMarkov:
 
     def fit(self, text):
 
-        words = re.findall(r"\w+", text.lower())
+        words = text.lower().split()
 
         vocab = sorted(set(words))
 
