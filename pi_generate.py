@@ -45,6 +45,10 @@ class TrigramWordEngine:
         self.remap_memory = defaultdict(Counter)
         self.rule_memory = MemoryStore()
 
+        # --- backward-direction indices, used only for the certainty duplex ---
+        self.word_trigrams_rev = defaultdict(Counter)   # (w2, w3) -> Counter(w1)
+        self.label_trigrams_rev = defaultdict(Counter)  # (l2, l3) -> Counter(l1)
+
     def _build_clusters(self, contexts):
         self.bitshift_clusters.clear()
         total_occurrences = max(1, sum(sum(ctx.values()) for ctx in contexts.values()))
@@ -130,14 +134,17 @@ class TrigramWordEngine:
 
             for i in range(len(tokens) - 2):
                 self.trigrams[(tokens[i], tokens[i + 1])][tokens[i + 2]] += 1
+                # backward index: given (w2, w3), what was w1?
+                self.word_trigrams_rev[(tokens[i + 1], tokens[i + 2])][tokens[i]] += 1
 
-           
             label_seq = [self._make_label(t) for t in tokens]
             label_seq = [t for t in label_seq if t]
             for i in range(len(label_seq) - 1):
                 self.label_bigrams[label_seq[i]][label_seq[i + 1]] += 1
             for i in range(len(label_seq) - 2):
                 self.label_trigrams[(label_seq[i], label_seq[i + 1])][label_seq[i + 2]] += 1
+                # backward index: given (l2, l3), what was l1?
+                self.label_trigrams_rev[(label_seq[i + 1], label_seq[i + 2])][label_seq[i]] += 1
 
         self.vocab = sorted(set(all_tokens))
         self.labels = sorted(set(label_tokens))
@@ -147,9 +154,6 @@ class TrigramWordEngine:
             oldest, _ = self.lru.popitem(last=False)
             if oldest in self.bigrams:
                 del self.bigrams[oldest]
-            for i in range(1, len(label_tokens) - 1):
-                contexts[label_tokens[i]][label_seq[i - 1]] += self.trigrams[(tokens[i], tokens[i + 1])][tokens[i + 2]]
-                contexts[label_tokens[i]][label_seq[i + 1]] += 1
 
     def _sample(self, counter, temperature=0.8):
         if not counter:
@@ -165,7 +169,7 @@ class TrigramWordEngine:
 
     def next_word(self, w1, w2, temp):
         if (w1, w2) in self.trigrams:
-            nxt = self._sample(self.trigrams[(self._sample(self.bigrams[w2], temp))])
+            nxt = self._sample(self.trigrams[(w1, w2)], temp)
             if nxt:
                 return nxt
 
@@ -201,6 +205,101 @@ class TrigramWordEngine:
                 candidates.update(Counter({lab: self.label_counts.get(lab, 1) for lab in self.labels}))
         return candidates
 
+    # ------------------------------------------------------------------
+    # Certainty duplex: a real, measurable answer to "which structure is
+    # more predictable in this dataset" instead of an asserted claim.
+    #
+    # For any distribution P over "what comes next", Shannon entropy
+    #   H(P) = -sum(p * log2(p))
+    # is a standard, well-defined measure of uncertainty: H = 0 means the
+    # outcome is always the same (fully certain); higher H means the
+    # outcome is spread across more possibilities (less certain).
+    #
+    # "Duplex" here means we measure it in both directions:
+    #   forward:  given (t1, t2), how uncertain is t3?
+    #   backward: given (t2, t3), how uncertain is t1?
+    # for both the word-level trigrams and the label-level trigrams, so we
+    # can compare word-structure vs label-structure certainty head to head.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _entropy(counter):
+        if not counter:
+            return None
+        counts = np.array(list(counter.values()), dtype=np.float64)
+        probs = counts / counts.sum()
+        return float(-np.sum(probs * np.log2(probs)))
+
+    @staticmethod
+    def _weighted_avg_entropy(table):
+        """table: dict of context -> Counter(next_token -> count)."""
+        total_weight = 0.0
+        weighted_sum = 0.0
+        per_bucket = {}
+        for ctx, counter in table.items():
+            h = TrigramWordEngine._entropy(counter)
+            if h is None:
+                continue
+            weight = sum(counter.values())
+            per_bucket[ctx] = h
+            weighted_sum += h * weight
+            total_weight += weight
+        avg = (weighted_sum / total_weight) if total_weight > 0 else None
+        return avg, per_bucket, total_weight
+
+    def measure_certainty(self):
+        """
+        Computes forward/backward entropy for word-trigrams and
+        label-trigrams across the whole trained dataset, and returns a
+        report dict. Lower entropy = more certain / more predictable.
+        """
+        word_fwd_avg, word_fwd_buckets, word_fwd_n = self._weighted_avg_entropy(self.trigrams)
+        word_bwd_avg, word_bwd_buckets, word_bwd_n = self._weighted_avg_entropy(self.word_trigrams_rev)
+        label_fwd_avg, label_fwd_buckets, label_fwd_n = self._weighted_avg_entropy(self.label_trigrams)
+        label_bwd_avg, label_bwd_buckets, label_bwd_n = self._weighted_avg_entropy(self.label_trigrams_rev)
+
+        def safe(x):
+            return None if x is None else round(x, 4)
+
+        report = {
+            "word": {
+                "forward_entropy_bits": safe(word_fwd_avg),
+                "backward_entropy_bits": safe(word_bwd_avg),
+                "num_forward_observations": word_fwd_n,
+                "num_backward_observations": word_bwd_n,
+                "num_forward_contexts": len(word_fwd_buckets),
+                "num_backward_contexts": len(word_bwd_buckets),
+            },
+            "label": {
+                "forward_entropy_bits": safe(label_fwd_avg),
+                "backward_entropy_bits": safe(label_bwd_avg),
+                "num_forward_observations": label_fwd_n,
+                "num_backward_observations": label_bwd_n,
+                "num_forward_contexts": len(label_fwd_buckets),
+                "num_backward_contexts": len(label_bwd_buckets),
+            },
+        }
+
+        # Head-to-head verdict, based only on the numbers above.
+        comparable = (
+            report["word"]["forward_entropy_bits"] is not None
+            and report["label"]["forward_entropy_bits"] is not None
+        )
+        if comparable:
+            w = report["word"]["forward_entropy_bits"]
+            l = report["label"]["forward_entropy_bits"]
+            if abs(w - l) < 1e-6:
+                verdict = "word-level and label-level structure are equally certain (tie) in this dataset"
+            elif w < l:
+                verdict = "word-level trigram structure is MORE certain (lower entropy) than label-level structure in this dataset"
+            else:
+                verdict = "label-level trigram structure is MORE certain (lower entropy) than word-level structure in this dataset"
+        else:
+            verdict = "not enough label data in this dataset to compare (no label trigrams observed)"
+
+        report["verdict"] = verdict
+        return report
+
     def _mix_word_and_label_candidates(self, word_candidates, label_candidates, t, prompt_set):
         mixed = Counter()
 
@@ -215,8 +314,9 @@ class TrigramWordEngine:
         if label_candidates:
             for tok, val in label_candidates.items():
                 label_strength = float(self.label_counts.get(tok, 1))
-                mixed[tok] += mixed[tok] * self.label_weight(t, label_strength=max(label_strength, 1.0))
+                mixed[tok] += val * self.label_weight(t, label_strength=max(label_strength, 1.0))
 
+        label_mix = 0.5
         if total_word > 0 and total_label > 0:
             label_mix = 0.35 + 0.25 * np.sin(2 * np.pi * t)
             word_mix = 1.0 - label_mix
@@ -229,7 +329,7 @@ class TrigramWordEngine:
         total = sum(mixed.values())
         if total > 0:
             for tok in list(mixed.keys()):
-                mixed[tok] /= label_mix
+                mixed[tok] /= total
 
         return mixed
 
@@ -275,9 +375,9 @@ class TrigramWordEngine:
                     t,
                     prompt_set
                 )
-                nxt = self._sample(candidates, temperature) if prompt_set else None
+                nxt = self._sample(candidates, temperature)
             else:
-                nxt = self.cluster_fallback(word_candidates)
+                nxt = self.cluster_fallback(w2)
 
             if not nxt:
                 break
@@ -285,13 +385,12 @@ class TrigramWordEngine:
             output.append(nxt)
 
             if self._is_label(nxt):
-                lw1, lw2 =  self.lru.popitem(last=False)
+                lw1, lw2 = lw2, nxt
             else:
                 w1, w2 = w2, nxt
-
                 lab = self._make_label(nxt)
                 if lab and lab in self.labels:
-                    lw1, lw2 = self.lru.popitem(last=False)
+                    lw1, lw2 = lw2, lab
 
         return self.detokenize(output)
 
@@ -315,10 +414,17 @@ def main():
     parser.add_argument("training_file")
     parser.add_argument("--length", type=int, default=400)
     parser.add_argument("--temperature", type=float, default=0.8)
+    parser.add_argument("--certainty", action="store_true",
+                         help="Print the forward/backward entropy certainty duplex report and exit.")
     args = parser.parse_args()
 
     engine = TrigramWordEngine()
     engine.train(load_text_file(args.training_file))
+
+    if args.certainty:
+        import json
+        print(json.dumps(engine.measure_certainty(), indent=2))
+        return
 
     while True:
         user = input("USER: ").strip()
