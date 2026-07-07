@@ -220,6 +220,6 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("TRIGRAM MODEL (order=2) -- state = 2 words")
     print("=" * 60)
-    model = MarkovInfluenceModel(corpus, order=2, alpha=1.0)
+    model = MarkovInfluenceModel(corpus, order=2, alpha=2.0)
     print("\nGenerated text (unseen seed 'what are you' -> falls back to random start):")
     print(" ", model.generate(input("USER: "), length=250, seed=42))
