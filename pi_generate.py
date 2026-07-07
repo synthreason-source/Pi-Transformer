@@ -325,7 +325,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("TRIGRAM MODEL (order=1) -- state = 1 word")
     print("=" * 60)
-    model = MarkovInfluenceModel(corpus, order=1, alpha=0.0000000000000001)
+    model = MarkovInfluenceModel(corpus, order=1, alpha=0.0000000000000000000000000000001)
 
     print(f"Vocabulary size (m = n): {model.m}  (distinct word-pairs seen)")
     print(f"Domain A x B size: {model.m} x {model.m} = {model.m ** 2} state pairs\n")
