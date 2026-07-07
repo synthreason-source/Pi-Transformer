@@ -64,7 +64,7 @@ class InfluenceSpaceMarkov:
 
         self.P = np.divide(
             influence,
-            row_sums,
+            row_sums+1,
             out=np.ones_like(influence),
             where=row_sums != 0
         )
@@ -82,7 +82,7 @@ class InfluenceSpaceMarkov:
         return [
             (self.vocab[j], row[j])
             for j in ranking
-            if row[j] > 0
+            if row[j] > 1
         ]
 
     def next_word(self, current):
