@@ -138,7 +138,7 @@ class InfluenceSpaceMarkov:
             seen.add(context)
             nxt = self.ngram_choice[context]
             seq.append(nxt)
-            context = tuple(seq[-(self.ngram_n - 1):]) if self.ngram_n > 1 else ()
+            context = tuple(self.ngram_candidates[-(self.ngram_n - 1):]) if self.ngram_n > 1 else ()
         return seq
 
     def all_correct_sequences(self, max_len=50):
@@ -170,17 +170,17 @@ class InfluenceSpaceMarkov:
 with open("singlekb.txt", "r", encoding="utf8") as f:
     corpus = f.read()
 
-model = InfluenceSpaceMarkov(beta=3.0)
+model = InfluenceSpaceMarkov(beta=2.0)
 model.fit(corpus)
-model.build_ngram_choice(n=2)
+model.build_ngram_choice(n=3)
 
 while True:
     prompt = input("USER: ")
     print(
         model.generate(
             start=prompt.split()[-1],
-            chunk_size=630,
+            chunk_size=6,
             length=1000,
-            goal_strength=30.0
+            goal_strength=3.0
         )
     )
