@@ -7,10 +7,12 @@ class InfluenceSpaceMarkov:
     def __init__(
         self,
         beta=2.0,
-        alpha=3.0
+        alpha=3.0,
+        gamma=2.0
     ):
         self.beta = beta
         self.alpha = alpha
+        self.gamma = gamma
 
 
     def fit(self, text):
@@ -24,11 +26,13 @@ class InfluenceSpaceMarkov:
             text.strip()
         )
 
+
         sentence_words = [
             s.lower().split()
             for s in sentences
             if s.strip()
         ]
+
 
         self.sentences = sentence_words
 
@@ -51,15 +55,14 @@ class InfluenceSpaceMarkov:
         }
 
 
-        n=len(self.vocab)
-
+        n = len(self.vocab)
 
 
         # ---------------------
         # MARKOV MATRIX
         # ---------------------
 
-        counts=np.zeros(
+        counts = np.zeros(
             (n,n)
         )
 
@@ -82,20 +85,31 @@ class InfluenceSpaceMarkov:
 
 
         # ---------------------
-        # INFLUENCE FIELD
+        # SINE LOG INFLUENCE FIELD
         # ---------------------
 
+        L=np.log1p(counts)
+
+
         Y=np.exp(
-            self.beta *
-            np.log1p(counts)
+            self.beta * L
+            +
+            np.sin(
+                self.gamma * L
+            )
         )
 
 
         Y[counts==0]=0
 
+
         self.Y=Y
 
 
+
+        # ---------------------
+        # OSCILLATING ENERGY FIELD
+        # ---------------------
 
         ymax=max(
             Y.max(),
@@ -103,13 +117,20 @@ class InfluenceSpaceMarkov:
         )
 
 
+        Yn=Y/ymax
+
+
         Z=np.exp(
-            self.alpha *
-            (Y/ymax)
+            self.alpha*Yn
+            +
+            np.sin(
+                self.gamma*Yn
+            )
         )
 
 
         Z[Y==0]=0
+
 
         self.Z=Z
 
@@ -131,10 +152,11 @@ class InfluenceSpaceMarkov:
 
 
         # ---------------------
-        # CLASSICAL CO-OCCURRENCE
+        # CO-OCCURRENCE SPACE
         # ---------------------
 
         window=4
+
 
         cooc=np.zeros(
             (n,n)
@@ -147,10 +169,12 @@ class InfluenceSpaceMarkov:
 
                 wi=self.word_to_idx[w]
 
+
                 left=max(
                     0,
                     i-window
                 )
+
 
                 right=min(
                     len(sent),
@@ -163,9 +187,11 @@ class InfluenceSpaceMarkov:
                     if i==j:
                         continue
 
+
                     wj=self.word_to_idx[
                         sent[j]
                     ]
+
 
                     cooc[wi,wj]+=1
 
@@ -176,7 +202,7 @@ class InfluenceSpaceMarkov:
 
 
         # ---------------------
-        # COSINE SPACE
+        # EMBEDDING SPACE
         # ---------------------
 
         norms=np.linalg.norm(
@@ -206,7 +232,7 @@ class InfluenceSpaceMarkov:
 
     # =================================================
     # SPACE A
-    # INFLUENCE GENERATOR
+    # INFLUENCE WALK
     # =================================================
 
     def influence_generate(
@@ -214,8 +240,6 @@ class InfluenceSpaceMarkov:
         start,
         length=50
     ):
-
-        start=start.lower()
 
 
         if start not in self.word_to_idx:
@@ -227,6 +251,7 @@ class InfluenceSpaceMarkov:
 
         current=start
 
+
         result=[
             current
         ]
@@ -235,6 +260,7 @@ class InfluenceSpaceMarkov:
         for _ in range(length):
 
             i=self.word_to_idx[current]
+
 
             p=self.P[i]
 
@@ -269,8 +295,6 @@ class InfluenceSpaceMarkov:
         length=50
     ):
 
-        start=start.lower()
-
 
         if start not in self.word_to_idx:
 
@@ -280,6 +304,7 @@ class InfluenceSpaceMarkov:
 
 
         current=start
+
 
         result=[
             current
@@ -326,7 +351,7 @@ class InfluenceSpaceMarkov:
 
 
     # =================================================
-    # VECTOR REPRESENTATION
+    # VECTOR SPACE
     # =================================================
 
     def sentence_vector(
@@ -341,10 +366,10 @@ class InfluenceSpaceMarkov:
 
             if w in self.word_to_idx:
 
-                i=self.word_to_idx[w]
-
                 vectors.append(
-                    self.embedding[i]
+                    self.embedding[
+                        self.word_to_idx[w]
+                    ]
                 )
 
 
@@ -368,23 +393,23 @@ class InfluenceSpaceMarkov:
         b
     ):
 
-        denom=(
+        d=(
             np.linalg.norm(a)
             *
             np.linalg.norm(b)
         )
 
 
-        if denom==0:
+        if d==0:
             return 0
 
 
-        return np.dot(a,b)/denom
+        return np.dot(a,b)/d
 
 
 
     # =================================================
-    # INTERSECTION SELECTOR
+    # INTERSECTION DYNAMICS
     # =================================================
 
     def intersection_generate(
@@ -394,8 +419,6 @@ class InfluenceSpaceMarkov:
         length=50
     ):
 
-
-        # semantic target
 
         semantic_path=self.semantic_generate(
             start,
@@ -444,6 +467,60 @@ class InfluenceSpaceMarkov:
 
 
 # =====================================================
+# PROMPT ENDOFUNCTION
+# =====================================================
+
+def prompt_endofunction(prompt):
+
+    words=prompt.lower().split()
+
+
+    if not words:
+        return ""
+
+
+    transformed=[]
+
+
+    for w in words:
+
+        phase=np.sin(
+            len(w)
+        )
+
+
+        if phase >= 0:
+
+            transformed.append(
+                w
+            )
+
+        else:
+
+            transformed.insert(
+                0,
+                w
+            )
+
+
+    # nonlinear collapse to a single attractor word
+
+    index=int(
+        abs(
+            np.sin(
+                len(prompt)
+            )
+        )
+        *
+        (len(transformed)-1)
+    )
+
+
+    return transformed[index]
+
+
+
+# =====================================================
 # LOAD CORPUS
 # =====================================================
 
@@ -460,7 +537,8 @@ with open(
 
 model=InfluenceSpaceMarkov(
     beta=2.0,
-    alpha=3.0
+    alpha=3.0,
+    gamma=2.0
 )
 
 
@@ -471,9 +549,8 @@ model.fit(
 
 
 # =====================================================
-# CHAT
+# CHAT LOOP
 # =====================================================
-
 
 while True:
 
@@ -486,7 +563,19 @@ while True:
         continue
 
 
-    seed=prompt.split()[-1]
+    if prompt.lower() in [
+        "exit",
+        "quit"
+    ]:
+        break
+
+
+
+    # prompt becomes its own transformed state
+
+    seed=prompt_endofunction(
+        prompt
+    )
 
 
     score,result=model.intersection_generate(
@@ -501,6 +590,8 @@ while True:
     print(
         " ".join(result)
     )
+
+    print()
 
     print(
         "-"*80
