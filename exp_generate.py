@@ -81,7 +81,7 @@ class InfluenceSpaceMarkov:
 
         return [
             (self.vocab[j], row[j])
-            for j in ranking[:10]
+            for j in ranking
             if row[j] > 0
         ]
 
@@ -118,8 +118,6 @@ with open("singlekb.txt","r",encoding="utf8") as f:
 model = InfluenceSpaceMarkov(beta=2.0)
 
 model.fit(corpus)
-
-print(model.influence("machine"))
 
 print(model.generate(
     start=input("seed word: "),
