@@ -1,116 +1,202 @@
-import os
+import numpy as np
 import re
-import torch
 
-from torch.utils.data import Dataset
-
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments
-)
-
-
-# ==========================================================
-# INFLUENCE SPACE MARKOV
-# ==========================================================
 
 class InfluenceSpaceMarkov:
 
     def __init__(
         self,
         beta=2.0,
-        alpha=3.0,
-        gamma=2.0
+        alpha=3.0
     ):
         self.beta = beta
         self.alpha = alpha
-        self.gamma = gamma
 
 
     def fit(self, text):
 
-        words = re.findall(
-            r"\b\w+\b",
-            text.lower()
+        # ---------------------
+        # SENTENCE SPLIT
+        # ---------------------
+
+        sentences = re.split(
+            r'(?<=[.!?])\s+',
+            text.strip()
         )
+
+        sentence_words = [
+            s.lower().split()
+            for s in sentences
+            if s.strip()
+        ]
+
+        self.sentences = sentence_words
+
+
+        words = [
+            w
+            for s in sentence_words
+            for w in s
+        ]
+
 
         self.vocab = sorted(
             set(words)
         )
+
 
         self.word_to_idx = {
             w:i
             for i,w in enumerate(self.vocab)
         }
 
-        size = len(self.vocab)
 
-        counts = torch.zeros(
-            (size,size),
-            dtype=torch.float32
+        n=len(self.vocab)
+
+
+
+        # ---------------------
+        # MARKOV MATRIX
+        # ---------------------
+
+        counts=np.zeros(
+            (n,n)
         )
 
 
-        for a,b in zip(
-            words[:-1],
-            words[1:]
-        ):
+        for sent in sentence_words:
 
-            i = self.word_to_idx[a]
-            j = self.word_to_idx[b]
+            for a,b in zip(
+                sent[:-1],
+                sent[1:]
+            ):
 
-            counts[i,j] += 1
+                i=self.word_to_idx[a]
+                j=self.word_to_idx[b]
 
-
-
-        L = torch.log1p(counts)
+                counts[i,j]+=1
 
 
-        Y = torch.exp(
-            self.beta * L
-            +
-            torch.sin(
-                self.gamma * L
-            )
+        self.counts=counts
+
+
+
+        # ---------------------
+        # INFLUENCE FIELD
+        # ---------------------
+
+        Y=np.exp(
+            self.beta *
+            np.log1p(counts)
         )
 
 
-        Y[counts == 0] = 0
+        Y[counts==0]=0
+
+        self.Y=Y
 
 
-        maximum = max(
-            Y.max().item(),
+
+        ymax=max(
+            Y.max(),
             1
         )
 
 
-        Y /= maximum
-
-
-        Z = torch.exp(
-            self.alpha * Y
-            +
-            torch.sin(
-                self.gamma * Y
-            )
+        Z=np.exp(
+            self.alpha *
+            (Y/ymax)
         )
 
 
-        Z[Y == 0] = 0
+        Z[Y==0]=0
+
+        self.Z=Z
 
 
-        row_sum = Z.sum(
-            dim=1,
-            keepdim=True
+
+        sums=Z.sum(
+            axis=1,
+            keepdims=True
         )
 
 
-        self.P = torch.where(
-            row_sum != 0,
-            Z / row_sum,
-            torch.zeros_like(Z)
+        self.P=np.divide(
+            Z,
+            sums,
+            out=np.zeros_like(Z),
+            where=sums!=0
+        )
+
+
+
+        # ---------------------
+        # CLASSICAL CO-OCCURRENCE
+        # ---------------------
+
+        window=4
+
+        cooc=np.zeros(
+            (n,n)
+        )
+
+
+        for sent in sentence_words:
+
+            for i,w in enumerate(sent):
+
+                wi=self.word_to_idx[w]
+
+                left=max(
+                    0,
+                    i-window
+                )
+
+                right=min(
+                    len(sent),
+                    i+window+1
+                )
+
+
+                for j in range(left,right):
+
+                    if i==j:
+                        continue
+
+                    wj=self.word_to_idx[
+                        sent[j]
+                    ]
+
+                    cooc[wi,wj]+=1
+
+
+
+        self.cooc=cooc
+
+
+
+        # ---------------------
+        # COSINE SPACE
+        # ---------------------
+
+        norms=np.linalg.norm(
+            cooc,
+            axis=1,
+            keepdims=True
+        )
+
+
+        norms[norms==0]=1
+
+
+        E=cooc/norms
+
+
+        self.embedding=E
+
+
+        self.cosine=(
+            E @ E.T
         )
 
 
@@ -118,408 +204,304 @@ class InfluenceSpaceMarkov:
 
 
 
-    def transform(self,text):
+    # =================================================
+    # SPACE A
+    # INFLUENCE GENERATOR
+    # =================================================
 
-        words = re.findall(
-            r"\b\w+\b",
-            text.lower()
-        )
+    def influence_generate(
+        self,
+        start,
+        length=50
+    ):
 
-
-        result=[]
-
-
-        for word in words:
-
-            if word not in self.word_to_idx:
-                continue
+        start=start.lower()
 
 
-            idx = self.word_to_idx[word]
+        if start not in self.word_to_idx:
 
-            weights = self.P[idx]
+            start=np.random.choice(
+                self.vocab
+            )
 
 
-            if weights.sum() == 0:
+        current=start
 
-                result.append(word)
+        result=[
+            current
+        ]
 
-            else:
 
-                next_word_id = torch.argmax(
-                    weights
-                ).item()
+        for _ in range(length):
 
-                result.append(
-                    self.vocab[next_word_id]
+            i=self.word_to_idx[current]
+
+            p=self.P[i]
+
+
+            if p.sum()==0:
+                break
+
+
+            current=np.random.choice(
+                self.vocab,
+                p=p
+            )
+
+
+            result.append(
+                current
+            )
+
+
+        return result
+
+
+
+    # =================================================
+    # SPACE B
+    # COSINE WALK
+    # =================================================
+
+    def semantic_generate(
+        self,
+        start,
+        length=50
+    ):
+
+        start=start.lower()
+
+
+        if start not in self.word_to_idx:
+
+            start=np.random.choice(
+                self.vocab
+            )
+
+
+        current=start
+
+        result=[
+            current
+        ]
+
+
+        for _ in range(length):
+
+            i=self.word_to_idx[current]
+
+
+            sim=self.cosine[i].copy()
+
+
+            sim[i]=0
+
+
+            sim=np.maximum(
+                sim,
+                0
+            )
+
+
+            if sim.sum()==0:
+                break
+
+
+            sim/=sim.sum()
+
+
+            current=np.random.choice(
+                self.vocab,
+                p=sim
+            )
+
+
+            result.append(
+                current
+            )
+
+
+        return result
+
+
+
+    # =================================================
+    # VECTOR REPRESENTATION
+    # =================================================
+
+    def sentence_vector(
+        self,
+        words
+    ):
+
+        vectors=[]
+
+
+        for w in words:
+
+            if w in self.word_to_idx:
+
+                i=self.word_to_idx[w]
+
+                vectors.append(
+                    self.embedding[i]
                 )
 
 
-        return " ".join(result)
+        if not vectors:
 
-
-
-# ==========================================================
-# PYTORCH DATASET
-# ==========================================================
-
-class TextDataset(Dataset):
-
-    def __init__(
-        self,
-        texts,
-        tokenizer
-    ):
-
-        self.data = tokenizer(
-            texts,
-            truncation=True,
-            padding="max_length",
-            max_length=256
-        )
-
-
-    def __len__(self):
-
-        return len(
-            self.data["input_ids"]
-        )
-
-
-    def __getitem__(
-        self,
-        index
-    ):
-
-        item = {
-
-            key:
-            torch.tensor(
-                value[index]
+            return np.zeros(
+                len(self.vocab)
             )
 
-            for key,value
-            in self.data.items()
 
-        }
-
-
-        item["labels"] = (
-            item["input_ids"].clone()
+        return np.mean(
+            vectors,
+            axis=0
         )
 
 
-        return item
 
-
-
-# ==========================================================
-# BUILD INFLUENCE DATASET
-# ==========================================================
-
-def build_dataset(
-    filename,
-    chunk_size=256
-):
-
-    print(
-        "Loading dataset..."
-    )
-
-
-    with open(
-        filename,
-        "r",
-        encoding="utf-8"
-    ) as f:
-
-        text=f.read()
-
-
-
-    print(
-        "Building influence matrix..."
-    )
-
-
-    influence = InfluenceSpaceMarkov()
-
-    influence.fit(
-        text
-    )
-
-
-    words=text.split()
-
-
-    chunks=[]
-
-
-    for i in range(
-        0,
-        len(words),
-        chunk_size
+    def cosine_similarity(
+        self,
+        a,
+        b
     ):
 
-        chunk=" ".join(
-            words[
-                i:i+chunk_size
-            ]
+        denom=(
+            np.linalg.norm(a)
+            *
+            np.linalg.norm(b)
         )
 
 
-        changed=influence.transform(
-            chunk
+        if denom==0:
+            return 0
+
+
+        return np.dot(a,b)/denom
+
+
+
+    # =================================================
+    # INTERSECTION SELECTOR
+    # =================================================
+
+    def intersection_generate(
+        self,
+        start,
+        candidates=50,
+        length=50
+    ):
+
+
+        # semantic target
+
+        semantic_path=self.semantic_generate(
+            start,
+            length
         )
 
 
-        chunks.append(
-            changed
+        semantic_vector=self.sentence_vector(
+            semantic_path
         )
 
 
-    print(
-        "Samples:",
-        len(chunks)
-    )
+        best=None
 
 
-    return chunks
+        for _ in range(candidates):
 
 
-
-# ==========================================================
-# TRAIN MODEL
-# ==========================================================
-
-def train():
-
-    model_name = (
-        "HuggingFaceTB/"
-        "SmolLM2-135M-Instruct"
-    )
+            candidate=self.influence_generate(
+                start,
+                length
+            )
 
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_name
-    )
+            candidate_vector=self.sentence_vector(
+                candidate
+            )
 
 
-    if tokenizer.pad_token is None:
-
-        tokenizer.pad_token = (
-            tokenizer.eos_token
-        )
-
+            score=self.cosine_similarity(
+                candidate_vector,
+                semantic_vector
+            )
 
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name
-    )
+            if best is None or score>best[0]:
+
+                best=(
+                    score,
+                    candidate
+                )
+
+
+        return best
 
 
 
-    texts = build_dataset(
-        "singlekb.txt"
-    )
+# =====================================================
+# LOAD CORPUS
+# =====================================================
 
 
-    dataset = TextDataset(
-        texts,
-        tokenizer
-    )
+with open(
+    "singlekb.txt",
+    "r",
+    encoding="utf8"
+) as f:
 
-
-
-    print(
-        "Dataset size:",
-        len(dataset)
-    )
+    corpus=f.read()
 
 
 
-    args = TrainingArguments(
+model=InfluenceSpaceMarkov(
+    beta=2.0,
+    alpha=3.0
+)
 
-    output_dir="./influenced_model",
 
-    num_train_epochs=3,
-
-    per_device_train_batch_size=1,
-
-    gradient_accumulation_steps=4,
-
-    learning_rate=2e-5,
-
-    logging_steps=1,
-
-    save_strategy="epoch",
-
-    save_total_limit=2,
-
-    report_to=[]
-
+model.fit(
+    corpus
 )
 
 
 
-    trainer = Trainer(
-
-        model=model,
-
-        args=args,
-
-        train_dataset=dataset
-
-    )
-
-
-    print(
-        "TRAINING..."
-    )
-
-
-    trainer.train()
-
-
-
-    print(
-        "SAVING MODEL..."
-    )
-
-
-    trainer.save_model(
-        "./influenced_model"
-    )
-
-
-    tokenizer.save_pretrained(
-        "./influenced_model"
-    )
-
-
-    print(
-        "DONE"
-    )
-
-
-
-# ==========================================================
+# =====================================================
 # CHAT
-# ==========================================================
-
-def chat():
-
-    path="./influenced_model"
+# =====================================================
 
 
-    if not os.path.exists(path):
+while True:
 
-        print(
-            "Train the model first."
-        )
-
-        return
+    prompt=input(
+        "USER: "
+    ).strip()
 
 
+    if not prompt:
+        continue
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        path
+
+    seed=prompt.split()[-1]
+
+
+    score,result=model.intersection_generate(
+        seed,
+        candidates=30,
+        length=60
     )
 
 
-    model = AutoModelForCausalLM.from_pretrained(
-        path
-    )
-
-
-    model.eval()
-
-
-
-    while True:
-
-
-        prompt=input(
-            "USER: "
-        )
-
-
-        if prompt.lower() in [
-            "exit",
-            "quit"
-        ]:
-
-            break
-
-
-
-        inputs=tokenizer(
-            prompt,
-            return_tensors="pt"
-        )
-
-
-
-        with torch.no_grad():
-
-            output=model.generate(
-
-                **inputs,
-
-                max_new_tokens=650,
-
-                temperature=0.8,
-
-                top_p=0.95,
-
-                do_sample=True,
-
-                pad_token_id=
-                tokenizer.eos_token_id
-
-            )
-
-
-
-        print()
-
-        print(
-            tokenizer.decode(
-                output[0],
-                skip_special_tokens=True
-            )
-        )
-
-        print("-"*80)
-
-
-
-# ==========================================================
-# MAIN
-# ==========================================================
-
-if __name__=="__main__":
-
+    print()
 
     print(
-        "1 = Train"
+        " ".join(result)
     )
 
     print(
-        "2 = Chat"
+        "-"*80
     )
-
-
-    choice=input(
-        "> "
-    )
-
-
-    if choice=="1":
-
-        train()
-
-
-    elif choice=="2":
-
-        chat()
