@@ -99,17 +99,70 @@ class InfluenceSpaceMarkov:
             p=probs
         )
 
-    def generate(self, start, length=50):
+    def generate(self, start, checkpoints=None, chunk_size=20, length=1000, goal_strength=2.0):
 
         text = [start]
-
         current = start
 
-        for _ in range(length):
+        if checkpoints is None:
+            checkpoints = np.random.choice(self.vocab, size=50)
 
-            current = self.next_word(current)
+        checkpoint_index = 0
+        target = checkpoints[checkpoint_index]
+
+        for step in range(length):
+
+            # change checkpoint every chunk
+            if step % chunk_size == 0:
+                target = checkpoints[checkpoint_index % len(checkpoints)]
+                checkpoint_index += 1
+
+
+            i = self.word_to_idx[current]
+
+            probs = self.P[i].copy()
+
+
+            # -----------------------------
+            # TARGET INFLUENCE FIELD
+            # -----------------------------
+
+            if target in self.word_to_idx:
+
+                target_idx = self.word_to_idx[target]
+
+                influence_to_target = self.Y[:, target_idx]
+
+
+                # combine Markov probability
+                # with attraction toward checkpoint
+
+                attraction = influence_to_target ** goal_strength
+
+
+                probs = probs * (attraction + 1e-9)
+
+
+            # fallback
+            if probs.sum() == 0:
+                current = np.random.choice(self.vocab)
+
+            else:
+                probs /= probs.sum()
+
+                current = np.random.choice(
+                    self.vocab,
+                    p=probs
+                )
+
 
             text.append(current)
+
+
+            # reached checkpoint
+            if current == target:
+                checkpoint_index += 1
+
 
         return " ".join(text)
 with open("singlekb.txt","r",encoding="utf8") as f:
@@ -118,8 +171,21 @@ with open("singlekb.txt","r",encoding="utf8") as f:
 model = InfluenceSpaceMarkov(beta=2.0)
 
 model.fit(corpus)
+checkpoints = [
+    "quantum",
+    "network",
+    "language",
+    "mind",
+    "system"
+]
 
-print(model.generate(
-    start=input("seed word: "),
-    length=1000
-))
+prompt = input("USER: ")
+print(
+    model.generate(
+        start=prompt.split()[-1],
+        checkpoints=checkpoints,
+        chunk_size=630,
+        length=1000,
+        goal_strength=30.0
+    )
+)
