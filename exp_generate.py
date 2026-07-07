@@ -178,14 +178,14 @@ checkpoints = [
     "mind",
     "system"
 ]
-
-prompt = input("USER: ")
-print(
-    model.generate(
-        start=prompt.split()[-1],
-        checkpoints=checkpoints,
-        chunk_size=630,
-        length=1000,
-        goal_strength=30.0
+while True:
+    prompt = input("USER: ")
+    print(
+        model.generate(
+            start=prompt.split()[-1],
+            checkpoints=checkpoints,
+            chunk_size=630,
+            length=1000,
+            goal_strength=30.0
+        )
     )
-)
