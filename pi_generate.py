@@ -67,7 +67,7 @@ from collections import Counter
 import numpy as np
 from scipy.linalg import expm
 
-KB_LEN = 99999
+KB_LEN = -1
 # ---------------------------------------------------------------------
 # 1. Domain Construction: build A x B (state pairs) as an m x m matrix
 # ---------------------------------------------------------------------
