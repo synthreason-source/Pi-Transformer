@@ -65,7 +65,7 @@ class InfluenceSpaceMarkov:
         self.P = np.divide(
             influence,
             row_sums,
-            out=np.zeros_like(influence),
+            out=np.ones_like(influence),
             where=row_sums != 0
         )
 
