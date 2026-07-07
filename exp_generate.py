@@ -581,7 +581,7 @@ while True:
     score,result=model.intersection_generate(
         seed,
         candidates=30,
-        length=60
+        length=600
     )
 
 
