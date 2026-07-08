@@ -2,6 +2,15 @@ import numpy as np
 import re
 
 
+def exp_sin(x, scale, freq):
+    """
+    Winning curve family from the stacking-curve selection charts.
+    Assumed form: exp(scale * x) * (1 + sin(freq * x))
+    Applied element-wise to whatever matrix x is.
+    """
+    return np.exp(scale * x) * (1 + np.cos(freq * x))
+
+
 class InfluenceSpaceMarkov:
 
     def __init__(
@@ -84,12 +93,12 @@ class InfluenceSpaceMarkov:
         # ---------------------
         # INFLUENCE FIELD
         # ---------------------
+        # Stage 1 winner: exp_sin, scale=4.0, freq=0.5
+        # x = log1p(counts)   (matches stage_1_L_to_Y chart domain 0 -> ~3.6)
 
-        Y=np.exp(
-            self.beta *
-            np.log1p(counts)
-        )
+        x1 = np.log1p(counts)
 
+        Y = exp_sin(x1, scale=4.0, freq=0.5)
 
         Y[counts==0]=0
 
@@ -103,11 +112,13 @@ class InfluenceSpaceMarkov:
         )
 
 
-        Z=np.exp(
-            self.alpha *
-            (Y/ymax)
-        )
+        # ---------------------
+        # Stage 2 winner: exp_sin, scale=4.0, freq=2.0
+        # x = Y / ymax   (matches stage_2_Y_to_Z chart domain 0 -> 1.0)
 
+        x2 = Y / ymax
+
+        Z = exp_sin(x2, scale=4.0, freq=2.0)
 
         Z[Y==0]=0
 
