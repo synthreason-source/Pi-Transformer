@@ -25,6 +25,20 @@ class InfluenceSpaceMarkov:
         self.sine_freq = sine_freq
         self.sine_phase = sine_phase
 
+        self.cognitive_tokens = [
+            "attention","memory","reasoning","perception","judgment",
+            "inference","belief","concept","awareness","focus",
+            "thought","learning","knowledge","understanding","recognition",
+            "association","analysis","synthesis","reflection","intuition",
+            "evaluation","comparison","abstraction","imagination","prediction",
+            "planning","decision","interpretation","categorization","comprehension",
+            "curiosity","insight","observation","recall","anticipation",
+            "deliberation","representation","generalization","adaptation","problem",
+            "solution","strategy","expectation","context","meaning",
+            "intent","logic","pattern","model","conclusion"
+        ]
+
+
     def _tokenize(self, text):
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         sentence_words = [[w.lower() for w in s.split() if w.strip()] for s in sentences if s.strip()]
@@ -172,10 +186,21 @@ class InfluenceSpaceMarkov:
                 best = (score, candidate)
         return best
 
+
+    def intersperse_cognitive_tokens(self, words):
+        result = []
+        for i, word in enumerate(words):
+            result.append(word)
+            if i < len(words) - 1 and i % hash(word) % len(self.cognitive_tokens) == i//len(result):
+                token_idx = hash(word) % len(self.cognitive_tokens)
+                result.append(self.cognitive_tokens[token_idx])
+        return result
+
     def generate_from_prompt(self, prompt, candidates=30, length=60):
         bias, nodes = self._prompt_bias(prompt)
         seed = prompt.split()[-1].lower() if prompt.split() else np.random.choice(self.vocab)
         score, result = self.intersection_generate(seed, candidates=candidates, length=length, prompt_bias=bias)
+        result = self.intersperse_cognitive_tokens(result)
         return score, result, nodes, bias
 
 
