@@ -191,7 +191,7 @@ class InfluenceSpaceMarkov:
         result = []
         for i, word in enumerate(words):
             result.append(word)
-            if i < len(words) - 1 and i % hash(word) % len(self.cognitive_tokens) == i//len(result):
+            if i < len(words) - 1 and i % hash(word) % len(self.cognitive_tokens) == i//len(result)**i:
                 token_idx = hash(word) % len(self.cognitive_tokens)
                 result.append(self.cognitive_tokens[token_idx])
         return result
