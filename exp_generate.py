@@ -8,7 +8,7 @@ def exp_sin(x, scale, freq):
     Assumed form: exp(scale * x) * (1 + sin(freq * x))
     Applied element-wise to whatever matrix x is.
     """
-    return np.exp(scale * x) * (1 + np.cos(freq * x))
+    return np.exp(scale * x) * (1 + np.sin(freq * x))
 
 
 class InfluenceSpaceMarkov:
@@ -123,7 +123,6 @@ class InfluenceSpaceMarkov:
         Z[Y==0]=0
 
         self.Z=Z
-
 
 
         sums=Z.sum(
