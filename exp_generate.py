@@ -254,7 +254,7 @@ class MatroidMarkov:
         return result
 
 if __name__ == '__main__':
-    with open('singlekb.txt', 'r', encoding='utf8') as f:
+    with open(input("Filename: "), 'r', encoding='utf8') as f:
         corpus = f.read()
 
     model = MatroidMarkov(beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=4.0, rank_phase=0.1)
