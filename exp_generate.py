@@ -202,7 +202,7 @@ def main():
             stoi,
             itos,
             prime=input("USER: "),
-            length=100,
+            length=600,
             temperature=0.9,
             device="cuda" if torch.cuda.is_available() else "cpu",
         )
