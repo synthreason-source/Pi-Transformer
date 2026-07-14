@@ -151,43 +151,122 @@ def generate_text(model, stoi, itos, prime="the", length=80, temperature=1.0, de
     return " ".join(text)
 
 
+# ---------------------------------------------------------------------------
+# Checkpoint save / load
+# ---------------------------------------------------------------------------
+
+def save_checkpoint(path, model, vocab, config):
+    """
+    Saves everything needed to fully restore the model later:
+    - model weights (state_dict)
+    - vocab (so stoi/itos can be rebuilt identically)
+    - config (constructor args needed to rebuild the architecture)
+    """
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(
+        {
+            "model_state": model.state_dict(),
+            "vocab": vocab,
+            "config": config,
+        },
+        path,
+    )
+    print(f"[checkpoint] saved to {path}")
+
+
+def load_checkpoint(path, device="cpu"):
+    """
+    Rebuilds the model, vocab, stoi, and itos from a checkpoint file.
+    Returns (model, vocab, stoi, itos, config).
+    """
+    ckpt = torch.load(path, map_location=device)
+    vocab = ckpt["vocab"]
+    config = ckpt["config"]
+
+    stoi = {w: i for i, w in enumerate(vocab)}
+    itos = {i: w for w, i in stoi.items()}
+
+    model = CurvePriorNet(
+        vocab_size=len(vocab),
+        emb_dim=config.get("emb_dim", 64),
+        hidden=config.get("hidden", 128),
+        layers=config.get("layers", 2),
+    )
+    model.load_state_dict(ckpt["model_state"])
+    model.to(device)
+    model.eval()
+
+    print(f"[checkpoint] loaded from {path}")
+    return model, vocab, stoi, itos, config
+
+
 def main():
     os.makedirs("output", exist_ok=True)
 
-    with open(input('Filename: '), 'r', encoding='utf8') as f:
-        text = f.read()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    default_ckpt_path = "output/model.pt"
 
-    tokens = tokenize(text)
-    vocab, stoi, itos = build_vocab(tokens, min_freq=1)
-    ids = encode(["<bos>"] + tokens + ["<eos>"], stoi)
+    ckpt_path = input(f"Checkpoint path to load (blank to skip, default '{default_ckpt_path}'): ").strip()
+    if ckpt_path == "":
+        ckpt_path = default_ckpt_path
 
-    seq_len = 32
-    x, y = make_dataset(ids, seq_len=seq_len)
+    model = None
+    vocab = stoi = itos = None
+    config = None
 
-    curve_prior = load_curve_prior(None, top_k=min(50, len(vocab)))
+    if os.path.exists(ckpt_path):
+        load_choice = input(f"Found checkpoint at '{ckpt_path}'. Load it? [Y/n]: ").strip().lower()
+        if load_choice in ("", "y", "yes"):
+            model, vocab, stoi, itos, config = load_checkpoint(ckpt_path, device=device)
 
-    model = CurvePriorNet(vocab_size=len(vocab), emb_dim=64, hidden=128, layers=2)
-    model = train_model(
-        model,
-        x,
-        y,
-        curve_prior=curve_prior,
-        curve_weight=0.05,
-        epochs=20,
-        batch_size=64,
-        lr=3e-4,
-        device="cuda" if torch.cuda.is_available() else "cpu",
-    )
+    if model is None:
+        with open(input('Filename: '), 'r', encoding='utf8') as f:
+            text = f.read()
+
+        tokens = tokenize(text)
+        vocab, stoi, itos = build_vocab(tokens, min_freq=1)
+        ids = encode(["<bos>"] + tokens + ["<eos>"], stoi)
+
+        seq_len = 32
+        x, y = make_dataset(ids, seq_len=seq_len)
+
+        curve_prior = load_curve_prior(None, top_k=min(50, len(vocab)))
+
+        config = {"emb_dim": 64, "hidden": 128, "layers": 2, "seq_len": seq_len}
+        model = CurvePriorNet(vocab_size=len(vocab), emb_dim=config["emb_dim"],
+                               hidden=config["hidden"], layers=config["layers"])
+        model = train_model(
+            model,
+            x,
+            y,
+            curve_prior=curve_prior,
+            curve_weight=0.05,
+            epochs=20,
+            batch_size=64,
+            lr=3e-4,
+            device=device,
+        )
+
+        save_path = input(f"Save trained model to [{ckpt_path}]: ").strip() or ckpt_path
+        save_checkpoint(save_path, model, vocab, config)
 
     while True:
+        prompt = input("USER: ")
+        if prompt.strip().lower() in ("/quit", "/exit"):
+            break
+        if prompt.strip().lower() == "/save":
+            save_path = input(f"Save model to [{ckpt_path}]: ").strip() or ckpt_path
+            save_checkpoint(save_path, model, vocab, config)
+            continue
+
         sample = generate_text(
             model,
             stoi,
             itos,
-            prime=input("USER: "),
+            prime=prompt,
             length=600,
             temperature=0.9,
-            device="cuda" if torch.cuda.is_available() else "cpu",
+            device=device,
         )
         with open("output/sample.txt", "w", encoding="utf-8") as f:
             f.write(sample)
