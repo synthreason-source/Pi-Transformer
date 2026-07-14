@@ -1,27 +1,25 @@
 import numpy as np
 import re
 
+
 def rank_transform(x, scale, freq):
-    """Same shape as the original exp_sin: exponential-sine weighting,
-    now framed as a rank-inflation transform over a ground set."""
     return np.exp(scale * x) * (1 + np.sin(freq * x))
+
 
 def apply_density_volatility(p, beta=2.0, eps=1e-8, vol_clip=10.0):
     p = np.asarray(p, dtype=float)
     p = np.clip(p, eps, 1.0 - eps)
-
     density = p * (1.0 - p)
     volatility = np.abs(np.tan(1.0 - p))
     volatility = np.clip(volatility, 0.0, vol_clip)
-
     p = p * (1.0 + beta * density) * (1.0 + volatility)
     s = p.sum()
     if s <= 0 or not np.isfinite(s):
         return None
     return p / s
 
+
 class GroundElement:
-    """One element of the ground set E (a word occurrence in the prompt)."""
     def __init__(self, text, index):
         self.text = text
         self.index = index
@@ -30,27 +28,23 @@ class GroundElement:
         self.weight = 0.0
         self.phase = 0.0
         self.rank_contribution = 0.0
+        self.reduced = False
+
 
 class MatroidMarkov:
-    """
-    Reframing of InfluenceSpaceMarkov in matroid-theory vocabulary:
-
-    - ground set E : the corpus vocabulary
-    - independent sets I : subsets of transitions kept during generation
-    - rank function r(S) : exponential-sine weighted transition strength
-    - bases B : the best-scoring generated sequences
-
-    Note: this is a *relabeling* of the same computation, not a literal
-    matroid (no independence axioms are checked). The math is identical
-    to the original file.
-    """
-
-    def __init__(self, beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=1.0, rank_phase=0.0):
+    def __init__(self, beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=1.0, rank_phase=0.0,
+                 use_hyponym_reduction=False, hyponym_levels=1, wordnet_penalty=0.5):
         self.beta = beta
         self.alpha = alpha
         self.rank_amplitude = rank_amplitude
         self.rank_freq = rank_freq
         self.rank_phase = rank_phase
+        self.use_hyponym_reduction = use_hyponym_reduction
+        self.hyponym_levels = hyponym_levels
+        self.wordnet_penalty = wordnet_penalty
+        self._hyponym_cache = {}
+        self._wordnet_ready = False
+        self.reduced_vocab = set()
 
         self.cognitive_tokens = [
             "attention", "memory", "reasoning", "perception", "judgment",
@@ -65,14 +59,58 @@ class MatroidMarkov:
             "intent", "logic", "pattern", "model", "conclusion"
         ]
 
+    def _ensure_wordnet(self):
+        if self._wordnet_ready:
+            return
+        import nltk
+        try:
+            from nltk.corpus import wordnet as wn
+            wn.synsets("test")
+        except LookupError:
+            nltk.download("wordnet", quiet=True)
+            nltk.download("omw-1.4", quiet=True)
+        self._wordnet_ready = True
+
+    def _hyponym_reduce_word(self, word):
+        if word in self._hyponym_cache:
+            return self._hyponym_cache[word]
+        from nltk.corpus import wordnet as wn
+        reduced = word
+        synsets = wn.synsets(word)
+        if synsets:
+            synset = synsets[0]
+            for _ in range(self.hyponym_levels):
+                hypernyms = synset.hypernyms()
+                if not hypernyms:
+                    break
+                synset = hypernyms[0]
+            lemma_name = synset.lemmas()[0].name().replace("_", " ")
+            reduced = lemma_name.lower()
+        self._hyponym_cache[word] = reduced
+        return reduced
+
+    def hyponym_reduce_tokens(self, tokens):
+        self._ensure_wordnet()
+        reduced = []
+        for w in tokens:
+            rw = self._hyponym_reduce_word(w)
+            reduced.append(rw)
+            if rw != w:
+                self.reduced_vocab.add(rw)
+        return reduced
+
     def _tokenize(self, text):
         sentences = re.split(r'(?<=[.!?])\s+', text.strip())
         sentence_words = [[w.lower() for w in s.split() if w.strip()] for s in sentences if s.strip()]
+        if self.use_hyponym_reduction:
+            sentence_words = [self.hyponym_reduce_tokens(s) for s in sentence_words]
         words = [w for s in sentence_words for w in s]
         return sentence_words, words
 
     def _build_ground_set(self, prompt):
         toks = [w.lower() for w in prompt.split() if w.strip()]
+        if self.use_hyponym_reduction:
+            toks = self.hyponym_reduce_tokens(toks)
         elements = [GroundElement(w, i) for i, w in enumerate(toks)]
         for i in range(len(elements) - 1):
             elements[i].next = elements[i + 1]
@@ -83,9 +121,7 @@ class MatroidMarkov:
             for i, el in enumerate(elements):
                 el.phase = i / denom
                 el.weight = 1.0
-                el.rank_contribution = el.weight * self.rank_amplitude * np.sin(
-                    2 * np.pi * self.rank_freq * el.phase + self.rank_phase
-                )
+                el.rank_contribution = el.weight * self.rank_amplitude * np.sin(2 * np.pi * self.rank_freq * el.phase + self.rank_phase)
         return elements
 
     def _independence_bias(self, prompt):
@@ -96,6 +132,7 @@ class MatroidMarkov:
         return bias, elements
 
     def fit(self, text):
+        self.reduced_vocab = set()
         sentence_words, words = self._tokenize(text)
         self.sentences = sentence_words
         self.vocab = sorted(set(words))
@@ -143,9 +180,19 @@ class MatroidMarkov:
         self.cosine = E @ E.T
         return self
 
+    def _apply_wordnet_penalty(self, p):
+        if not self.use_hyponym_reduction or not self.reduced_vocab:
+            return p
+        p = np.asarray(p, dtype=float).copy()
+        for w in self.reduced_vocab:
+            if w in self.word_to_idx:
+                p[self.word_to_idx[w]] *= self.wordnet_penalty
+        s = p.sum()
+        if s <= 0 or not np.isfinite(s):
+            return None
+        return p / s
+
     def rank_walk(self, start, length=50, bias=None):
-        """Random walk over the transition distribution, biased toward
-        elements with higher aggregated rank contribution."""
         start = start.lower()
         if start not in self.word_to_idx:
             start = np.random.choice(self.vocab)
@@ -154,22 +201,21 @@ class MatroidMarkov:
         for _ in range(length):
             i = self.word_to_idx[current]
             p = self.P[i].copy()
-
             if bias:
                 for w, b in bias.items():
                     if w in self.word_to_idx:
                         p[self.word_to_idx[w]] = min(1.0, p[self.word_to_idx[w]] * (1.0 + b))
-
+            p = self._apply_wordnet_penalty(p)
+            if p is None:
+                break
             p = apply_density_volatility(p, beta=self.beta)
             if p is None:
                 break
-
             current = np.random.choice(self.vocab, p=p)
             result.append(current)
         return result
 
     def similarity_walk(self, start, length=50, bias=None):
-        """Random walk over cosine similarity in embedding space."""
         start = start.lower()
         if start not in self.word_to_idx:
             start = np.random.choice(self.vocab)
@@ -184,7 +230,8 @@ class MatroidMarkov:
                 for w, b in bias.items():
                     if w in self.word_to_idx:
                         sim[self.word_to_idx[w]] = max(0.0, sim[self.word_to_idx[w]] * (1.0 + b))
-            if sim.sum() == 0:
+            sim = self._apply_wordnet_penalty(sim)
+            if sim is None or sim.sum() == 0:
                 break
             sim /= sim.sum()
             current = np.random.choice(self.vocab, p=sim)
@@ -207,8 +254,6 @@ class MatroidMarkov:
         return float(np.dot(a, b) / denom)
 
     def basis_generate(self, start, candidates=50, length=50, bias=None):
-        """Generate several candidate walks and keep the one whose vector
-        is closest to the similarity-walk target."""
         target_path = self.similarity_walk(start, length, bias=bias)
         target_vector = self.sequence_vector(target_path)
         best = None
@@ -224,7 +269,6 @@ class MatroidMarkov:
         out = []
         prev_prob = 0.0
         rows, cols = matrix.shape
-
         for i, (prob, word) in enumerate(pairs):
             base = 0.5 * prev_prob + 0.5 * prob
             frags = []
@@ -233,21 +277,20 @@ class MatroidMarkov:
                 frag_prob = base * frac + prob * (1 - frac)
                 frag_word = f"{word}_{k}"
                 frags.append((frag_prob, frag_word))
-
             for k, (frag_prob, frag_word) in enumerate(frags):
                 r = (len(out) + k) % rows
                 c = (len(out) * frag_count + k) % cols
                 matrix[r, c] = frag_prob
                 out.append((frag_prob, frag_word))
-
             prev_prob = prob
-
         return out, matrix
 
     def generate_from_prompt(self, prompt, candidates=30, length=60, p=0.01, seed=None):
         rng = np.random.default_rng(seed)
         bias, elements = self._independence_bias(prompt)
         seed_word = prompt.split()[-1].lower() if prompt.split() else str(rng.choice(self.vocab))
+        if self.use_hyponym_reduction:
+            seed_word = self._hyponym_reduce_word(seed_word)
         score, result = self.basis_generate(seed_word, candidates=candidates, length=length, bias=bias)
         result = self.intersperse_cognitive_tokens(result, p=p, rng=rng)
         return score, result, elements, bias
@@ -263,11 +306,13 @@ class MatroidMarkov:
                 result.append(self.cognitive_tokens[token_idx])
         return result
 
+
 if __name__ == '__main__':
-    with open(input("Filename: "), 'r', encoding='utf8') as f:
+    with open(input('Filename: '), 'r', encoding='utf8') as f:
         corpus = f.read()
 
-    model = MatroidMarkov(beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=4.0, rank_phase=0.1)
+    model = MatroidMarkov(beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=4.0, rank_phase=0.1,
+                          use_hyponym_reduction=True, hyponym_levels=1, wordnet_penalty=0.35)
     model.fit(corpus)
 
     while True:
