@@ -6,6 +6,20 @@ def rank_transform(x, scale, freq):
     now framed as a rank-inflation transform over a ground set."""
     return np.exp(scale * x) * (1 + np.sin(freq * x))
 
+def apply_density_volatility(p, beta=2.0, eps=1e-8, vol_clip=10.0):
+    p = np.asarray(p, dtype=float)
+    p = np.clip(p, eps, 1.0 - eps)
+
+    density = p * (1.0 - p)
+    volatility = np.abs(np.tan(1.0 - p))
+    volatility = np.clip(volatility, 0.0, vol_clip)
+
+    p = p * (1.0 + beta * density) * (1.0 + volatility)
+    s = p.sum()
+    if s <= 0 or not np.isfinite(s):
+        return None
+    return p / s
+
 class GroundElement:
     """One element of the ground set E (a word occurrence in the prompt)."""
     def __init__(self, text, index):
@@ -58,9 +72,6 @@ class MatroidMarkov:
         return sentence_words, words
 
     def _build_ground_set(self, prompt):
-        """Build the ground set E from the prompt's tokens, as a doubly
-        linked chain, with each element's rank contribution computed from
-        its position (phase) in the sequence."""
         toks = [w.lower() for w in prompt.split() if w.strip()]
         elements = [GroundElement(w, i) for i, w in enumerate(toks)]
         for i in range(len(elements) - 1):
@@ -78,8 +89,6 @@ class MatroidMarkov:
         return elements
 
     def _independence_bias(self, prompt):
-        """Aggregate rank contributions per distinct word -> a bias dict
-        used to favor certain ground-set elements during generation."""
         elements = self._build_ground_set(prompt)
         bias = {}
         for el in elements:
@@ -96,9 +105,7 @@ class MatroidMarkov:
         incidence = np.zeros((n, n), dtype=float)
         for sent in sentence_words:
             for a, b in zip(sent[:-1], sent[1:]):
-                i = self.word_to_idx[a]
-                j = self.word_to_idx[b]
-                incidence[i, j] += 1
+                incidence[self.word_to_idx[a], self.word_to_idx[b]] += 1
         self.incidence = incidence
 
         x1 = np.log1p(incidence)
@@ -147,13 +154,16 @@ class MatroidMarkov:
         for _ in range(length):
             i = self.word_to_idx[current]
             p = self.P[i].copy()
+
             if bias:
                 for w, b in bias.items():
                     if w in self.word_to_idx:
                         p[self.word_to_idx[w]] = min(1.0, p[self.word_to_idx[w]] * (1.0 + b))
-            if p.sum() == 0:
+
+            p = apply_density_volatility(p, beta=self.beta)
+            if p is None:
                 break
-            p = p / p.sum()
+
             current = np.random.choice(self.vocab, p=p)
             result.append(current)
         return result
