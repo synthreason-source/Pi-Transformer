@@ -151,22 +151,6 @@ def generate_text(model, stoi, itos, prime="the", length=80, temperature=1.0, de
     return " ".join(text)
 
 
-def save_curve_png(probs, out_path="output/curve.png"):
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=np.arange(len(probs)), y=probs, mode="lines+markers", name="curve"))
-    fig.update_layout(
-        title="Probability curve prior",
-        xaxis_title="Rank",
-        yaxis_title="Probability",
-        template="plotly_white",
-        width=1000,
-        height=600,
-    )
-    fig.write_image(out_path)
-    return out_path
-
-
 def main():
     os.makedirs("output", exist_ok=True)
 
@@ -181,7 +165,6 @@ def main():
     x, y = make_dataset(ids, seq_len=seq_len)
 
     curve_prior = load_curve_prior(None, top_k=min(50, len(vocab)))
-    save_curve_png(curve_prior, "output/curve.png")
 
     model = CurvePriorNet(vocab_size=len(vocab), emb_dim=64, hidden=128, layers=2)
     model = train_model(
