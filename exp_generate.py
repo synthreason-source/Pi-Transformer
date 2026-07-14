@@ -265,27 +265,7 @@ class MatroidMarkov:
                 best = (score, candidate)
         return best
 
-    def spread_prob_word_pairs(self, pairs, matrix, frag_count=3):
-        out = []
-        prev_prob = 0.0
-        rows, cols = matrix.shape
-        for i, (prob, word) in enumerate(pairs):
-            base = 0.5 * prev_prob + 0.5 * prob
-            frags = []
-            for k in range(frag_count):
-                frac = (k + 1) / (frag_count + 1)
-                frag_prob = base * frac + prob * (1 - frac)
-                frag_word = f"{word}_{k}"
-                frags.append((frag_prob, frag_word))
-            for k, (frag_prob, frag_word) in enumerate(frags):
-                r = (len(out) + k) % rows
-                c = (len(out) * frag_count + k) % cols
-                matrix[r, c] = frag_prob
-                out.append((frag_prob, frag_word))
-            prev_prob = prob
-        return out, matrix
-
-    def generate_from_prompt(self, prompt, candidates=30, length=60, p=0.01, seed=None):
+    def generate_from_prompt(self, prompt, candidates=30, length=60, p=0.51, seed=None):
         rng = np.random.default_rng(seed)
         bias, elements = self._independence_bias(prompt)
         seed_word = prompt.split()[-1].lower() if prompt.split() else str(rng.choice(self.vocab))
@@ -295,7 +275,7 @@ class MatroidMarkov:
         result = self.intersperse_cognitive_tokens(result, p=p, rng=rng)
         return score, result, elements, bias
 
-    def intersperse_cognitive_tokens(self, words, p=0.01, rng=None):
+    def intersperse_cognitive_tokens(self, words, p=0.81, rng=None):
         if rng is None:
             rng = np.random.default_rng()
         result = []
