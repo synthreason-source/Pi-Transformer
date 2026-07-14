@@ -312,7 +312,7 @@ if __name__ == '__main__':
         corpus = f.read()
 
     model = MatroidMarkov(beta=2.0, alpha=3.0, rank_amplitude=1.0, rank_freq=4.0, rank_phase=0.1,
-                          use_hyponym_reduction=True, hyponym_levels=1, wordnet_penalty=0.35)
+                          use_hyponym_reduction=True, hyponym_levels=2, wordnet_penalty=1.55)
     model.fit(corpus)
 
     while True:
