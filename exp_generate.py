@@ -247,7 +247,7 @@ def main():
             device=device,
         )
 
-        save_path = input(f"Save trained model to [{ckpt_path}]: ").strip() or ckpt_path
+        save_path = input(f"Save trained model as: ").strip() or ckpt_path
         save_checkpoint(save_path, model, vocab, config)
 
     while True:
