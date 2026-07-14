@@ -7,8 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import Counter
-import plotly.graph_objects as go
-
 
 class CurvePriorNet(nn.Module):
     def __init__(self, vocab_size, emb_dim=64, hidden=128, layers=2):
