@@ -13,11 +13,7 @@ product of everyday predictions could be represented in such a way...
 4D time slice with an unresolved sum or hotswap on either end, a catch 22.
 
 Completely deterministic, set since the beginning of the document...
-somehow manifest in everyday life? a one sided proof?
-
-Usage:
-    python3 cube_world_hash_resolver.py "catch-22"
-    python3 cube_world_hash_resolver.py          # prompts interactively
+Somehow manifest in everyday life? a one sided proof?
 """
 
 import hashlib
