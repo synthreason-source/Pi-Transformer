@@ -139,27 +139,6 @@ def make_dataset(ids, seq_len=32, stride=1):
     y = torch.tensor(ys, dtype=torch.long)
     return x, y
 
-
-def show_sliding_windows(inter_stream, seq_len=32, stride=8, num_windows=5):
-    """
-    'Show and tell' visualization of how the sliding window moves
-    over the interleaved stream. Prints tokens with source labels.
-    """
-    print("\n=== Sliding window 'show and tell' ===")
-    n = len(inter_stream)
-    count = 0
-    for start in range(0, n - seq_len, stride):
-        if count >= num_windows:
-            break
-        window = inter_stream[start:start + seq_len]
-        line = " | ".join(f"{t} (S{src})" for t, src in window)
-        print(f"Window {count} [start={start}]:")
-        print(line)
-        print()
-        count += 1
-    print("=== End of show and tell ===\n")
-
-
 # ---------------------------------------------------------------------------
 # Curve prior
 # ---------------------------------------------------------------------------
@@ -370,9 +349,6 @@ def main():
 
         combined_ids = interleave_ids(ids1, ids2, block_len=block_len)
         inter_stream = build_source_stream(tokens1, tokens2, block_len=block_len)
-
-        # Visualize a few sliding windows over the interspersed stream
-        show_sliding_windows(inter_stream, seq_len=seq_len, stride=stride, num_windows=5)
 
         x, y = make_dataset(combined_ids, seq_len=seq_len, stride=stride)
 
