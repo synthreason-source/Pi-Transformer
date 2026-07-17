@@ -12,6 +12,8 @@ If indeed our 2d world is actually cube world then the transitive
 product of everyday predictions could be represented in such a way...
 4D time slice with an unresolved sum or hotswap on either end, a catch 22.
 
+completely deterministic, set since the beginning of the document...
+
 Usage:
     python3 cube_world_hash_resolver.py "catch-22"
     python3 cube_world_hash_resolver.py          # prompts interactively
