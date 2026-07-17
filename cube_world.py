@@ -76,4 +76,4 @@ if __name__ == "__main__":
         else:
             input_word = input("drop a word into the cube: ").strip() or "catch-22"
 
-    report(input_word)
+        report(input_word)
