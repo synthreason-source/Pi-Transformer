@@ -77,3 +77,4 @@ if __name__ == "__main__":
             input_word = input("drop a word into the cube: ").strip() or "catch-22"
 
         report(input_word)
+        print()
