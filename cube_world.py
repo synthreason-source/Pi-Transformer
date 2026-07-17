@@ -20,7 +20,7 @@ Usage:
 import hashlib
 import sys
 
-with open("singlekb.txt", "r", encoding="utf-8") as file:
+with open(input("Filename: "), "r", encoding="utf-8") as file:
     WORDS = file.read().split()
 
 
