@@ -85,7 +85,6 @@ def report(word: str):
     print(f"sha256: {hex_digest}\n")
 
     print(f"{'unresolved sum':20} {unresolved_sum}")
-    print(f"{'hotswap':20} {hotswap}")
     print(f"{'transitive product':20} {transitive_product}")
     print()
 
