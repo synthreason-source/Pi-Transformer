@@ -18,6 +18,7 @@ Somehow manifest in everyday life? a one sided proof?
 
 import hashlib
 import sys
+import itertools
 
 with open(input("Filename: "), "r", encoding="utf-8") as file:
     WORDS = file.read().split()
@@ -25,6 +26,28 @@ with open(input("Filename: "), "r", encoding="utf-8") as file:
 
 def sha256_hex(word: str) -> str:
     return hashlib.sha256(word.encode("utf-8")).hexdigest()
+
+
+def is_prime(n: int) -> bool:
+    if n < 2:
+        return False
+    if n in (2, 3):
+        return True
+    if n % 2 == 0:
+        return False
+    for d in range(3, int(n ** 0.5) + 1, 2):
+        if n % d == 0:
+            return False
+    return True
+
+
+def primes():
+    """Infinite generator of prime numbers: 2, 3, 5, 7, 11, ..."""
+    n = 1
+    while True:
+        if is_prime(n) or n == 1:
+            yield n
+        n += 1
 
 
 def resolve(word: str):
@@ -35,40 +58,50 @@ def resolve(word: str):
     slices = [hex_digest[i:i + 8] for i in range(0, 64, 8)]
 
     results = []
-    for s in slices:
-        n = int(s, 16)
-        idx = n % len(WORDS)
-        results.append((s, n, idx, WORDS[idx]))
-
+    # Outer loop: every prime F < 1000 (2, 3, 5, 7, ..., 997)
+    # Inner loop: all 8 byte-slices, re-resolved against that prime
+    for F in itertools.takewhile(lambda p: p < 1000, primes()):
+        for s in slices:
+            n = int(s, 16)
+            divisor = max(1, len(WORDS) // F)  # guard against len(WORDS) < F
+            idx = n % divisor
+            results.append((s, n, idx, WORDS[idx]))
+            break
     return hex_digest, results
 
 
 def report(word: str):
     hex_digest, results = resolve(word)
 
-    unresolved_sum = results[0][3]          # slice 0
-    hotswap = results[1][3]                 # slice 1
-    transitive_product = " · ".join(r[3] for r in results[2:6])  # slices 2-5
+    # Each prime F contributes a block of 8 rows (one per byte-slice).
+    block = 8
+    first_block = results[:block]
+
+    unresolved_sum = first_block[0][3]                     # slice 0, F=2
+    hotswap = first_block[1][3]                            # slice 1, F=2
+    transitive_product = " · ".join(r[3] for r in first_block[2:6])  # slices 2-5, F=2
 
     print(f"\nword:  {word}")
     print(f"sha256: {hex_digest}\n")
 
     print(f"{'unresolved sum':20} {unresolved_sum}")
+    print(f"{'hotswap':20} {hotswap}")
+    print(f"{'transitive product':20} {transitive_product}")
     print()
 
-    print(f"{'byte slice':10} {'index':>6}   word")
-    print("-" * 34)
-    i = 0
-    for s, n, idx, w in results:
-
-        if i == 3:
-            print(f"{s:10} {idx:>6}   {w}")
-        i += 1 
+    print(f"{'F':>6}   {'byte slice':10} {'index':>6}   word")
+    print("-" * 44)
+    for offset, F_prime in zip(range(0, len(results), block),
+                                itertools.takewhile(lambda p: p < 1000, primes())):
+        
+        if offset + 3 < len(results):
+            s, n, idx, w = results[offset + 3]  # the 4th slice (index 3) within this F-block
+            print(f"{F_prime:>6}   {s:10} {idx:>6}   {w}")
     print()
 
 
 if __name__ == "__main__":
-    
+
     while True:
         if len(sys.argv) > 1:
             input_word = " ".join(sys.argv[1:])
