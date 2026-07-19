@@ -251,7 +251,7 @@ def main():
     if model is None:
         filename = input("Filename: ").strip()
         with open(filename, "r", encoding="utf8") as f:
-            text = ' '.join(f.read().split()[:9999])
+            text = f.read()
 
         tokens = tokenize(text)
         vocab, stoi, itos = build_vocab(tokens, min_freq=1)
