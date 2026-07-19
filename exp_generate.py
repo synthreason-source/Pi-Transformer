@@ -1,7 +1,6 @@
 import os
 import math
 import re
-import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -77,7 +76,28 @@ def load_curve_prior(path=None, top_k=50):
     return probs
 
 
-def train_model(model, x, y, curve_prior=None, curve_weight=0.0, epochs=20, batch_size=64, lr=3e-4, device="cpu"):
+def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
+    bias = torch.zeros(vocab_size, device=device)
+    if len(prompt_ids) == 0:
+        return bias
+    counts = torch.bincount(torch.tensor(prompt_ids, device=device), minlength=vocab_size).float()
+    counts = counts / counts.sum().clamp_min(1.0)
+    bias = sensitivity * counts
+    return bias
+
+
+def train_model(
+    model,
+    x,
+    y,
+    curve_prior=None,
+    curve_weight=0.0,
+    sensitivity=1.0,
+    epochs=20,
+    batch_size=64,
+    lr=3e-4,
+    device="cpu"
+):
     model.to(device)
     x = x.to(device)
     y = y.to(device)
@@ -89,20 +109,25 @@ def train_model(model, x, y, curve_prior=None, curve_weight=0.0, epochs=20, batc
     for epoch in range(epochs):
         perm = torch.randperm(n, device=device)
         total = 0.0
+
         for s in range(steps):
             idx = perm[s * batch_size:(s + 1) * batch_size]
             xb = x[idx]
             yb = y[idx]
+
             logits, _ = model(xb)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), yb.reshape(-1))
 
             if curve_prior is not None and curve_weight > 0:
                 vocab_slice = min(logits.size(-1), len(curve_prior))
                 prior = torch.tensor(curve_prior[:vocab_slice], device=device)
-                prior = prior / prior.sum()
-                logp = F.log_softmax(logits[:, -1, :vocab_slice], dim=-1).mean(dim=0)
-                prior_loss = F.kl_div(logp, prior, reduction="batchmean")
-                loss = loss + curve_weight * prior_loss
+                prior = prior / prior.sum().clamp_min(1e-12)
+
+                last_logits = logits[:, -1, :vocab_slice]
+                pred = F.softmax(last_logits, dim=-1).mean(dim=0)
+                prior_loss = F.mse_loss(pred, prior)
+
+                loss = loss + curve_weight * sensitivity * prior_loss
 
             opt.zero_grad()
             loss.backward()
@@ -116,25 +141,43 @@ def train_model(model, x, y, curve_prior=None, curve_weight=0.0, epochs=20, batc
 
 
 @torch.no_grad()
-def generate_text(model, stoi, itos, prime="the", length=80, temperature=1.0, device="cpu"):
+def generate_text(
+    model,
+    stoi,
+    itos,
+    prime="the",
+    length=80,
+    temperature=1.0,
+    sensitivity=1.0,
+    device="cpu"
+):
     model.eval()
     tokens = tokenize(prime)
-    ids = [stoi.get("<bos>", 1)] + [stoi.get(t, stoi["<unk>"]) for t in tokens]
+    prompt_ids = [stoi.get(t, stoi["<unk>"]) for t in tokens]
+    ids = [stoi.get("<bos>", 1)] + prompt_ids
+
     x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
     h = None
-
     logits, h = model(x, h)
-    out = tokens[:]
 
+    vocab_size = logits.size(-1)
+    prompt_bias = prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=sensitivity)
+
+    out = tokens[:]
     cur = x[:, -1:]
+
     for _ in range(length):
         logits, h = model(cur, h)
-        logits = logits[:, -1, :] / max(1e-6, temperature)
-        probs = F.softmax(logits, dim=-1)
+        step_logits = logits[:, -1, :] / max(1e-6, temperature)
+        step_logits = step_logits + prompt_bias.unsqueeze(0)
+
+        probs = F.softmax(step_logits, dim=-1)
         next_id = torch.multinomial(probs, 1).item()
         next_tok = itos[next_id]
+
         if next_tok == "<eos>":
             break
+
         out.append(next_tok)
         cur = torch.tensor([[next_id]], dtype=torch.long, device=device)
 
@@ -147,20 +190,11 @@ def generate_text(model, stoi, itos, prime="the", length=80, temperature=1.0, de
                 text.append(t)
         else:
             text.append(t)
+
     return " ".join(text)
 
 
-# ---------------------------------------------------------------------------
-# Checkpoint save / load
-# ---------------------------------------------------------------------------
-
 def save_checkpoint(path, model, vocab, config):
-    """
-    Saves everything needed to fully restore the model later:
-    - model weights (state_dict)
-    - vocab (so stoi/itos can be rebuilt identically)
-    - config (constructor args needed to rebuild the architecture)
-    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     torch.save(
         {
@@ -174,10 +208,6 @@ def save_checkpoint(path, model, vocab, config):
 
 
 def load_checkpoint(path, device="cpu"):
-    """
-    Rebuilds the model, vocab, stoi, and itos from a checkpoint file.
-    Returns (model, vocab, stoi, itos, config).
-    """
     ckpt = torch.load(path, map_location=device)
     vocab = ckpt["vocab"]
     config = ckpt["config"]
@@ -219,8 +249,9 @@ def main():
             model, vocab, stoi, itos, config = load_checkpoint(ckpt_path, device=device)
 
     if model is None:
-        with open(input('Filename: '), 'r', encoding='utf8') as f:
-            text = f.read()
+        filename = input("Filename: ").strip()
+        with open(filename, "r", encoding="utf8") as f:
+            text = ' '.join(f.read().split()[:9999])
 
         tokens = tokenize(text)
         vocab, stoi, itos = build_vocab(tokens, min_freq=1)
@@ -232,14 +263,20 @@ def main():
         curve_prior = load_curve_prior(None, top_k=min(50, len(vocab)))
 
         config = {"emb_dim": 64, "hidden": 128, "layers": 2, "seq_len": seq_len}
-        model = CurvePriorNet(vocab_size=len(vocab), emb_dim=config["emb_dim"],
-                               hidden=config["hidden"], layers=config["layers"])
+        model = CurvePriorNet(
+            vocab_size=len(vocab),
+            emb_dim=config["emb_dim"],
+            hidden=config["hidden"],
+            layers=config["layers"]
+        )
+
         model = train_model(
             model,
             x,
             y,
             curve_prior=curve_prior,
             curve_weight=0.05,
+            sensitivity=1.0,
             epochs=20,
             batch_size=64,
             lr=3e-4,
@@ -265,8 +302,10 @@ def main():
             prime=prompt,
             length=600,
             temperature=0.9,
+            sensitivity=1.0,
             device=device,
         )
+
         with open("output/sample.txt", "w", encoding="utf-8") as f:
             f.write(sample)
 
