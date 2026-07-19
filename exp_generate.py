@@ -251,7 +251,7 @@ def main():
     if model is None:
         filename = input("Filename: ").strip()
         with open(filename, "r", encoding="utf8") as f:
-            text = f.read()
+            text = ' '.join(f.read().split()[:9999])
 
         tokens = tokenize(text)
         vocab, stoi, itos = build_vocab(tokens, min_freq=1)
@@ -276,7 +276,7 @@ def main():
             y,
             curve_prior=curve_prior,
             curve_weight=0.05,
-            sensitivity=1.0,
+            sensitivity=50,
             epochs=20,
             batch_size=64,
             lr=3e-4,
@@ -302,7 +302,7 @@ def main():
             prime=prompt,
             length=600,
             temperature=0.9,
-            sensitivity=1.0,
+            sensitivity=10.1,
             device=device,
         )
 
