@@ -39,15 +39,33 @@ def encode(tokens, stoi):
     return [stoi.get(t, stoi["<unk>"]) for t in tokens]
 
 
-def make_dataset(ids, seq_len=32):
+def make_dataset(ids, seq_len=32, keep_prob=0.5, dedupe=True, generator=None):
     xs, ys = [], []
-    for i in range(len(ids) - seq_len):
-        xs.append(ids[i:i + seq_len])
-        ys.append(ids[i + 1:i + seq_len + 1])
+    seen = set()
+
+    probs = torch.full((len(ids) - seq_len,), keep_prob, dtype=torch.float32)
+    mask = torch.bernoulli(probs, generator=generator).bool().tolist()
+
+    for i, keep in enumerate(mask):
+        if not keep:
+            continue
+
+        xw = tuple(ids[i:i + seq_len])
+        yw = tuple(ids[i + 1:i + seq_len + 1])
+
+        if dedupe and xw in seen:
+            continue
+        seen.add(xw)
+
+        xs.append(xw)
+        ys.append(yw)
+
+    if not xs:
+        raise ValueError("No samples created; raise keep_prob or lower seq_len.")
+
     x = torch.tensor(xs, dtype=torch.long)
     y = torch.tensor(ys, dtype=torch.long)
     return x, y
-
 
 def load_curve_prior(path=None, top_k=50):
     if path is None:
