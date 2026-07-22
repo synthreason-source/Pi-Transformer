@@ -8,18 +8,59 @@ import torch.nn.functional as F
 from collections import Counter
 
 
+class LieBracketLayer(nn.Module):
+    """
+    Computes the Lie Bracket f(x, y) = [x, y] to model causal influence.
+    f(x, y) = xWy^T - yWx^T (Skew-symmetric / Alternating)
+    """
+    def __init__(self, emb_dim):
+        super().__init__()
+        self.W = nn.Parameter(torch.randn(emb_dim, emb_dim) * 0.1)
+
+    def forward(self, x, y):
+        # x, y shape: (batch, emb_dim)
+        # Bilinear interaction: xWy^T
+        term1 = torch.matmul(torch.matmul(x, self.W), y.transpose(-1, -2))
+        term2 = torch.matmul(torch.matmul(y, self.W), x.transpose(-1, -2))
+        
+        # Alternating Property: f(x, y) = -f(y, x)
+        return term1 - term2
+
 class CurvePriorNet(nn.Module):
     def __init__(self, vocab_size, emb_dim=64, hidden=128, layers=2):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, emb_dim)
         self.rnn = nn.GRU(emb_dim, hidden, num_layers=layers, batch_first=True)
+        
+        # Lie Bracket module to capture interaction dynamics
+        self.lie_bracket = LieBracketLayer(emb_dim)
+        
         self.head = nn.Linear(hidden, vocab_size)
 
     def forward(self, x, h=None):
-        x = self.embed(x)
-        out, h = self.rnn(x, h)
-        logits = self.head(out)
-        return logits, h
+        # 1. Standard RNN processing
+        embs = self.embed(x)
+        out, h_new = self.rnn(embs, h)
+        
+        # 2. Synthesis with Lie Bracket
+        # We look at the relationship between the last two tokens to compute influence
+        if x.size(1) > 1:
+            prev_token = embs[:, -2, :]
+            curr_token = embs[:, -1, :]
+            
+            # Compute Lie Bracket as "influence score"
+            influence = self.lie_bracket(prev_token, curr_token) # Shape: (batch, batch) or similar
+            
+            # Apply Exponential mapping to scale influence
+            # Map the influence into the logit space (exp/log transformation)
+            influence_map = torch.exp(influence.mean(dim=-1, keepdim=True)) 
+            
+            # Modulate logits
+            logits = self.head(out) * influence_map.unsqueeze(-1)
+        else:
+            logits = self.head(out)
+            
+        return logits, h_new
 
 
 def tokenize(text):
