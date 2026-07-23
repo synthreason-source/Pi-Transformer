@@ -250,7 +250,7 @@ def run_dataset_pipeline():
     print(f"Using device: {device}\n")
 
     # Combine sentences into sequence tokens
-    full_text = " ".join(dataset_rows)
+    full_text = ".".join(dataset_rows)
     tokens = tokenize(full_text)
     
     vocab, stoi, itos = build_vocab(tokens, min_freq=1)
