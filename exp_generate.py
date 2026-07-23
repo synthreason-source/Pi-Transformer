@@ -31,7 +31,7 @@ class CurvePriorNet(nn.Module):
 
 
 def tokenize(text):
-    return re.findall(r"[A-Za-z']+|[.,!?;:]", text.lower())
+    return text.lower().split()
 
 
 def build_vocab(tokens, min_freq=1):
@@ -269,7 +269,7 @@ def run_dataset_pipeline():
         layers=config["layers"]
     )
 
-    print("Training model on image dataset rows...")
+    print("Training model on dataset...")
     model = train_model(
         model,
         x,
