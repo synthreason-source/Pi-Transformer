@@ -214,6 +214,25 @@ def nilpotent_ideal_to_probs(N, eps=1e-12):
     if s < eps:
         return np.full_like(vec, 1.0 / len(vec))
     return vec / s
+
+
+def to_nilpotent_ideal(t):
+    """
+    Embed the last dimension of an arbitrary tensor into the nilpotent
+    ideal n (strictly upper-triangular matrices) of the Borel subalgebra b
+    of gl_k, batched over all leading dimensions.
+
+    Input shape (..., k) -> output shape (..., k, k), with
+    N[..., i, i+1] = t[..., i] for i < k - 1. N^k = 0 automatically.
+    """
+    *batch, k = t.shape
+    N = torch.zeros(*batch, k, k, dtype=t.dtype, device=t.device)
+    if k > 1:
+        i0 = torch.arange(k - 1, device=t.device)
+        i1 = torch.arange(1, k, device=t.device)
+        N[..., i0, i1] = t[..., :-1]
+    return N
+    
 # -----------------------------------------------------------------------------
 # 3. Execution Pipeline
 # -----------------------------------------------------------------------------
