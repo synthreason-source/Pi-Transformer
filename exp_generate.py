@@ -11,7 +11,7 @@ KB_LEN = 9999
 # 1. Dataset extracted directly from Image 1
 # -----------------------------------------------------------------------------
 with open(input("Filename: "), "r", encoding="utf-8") as f:
-    text = f.read().split(".")[:KB_LEN]
+    dataset_rows = f.read().split(".")[:KB_LEN]
 
 # -----------------------------------------------------------------------------
 # 2. Model Definition & Helper Functions
