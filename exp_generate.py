@@ -202,6 +202,15 @@ def probs_to_nilpotent_ideal(probs):
     return to_nilpotent_ideal(probs_t).numpy()
 
 
+def from_nilpotent_ideal(N):
+    """
+    Recover a vector from an element of the nilpotent ideal by reading back
+    its superdiagonal (row sums, since each row of N has at most one
+    nonzero entry). Inverse of to_nilpotent_ideal (up to the dropped last
+    coordinate, which the ideal has no room to store).
+    """
+    return N.sum(dim=-1)
+
 def nilpotent_ideal_to_probs(N, eps=1e-12):
     """Vector-only convenience wrapper that also renormalizes back into a
     valid probability distribution, kept for backward compatibility."""
@@ -268,7 +277,7 @@ def run_dataset_pipeline():
         curve_prior=curve_prior,
         curve_weight=0.05,
         sensitivity=10.0,
-        epochs=30,
+        epochs=10,
         batch_size=16,
         lr=1e-3,
         device=device
