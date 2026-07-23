@@ -6,29 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import Counter
-
+KB_LEN = 9999
 # -----------------------------------------------------------------------------
 # 1. Dataset extracted directly from Image 1
 # -----------------------------------------------------------------------------
-dataset_rows = [
-    # Length = 3 words
-    "The cat sleeps.",
-    "Birds are singing.",
-    "Time flies fast.",
-    "Rain falls down.",
-    # Length = 4 words
-    "A quick brown fox.",
-    "I love this game.",
-    "Data drives world.",
-    "We build the future.",
-    # Length = 5 words
-    "Never stop learning new things.",
-    "OpenAI creates helpful tools.",
-    "Surjection maps rows to columns.",
-    # Length = 6 words
-    "Artificial intelligence changes lives.",
-    "Understanding leads to innovation."
-]
+with open(filename, "r", encoding="utf8") as f:
+    text = ' '.join(f.read().split(".")[:KB_LEN])
 
 # -----------------------------------------------------------------------------
 # 2. Model Definition & Helper Functions
