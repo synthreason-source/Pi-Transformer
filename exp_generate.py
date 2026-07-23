@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import Counter
-KB_LEN = 9999
+KB_LEN = -1
 # -----------------------------------------------------------------------------
 # 1. Dataset extracted directly from Image 1
 # -----------------------------------------------------------------------------
