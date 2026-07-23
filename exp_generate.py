@@ -281,7 +281,7 @@ def run_dataset_pipeline():
             stoi,
             itos,
             prime=input("USER: "),
-            length=20,
+            length=600,
             temperature=0.8,
             device=device
         )
