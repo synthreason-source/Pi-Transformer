@@ -256,16 +256,17 @@ def run_dataset_pipeline():
     )
 
     print("\nGenerating sample output from trained prior net:")
-    sample = generate_text(
-        model,
-        stoi,
-        itos,
-        prime="data",
-        length=20,
-        temperature=0.8,
-        device=device
-    )
-    print(f"\nGenerated Result: '{sample}'")
+    while True:    
+        sample = generate_text(
+            model,
+            stoi,
+            itos,
+            prime="data",
+            length=20,
+            temperature=0.8,
+            device=device
+        )
+        print(f"\nGenerated Result: '{sample}'")
 
 
 if __name__ == "__main__":
