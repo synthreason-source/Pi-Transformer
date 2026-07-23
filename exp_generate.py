@@ -191,7 +191,29 @@ def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
     counts = counts / counts.sum().clamp_min(1.0)
     bias = sensitivity * counts
     return bias
-    
+
+
+def probs_to_nilpotent_ideal(probs):
+    """Vector-only convenience wrapper (numpy or torch) used for the
+    curve-prior distribution, kept for backward compatibility."""
+    if isinstance(probs, torch.Tensor):
+        return to_nilpotent_ideal(probs)
+    probs_t = torch.from_numpy(np.asarray(probs))
+    return to_nilpotent_ideal(probs_t).numpy()
+
+
+def nilpotent_ideal_to_probs(N, eps=1e-12):
+    """Vector-only convenience wrapper that also renormalizes back into a
+    valid probability distribution, kept for backward compatibility."""
+    if isinstance(N, torch.Tensor):
+        vec = from_nilpotent_ideal(N)
+        return vec / vec.sum().clamp_min(eps)
+    N_t = torch.from_numpy(np.asarray(N))
+    vec = from_nilpotent_ideal(N_t).numpy()
+    s = vec.sum()
+    if s < eps:
+        return np.full_like(vec, 1.0 / len(vec))
+    return vec / s
 # -----------------------------------------------------------------------------
 # 3. Execution Pipeline
 # -----------------------------------------------------------------------------
