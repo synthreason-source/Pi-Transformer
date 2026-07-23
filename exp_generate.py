@@ -183,6 +183,15 @@ def generate_text(
 
     return " ".join(text)
 
+def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
+    bias = torch.zeros(vocab_size, device=device)
+    if len(prompt_ids) == 0:
+        return bias
+    counts = torch.bincount(torch.tensor(prompt_ids, device=device), minlength=vocab_size).float()
+    counts = counts / counts.sum().clamp_min(1.0)
+    bias = sensitivity * counts
+    return bias
+    
 # -----------------------------------------------------------------------------
 # 3. Execution Pipeline
 # -----------------------------------------------------------------------------
