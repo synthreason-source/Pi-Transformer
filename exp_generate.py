@@ -123,6 +123,66 @@ def train_model(model, x, y, curve_prior=None, curve_weight=0.05, sensitivity=50
 
     return model
 
+@torch.no_grad()
+def generate_text(
+    model,
+    stoi,
+    itos,
+    prime="the",
+    length=80,
+    temperature=1.0,
+    sensitivity=1.0,
+    device="cpu"
+):
+    model.eval()
+    tokens = tokenize(prime)
+    prompt_ids = [stoi.get(t, stoi["<unk>"]) for t in tokens]
+    ids = [stoi.get("<bos>", 1)] + prompt_ids
+
+    x = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)
+    h = None
+    logits, h = model(x, h)
+
+    vocab_size = logits.size(-1)
+    prompt_bias = prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=sensitivity)
+
+    out = tokens[:]
+    cur = x[:, -1:]
+
+    for _ in range(length):
+        logits, h = model(cur, h)
+        step_logits = logits[:, -1, :] / max(1e-6, temperature)
+        step_logits = step_logits + prompt_bias.unsqueeze(0)
+
+        probs = F.softmax(step_logits, dim=-1).squeeze(0)
+
+        # Route the sampling distribution through the nilpotent ideal before
+        # drawing a sample -- same embed/read-back roundtrip used for the
+        # curve prior.
+        N = probs_to_nilpotent_ideal(probs)
+        probs = nilpotent_ideal_to_probs(N).unsqueeze(0)
+
+        next_id = torch.multinomial(probs, 1).item()
+        next_tok = itos[next_id]
+
+        if next_tok == "<eos>":
+            break
+
+        out.append(next_tok)
+        cur = torch.tensor([[next_id]], dtype=torch.long, device=device)
+
+    text = []
+    for t in out:
+        if t in ".,!?;:":
+            if text:
+                text[-1] = text[-1] + t
+            else:
+                text.append(t)
+        else:
+            text.append(t)
+
+    return " ".join(text)
+
 # -----------------------------------------------------------------------------
 # 3. Execution Pipeline
 # -----------------------------------------------------------------------------
