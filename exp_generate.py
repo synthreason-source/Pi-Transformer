@@ -19,10 +19,15 @@ class LieBracketLayer(nn.Module):
 
     def forward(self, x, y):
         # x, y shape: (batch, emb_dim)
+        # Restrict W to the nilpotent ideal n (strictly upper-triangular
+        # matrices) before using it, so the parameter itself is always a
+        # genuine element of the ideal: W_n^emb_dim = 0.
+        W_n = torch.triu(self.W, diagonal=1)
+
         # Bilinear interaction: xWy^T
-        term1 = torch.matmul(torch.matmul(x, self.W), y.transpose(-1, -2))
-        term2 = torch.matmul(torch.matmul(y, self.W), x.transpose(-1, -2))
-        
+        term1 = torch.matmul(torch.matmul(x, W_n), y.transpose(-1, -2))
+        term2 = torch.matmul(torch.matmul(y, W_n), x.transpose(-1, -2))
+
         # Alternating Property: f(x, y) = -f(y, x)
         return term1 - term2
 
@@ -31,35 +36,45 @@ class CurvePriorNet(nn.Module):
         super().__init__()
         self.embed = nn.Embedding(vocab_size, emb_dim)
         self.rnn = nn.GRU(emb_dim, hidden, num_layers=layers, batch_first=True)
-        
+
         # Lie Bracket module to capture interaction dynamics
         self.lie_bracket = LieBracketLayer(emb_dim)
-        
+
         self.head = nn.Linear(hidden, vocab_size)
 
     def forward(self, x, h=None):
         # 1. Standard RNN processing
         embs = self.embed(x)
+        # Route embeddings through the nilpotent ideal (embed/read-back
+        # roundtrip on the last dimension, batched over every leading dim).
+        embs = from_nilpotent_ideal(to_nilpotent_ideal(embs))
+
         out, h_new = self.rnn(embs, h)
-        
+        out = from_nilpotent_ideal(to_nilpotent_ideal(out))
+        # h_new is the GRU's carried state; route it too so no numeric
+        # variable in the forward pass skips the ideal.
+        h_new = from_nilpotent_ideal(to_nilpotent_ideal(h_new))
+
         # 2. Synthesis with Lie Bracket
         # We look at the relationship between the last two tokens to compute influence
         if x.size(1) > 1:
             prev_token = embs[:, -2, :]
             curr_token = embs[:, -1, :]
-            
+
             # Compute Lie Bracket as "influence score"
             influence = self.lie_bracket(prev_token, curr_token) # Shape: (batch, batch) or similar
-            
+
             # Apply Exponential mapping to scale influence
             # Map the influence into the logit space (exp/log transformation)
-            influence_map = torch.exp(influence.mean(dim=-1, keepdim=True)) 
-            
+            influence_map = torch.exp(influence.mean(dim=-1, keepdim=True))
+
             # Modulate logits
             logits = self.head(out) * influence_map.unsqueeze(-1)
         else:
             logits = self.head(out)
-            
+
+        logits = from_nilpotent_ideal(to_nilpotent_ideal(logits))
+
         return logits, h_new
 
 
@@ -90,6 +105,79 @@ def make_dataset(ids, seq_len=32):
     return x, y
 
 
+# ---------------------------------------------------------------------------
+# Nilpotent-ideal embedding
+#
+# In the Borel subalgebra b = t ⊕ n of gl_k (t = diagonal matrices, n =
+# strictly-upper-triangular matrices), n is a nilpotent ideal: it is closed
+# under the bracket with all of b, and N^k = 0 for any N in n, since each
+# matrix product pushes the nonzero band strictly further off the diagonal
+# until it falls off the edge of the k x k matrix.
+#
+# Any vector v = (v_0, ..., v_{k-1}) -- along the last dimension of any
+# tensor, batch dims included -- can be embedded into this ideal by placing
+# it on the superdiagonal of an otherwise-zero k x k matrix. The resulting
+# matrix N is nilpotent by construction, and no extra machinery is needed
+# to guarantee that; it falls out of the shape of the ideal itself.
+#
+# This is a general tensor operation, not just something for probability
+# vectors: anything with a last dimension can be routed through it
+# (embeddings, hidden states, logits, gradients, ...). Objects that are NOT
+# numeric tensors -- strings, dicts, ints, module references -- have no
+# ring for an ideal to live in, so they are left untouched.
+# ---------------------------------------------------------------------------
+
+def to_nilpotent_ideal(t):
+    """
+    Embed the last dimension of an arbitrary tensor into the nilpotent
+    ideal n (strictly upper-triangular matrices) of the Borel subalgebra b
+    of gl_k, batched over all leading dimensions.
+
+    Input shape (..., k) -> output shape (..., k, k), with
+    N[..., i, i+1] = t[..., i] for i < k - 1. N^k = 0 automatically.
+    """
+    *batch, k = t.shape
+    N = torch.zeros(*batch, k, k, dtype=t.dtype, device=t.device)
+    if k > 1:
+        i0 = torch.arange(k - 1, device=t.device)
+        i1 = torch.arange(1, k, device=t.device)
+        N[..., i0, i1] = t[..., :-1]
+    return N
+
+
+def from_nilpotent_ideal(N):
+    """
+    Recover a vector from an element of the nilpotent ideal by reading back
+    its superdiagonal (row sums, since each row of N has at most one
+    nonzero entry). Inverse of to_nilpotent_ideal (up to the dropped last
+    coordinate, which the ideal has no room to store).
+    """
+    return N.sum(dim=-1)
+
+
+def probs_to_nilpotent_ideal(probs):
+    """Vector-only convenience wrapper (numpy or torch) used for the
+    curve-prior distribution, kept for backward compatibility."""
+    if isinstance(probs, torch.Tensor):
+        return to_nilpotent_ideal(probs)
+    probs_t = torch.from_numpy(np.asarray(probs))
+    return to_nilpotent_ideal(probs_t).numpy()
+
+
+def nilpotent_ideal_to_probs(N, eps=1e-12):
+    """Vector-only convenience wrapper that also renormalizes back into a
+    valid probability distribution, kept for backward compatibility."""
+    if isinstance(N, torch.Tensor):
+        vec = from_nilpotent_ideal(N)
+        return vec / vec.sum().clamp_min(eps)
+    N_t = torch.from_numpy(np.asarray(N))
+    vec = from_nilpotent_ideal(N_t).numpy()
+    s = vec.sum()
+    if s < eps:
+        return np.full_like(vec, 1.0 / len(vec))
+    return vec / s
+
+
 def load_curve_prior(path=None, top_k=50):
     if path is None:
         probs = np.array([
@@ -114,6 +202,12 @@ def load_curve_prior(path=None, top_k=50):
     if top_k is not None:
         probs = probs[:top_k]
     probs = probs / probs.sum()
+
+    # Embed into the nilpotent ideal, then read back a normalized vector.
+    # N^k = 0 holds for the intermediate matrix by construction.
+    N = probs_to_nilpotent_ideal(probs)
+    probs = nilpotent_ideal_to_probs(N).astype(np.float32)
+
     return probs
 
 
@@ -172,6 +266,14 @@ def train_model(
 
             opt.zero_grad()
             loss.backward()
+
+            # Route every gradient through the nilpotent ideal too, so the
+            # optimizer never touches a raw, un-embedded numeric variable.
+            with torch.no_grad():
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.copy_(from_nilpotent_ideal(to_nilpotent_ideal(p.grad)))
+
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             total += loss.item()
@@ -212,7 +314,14 @@ def generate_text(
         step_logits = logits[:, -1, :] / max(1e-6, temperature)
         step_logits = step_logits + prompt_bias.unsqueeze(0)
 
-        probs = F.softmax(step_logits, dim=-1)
+        probs = F.softmax(step_logits, dim=-1).squeeze(0)
+
+        # Route the sampling distribution through the nilpotent ideal before
+        # drawing a sample -- same embed/read-back roundtrip used for the
+        # curve prior.
+        N = probs_to_nilpotent_ideal(probs)
+        probs = nilpotent_ideal_to_probs(N).unsqueeze(0)
+
         next_id = torch.multinomial(probs, 1).item()
         next_tok = itos[next_id]
 
@@ -292,7 +401,7 @@ def main():
     if model is None:
         filename = input("Filename: ").strip()
         with open(filename, "r", encoding="utf8") as f:
-            text = f.read()
+            text = f.read()[:9999]
 
         tokens = tokenize(text)
         vocab, stoi, itos = build_vocab(tokens, min_freq=1)
@@ -355,3 +464,43 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# ---------------------------------------------------------------------------
+# Surjection Matrix (rows grouped by sentence length -> columns A,B,C,...)
+# Demonstration structure based on the supplied diagram.
+# ---------------------------------------------------------------------------
+
+SURJECTION_COLUMNS = ["A","B","C","D","E"]
+
+SURJECTION_MATRIX = {
+    3: [("r1","A"),("r2","C"),("r3","B"),("r4","E")],
+    4: [("r5","A"),("r6","D"),("r7","B"),("r8","C")],
+    5: [("r9","B"),("r10","D"),("r11","A")],
+    6: [("r12","C"),("r13","E")],
+}
+
+def apply_surjection_matrix(sentence_chunks):
+    """
+    sentence_chunks: iterable of strings.
+    Groups rows by sentence length (word count), sorts by size,
+    then surjectively assigns rows to columns A,B,C,...
+    Returns list of dictionaries.
+    """
+    grouped = {}
+    for s in sentence_chunks:
+        n = len(s.split())
+        grouped.setdefault(n, []).append(s)
+
+    result = []
+    for length in sorted(grouped):
+        mapping = SURJECTION_MATRIX.get(length, [])
+        for i, sent in enumerate(grouped[length]):
+            col = mapping[i % max(1,len(mapping))][1] if mapping else SURJECTION_COLUMNS[i % len(SURJECTION_COLUMNS)]
+            result.append({
+                "length": length,
+                "row": f"r{i+1}",
+                "column": col,
+                "sentence": sent,
+            })
+    return result
