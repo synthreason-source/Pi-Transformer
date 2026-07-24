@@ -6,7 +6,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from collections import Counter
+
 KB_LEN = -1
+
 # -----------------------------------------------------------------------------
 # 1. Dataset extracted directly from Image 1
 # -----------------------------------------------------------------------------
@@ -48,13 +50,8 @@ def encode(tokens, stoi):
 
 
 def make_dataset(ids, seq_len=8):
-    """
-    Creates input (x) and target (y) sequences.
-    Adjusted seq_len default to fit smaller example datasets cleanly.
-    """
     xs, ys = [], []
     if len(ids) <= seq_len:
-        # Pad sequence if total token count is smaller than seq_len
         pad_id = 0
         ids = ids + [pad_id] * (seq_len + 1 - len(ids))
 
@@ -99,7 +96,11 @@ def train_model(model, x, y, curve_prior=None, curve_weight=0.05, sensitivity=50
             xb, yb = x[idx], y[idx]
 
             logits, _ = model(xb)
-            loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), yb.reshape(-1), ignore_index=0)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                yb.reshape(-1),
+                ignore_index=0
+            )
 
             if curve_prior is not None and curve_weight > 0:
                 vocab_slice = min(logits.size(-1), len(curve_prior))
@@ -122,6 +123,7 @@ def train_model(model, x, y, curve_prior=None, curve_weight=0.05, sensitivity=50
             print(f"Epoch {epoch+1:03d} | Loss: {total/steps:.4f}")
 
     return model
+
 
 @torch.no_grad()
 def generate_text(
@@ -156,13 +158,11 @@ def generate_text(
 
         probs = F.softmax(step_logits, dim=-1).squeeze(0)
 
-        # Route the sampling distribution through the nilpotent ideal before
-        # drawing a sample -- same embed/read-back roundtrip used for the
-        # curve prior.
         N = probs_to_nilpotent_ideal(probs)
-        probs = nilpotent_ideal_to_probs(N).unsqueeze(0)
+        probs = nilpotent_ideal_to_probs(N)
 
-        next_id = torch.multinomial(probs, 1).item()
+        dist = torch.distributions.Categorical(probs=probs)
+        next_id = dist.sample().item()
         next_tok = itos[next_id]
 
         if next_tok == "<eos>":
@@ -183,6 +183,7 @@ def generate_text(
 
     return " ".join(text)
 
+
 def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
     bias = torch.zeros(vocab_size, device=device)
     if len(prompt_ids) == 0:
@@ -194,8 +195,6 @@ def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
 
 
 def probs_to_nilpotent_ideal(probs):
-    """Vector-only convenience wrapper (numpy or torch) used for the
-    curve-prior distribution, kept for backward compatibility."""
     if isinstance(probs, torch.Tensor):
         return to_nilpotent_ideal(probs)
     probs_t = torch.from_numpy(np.asarray(probs))
@@ -203,17 +202,10 @@ def probs_to_nilpotent_ideal(probs):
 
 
 def from_nilpotent_ideal(N):
-    """
-    Recover a vector from an element of the nilpotent ideal by reading back
-    its superdiagonal (row sums, since each row of N has at most one
-    nonzero entry). Inverse of to_nilpotent_ideal (up to the dropped last
-    coordinate, which the ideal has no room to store).
-    """
     return N.sum(dim=-1)
 
+
 def nilpotent_ideal_to_probs(N, eps=1e-12):
-    """Vector-only convenience wrapper that also renormalizes back into a
-    valid probability distribution, kept for backward compatibility."""
     if isinstance(N, torch.Tensor):
         vec = from_nilpotent_ideal(N)
         return vec / vec.sum().clamp_min(eps)
@@ -226,14 +218,6 @@ def nilpotent_ideal_to_probs(N, eps=1e-12):
 
 
 def to_nilpotent_ideal(t):
-    """
-    Embed the last dimension of an arbitrary tensor into the nilpotent
-    ideal n (strictly upper-triangular matrices) of the Borel subalgebra b
-    of gl_k, batched over all leading dimensions.
-
-    Input shape (..., k) -> output shape (..., k, k), with
-    N[..., i, i+1] = t[..., i] for i < k - 1. N^k = 0 automatically.
-    """
     *batch, k = t.shape
     N = torch.zeros(*batch, k, k, dtype=t.dtype, device=t.device)
     if k > 1:
@@ -241,7 +225,7 @@ def to_nilpotent_ideal(t):
         i1 = torch.arange(1, k, device=t.device)
         N[..., i0, i1] = t[..., :-1]
     return N
-    
+
 # -----------------------------------------------------------------------------
 # 3. Execution Pipeline
 # -----------------------------------------------------------------------------
@@ -249,14 +233,13 @@ def run_dataset_pipeline():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}\n")
 
-    # Combine sentences into sequence tokens
     full_text = ".".join(dataset_rows)
     tokens = tokenize(full_text)
-    
+
     vocab, stoi, itos = build_vocab(tokens, min_freq=1)
     ids = encode(["<bos>"] + tokens + ["<eos>"], stoi)
 
-    seq_len = 8  # Adjusted sequence length for chunked sentences
+    seq_len = 8
     x, y = make_dataset(ids, seq_len=seq_len)
 
     curve_prior = load_curve_prior(None, top_k=min(50, len(vocab)))
@@ -284,7 +267,7 @@ def run_dataset_pipeline():
     )
 
     print("\nGenerating sample output from trained prior net:")
-    while True:    
+    while True:
         sample = generate_text(
             model,
             stoi,
