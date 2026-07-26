@@ -13,8 +13,8 @@ PAD_TOKEN = "<pad>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 UNK_TOKEN = "<unk>"
-MARKOV_ORDER = 7
-NGRAM_BLOCK = 8
+MARKOV_ORDER = 2
+NGRAM_BLOCK = 3
 
 # -----------------------------------------------------------------------------
 # 1. Dataset extraction, uniqueness filtering, and combinatorial pruning
@@ -61,7 +61,7 @@ def build_combinatorial_token_stream(rows, n=3):
                 continue
             seen.add(ng)
             if len(toks) <= n:
-                tokens.extend(list(toks))
+                tokens.extend(list(toks[-1]))
             else:
                 tokens.extend(toks)
     return tokens
@@ -145,7 +145,7 @@ def nilpotent_ideal_to_probs(N, eps=1e-12):
         return vec / vec.sum().clamp_min(eps)
     vec = from_nilpotent_ideal(torch.from_numpy(np.asarray(N))).numpy()
     s = vec.sum()
-    return np.full_like(vec, 1.0 / len(vec)) if s < eps else vec / s
+    return np.full_like(vec, 0.1 / len(vec)) if s < eps else vec / s
 
 # -----------------------------------------------------------------------------
 # 3. Markov chain
