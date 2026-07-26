@@ -8,20 +8,20 @@ import torch.nn.functional as F
 from collections import Counter, defaultdict
 
 KB_LEN = -1
-SEQ_LEN = 4
+SEQ_LEN = 16
 PAD_TOKEN = "<pad>"
 BOS_TOKEN = "<bos>"
 EOS_TOKEN = "<eos>"
 UNK_TOKEN = "<unk>"
 MARKOV_ORDER = 2
-NGRAM_BLOCK = 2
+NGRAM_BLOCK = 3
 
 # -----------------------------------------------------------------------------
 # 1. Dataset extraction, uniqueness filtering, and combinatorial pruning
 # -----------------------------------------------------------------------------
 def normalize_row(row):
     row = row.strip().lower()
-    row = row
+    row = re.sub(r"\s+", " ", row)
     return row
 
 def load_unique_rows(path, kb_len=-1):
@@ -62,7 +62,7 @@ def build_combinatorial_token_stream(rows, n=3):
             seen.add(ng)
             if len(toks) <= n:
                 tokens.extend(list(toks[-1]))
-        else:
+            else:
                 tokens.extend(toks)
     return tokens
 
@@ -93,8 +93,6 @@ def build_vocab(tokens, min_freq=1):
 def encode(tokens, stoi):
     return [stoi.get(t, stoi[UNK_TOKEN]) for t in tokens]
 
-import torch
-
 def make_dataset(ids, seq_len=8, pad_id=0):
     xs, ys = [], []
     if len(ids) <= seq_len:
@@ -102,10 +100,8 @@ def make_dataset(ids, seq_len=8, pad_id=0):
     for i in range(len(ids) - seq_len):
         xs.append(ids[i:i+seq_len])
         ys.append(ids[i+1:i+seq_len+1])
-    return (
-        torch.tensor(xs, dtype=torch.long),
-        torch.tensor(ys, dtype=torch.long),
-    )
+    return torch.tensor(xs, dtype=torch.long), torch.tensor(ys, dtype=torch.long)
+
 def load_curve_prior(path=None, top_k=50):
     probs = np.array([
         0.0390, 0.0384, 0.0368, 0.0335, 0.0275, 0.0218, 0.0208, 0.0183, 0.0164, 0.0156,
@@ -123,7 +119,7 @@ def prompt_bias_from_tokens(prompt_ids, vocab_size, device, sensitivity=1.0):
     if len(prompt_ids) == 0:
         return bias
     counts = torch.bincount(torch.tensor(prompt_ids, device=device), minlength=vocab_size).float()
-    counts = counts / counts.sum().clamp_min(0.001)
+    counts = counts / counts.sum().clamp_min(1.0)
     return sensitivity * counts
 
 def to_nilpotent_ideal(t):
@@ -257,7 +253,7 @@ def generate_text(model, stoi, itos, markov_chain=None, prime="the", length=80, 
         next_tok = itos[next_id]
         if next_tok == EOS_TOKEN:
             break
-        if not out or next_tok != out[-1]:
+        if next_tok != out[-1]:
             out.append(next_tok)
             generated_ids.append(next_id)
             cur = torch.tensor([[next_id]], dtype=torch.long, device=device)
@@ -268,9 +264,10 @@ def generate_text(model, stoi, itos, markov_chain=None, prime="the", length=80, 
         if t in ".,!?;:":
             if text:
                 text[-1] = text[-1] + t
-        else:
+            else:
                 text.append(t)
-        
+        else:
+            text.append(t)
     return " ".join(text)
 
 # -----------------------------------------------------------------------------
