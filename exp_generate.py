@@ -131,58 +131,59 @@ if __name__ == "__main__":
     
     # 2. Initialize Model
     model = TrigramNeuralLM(vocab_size=vocab_size)
+
+    while True:
+        # 3. Process User Input Deterministically
+        raw_input = input("USER: ").strip()
+        tokens = raw_input.lower().split() if raw_input else []
     
-    # 3. Process User Input Deterministically
-    raw_input = input("USER: ").strip()
-    tokens = raw_input.lower().split() if raw_input else []
-
-    unk_trigram = ("<UNK>", "<UNK>", "<UNK>")
-    unk_id = word_to_idx[unk_trigram]
-
-    # Collect all single words in vocabulary
-    known_words = sorted(list({w for tg in word_to_idx.keys() if tg != unk_trigram for w in tg}))
-
-    # STEP A: Fuzzy match unknown words to nearest known word deterministically
-    corrected_tokens = []
-    for w in tokens:
-        matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.0)
-        if matches:
-            corrected_tokens.append(matches[0])
-
-    # STEP B: Construct trigrams from corrected tokens
-    seed_trigrams = [tuple(corrected_tokens[i:i+3]) for i in range(len(corrected_tokens) - 2)]
-    valid_trigrams = [tg for tg in seed_trigrams if tg in word_to_idx]
-
-    # STEP C: Deterministic Fallback to most frequent trigram in dataset if no matches found
-    if not valid_trigrams:
-        print("No exact matches found. Falling back to highest frequency dataset trigrams...")
-        seed_trigrams = frequent_trigrams[:model.context_size]
-    else:
-        seed_trigrams = valid_trigrams
-
-    # Pad deterministically by repeating the last valid trigram
-    while len(seed_trigrams) < model.context_size:
-        seed_trigrams.append(seed_trigrams[-1])
-
-    context = torch.tensor(
-        [[word_to_idx[tg] for tg in seed_trigrams]], 
-        dtype=torch.long
-    )
+        unk_trigram = ("<UNK>", "<UNK>", "<UNK>")
+        unk_id = word_to_idx[unk_trigram]
     
-    # 4. Generate Trigram Sequence
-    print("\nGenerating trigram text sequence...")
-    generated_indices = model.generate(
-        context, 
-        max_new_words=50, 
-        amplification_boost=amp_boost, 
-        unk_id=unk_id,
-        temperature=0.8
-    )[0].tolist()
+        # Collect all single words in vocabulary
+        known_words = sorted(list({w for tg in word_to_idx.keys() if tg != unk_trigram for w in tg}))
     
-    # 5. Decode output
-    generated_trigrams = [idx_to_word[i] for i in generated_indices]
-    words = [w for tg in generated_trigrams for w in tg if w != "<UNK>"]
-    generated_text = " ".join(words)
+        # STEP A: Fuzzy match unknown words to nearest known word deterministically
+        corrected_tokens = []
+        for w in tokens:
+            matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.0)
+            if matches:
+                corrected_tokens.append(matches[0])
     
-    print("\n--- GENERATED OUTPUT ---")
-    print(generated_text)
+        # STEP B: Construct trigrams from corrected tokens
+        seed_trigrams = [tuple(corrected_tokens[i:i+3]) for i in range(len(corrected_tokens) - 2)]
+        valid_trigrams = [tg for tg in seed_trigrams if tg in word_to_idx]
+    
+        # STEP C: Deterministic Fallback to most frequent trigram in dataset if no matches found
+        if not valid_trigrams:
+            print("No exact matches found. Falling back to highest frequency dataset trigrams...")
+            seed_trigrams = frequent_trigrams[:model.context_size]
+        else:
+            seed_trigrams = valid_trigrams
+    
+        # Pad deterministically by repeating the last valid trigram
+        while len(seed_trigrams) < model.context_size:
+            seed_trigrams.append(seed_trigrams[-1])
+    
+        context = torch.tensor(
+            [[word_to_idx[tg] for tg in seed_trigrams]], 
+            dtype=torch.long
+        )
+        
+        # 4. Generate Trigram Sequence
+        print("\nGenerating trigram text sequence...")
+        generated_indices = model.generate(
+            context, 
+            max_new_words=50, 
+            amplification_boost=amp_boost, 
+            unk_id=unk_id,
+            temperature=0.8
+        )[0].tolist()
+        
+        # 5. Decode output
+        generated_trigrams = [idx_to_word[i] for i in generated_indices]
+        words = [w for tg in generated_trigrams for w in tg if w != "<UNK>"]
+        generated_text = " ".join(words)
+        
+        print("\n--- GENERATED OUTPUT ---")
+        print(generated_text)
