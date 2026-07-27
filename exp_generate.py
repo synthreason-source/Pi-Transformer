@@ -127,7 +127,7 @@ class TrigramNeuralLM(nn.Module):
 # ==========================================
 if __name__ == "__main__":
     # 1. Load Data
-    word_to_idx, idx_to_word, vocab_size, amp_boost, frequent_trigrams = load_and_analyze_dataset("singlekb.txt")
+    word_to_idx, idx_to_word, vocab_size, amp_boost, frequent_trigrams = load_and_analyze_dataset(input("Filename: "))
     
     # 2. Initialize Model
     model = TrigramNeuralLM(vocab_size=vocab_size)
