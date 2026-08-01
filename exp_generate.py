@@ -208,7 +208,7 @@ if __name__ == "__main__":
         tokens = raw_input.lower().split() if raw_input else []
         corrected_tokens = []
         for w in tokens:
-            matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.0)
+            matches = difflib.get_close_matches(w, known_words, n=100, cutoff=0.0)
             if matches:
                 corrected_tokens.append(matches[0])
 
