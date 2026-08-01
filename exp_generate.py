@@ -37,7 +37,7 @@ def load_and_analyze_dataset(filename):
             context_to_row[context] = row_count
             row_count += 1
         target_idx = word_to_idx.get(t, word_to_idx[unk_trigram])
-        trigram_counts[context][target_idx] += 1
+        trigram_counts[context][target_idx] += row_count
 
     freq_matrix = torch.zeros((row_count, vocab_size))
     for context, targets in trigram_counts.items():
