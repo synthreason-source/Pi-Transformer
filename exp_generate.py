@@ -238,7 +238,7 @@ if __name__ == "__main__":
             amp_boost=amp_boost,
             idx_to_word=idx_to_word,
             unk_id=unk_id,
-            temperature=10.0
+            temperature=0.8
         )
 
         # STEP 2: GENETIC IN / GENETIC OUT (Evolutionary Filtering)
