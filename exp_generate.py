@@ -178,12 +178,7 @@ class GeneticOptimizerEngine:
 
 
 # ==========================================================
-# 4. Stage 3: Markov Re-Inference Layer (Markov Out)
-# ==========================================================
-
-
-# ==========================================================
-# 5. Pipeline Execution Loop
+# 4. Pipeline Execution Loop
 # ==========================================================
 
 if __name__ == "__main__":
@@ -248,8 +243,6 @@ if __name__ == "__main__":
             target_trigrams=target_trigrams,
             corpus_trigrams=corpus_trigrams
         )
-
-
 
         print("\n--- FINAL PIPELINE OUTPUT ---")
         flattened_words = [word for trigram in evolved_ga_trigrams for word in trigram]
