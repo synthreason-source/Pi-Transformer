@@ -75,7 +75,7 @@ class MarkovSeedingLayer(nn.Module):
     """
     def __init__(self, vocab_size, embed_dim=32):
         super().__init__()
-        self.context_size = 2
+        self.context_size = 3
         self.word_embedding = nn.Embedding(vocab_size, embed_dim)
         self.pos_embedding = nn.Embedding(self.context_size, embed_dim)
         self.lm_head = nn.Linear(embed_dim * self.context_size, vocab_size)
@@ -123,7 +123,7 @@ class GeneticOptimizerEngine:
     """
     Stage 2: Consumes neural seeds, performs selection, crossover, and mutation.
     """
-    def __init__(self, population_size=100, mutation_rate=0.1, generations=50):
+    def __init__(self, population_size=1000, mutation_rate=0.1, generations=500):
         self.pop_size = population_size
         self.mutation_rate = mutation_rate
         self.generations = generations
@@ -178,12 +178,7 @@ class GeneticOptimizerEngine:
 
 
 # ==========================================================
-# 4. Stage 3: Markov Re-Inference Layer (Markov Out)
-# ==========================================================
-
-
-# ==========================================================
-# 5. Pipeline Execution Loop
+# 4. Pipeline Execution Loop
 # ==========================================================
 
 if __name__ == "__main__":
@@ -208,7 +203,7 @@ if __name__ == "__main__":
         tokens = raw_input.lower().split() if raw_input else []
         corrected_tokens = []
         for w in tokens:
-            matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.0)
+            matches = difflib.get_close_matches(w, known_words, n=100, cutoff=0.0)
             if matches:
                 corrected_tokens.append(matches[0])
 
@@ -248,8 +243,6 @@ if __name__ == "__main__":
             target_trigrams=target_trigrams,
             corpus_trigrams=corpus_trigrams
         )
-
-
 
         print("\n--- FINAL PIPELINE OUTPUT ---")
         flattened_words = [word for trigram in evolved_ga_trigrams for word in trigram]
