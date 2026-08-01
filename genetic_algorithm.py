@@ -10,7 +10,7 @@ NUM_GENERATIONS = 1000
 MUTATION_RATE   = 0.1
 
 # Load base dataset to extract trigrams pool
-with open("questions.conf", encoding="ISO-8859-1") as f:
+with open("xaa", encoding="ISO-8859-1") as f:
     raw_lines = f.readlines()
 
 corpus_tokens = " ".join(raw_lines).lower().split()
