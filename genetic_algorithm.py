@@ -176,12 +176,34 @@ class MarkovSeedingLayer(nn.Module):
 class GeneticOptimizerEngine:
     """
     Stage 2: Consumes neural seeds, performs selection, crossover, and mutation.
+
+    Adds a lightweight backward-propagation loop: a learnable per-word score
+    vector (self.word_scores) is nudged with a real torch optimizer each
+    generation. `fitness()` reads the current scores as a bonus term, and
+    `mutate()` uses them (softmax-weighted) to bias which replacement words
+    get sampled — so the GA's mutation/fitness behavior is steered by a
+    gradient-trained signal rather than being purely random/heuristic.
     """
-    def __init__(self, population_size=1000, mutation_rate=0.1, generations=500, elite_size=10):
+    def __init__(self, population_size=1000, mutation_rate=0.1, generations=500,
+                 elite_size=10, word_vocab=None, learning_rate=0.05):
         self.pop_size = population_size
         self.mutation_rate = mutation_rate
         self.generations = generations
         self.elite_size = elite_size
+
+        # --- backward-propagation setup -----------------------------------
+        # word_vocab: list of unique surface-form words the GA is allowed to
+        # mutate towards. If provided, we keep a learnable score per word and
+        # an optimizer to update it via backprop each generation.
+        self.word_vocab = word_vocab
+        if word_vocab:
+            self.word_to_idx_word = {w: i for i, w in enumerate(word_vocab)}
+            self.word_scores = torch.zeros(len(word_vocab), requires_grad=True)
+            self.score_optimizer = torch.optim.Adam([self.word_scores], lr=learning_rate)
+        else:
+            self.word_to_idx_word = {}
+            self.word_scores = None
+            self.score_optimizer = None
 
     def fitness(self, candidate, target_trigrams, corpus_word_freq=None):
         score = 0.0
@@ -195,7 +217,60 @@ class GeneticOptimizerEngine:
         if corpus_word_freq is not None:
             score += 0.01 * sum(corpus_word_freq.get(w, 0) for tg in candidate for w in tg)
 
+        # Bonus term driven by the backprop-trained word scores. Detached
+        # (no_grad) since fitness() itself is used purely for ranking, not
+        # for building the backward graph — that happens in backpropagate().
+        if self.word_scores is not None:
+            with torch.no_grad():
+                bonus = 0.0
+                for tg in candidate:
+                    for w in tg:
+                        idx = self.word_to_idx_word.get(w)
+                        if idx is not None:
+                            bonus += self.word_scores[idx].item()
+                score += 0.05 * bonus
+
         return score
+
+    def backpropagate(self, population, target_trigrams, corpus_word_freq=None):
+        """
+        Real backward-propagation step. Builds a differentiable proxy for
+        population fitness out of self.word_scores (summed over every word
+        that appears in every candidate), then backpropagates the negative
+        of that signal so gradient descent pushes scores for
+        frequently-appearing / target-aligned words upward and scores for
+        words that drag fitness down, downward. Call this once per
+        generation before ranking, so both fitness() and mutate() act on the
+        freshly-updated scores.
+        """
+        if self.word_scores is None or self.score_optimizer is None:
+            return
+
+        target_word_set = {w for tg in target_trigrams for w in tg}
+
+        self.score_optimizer.zero_grad()
+        total = torch.zeros(1)
+        count = 0
+
+        for candidate in population:
+            cand_score = torch.zeros(1)
+            for tg in candidate:
+                for w in tg:
+                    idx = self.word_to_idx_word.get(w)
+                    if idx is None:
+                        continue
+                    weight = 1.5 if w in target_word_set else 1.0
+                    cand_score = cand_score + weight * self.word_scores[idx]
+            total = total + cand_score
+            count += 1
+
+        if count == 0:
+            return
+
+        mean_score = total / count
+        loss = -mean_score  # ascend fitness == descend negative fitness
+        loss.backward()
+        self.score_optimizer.step()
 
     def crossover(self, parent1, parent2):
         if len(parent1) <= 1:
@@ -203,8 +278,34 @@ class GeneticOptimizerEngine:
         split_point = random.randint(1, len(parent1) - 1)
         return parent1[:split_point] + parent2[split_point:]
 
+    def _score_weighted_words(self, corpus_words):
+        """Softmax-normalized sampling weights over corpus_words, derived
+        from the current (backprop-trained) word_scores. Falls back to None
+        (uniform sampling) if scores aren't enabled or none of the words are
+        in the learnable vocab."""
+        if self.word_scores is None or not corpus_words:
+            return None
+
+        with torch.no_grad():
+            idxs = [self.word_to_idx_word.get(w) for w in corpus_words]
+            known = [i for i in idxs if i is not None]
+            if not known:
+                return None
+            gathered = torch.stack([self.word_scores[i] for i in idxs if i is not None])
+            probs = F.softmax(gathered, dim=0).tolist()
+
+        # Map back to full-length weight list aligned with corpus_words,
+        # giving unknown words a small floor weight so they can still appear.
+        weights = []
+        p_iter = iter(probs)
+        for i in idxs:
+            weights.append(next(p_iter) if i is not None else 1e-6)
+        return weights
+
     def mutate(self, candidate, corpus_trigrams, corpus_words=None):
         mutated = []
+        weights = self._score_weighted_words(corpus_words) if corpus_words else None
+
         for tg in candidate:
             if random.random() < self.mutation_rate:
                 if random.random() < 0.5:
@@ -213,7 +314,10 @@ class GeneticOptimizerEngine:
                     if corpus_words is None:
                         mutated.append(random.choice(corpus_trigrams))
                     else:
-                        words = [random.choice(corpus_words) for _ in range(3)]
+                        if weights is not None:
+                            words = random.choices(corpus_words, weights=weights, k=3)
+                        else:
+                            words = [random.choice(corpus_words) for _ in range(3)]
                         mutated.append(tuple(words))
             else:
                 mutated.append(tg)
@@ -224,6 +328,10 @@ class GeneticOptimizerEngine:
         elite_size = min(self.elite_size, len(population))
 
         for _ in range(self.generations):
+            # backward-propagation pass: update learnable word scores before
+            # this generation's fitness ranking / mutation happen
+            self.backpropagate(population, target_trigrams, corpus_word_freq)
+
             fitness_scores = [self.fitness(cand, target_trigrams, corpus_word_freq) for cand in population]
 
             top_indices = sorted(
@@ -269,9 +377,17 @@ if __name__ == "__main__":
     corpus_word_freq = Counter(w for tg in corpus_trigrams for w in tg)
 
     markov_seed_layer = MarkovSeedingLayer(vocab_size=vocab_size, embed_dim=64, context_size=5)
-    genetic_engine = GeneticOptimizerEngine(population_size=100, mutation_rate=0.12, generations=50, elite_size=12)
 
     known_words = sorted(set(frequent_words) | {w for tg in word_to_idx.keys() if tg != unk_trigram for w in tg})
+
+    genetic_engine = GeneticOptimizerEngine(
+        population_size=100,
+        mutation_rate=0.12,
+        generations=50,
+        elite_size=12,
+        word_vocab=known_words,
+        learning_rate=0.05,
+    )
 
     print("\nEnter text to guide generation. Type 'quit' to exit.")
     while True:
@@ -325,7 +441,7 @@ if __name__ == "__main__":
             top_k=25,
         )
 
-        print("[2/2] GENETIC IN/OUT: Evolving neural seeds across generations...")
+        print("[2/2] GENETIC IN/OUT: Evolving neural seeds across generations (with backprop-guided scoring)...")
         evolved_ga_trigrams = genetic_engine.evolve(
             initial_population=neural_seeds,
             target_trigrams=target_trigrams,
