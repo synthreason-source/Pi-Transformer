@@ -230,7 +230,7 @@ if __name__ == "__main__":
         )
 
         # STEP 1: MARKOV GENERATE (Seeds Generation 0)
-        print("[1/3] MARKOV GENERATE: Generating neural seed candidates...")
+        print("[1/2] MARKOV GENERATE: Generating neural seed candidates...")
         neural_seeds = markov_seed_layer.generate_population_seeds(
             seed_context_idx=context_tensor,
             sequence_length=99,
@@ -238,11 +238,11 @@ if __name__ == "__main__":
             amp_boost=amp_boost,
             idx_to_word=idx_to_word,
             unk_id=unk_id,
-            temperature=1.2
+            temperature=0.8
         )
 
         # STEP 2: GENETIC IN / GENETIC OUT (Evolutionary Filtering)
-        print("[2/3] GENETIC IN/OUT: Evolving neural seeds across generations...")
+        print("[2/2] GENETIC IN/OUT: Evolving neural seeds across generations...")
         evolved_ga_trigrams = genetic_engine.evolve(
             initial_population=neural_seeds,
             target_trigrams=target_trigrams,
