@@ -41,13 +41,31 @@ def load_and_analyze_dataset(filename, context_window=5):
             row_count += 1
         trigram_counts[context][word_to_idx.get(t, word_to_idx[unk_trigram])] += 1
 
-    freq_matrix = torch.zeros((max(row_count, 1), vocab_size), dtype=torch.float32)
+    # Build a SPARSE frequency matrix instead of a dense one. trigram_counts
+    # is already sparse (most context/target pairs never co-occur), so a
+    # dense [row_count, vocab_size] float32 tensor wastes enormous amounts of
+    # memory on zeros -- e.g. 5,000 contexts x 20,000 vocab trigrams is
+    # 100M floats (~400MB) for a matrix that might only have a few thousand
+    # nonzero entries. Only the row/col indices + nonzero values are stored.
+    rows, cols, vals = [], [], []
     for context, targets in trigram_counts.items():
         r_idx = context_to_row[context]
         for target_idx, count in targets.items():
-            freq_matrix[r_idx, target_idx] = float(count)
+            rows.append(r_idx)
+            cols.append(target_idx)
+            vals.append(float(count))
 
-    col_sums = freq_matrix.sum(dim=0)
+    if vals:
+        indices = torch.tensor([rows, cols], dtype=torch.long)
+        values = torch.tensor(vals, dtype=torch.float32)
+        with torch.sparse.check_sparse_tensor_invariants(False):
+            freq_matrix = torch.sparse_coo_tensor(
+                indices, values, size=(max(row_count, 1), vocab_size)
+            ).coalesce()
+        col_sums = torch.sparse.sum(freq_matrix, dim=0).to_dense()
+    else:
+        col_sums = torch.zeros(vocab_size, dtype=torch.float32)
+
     max_freq = col_sums.max().clamp_min(1e-5)
     normalized_inv_freq = 1.0 - (col_sums / max_freq)
     exp_boost = torch.exp(normalized_inv_freq * 2.0)
@@ -72,7 +90,7 @@ def load_and_analyze_dataset(filename, context_window=5):
 # 2. Logit Transform Zoo: Triangular Transpose + 3D CP-Violation Transpose
 # ==========================================================
 
-def apply_triangular_logit_transpose(logits, mode="standard"):
+def apply_triangular_logit_transpose(logits):
     """
     Applies a geometric triangular transpose on predicted logits.
     Logits are reshaped into local triangular triples (v1, v2, v3) across channels/vocab,
@@ -153,7 +171,7 @@ def apply_cp_violation_transpose_3d(
         return (logits, None) if compute_gradient else logits
 
     B, V = logits.shape
-    cube_size = 27  # 3 x 3 x 3
+    cube_size = 5  # 3 x 3 x 3
 
     # NOTE: padding must be neutral (0.0), not a large negative sentinel like
     # the flat triangular transpose uses. This transform includes a charge
@@ -214,10 +232,9 @@ def apply_logit_transform(logits, mode="none", violation_strength=0.15, compute_
       - 'standard' / 'anti' / 'full_transpose': flat triangular transpose (2D)
       - 'cp_violation_3d': the new 3D CP-violation transpose (+ optional gradient)
     """
-    if mode == "cp_violation_3d":
-        return apply_cp_violation_transpose_3d(
-            logits, mode=mode, violation_strength=violation_strength, compute_gradient=compute_gradient
-        )
+    return apply_cp_violation_transpose_3d(
+        logits, mode=mode, violation_strength=violation_strength, compute_gradient=compute_gradient
+    )
     result = apply_triangular_logit_transpose(logits, mode=mode)
     return (result, None) if compute_gradient else result
 
@@ -287,7 +304,6 @@ class MarkovSeedingLayer(nn.Module):
         amp_boost,
         idx_to_word,
         unk_id,
-        transpose_mode="standard",
         violation_strength=0.15,
         temperature=1.2,
         top_k=25,
@@ -308,7 +324,6 @@ class MarkovSeedingLayer(nn.Module):
                 # Forward pass + logit transform (triangular or 3D CP-violation)
                 logits = self(
                     cond,
-                    transpose_mode=transpose_mode,
                     violation_strength=violation_strength,
                     compute_gradient=False,
                 ) + amp_boost
@@ -339,7 +354,6 @@ class MarkovSeedingLayer(nn.Module):
         """
         logits, gradient = self.forward(
             idx,
-            transpose_mode="cp_violation_3d",
             violation_strength=violation_strength,
             compute_gradient=True,
         )
@@ -418,7 +432,6 @@ if __name__ == "__main__":
             amp_boost=amp_boost,
             idx_to_word=idx_to_word,
             unk_id=unk_id,
-            transpose_mode="cp_violation_3d",
             violation_strength=0.15,
             temperature=0.8,
             top_k=25,
