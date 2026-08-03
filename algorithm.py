@@ -69,7 +69,7 @@ def load_and_analyze_dataset(filename, context_window=5):
 
 
 # ==========================================================
-# 2. Logit Triangular Transpose Transformation
+# 2. Logit Transform Zoo: Triangular Transpose + 3D CP-Violation Transpose
 # ==========================================================
 
 def apply_triangular_logit_transpose(logits, mode="standard"):
@@ -77,7 +77,7 @@ def apply_triangular_logit_transpose(logits, mode="standard"):
     Applies a geometric triangular transpose on predicted logits.
     Logits are reshaped into local triangular triples (v1, v2, v3) across channels/vocab,
     and transposed.
-    
+
     Modes:
       - 'standard': Reverses vertex orientation (v1 <-> v3 transpose).
       - 'anti': Flips along secondary axis (v1 <-> v2 anti-transpose).
@@ -87,7 +87,7 @@ def apply_triangular_logit_transpose(logits, mode="standard"):
         return logits
 
     B, V = logits.shape
-    
+
     # Pad vocabulary dimension to nearest multiple of 3 to form 3-vertex triangles
     pad_len = (3 - (V % 3)) % 3
     if pad_len > 0:
@@ -98,14 +98,128 @@ def apply_triangular_logit_transpose(logits, mode="standard"):
     # Reshape into [B, N, 3] triangular vertex triples
     triangles = padded_logits.view(B, -1, 3)
 
-
     # Full 2D triangular matrix transposition
     triangles_transposed = triangles.transpose(1, 2).contiguous()
     triangles_transposed = triangles_transposed.view(B, -1, 3)
-   
+
     # Flatten back to original logit vocabulary shape
     transposed_logits = triangles_transposed.view(B, -1)[:, :V]
     return transposed_logits
+
+
+def apply_cp_violation_transpose_3d(
+    logits,
+    mode="standard",
+    violation_strength=0.15,
+    compute_gradient=False,
+):
+    """
+    Extends the triangular transpose into a full 3D "CP-violation" style transform.
+
+    Logits are packed into 3x3x3 cubes (27 values per cube) instead of flat
+    triangles of 3. Three physics-flavored operators are then applied:
+
+      - P (parity):   reverses vertex ordering along one cube axis
+                       (`torch.flip`), analogous to a spatial mirror.
+      - C (charge):   negates the resulting values, analogous to swapping
+                       particle <-> antiparticle amplitude sign.
+      - CP transpose: a genuine 3D transpose (axis permutation) is applied
+                       on top of the C and P operators, giving the full
+                       "CP-transformed" cube.
+
+    If C and P were perfect symmetries, blending the CP-transformed cube
+    back in would do nothing (transformed == original). The
+    `violation_strength` term is what breaks that symmetry: the final
+    logits are an asymmetric mix of the original cube and its CP-transformed
+    counterpart, so `violation_strength=0` reduces to the identity and
+    `violation_strength=1` reduces to a pure CP transform.
+
+    Args:
+        logits: [B, V] logits tensor.
+        mode: 'none' returns logits unchanged. Any other string enables the
+              transform (kept for interface parity with the triangular version).
+        violation_strength: float in [0, 1], how strongly the CP-transformed
+              cube is blended back into the original ("degree of violation").
+        compute_gradient: if True, also returns d(transformed)/d(logits)
+              (summed grad_outputs of ones), useful for inspecting how
+              sensitive the transform is to the raw logits. Requires
+              `logits.requires_grad_(True)` to be set by the caller.
+
+    Returns:
+        transformed_logits [B, V], or (transformed_logits, gradient) if
+        compute_gradient=True. `gradient` is None if logits didn't require grad.
+    """
+    if mode == "none" or logits is None:
+        return (logits, None) if compute_gradient else logits
+
+    B, V = logits.shape
+    cube_size = 27  # 3 x 3 x 3
+
+    # NOTE: padding must be neutral (0.0), not a large negative sentinel like
+    # the flat triangular transpose uses. This transform includes a charge
+    # conjugation (negation) step, so a -1e9 pad would flip to +1e9 and, once
+    # shuffled by the 3D axis permutation, could land on a *real* vocab slot
+    # in the last (partially-padded) cube -- silently creating one
+    # astronomically large logit that dominates every sampling step. 0.0 is
+    # safe under negation and dilutes harmlessly when blended back in.
+    pad_len = (cube_size - (V % cube_size)) % cube_size
+    if pad_len > 0:
+        padded = F.pad(logits, (0, pad_len), value=0.0)
+    else:
+        padded = logits
+
+    n_cubes = padded.shape[1] // cube_size
+    cubes = padded.view(B, n_cubes, 3, 3, 3)
+
+    # --- P: parity inversion, reverse ordering along the first spatial axis ---
+    parity_cubes = torch.flip(cubes, dims=[2])
+
+    # --- C: charge conjugation, negate the amplitude ---
+    charge_conjugate_cubes = -parity_cubes
+
+    # --- Full 3D transpose: permute the three spatial axes of the cube ---
+    cp_transposed = charge_conjugate_cubes.permute(0, 1, 4, 3, 2).contiguous()
+
+    # --- CP violation: asymmetric blend between original and CP-transformed cube ---
+    v = max(0.0, min(1.0, violation_strength))
+    violated_cubes = (1.0 - v) * cubes + v * cp_transposed
+
+    transformed_logits = violated_cubes.reshape(B, -1)[:, :V]
+
+    if not compute_gradient:
+        return transformed_logits
+
+    gradient = None
+    if logits.requires_grad:
+        grad_outputs = torch.ones_like(transformed_logits)
+        gradient = torch.autograd.grad(
+            outputs=transformed_logits,
+            inputs=logits,
+            grad_outputs=grad_outputs,
+            retain_graph=True,
+            create_graph=False,
+            allow_unused=True,
+        )[0]
+
+    return transformed_logits, gradient
+
+
+def apply_logit_transform(logits, mode="none", violation_strength=0.15, compute_gradient=False):
+    """
+    Dispatch helper: routes to the flat triangular transpose or the new 3D
+    CP-violation transpose depending on `mode`.
+
+    Modes:
+      - 'none': identity
+      - 'standard' / 'anti' / 'full_transpose': flat triangular transpose (2D)
+      - 'cp_violation_3d': the new 3D CP-violation transpose (+ optional gradient)
+    """
+    if mode == "cp_violation_3d":
+        return apply_cp_violation_transpose_3d(
+            logits, mode=mode, violation_strength=violation_strength, compute_gradient=compute_gradient
+        )
+    result = apply_triangular_logit_transpose(logits, mode=mode)
+    return (result, None) if compute_gradient else result
 
 
 # ==========================================================
@@ -125,7 +239,7 @@ class MarkovSeedingLayer(nn.Module):
             nn.Linear(embed_dim, vocab_size),
         )
 
-    def forward(self, idx, transpose_mode="none"):
+    def forward(self, idx, transpose_mode="none", violation_strength=0.15, compute_gradient=False):
         B, T = idx.shape
         T_use = min(T, self.context_size)
         idx = idx[:, -T_use:]
@@ -141,10 +255,27 @@ class MarkovSeedingLayer(nn.Module):
         context_summary = self.context_proj(context_summary)
 
         logits = self.lm_head(torch.cat([x_flat, context_summary], dim=-1))
-        
-        # Apply Triangular Transpose directly to the output logits
-        logits = apply_triangular_logit_transpose(logits, mode=transpose_mode)
-        
+
+        if compute_gradient and not logits.requires_grad:
+            logits.requires_grad_(True)
+            logits.retain_grad()
+
+        # Apply the selected logit transform (flat triangular or 3D CP-violation)
+        if compute_gradient:
+            logits, gradient = apply_logit_transform(
+                logits,
+                mode=transpose_mode,
+                violation_strength=violation_strength,
+                compute_gradient=True,
+            )
+            return logits, gradient
+
+        logits = apply_logit_transform(
+            logits,
+            mode=transpose_mode,
+            violation_strength=violation_strength,
+            compute_gradient=False,
+        )
         return logits
 
     @torch.no_grad()
@@ -157,6 +288,7 @@ class MarkovSeedingLayer(nn.Module):
         idx_to_word,
         unk_id,
         transpose_mode="standard",
+        violation_strength=0.15,
         temperature=1.2,
         top_k=25,
     ):
@@ -173,8 +305,13 @@ class MarkovSeedingLayer(nn.Module):
                     pad = cond[:, :1].repeat(1, self.context_size - cond.shape[1])
                     cond = torch.cat([pad, cond], dim=1)
 
-                # Forward pass + Logit Triangular Transpose
-                logits = self(cond, transpose_mode=transpose_mode) + amp_boost
+                # Forward pass + logit transform (triangular or 3D CP-violation)
+                logits = self(
+                    cond,
+                    transpose_mode=transpose_mode,
+                    violation_strength=violation_strength,
+                    compute_gradient=False,
+                ) + amp_boost
                 logits[:, unk_id] = -float('inf')
 
                 if top_k is not None and top_k < logits.shape[-1]:
@@ -192,6 +329,21 @@ class MarkovSeedingLayer(nn.Module):
             seeds.append(candidate_sequence)
 
         return seeds
+
+    def inspect_cp_violation_gradient(self, idx, violation_strength=0.15):
+        """
+        Convenience helper: runs a forward pass with transpose_mode='cp_violation_3d'
+        and compute_gradient=True, returning (logits, gradient) so the caller can
+        inspect how sensitive the CP-violation transform is to the raw logits at
+        this context. Not used inside no_grad generation loops.
+        """
+        logits, gradient = self.forward(
+            idx,
+            transpose_mode="cp_violation_3d",
+            violation_strength=violation_strength,
+            compute_gradient=True,
+        )
+        return logits, gradient
 
 
 # ==========================================================
@@ -218,6 +370,7 @@ if __name__ == "__main__":
     known_words = sorted(set(frequent_words) | {w for tg in word_to_idx.keys() if tg != unk_trigram for w in tg})
 
     print("\nEnter text to guide generation. Type 'quit' to exit.")
+    print("(Generation uses the 3D CP-violation transpose: transpose_mode='cp_violation_3d')")
     while True:
         raw_input_text = input("\nUSER: ").strip()
         if raw_input_text.lower() in {"quit", "exit", "stop"}:
@@ -250,8 +403,14 @@ if __name__ == "__main__":
             dtype=torch.long
         )
 
+        # Optional: inspect the CP-violation gradient at this context before generating
+        grad_logits, grad_tensor = markov_seed_layer.inspect_cp_violation_gradient(
+            context_tensor, violation_strength=0.15
+        )
+        if grad_tensor is not None:
+            print(f"[cp_violation_3d] gradient norm at this context: {grad_tensor.norm().item():.4f}")
 
-        print("\n=== GENERATING SAMPLES WITH LOGIT TRIANGULAR TRANSPOSE ===")
+        print("\n=== GENERATING SAMPLES WITH 3D CP-VIOLATION TRANSPOSE ===")
         seeds = markov_seed_layer.generate_population_seeds(
             seed_context_idx=context_tensor,
             sequence_length=150,
@@ -259,6 +418,8 @@ if __name__ == "__main__":
             amp_boost=amp_boost,
             idx_to_word=idx_to_word,
             unk_id=unk_id,
+            transpose_mode="cp_violation_3d",
+            violation_strength=0.15,
             temperature=0.8,
             top_k=25,
         )
