@@ -199,7 +199,7 @@ if __name__ == "__main__":
         print("Generating sequence...")
         generated_indices = model.generate(
             context, 
-            max_new_words=50, 
+            max_new_words=500, 
             freq_boost=freq_boost_tensor, # Pass the CSV hat adjustments
             unk_id=unk_id,
             temperature=0.8
