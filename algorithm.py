@@ -172,7 +172,7 @@ if __name__ == "__main__":
     train_model(model, X, Y)
     
     # Process ai_instructions_diverse_2.csv and retrieve the hat matrix
-    freq_boost_tensor = csv_freq_updater("ai_instructions_diverse_2.csv", word_to_idx, vocab_size, hat_power=0.5)
+    freq_boost_tensor = csv_freq_updater("ai_instructions_diverse.csv", word_to_idx, vocab_size, hat_power=0.5)
 
     while True:
         raw_input = input("\nUSER (Seed with at least 2 words): ").strip()
