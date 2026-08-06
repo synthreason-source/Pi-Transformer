@@ -127,6 +127,8 @@ class AttentionTrigramLM(nn.Module):
             # Inject the CSV frequency hats to bias the generation
             if freq_boost is not None:
                 logits = csv_freq_updater(logits, "ai_instructions_diverse.csv", word_to_idx, vocab_size, hat_power=1.5)
+                logits = csv_freq_updater(logits, "ai_reasoning_diverse.csv", word_to_idx, vocab_size, hat_power=1.5)
+                
 
             if unk_id is not None:
                 logits[:, unk_id] = -float('inf')
