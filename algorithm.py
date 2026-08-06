@@ -46,7 +46,7 @@ def load_and_prepare_data(filename):
 # ==========================================
 # 2. CSV Frequency Updater (Applying Hats)
 # ==========================================
-def csv_freq_updater(csv_filename, word_to_idx, vocab_size, hat_power=0.5):
+def csv_freq_updater(logits, csv_filename, word_to_idx, vocab_size, hat_power=0.5):
     """
     Reads ai_instructions_diverse_2.csv, extracts vocabulary counts, and 
     applies a 'hat' (power) to the frequencies to create a logits boost.
@@ -66,12 +66,15 @@ def csv_freq_updater(csv_filename, word_to_idx, vocab_size, hat_power=0.5):
         for word, idx in word_to_idx.items():
             if word in counts:
                 # Apply the "hat" power scale
+                
                 freq_boost[idx] = float(counts[word]) ** hat_power
                 
         # Normalize the boost to a sensible range to avoid blowing up logits
         max_val = freq_boost.max()
         if max_val > 0:
-            freq_boost = (freq_boost / max_val) * 2.0 
+            log_hat = torch.log(freq_boost.to(logits.device) + eps)
+
+            freq_boost = (freq_boost+log_hat / max_val) * 2.0 
             
         print(f"--- Successfully applied frequency hats from {csv_filename} ---")
         
@@ -123,8 +126,8 @@ class AttentionTrigramLM(nn.Module):
             
             # Inject the CSV frequency hats to bias the generation
             if freq_boost is not None:
-                logits = logits + freq_boost.to(logits.device)
-            
+                logits = csv_freq_updater(logits, "ai_instructions_diverse.csv", word_to_idx, vocab_size, hat_power=1.5)
+
             if unk_id is not None:
                 logits[:, unk_id] = -float('inf')
                 
@@ -172,7 +175,6 @@ if __name__ == "__main__":
     train_model(model, X, Y)
     
     # Process ai_instructions_diverse_2.csv and retrieve the hat matrix
-    freq_boost_tensor = csv_freq_updater("ai_instructions_diverse.csv", word_to_idx, vocab_size, hat_power=0.5)
 
     while True:
         raw_input = input("\nUSER (Seed with at least 2 words): ").strip()
@@ -185,7 +187,7 @@ if __name__ == "__main__":
         # Fuzzy match to ensure words exist in vocabulary
         corrected_tokens = []
         for w in tokens:
-            matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.6)
+            matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.6)#conceptual control
             corrected_tokens.append(matches[0] if matches else known_words[0])
     
         # Ensure we have exactly 2 words for the context window
@@ -200,7 +202,6 @@ if __name__ == "__main__":
         generated_indices = model.generate(
             context, 
             max_new_words=500, 
-            freq_boost=freq_boost_tensor, # Pass the CSV hat adjustments
             unk_id=unk_id,
             temperature=0.8
         )[0].tolist()
