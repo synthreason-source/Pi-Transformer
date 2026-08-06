@@ -124,15 +124,9 @@ class AttentionTrigramLM(nn.Module):
             idx_cond = idx[:, -self.context_size:]
             logits = self(idx_cond)
             
-            
             # Inject the CSV frequency hats to bias the generation
-            if _ % 1 == 0:
+            if freq_boost is not None:
                 logits = csv_freq_updater(logits, "ai_instructions_diverse.csv", word_to_idx, vocab_size, hat_power=1.5)
-            else:
-                logits = csv_freq_updater(logits, "ai_reasoning_diverse.csv", word_to_idx, vocab_size, hat_power=1.5)
-                
-      
-                
 
             if unk_id is not None:
                 logits[:, unk_id] = -float('inf')
@@ -148,7 +142,7 @@ class AttentionTrigramLM(nn.Module):
 # ==========================================
 # 4. Training Loop
 # ==========================================
-def train_model(model, X, Y, epochs=50, batch_size=128, lr=0.01):
+def train_model(model, X, Y, epochs=5, batch_size=128, lr=0.01):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     dataset = torch.utils.data.TensorDataset(X, Y)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
