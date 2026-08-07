@@ -5,6 +5,9 @@ from collections import defaultdict
 import math
 import difflib
 import pandas as pd
+import re
+
+EPS = 1e-8
 
 # ==========================================
 # 1. Dataset Loading & Preprocessing
@@ -16,7 +19,8 @@ def load_and_prepare_data(filename):
     """
     with open(filename, 'r', encoding='utf-8') as f:
         raw_text = f.read()
-    
+
+   
     tokens = raw_text.lower().split()
     
     # Build word-level vocabulary
@@ -28,7 +32,8 @@ def load_and_prepare_data(filename):
     vocab_size = len(unique_words)
     word_to_idx = {w: i for i, w in enumerate(unique_words)}
     idx_to_word = {i: w for i, w in enumerate(unique_words)}
-    
+    unk_id = word_to_idx["<UNK>"]
+
     # Build dataset (Context = 2 previous words, Target = next word)
     contexts, targets = [], []
     for i in range(len(tokens) - 2):
@@ -39,8 +44,20 @@ def load_and_prepare_data(filename):
         
     X = torch.tensor(contexts, dtype=torch.long)
     Y = torch.tensor(targets, dtype=torch.long)
-    
-    return X, Y, word_to_idx, idx_to_word, vocab_size
+    # --- Char-frequency cosine association augmentation ---
+    sentences = split_into_sentences(raw_text)
+    if len(sentences) >= 2:
+        best_assoc, best_scores, alphabet = build_char_freq_associations(sentences)
+        X_extra, Y_extra = build_associative_examples(sentences, best_assoc, word_to_idx, unk_id)
+        if X_extra is not None:
+            print(f"--- Derived {len(X_extra)} associative examples from "
+                  f"{len(sentences)} sentences (char-freq cosine similarity, "
+                  f"alphabet size {len(alphabet)}) ---")
+            X = torch.cat([X, X_extra], dim=0)
+            Y = torch.cat([Y, Y_extra], dim=0)
+    else:
+        print("--- Skipping char-freq association: fewer than 2 sentences detected ---")
+    return X, Y, word_to_idx, idx_to_word, unk_id, vocab_size
 
 
 # ==========================================
@@ -142,7 +159,7 @@ class AttentionTrigramLM(nn.Module):
 # ==========================================
 # 4. Training Loop
 # ==========================================
-def train_model(model, X, Y, epochs=5, batch_size=128, lr=0.01):
+def train_model(model, X, Y, epochs=50, batch_size=128, lr=0.01):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     dataset = torch.utils.data.TensorDataset(X, Y)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -164,13 +181,92 @@ def train_model(model, X, Y, epochs=5, batch_size=128, lr=0.01):
     model.eval()
 
 
+
+# ==========================================
+# 2. Character-Frequency Cosine Association
+# ==========================================
+def split_into_sentences(raw_text):
+    """
+    Naive sentence splitter on '.', '!', '?' (kept simple/dependency-free).
+    """
+    parts = re.split(r'(?<=[.!?])\s+', raw_text.strip())
+    sentences = [p.strip() for p in parts if p.strip()]
+    return sentences
+
+
+def build_char_freq_associations(sentences):
+    """
+    For each sentence, build a character-frequency vector measured against
+    the GLOBAL character superset (every unique char across all sentences),
+    then find each sentence's most cosine-similar *other* sentence.
+
+    Returns:
+        best_assoc: list[int]   -- best_assoc[i] = index of sentence most
+                                    similar to sentence i (excluding itself)
+        best_scores: list[float] -- cosine similarity of that match
+        alphabet: list[str]     -- the character superset used
+    """
+    alphabet = sorted(set("".join(sentences).lower()))
+    char_to_idx = {c: i for i, c in enumerate(alphabet)}
+
+    vecs = torch.zeros(len(sentences), len(alphabet))
+    for i, s in enumerate(sentences):
+        for ch in s.lower():
+            if ch in char_to_idx:
+                vecs[i, char_to_idx[ch]] += 1.0
+
+    norm_vecs = F.normalize(vecs, p=2, dim=1, eps=EPS)
+    sim_matrix = norm_vecs @ norm_vecs.T  # [n_sentences, n_sentences]
+
+    n = len(sentences)
+    if n < 2:
+        return [0] * n, [0.0] * n, alphabet
+
+    sim_matrix.fill_diagonal_(-2.0)  # exclude self-matches
+    best_scores, best_assoc = sim_matrix.max(dim=1)
+
+    return best_assoc.tolist(), best_scores.tolist(), alphabet
+
+
+def build_associative_examples(sentences, best_assoc, word_to_idx, unk_id):
+    """
+    Derives EXTRA (context -> target) trigram examples from the cosine
+    associations: for each sentence A, bridge its last two words to the
+    first word of its most char-frequency-similar sentence B. This is the
+    "derive another sentence, within dataset training" part -- it injects
+    training signal for transitioning toward associated sentences.
+    """
+    tokenized = [s.lower().split() for s in sentences]
+
+    extra_contexts, extra_targets = [], []
+    for i, toks in enumerate(tokenized):
+        if len(toks) < 2:
+            continue
+        j = best_assoc[i]
+        assoc_toks = tokenized[j]
+        if len(assoc_toks) < 1:
+            continue
+
+        ctx = [word_to_idx.get(toks[-2], unk_id), word_to_idx.get(toks[-1], unk_id)]
+        tgt = word_to_idx.get(assoc_toks[0], unk_id)
+        extra_contexts.append(ctx)
+        extra_targets.append(tgt)
+
+    if not extra_contexts:
+        return None, None
+
+    X_extra = torch.tensor(extra_contexts, dtype=torch.long)
+    Y_extra = torch.tensor(extra_targets, dtype=torch.long)
+    return X_extra, Y_extra
 # ==========================================
 # 5. Execution Pipeline
 # ==========================================
 if __name__ == "__main__":
     filename = input("Filename for initial training: ")
-    X, Y, word_to_idx, idx_to_word, vocab_size = load_and_prepare_data(filename)
     
+    X, Y, word_to_idx, idx_to_word, unk_id, vocab_size = load_and_prepare_data(filename)
+    
+        
     model = AttentionTrigramLM(vocab_size=vocab_size)
     train_model(model, X, Y)
     
