@@ -272,6 +272,7 @@ if __name__ == "__main__":
         train_ids = [
             word_to_idx.get(w, unk_id)
             for n, w in enumerate(raw_input.split())
+            for divisor in [Y[(n + 1) % len(Y)].item()]  # latter of each Y[n], Y[n+1] pair, scalar pulled from the tensor
             if word_to_idx.get(w, unk_id) % (divisor + n) != 0 or divisor + n == 0
         ]
         train_model(model, X, Y)  # real training pairs — this is what train_model needs
