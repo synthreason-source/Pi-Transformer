@@ -159,7 +159,7 @@ class AttentionTrigramLM(nn.Module):
 # ==========================================
 # 4. Training Loop
 # ==========================================
-def train_model(model, X, Y, epochs=50, batch_size=128, lr=0.01):
+def train_model(model, X, Y, epochs=5, batch_size=128, lr=0.01):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     dataset = torch.utils.data.TensorDataset(X, Y)
     loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -263,37 +263,36 @@ def build_associative_examples(sentences, best_assoc, word_to_idx, unk_id):
 # ==========================================
 if __name__ == "__main__":
     filename = input("Filename for initial training: ")
-    
     X, Y, word_to_idx, idx_to_word, unk_id, vocab_size = load_and_prepare_data(filename)
-    
-        
     model = AttentionTrigramLM(vocab_size=vocab_size)
-    train_model(model, X, Y)
-    
-    # Process ai_instructions_diverse_2.csv and retrieve the hat matrix
-
     while True:
         raw_input = input("\nUSER (Seed with at least 2 words): ").strip()
-        if not raw_input: continue
-        
+        divisor = Y[-1].item()  # pull the scalar out of the 0-d tensor
+
+        train_ids = [
+            word_to_idx.get(w, unk_id)
+            for n, w in enumerate(raw_input.split())
+            if word_to_idx.get(w, unk_id) % (divisor + n) != 0 or divisor + n == 0
+        ]
+        train_model(model, X, Y)  # real training pairs — this is what train_model needs
+
+
         tokens = raw_input.lower().split()
         unk_id = word_to_idx["<UNK>"]
         known_words = list(word_to_idx.keys())
-    
-        # Fuzzy match to ensure words exist in vocabulary
+
         corrected_tokens = []
         for w in tokens:
             matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.6)#conceptual control
             corrected_tokens.append(matches[0] if matches else known_words[0])
-    
-        # Ensure we have exactly 2 words for the context window
+
         if len(corrected_tokens) < model.context_size:
             corrected_tokens = (known_words[:2] + corrected_tokens)[-2:]
         else:
             corrected_tokens = corrected_tokens[-2:]
-    
+
         context = torch.tensor([[word_to_idx[w] for w in corrected_tokens]], dtype=torch.long)
-        
+
         print("Generating sequence...")
         generated_indices = model.generate(
             context, 
@@ -301,8 +300,8 @@ if __name__ == "__main__":
             unk_id=unk_id,
             temperature=0.8
         )[0].tolist()
-        
+
         generated_text = " ".join([idx_to_word[i] for i in generated_indices])
-        
+
         print("\n--- GENERATED OUTPUT ---")
         print(generated_text)
