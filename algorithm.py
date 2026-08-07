@@ -272,7 +272,6 @@ if __name__ == "__main__":
         train_ids = [
             word_to_idx.get(w, unk_id)
             for n, w in enumerate(raw_input.split())
-            for divisor in [Y[(n + 1) % len(Y)].item()]  # latter of each Y[n], Y[n+1] pair, scalar pulled from the tensor
             if word_to_idx.get(w, unk_id) % (divisor + n) != 0 or divisor + n == 0
         ]
         train_model(model, X, Y)  # real training pairs — this is what train_model needs
@@ -285,7 +284,7 @@ if __name__ == "__main__":
         corrected_tokens = []
         for w in tokens:
             matches = difflib.get_close_matches(w, known_words, n=1, cutoff=0.6)#conceptual control
-            corrected_tokens.append(matches[0] if matches else known_words[0])
+            corrected_tokens.extend(matches[:3] if matches else known_words[0])
 
         if len(corrected_tokens) < model.context_size:
             corrected_tokens = (known_words[:2] + corrected_tokens)[-2:]
