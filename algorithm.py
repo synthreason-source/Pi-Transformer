@@ -2256,7 +2256,6 @@ class ThebaultWalker:
                 if ci not in PUNCT_TOKENS and cj not in PUNCT_TOKENS:
                     sim = (k_reg[i] * k_side[i] * k_reg[j] * k_side[j]).sqrt().item()
                     self.current_isomorphic_pairs.append((ci, cj, sim))
-        self.current_isomorphic_pairs.sort(key=lambda x: -x[0])
 
         # ---- Influence space mapping:  f : A × B → Y --------------------------
         # A = {w1,w2}-conditioned context, B = top-K candidate neighbourhood.
