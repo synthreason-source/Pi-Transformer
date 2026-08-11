@@ -1,508 +1,648 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-NeuroSymbolic-Backprop — a real, trainable neural network version
-===================================================================
+import networkx as nx
+import uuid
+import pickle
+import os
+import time
+import logging
+import sys
+import shutil # Added for directory cleanup
 
-The original V18-CUDA script computes everything with hand-tuned kernels
-under @torch.no_grad(): rho/theta/sigma "geometry" comes from fixed
-trigonometric formulas, and the "DNN layers" (sigma layer, theta layer,
-dim2-relu layer, rho layer) just apply those fixed weights — nothing is
-learned, so there is nothing to backpropagate through.
-
-This file keeps the same *shape* of the pipeline —
-
-    token -> geometric features (rho, theta, sigma)
-          -> sigma layer -> theta layer -> dim2-relu layer -> rho layer
-          -> synaptic (self-attention) mixing across the sequence
-          -> vocab logits
-
-— but every one of those stages is now an nn.Module with real trainable
-parameters, and the whole thing is trained with cross-entropy loss and
-optimizer.step() / loss.backward(), i.e. actual backprop, on next-token
-prediction over a text corpus.
-
-Usage:
-    python neurosymbolic_backprop.py --corpus mytext.txt --epochs 10
-    python neurosymbolic_backprop.py --corpus mytext.txt --generate "once upon a time"
-"""
-
-from __future__ import annotations
-import argparse, math, re
-from pathlib import Path
-from typing import List, Tuple, Dict
-
+# --- Hugging Face Imports ---
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from transformers import GPT2LMHeadModel, GPT2Tokenizer, pipeline, Trainer, TrainingArguments, DataCollatorForLanguageModeling
+from torch.utils.data import Dataset
 
+# --- Dataclasses Import ---
+from dataclasses import dataclass, field
 
-def best_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+# --- Typing Import ---
+from typing import List, Dict, Any, Optional
 
-DEVICE = best_device()
+# Suppress Hugging Face verbose warnings on startup
+logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
 
+# ==========================================
+# 0. Configuration & Persistence Setup
+# ==========================================
+MODEL_STORAGE_DIR = "./agi_core_storage"
+MODEL_FILENAME = "active_agi_core.pkl"
 
-# ─────────────────────────────────────────────────────────────────────────
-# Exact curve functions from the original script — same math, unchanged.
-# These are ordinary differentiable torch ops, so gradients flow through
-# them fine; nothing here needs @torch.no_grad().
-# ─────────────────────────────────────────────────────────────────────────
+# ==========================================
+# 1. Conceptual Datatype Synthesis (Abstraction)
+# ==========================================
 
-def smooth_power_relu(x: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
-    x_safe = x.clamp(-1, 0.5)
-    return (x_safe * x_safe) / (x_safe.abs() + eps)
+@dataclass
+class OptimizedDatatype:
+    """Represents the conceptual abstracted datatype."""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    original_component: str = ""
+    shape: tuple = ()
+    semantic_meaning: str = "Generic"
+    # Hold a reference to the actual tensor weight for training
+    tensor_ref: Optional[torch.Tensor] = field(default=None, repr=False)
 
+    def __repr__(self):
+        return f"<{self.semantic_meaning} Datatype ({self.shape}) from {self.original_component}>"
 
-def signed_power(x: torch.Tensor, p: float, cap: float = 50.0) -> torch.Tensor:
-    # cap lowered from the original's 3011.0 since features here are
-    # already small (post layer-norm / bounded heads); the curve shape
-    # (sign(x)*|x|^p) is identical.
-    return x.sign() * (x.abs().clamp(max=cap) + 1e-12).pow(p)
-
-
-def raised_cosine(delta_theta: torch.Tensor) -> torch.Tensor:
-    """k_ori(theta_a, theta_b) = 0.5*(1+cos(theta_b - theta_a)) — identical
-    to ThebaultKernels.k_ori in the original."""
-    return 0.5 * (1.0 + torch.cos(delta_theta))
-
-
-def gaussian_kernel(delta: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """exp(-scale * delta^2) — identical curve shape to k_reg / k_side in
-    the original (lambda_reg / gamma_side become learnable here)."""
-    return torch.exp((-scale * delta * delta).clamp(min=-50.0))
-
-
-def theta_weight_curve(theta: torch.Tensor) -> torch.Tensor:
-    """DNNArrayPipeline._theta_weights: 0.5*(1+cos(theta)) — same formula."""
-    return 0.5 * (1.0 + torch.cos(theta))
-
-
-def sigma_weight_curve(sigma_norm: torch.Tensor) -> torch.Tensor:
-    """DNNArrayPipeline._sigma_weights: 0.7 + 0.3*sigma_norm — same affine
-    curve, bounded to [0.7, 1.0]."""
-    return 0.7 + 0.3 * sigma_norm
-
-
-def rho_weight_curve(rho: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    """DNNArrayPipeline._rho_weights: z-score the batch of rho, clamp to
-    [-2.5, 2.5], map through 1 + 0.5*z — same formula, same clamp range.
-
-    unbiased=False (population std, divide by N not N-1) is important here:
-    during generation the sequence length can be 1 (e.g. a one-token
-    prompt), and the default Bessel-corrected std is 0/0 = NaN for N=1,
-    which silently poisons everything downstream. Population std of a
-    single element is a well-defined 0.
+class ConceptualSynthesisEngine:
     """
-    mu = rho.mean(dim=-1, keepdim=True)
-    std = rho.std(dim=-1, keepdim=True, unbiased=False) + eps
-    z = ((rho - mu) / std).clamp(-2.5, 2.5)
-    return 1.0 + 0.5 * z
+    Abstracts HF model components into conceptual types and maps live weights.
+    """
+    def abstract_from_model(self, model: torch.nn.Module) -> List[OptimizedDatatype]:
+        print(f"\n|-- [SYNTHESIS] Analyzing HF Model Architecture and mapping weights...")
+        abstracted_types = []
 
+        # Iterate through all modules to find optimization targets
+        for name, module in model.named_modules():
+            # Handle GPT-2 Attention weight structure.
+            if "attn" in name.lower():
+                 c_attn_module = getattr(module, 'c_attn', None)
+                 if c_attn_module is not None and hasattr(c_attn_module, 'weight'):
+                     weight_t = c_attn_module.weight.data
+                     dtype = OptimizedDatatype(
+                            original_component=f"{name}.c_attn",
+                            shape=weight_t.shape,
+                            semantic_meaning="CausalAttention_QKV",
+                            tensor_ref=weight_t
+                        )
+                     abstracted_types.append(dtype)
+                 else:
+                     print(f"|-- [WARN] Skipped weight mapping for Attention layer '{name}': Unexpected structure.")
 
-# ─────────────────────────────────────────────────────────────────────────
-# Tokenizer + vocab (simple word-level, mirrors the spirit of the original)
-# ─────────────────────────────────────────────────────────────────────────
+            # Identify MLP layers (Feed Forward)
+            elif "mlp" in name.lower():
+                 c_fc_module = getattr(module, 'c_fc', None)
+                 if c_fc_module is not None and hasattr(c_fc_module, 'weight'):
+                     weight_t = c_fc_module.weight.data
+                     dtype = OptimizedDatatype(
+                            original_component=f"{name}.c_fc",
+                            shape=weight_t.shape,
+                            semantic_meaning="FeedForward_InputProjection",
+                            tensor_ref=weight_t
+                        )
+                     abstracted_types.append(dtype)
 
-def tokenize(text: str) -> List[str]:
-    text = text.replace("\n", " \n ")
-    return re.findall(r"\w+|[.,!?;:]|\n", text.lower())
+        print(f"|-- [SYNTHESIS] Complete. Mapped {len(abstracted_types)} conceptual datatypes to live tensors.")
+        return abstracted_types
 
+# ==========================================
+# 2. Hierarchical Graph Optimization
+# ==========================================
 
-def build_trigrams(tokens: List[str]) -> "OrderedDict[Tuple[str, str, str], int]":
-    """(w1, w2, w3) -> count, in first-seen order. Same idea as the original
-    ThebaultCompositionLM.ingest()'s tri_raw table, just standalone here."""
-    from collections import OrderedDict
-    tri: "OrderedDict[Tuple[str, str, str], int]" = OrderedDict()
-    for i in range(len(tokens) - 2):
-        key = (tokens[i], tokens[i + 1], tokens[i + 2])
-        tri[key] = tri.get(key, 0) + 1
-    return tri
+class ConceptualGraphOptimizer:
+    """
+    Optimizes graph; ensures tensor references are preserved during node fusion.
+    """
+    def optimize_model_graph(self, call_graph: nx.DiGraph) -> nx.DiGraph:
+        print("\n|-- [OPTIMIZATION] Starting Hierarchical Graph Optimization...")
+        optimized_graph = call_graph.copy()
+        
+        # Pruning: Remove redundant Dropout layers often found in training graphs
+        nodes_to_remove = [node for node in optimized_graph.nodes() if "drop" in node.lower()]
+        for node in nodes_to_remove:
+            optimized_graph.remove_node(node)
 
+        # Fusion: Look for LayerNorm -> Attention -> Add pattern and fuse it
+        nodes = list(optimized_graph.nodes())
+        for i in range(len(nodes) - 2):
+            u = nodes[i]
+            v = nodes[i+1]
+            w = nodes[i+2]
 
-def top_trigrams(tri: "Dict[Tuple[str, str, str], int]", k: int = 15) -> List[Tuple[Tuple[str, str, str], int]]:
-    return sorted(tri.items(), key=lambda kv: -kv[1])[:k]
+            # GPT-2 block structure: ln_1 -> attn -> resid_dropout
+            if "ln_1" in u and "attn" in v and "resid_dropout" in w:
+                fused_id = f"Fused_Attn_Block_{u.split('.')[1]}"
+                print(f"|-- [FUSION] Fusing GPT-2 Block: {u} + {v} + {w} -> {fused_id}")
+                
+                optimized_graph.add_node(fused_id, 
+                                       op='FusedGPT2Attn', 
+                                       conceptual_modules=[u, v, w], 
+                                       customized=True
+                                       )
+                
+                predecessors = list(call_graph.predecessors(u))
+                successors = list(call_graph.successors(w))
+                for pred in predecessors: optimized_graph.add_edge(pred, fused_id)
+                for succ in successors: optimized_graph.add_edge(fused_id, succ)
+                
+                optimized_graph.remove_nodes_from([u, v, w])
+                break
 
+        print(f"|-- [OPTIMIZATION] Graph Optimized. New node count: {optimized_graph.number_of_nodes()}")
+        return optimized_graph
 
-class Vocab:
-    def __init__(self, tokens: List[str]):
-        uniq = sorted(set(tokens))
-        self.itos = ["<pad>", "<unk>"] + uniq
-        self.stoi = {t: i for i, t in enumerate(self.itos)}
+def build_call_graph_from_hf_model(model: torch.nn.Module) -> nx.DiGraph:
+    print(f"|-- [BUILDER] Building initial conceptual graph representing architecture...")
+    graph = nx.DiGraph()
+    
+    for name, module in model.named_modules():
+        if name:
+            graph.add_node(name, type=type(module).__name__)
+            
+    for name, module in model.named_modules():
+        for child_name, child_module in module.named_children():
+            full_child_name = f"{name}.{child_name}" if name else child_name
+            if graph.has_node(name) and graph.has_node(full_child_name):
+                 graph.add_edge(name, full_child_name)
+    print(f"|-- [BUILDER] Call graph built with {graph.number_of_nodes()} nodes.")
+    return graph
+
+# ==========================================
+# 3. AGI Core Assembly Simulator
+# ==========================================
+
+class AGICoreAssembler:
+    """
+    Packages the graph and references to live model/tokenizer into an AGI Core object.
+    """
+    def assemble(self, optimized_graph: nx.DiGraph, model: GPT2LMHeadModel, tokenizer: GPT2Tokenizer):
+        print("\n========================================")
+        print(">>> AGI Core Assembly Sequence Initiated <<<")
+        print("========================================")
+        
+        core_id = str(uuid.uuid4())[:8]
+        
+        agi_core = {
+            'id': core_id,
+            'architecture_graph': optimized_graph,
+            'runtime_model': model, # Live PyTorch model
+            'runtime_tokenizer': tokenizer,
+            'assembly_time': time.time()
+        }
+        
+        print(f"[SUCCESS] AGI Core (v.Adaptive) Assembled: {core_id}")
+        
+        return agi_core
+
+# ==========================================
+# Dataset Helper for Training
+# ==========================================
+
+class SimpleTextDataset(Dataset):
+    def __init__(self, tokenizer, texts, max_length=128):
+        self.tokenizer = tokenizer
+        self.inputs = []
+        for text in texts:
+            # Tokenize immediately
+            encodings = tokenizer(text, truncation=True, max_length=max_length, padding='max_length')
+            self.inputs.append(torch.tensor(encodings['input_ids']))
 
     def __len__(self):
-        return len(self.itos)
+        return len(self.inputs)
 
-    def encode(self, tokens: List[str]) -> torch.Tensor:
-        return torch.tensor([self.stoi.get(t, 1) for t in tokens], dtype=torch.long)
+    def __getitem__(self, idx):
+        # For CLM, labels are usually the same as inputs (shifted internally by Trainer)
+        return {'input_ids': self.inputs[idx], 'labels': self.inputs[idx]}
 
-    def decode(self, ids: List[int]) -> str:
-        toks = [self.itos[i] for i in ids]
-        out = []
-        for t in toks:
-            if t in {".", ",", "!", "?", ";", ":"}:
-                if out:
-                    out[-1] += t
-            else:
-                out.append(t)
-        return " ".join(out)
+# ==========================================
+# 4. Execution Engine (Inference)
+# ==========================================
 
-
-# ─────────────────────────────────────────────────────────────────────────
-# Learnable geometric embedding — replaces the fixed Thebault-triple math
-# with three small trainable heads (rho, theta, sigma) on top of a token
-# embedding. These are ordinary parameters trained by backprop, not the
-# closed-form trig formulas from the original script.
-# ─────────────────────────────────────────────────────────────────────────
-
-class GeometricEmbedding(nn.Module):
-    def __init__(self, vocab_size: int, dim: int, max_len: int = 2048):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.max_len = max_len
-        self.tok_emb   = nn.Embedding(vocab_size, dim)
-        self.pos_emb   = nn.Embedding(max_len, dim)
-        self.rho_head  = nn.Linear(dim, 1)
-        self.theta_head = nn.Linear(dim, 1)
-        self.sigma_head = nn.Linear(dim, 1)
-
-    def forward(self, idx: torch.Tensor):
-        B, T = idx.shape
-
-        # Fail with a clear CPU-side error instead of a CUDA device-side
-        # assert deep in an embedding kernel. This forces a sync (cheap —
-        # it's just two reductions), which is worth it: without it, an
-        # out-of-range token id or a sequence longer than max_len shows up
-        # as an opaque "CUDA error: device-side assert triggered" that
-        # points at the wrong line and often corrupts the CUDA context for
-        # the rest of the process.
-        if T > self.max_len:
-            raise ValueError(
-                f"sequence length {T} exceeds GeometricEmbedding.max_len={self.max_len}; "
-                f"pass a larger max_len to NeuroSymbolicNet (>= your --block-size), "
-                f"or reduce --block-size."
-            )
-        tok_min, tok_max = idx.min().item(), idx.max().item()
-        if tok_min < 0 or tok_max >= self.vocab_size:
-            raise ValueError(
-                f"token id out of range: min={tok_min}, max={tok_max}, "
-                f"but vocab_size={self.vocab_size}. This usually means the "
-                f"Vocab used to encode ids doesn't match the vocab the model "
-                f"was built/loaded with."
-            )
-
-        pos = torch.arange(T, device=idx.device).unsqueeze(0).expand(B, T)
-        e = self.tok_emb(idx) + self.pos_emb(pos)
-        rho   = torch.sigmoid(self.rho_head(e)).squeeze(-1)          # [0,1]
-        theta = torch.tanh(self.theta_head(e)).squeeze(-1) * math.pi  # (-pi, pi)
-        sigma = torch.sigmoid(self.sigma_head(e)).squeeze(-1)         # [0,1]
-        return e, rho, theta, sigma
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Trainable "dim-2 relu" layer — same gating idea as the original
-# (_dim2_relu_layer), but the gate is now derived from a learnable theta
-# projection rather than a fixed cosine kernel, and gradients flow through
-# it normally (no torch.no_grad()).
-# ─────────────────────────────────────────────────────────────────────────
-
-class Dim2ReluLayer(nn.Module):
-    """Identical curve to the original _dim2_relu_layer:
-        theta_w  = 0.5*(1+cos(theta))
-        gate_raw = relu(theta_w - mean(theta_w))
-        gate     = gate_raw / max(gate_raw)
-        out      = x*gate + relu(x)*(1-gate)
+class SimulationExecutionEngine:
     """
-    def forward(self, x: torch.Tensor, theta: torch.Tensor) -> torch.Tensor:
-        theta_w  = theta_weight_curve(theta)                      # [B,T] in [0,1]
-        gate_raw = F.relu(theta_w - theta_w.mean(dim=-1, keepdim=True))
-        g_max    = gate_raw.max(dim=-1, keepdim=True).values.clamp(min=1e-8)
-        gate     = (gate_raw / g_max).unsqueeze(-1)                # [B,T,1]
-        return x * gate + F.relu(x) * (1.0 - gate)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Trainable "synaptic sum" — the differentiable analogue of
-# CrossSynapticNeuronSum / build_synaptic_weight_matrix: instead of a
-# fixed RBF-kernel weight matrix, this is ordinary learned causal
-# self-attention, which plays the same structural role (mixing
-# information across candidate/context tokens) but with real gradients.
-# ─────────────────────────────────────────────────────────────────────────
-
-class SynapticSelfAttention(nn.Module):
-    """Differentiable analogue of build_synaptic_weight_matrix / CSNS.
-
-    The original computed a fixed weight matrix
-        W = k_reg(rho) * k_ori(theta) * k_side(sigma)
-    with k_reg/k_side Gaussian kernels and k_ori a raised cosine, using
-    fixed lambda_reg=811.0 / gamma_side=411.0. Here those same three curve
-    shapes are computed per pair of positions and added (in log-space, so
-    the product becomes a sum) as a bias to ordinary learned Q/K attention
-    scores — same curves, but lambda_reg/gamma_side are now nn.Parameters
-    trained by backprop instead of hand-picked constants.
+    Performs inference using the live model contained within the AGI Core.
     """
-    def __init__(self, dim: int, n_heads: int = 4):
-        super().__init__()
-        assert dim % n_heads == 0
-        self.n_heads = n_heads
-        self.head_dim = dim // n_heads
-        self.qkv  = nn.Linear(dim, dim * 3)
-        self.proj = nn.Linear(dim, dim)
-        # learnable analogues of lambda_reg / gamma_side, softplus-ed to
-        # stay positive (same role, same curve family as the original)
-        self.raw_lambda_reg = nn.Parameter(torch.tensor(2.0))
-        self.raw_gamma_side = nn.Parameter(torch.tensor(2.0))
-        self.kernel_weight  = nn.Parameter(torch.tensor(1.0))
+    def __init__(self, agi_core: Dict[str, Any]):
+        self.model = agi_core['runtime_model']
+        self.tokenizer = agi_core['runtime_tokenizer']
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
 
-    def forward(self, x: torch.Tensor, rho: torch.Tensor, theta: torch.Tensor,
-                sigma: torch.Tensor) -> torch.Tensor:
-        B, T, D = x.shape
-        qkv = self.qkv(x).view(B, T, 3, self.n_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        q, k, v = (t.transpose(1, 2) for t in (q, k, v))   # [B,H,T,hd]
-
-        lambda_reg = F.softplus(self.raw_lambda_reg).clamp(max=50.0)
-        gamma_side = F.softplus(self.raw_gamma_side).clamp(max=50.0)
-
-        d_rho   = rho.unsqueeze(-1)   - rho.unsqueeze(-2)     # [B,T,T]
-        d_theta = theta.unsqueeze(-1) - theta.unsqueeze(-2)
-        d_sigma = sigma.unsqueeze(-1) - sigma.unsqueeze(-2)
-
-        k_reg  = gaussian_kernel(d_rho, lambda_reg)     # same curve as original k_reg
-        k_ori  = raised_cosine(d_theta)                 # same curve as original k_ori
-        k_side = gaussian_kernel(d_sigma, gamma_side)    # same curve as original k_side
-
-        kernel_bias = (k_reg * k_ori * k_side).clamp(min=1e-8).log()  # [B,T,T]
-        kernel_bias = kernel_bias.unsqueeze(1)                         # [B,1,T,T]
-
-        kw = self.kernel_weight.clamp(-10.0, 10.0)
-        mask = torch.tril(torch.ones(T, T, device=x.device, dtype=torch.bool))
-        scores = (q @ k.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        scores = scores + kw * kernel_bias
-        scores = scores.masked_fill(~mask, float("-inf"))
-        attn = F.softmax(scores, dim=-1)
-        out = attn @ v                                       # [B,H,T,hd]
-        out = out.transpose(1, 2).contiguous().view(B, T, D)
-        return self.proj(out)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# The network: sigma layer -> theta layer -> dim2-relu -> rho layer ->
-# synaptic self-attention -> vocab logits. Mirrors the reversed layer
-# order from DNNArrayPipeline.forward, but every weight here is learned.
-# ─────────────────────────────────────────────────────────────────────────
-
-class NeuroSymbolicNet(nn.Module):
-    def __init__(self, vocab_size: int, dim: int = 128, hidden: int = 256,
-                 n_layers: int = 2, n_heads: int = 4, dropout: float = 0.1,
-                 max_len: int = 2048):
-        super().__init__()
-        self.geo = GeometricEmbedding(vocab_size, dim, max_len=max_len)
-
-        self.sigma_layer = nn.Linear(dim, hidden)
-        self.theta_layer = nn.Linear(hidden, hidden)
-        self.dim2_relu   = Dim2ReluLayer()
-        self.rho_layer   = nn.Linear(hidden, hidden)
-
-        self.blocks = nn.ModuleList([
-            nn.ModuleDict(dict(
-                attn=SynapticSelfAttention(hidden, n_heads),
-                ln1=nn.LayerNorm(hidden),
-                ff=nn.Sequential(
-                    nn.Linear(hidden, hidden * 4), nn.GELU(),
-                    nn.Linear(hidden * 4, hidden),
-                ),
-                ln2=nn.LayerNorm(hidden),
-            ))
-            for _ in range(n_layers)
-        ])
-        self.dropout = nn.Dropout(dropout)
-        self.ln_f = nn.LayerNorm(hidden)
-        self.out  = nn.Linear(hidden, vocab_size)
-
-    def forward(self, idx: torch.Tensor) -> torch.Tensor:
-        e, rho, theta, sigma = self.geo(idx)
-
-        # Layer 1 — sigma modulation: same curve as _sigma_weights (0.7+0.3*sigma),
-        # then signed_power(., p=1.0) as in the original z1.
-        sig_w = sigma_weight_curve(sigma)                       # [B,T] in [0.7,1.0]
-        z1 = signed_power(self.sigma_layer(e) * sig_w.unsqueeze(-1), p=1.0)
-
-        # Layer 2 — theta modulation: same curve as _theta_weights
-        # (0.5*(1+cos(theta))), residual + raw features * 0.3, signed_power(p=1.5).
-        theta_w = theta_weight_curve(theta)                     # [B,T] in [0,1]
-        z2 = signed_power(self.theta_layer(z1) * theta_w.unsqueeze(-1) + z1 * 0.3, p=1.5)
-
-        # Layer 2b — dim-2 relu, identical gate formula to the original.
-        z2b = self.dim2_relu(z2, theta)
-
-        # Layer 3 — rho amplification: same curve as _rho_weights
-        # (z-score clamp to [-2.5,2.5], 1+0.5*z), signed_power(p=2.0).
-        rho_w = rho_weight_curve(rho)                            # [B,T]
-        z3 = signed_power(self.rho_layer(z2b) * rho_w.unsqueeze(-1), p=2.0)
-        z3 = self.dropout(z3)
-
-        x = z3
-        for blk in self.blocks:
-            x = x + blk["attn"](blk["ln1"](x), rho, theta, sigma)
-            x = x + blk["ff"](blk["ln2"](x))
-
-        x = self.ln_f(x)
-        logits = self.out(x)
-        # Defensive: nothing upstream should be able to produce NaN/Inf given
-        # the clamps in signed_power / gaussian_kernel / rho_weight_curve,
-        # but if training has diverged (e.g. too high --lr) we want a clean
-        # signal rather than letting garbage reach softmax/multinomial where
-        # it shows up as an opaque CUDA device-side assert.
-        return torch.nan_to_num(logits, nan=0.0, posinf=50.0, neginf=-50.0)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# Training loop — real backprop: forward pass -> cross-entropy loss ->
-# loss.backward() -> optimizer.step().
-# ─────────────────────────────────────────────────────────────────────────
-
-def make_batches(ids: torch.Tensor, block_size: int, batch_size: int, device):
-    n = ids.shape[0] - block_size - 1
-    while True:
-        starts = torch.randint(0, n, (batch_size,))
-        x = torch.stack([ids[s:s + block_size] for s in starts]).to(device)
-        y = torch.stack([ids[s + 1:s + 1 + block_size] for s in starts]).to(device)
-        yield x, y
-
-
-def train(model: NeuroSymbolicNet, ids: torch.Tensor, vocab_size: int,
-          steps: int = 2000, block_size: int = 64, batch_size: int = 32,
-          lr: float = 3e-4, device=DEVICE, log_every: int = 100):
-    model.to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=lr)
-    batches = make_batches(ids, block_size, batch_size, device)
-
-    model.train()
-    for step in range(1, steps + 1):
-        x, y = next(batches)
-
-        logits = model(x)                                    # forward pass
-        loss = F.cross_entropy(logits.reshape(-1, vocab_size), y.reshape(-1))
-
-        if not torch.isfinite(loss):
-            # With the clamps in the model this shouldn't happen, but if it
-            # does, stop now with a clear message rather than continuing to
-            # train on garbage (which is what eventually surfaces as a
-            # confusing CUDA assert deep inside torch.multinomial later,
-            # during generation).
-            raise RuntimeError(
-                f"loss became non-finite ({loss.item()}) at step {step} — "
-                f"training has diverged. Try a smaller --lr (current={lr}), "
-                f"a smaller --dim/--hidden, or fewer --layers."
+    def generate(self, prompt: str, max_length: int = 50) -> str:
+        print(f"\n|-- [ENGINE] Executing generation using Active AGI Core...")
+        
+        inputs = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        
+        with torch.no_grad():
+            outputs = self.model.generate(
+                inputs, 
+                max_length=max_length, 
+                do_sample=True, 
+                temperature=0.7,
+                no_repeat_ngram_size=2,
+                pad_token_id=self.tokenizer.eos_token_id
             )
+        
+        return self.tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-        opt.zero_grad()
-        loss.backward()                                       # <-- backprop
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()                                            # <-- weight update
+def validate_agi_core(agi_core: Dict[str, Any]):
+    """Runs inference validation."""
+    print(f"\n[PHASE 4: Functional Validation of Core {agi_core['id']}]")
+    
+    try:
+        execution_engine = SimulationExecutionEngine(agi_core)
+        
+        print(f"\nAGI Core active. Enter a phrase to test generation.")
+        print(f"Press Enter alone to use the default prompt.")
+        
+        try:
+            user_prompt = input("> ").strip()
+        except EOFError:
+            user_prompt = ""
+            print()
 
-        if step % log_every == 0 or step == 1:
-            print(f"[step {step:5d}] loss={loss.item():.4f}  ppl={math.exp(min(loss.item(), 20)):.2f}")
-    return model
+        if not user_prompt:
+            test_prompt = "The synthesis of code and neural networks represents the future of"
+        else:
+            test_prompt = user_prompt
+            
+        generated_text = execution_engine.generate(test_prompt, max_length=50)
+        
+        print("\n|-- Validation Results:")
+        print("-" * 60)
+        print(f"\"{generated_text}\"")
+        print("-" * 60)
+            
+    except Exception as e:
+        print(f"[CRITICAL ERROR] Inference failed: {e}")
+        import traceback
+        traceback.print_exc()
 
+# ==========================================
+# 5. AGI Core Persistence (Save/Load)
+# ==========================================
 
-@torch.no_grad()
-def generate(model: NeuroSymbolicNet, vocab: Vocab, prompt: str,
-             max_new_tokens: int = 60, temperature: float = 1.0,
-             block_size: int = 64, device=DEVICE) -> str:
-    model.eval()
-    toks = tokenize(prompt) or ["<unk>"]
-    ids = vocab.encode(toks).unsqueeze(0).to(device)
+def save_agi_core(agi_core: Dict[str, Any]):
+    """
+    Serializes the AGI Core to disk.
+    Saves the live PyTorch state_dict() embedded in the core.
+    """
+    print(f"\n[PHASE 5: AGI Core Persistence (Saving to Disk)]")
+    if not os.path.exists(MODEL_STORAGE_DIR):
+        os.makedirs(MODEL_STORAGE_DIR)
+    
+    filepath = os.path.join(MODEL_STORAGE_DIR, MODEL_FILENAME)
+    print(f"|-- Saving Active AGI Core {agi_core['id']} state to: {filepath}...")
+    
+    try:
+        core_to_save = {
+            'id': agi_core['id'],
+            'architecture_graph': agi_core['architecture_graph'],
+            'model_state_dict': agi_core['runtime_model'].state_dict(),
+            # Tokenizer config is saved to ensure consistency on reload
+            'tokenizer_init_kwargs': agi_core['runtime_tokenizer'].init_kwargs,
+            'assembly_time': agi_core['assembly_time']
+        }
+        
+        with open(filepath, 'wb') as f:
+            pickle.dump(core_to_save, f)
+        print(f"[SUCCESS] Core state saved.")
+    except Exception as e:
+        print(f"[ERROR] Failed to save core: {e}")
+        import traceback
+        traceback.print_exc()
 
-    for _ in range(max_new_tokens):
-        ids_cond = ids[:, -block_size:]
-        # temperature floor raised from 1e-6 to 0.05: dividing already-large
-        # logits by something near 1e-6 can overflow to inf, which turns
-        # into NaN after softmax and crashes multinomial with the assert
-        # you hit ("Assertion `input[0] != 0` failed").
-        logits = model(ids_cond)[:, -1, :] / max(temperature, 0.05)
-        probs = F.softmax(logits, dim=-1)
+def configure_tokenizer(tokenizer):
+    """Helper to ensure GPT-2 tokenizer has a pad token."""
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        print(f"|-- Tokenizer configured with pad_token: {tokenizer.pad_token}")
+    return tokenizer
 
-        # Last line of defense: if anything upstream still produced a
-        # degenerate (all-zero / NaN) distribution, fall back to uniform
-        # over the vocab instead of letting torch.multinomial hard-crash.
-        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
-        row_sum = probs.sum(dim=-1, keepdim=True)
-        if (row_sum <= 0).any():
-            probs = torch.where(row_sum <= 0, torch.full_like(probs, 1.0 / probs.shape[-1]), probs)
-            row_sum = probs.sum(dim=-1, keepdim=True)
-        probs = probs / row_sum
+def load_agi_core_at_startup() -> Optional[Dict[str, Any]]:
+    """
+    Attempts to load the core from disk.
+    Reconstructs the live PyTorch model from the saved state_dict.
+    """
+    print(f"\n>>> AGI System Startup Sequence <<<")
+    filepath = os.path.join(MODEL_STORAGE_DIR, MODEL_FILENAME)
+    
+    if os.path.exists(filepath):
+        print(f"|-- Found existing AGI Core state at: {filepath}")
+        try:
+            with open(filepath, 'rb') as f:
+                saved_core = pickle.load(f)
+            
+            print(f"|-- Loading Core ID: {saved_core['id']} assembled on {time.ctime(saved_core['assembly_time'])}")
+            
+            # Reconstruct Runtime Objects
+            model_id = "gpt2"
+            # Pass saved config if available
+            tokenizer_kwargs = saved_core.get('tokenizer_init_kwargs', {})
+            tokenizer = GPT2Tokenizer.from_pretrained(model_id, **tokenizer_kwargs)
+            
+            # CRITICAL FIX: Ensure pad token is set immediately after loading tokenizer
+            tokenizer = configure_tokenizer(tokenizer)
+            
+            model = GPT2LMHeadModel.from_pretrained(model_id)
+            
+            # Load the saved weights into the fresh model
+            model.load_state_dict(saved_core['model_state_dict'])
+            
+            optimized_graph = saved_core['architecture_graph']
+            print(f"[SUCCESS] Core loaded and verified. Graph nodes: {optimized_graph.number_of_nodes()}")
+            
+            reconstructed_core = {
+                'id': saved_core['id'],
+                'architecture_graph': optimized_graph,
+                'runtime_model': model,
+                'runtime_tokenizer': tokenizer,
+                'assembly_time': saved_core['assembly_time']
+            }
+            return reconstructed_core
+            
+        except Exception as e:
+            print(f"[ERROR] Failed to load core state: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    else:
+        print(f"|-- No existing AGI Core found.")
+        return None
 
-        nxt = torch.multinomial(probs, num_samples=1)
-        ids = torch.cat([ids, nxt], dim=1)
+# ==========================================
+# 6. Adaptive Training Loop (Trainer)
+# ==========================================
 
-    return vocab.decode(ids[0].tolist())
+def train_agi_core_on_new_data(agi_core: Dict[str, Any]):
+    """
+    Simulates fine-tuning the AGI Core's live model on new data provided by the user.
+    Updated for TrainingArguments compatibility.
+    """
+    print(f"\n========================================")
+    print(">>> Adaptive Training Sequence Initiated <<<")
+    print("========================================")
+    print("|-- This process will update the live weights of the AGI Core.")
+    
+    model = agi_core['runtime_model']
+    tokenizer = agi_core['runtime_tokenizer']
+    
+    # Ensure tokenizer is ready for padding
+    tokenizer = configure_tokenizer(tokenizer)
+    
+    print(f"\nEnter new natural text data below to train the core (press Ctrl+C to finish input).")
+    new_corpus = []
+    try:
+        while True:
+            line = input("> ").strip()
+            if line:
+                new_corpus.append(line)
+    except KeyboardInterrupt:
+        print("\n|-- Input stream ended.")
 
+    if not new_corpus:
+        print("|-- No data provided. Skipping training.")
+        return
 
-# ─────────────────────────────────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────────────────────────────────
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--corpus", type=str, required=True, help="path to a .txt corpus")
-    ap.add_argument("--steps", type=int, default=2000)
-    ap.add_argument("--block-size", type=int, default=64)
-    ap.add_argument("--batch-size", type=int, default=32)
-    ap.add_argument("--dim", type=int, default=128)
-    ap.add_argument("--hidden", type=int, default=256)
-    ap.add_argument("--layers", type=int, default=2)
-    ap.add_argument("--lr", type=float, default=3e-4)
-    ap.add_argument("--generate", type=str, default=None, help="prompt to sample from after training")
-    ap.add_argument("--max-new-tokens", type=int, default=600)
-    ap.add_argument("--temperature", type=float, default=0.9)
-    ap.add_argument("--save", type=str, default="neurosymbolic_backprop.pt")
-    args = ap.parse_args()
-
-    text = Path(args.corpus).read_text(encoding="utf-8")
-    toks = tokenize(text)
-    vocab = Vocab(toks)
-    ids = vocab.encode(toks)
-    print(f"[*] corpus: {len(toks)} tokens, vocab size {len(vocab)}, device={DEVICE}")
-
-    trigrams = build_trigrams(toks)
-    print(f"[*] trigrams: {len(trigrams)} unique (w1,w2,w3) windows")
-    print("[*] top trigrams:")
-    for (w1, w2, w3), cnt in top_trigrams(trigrams, k=10):
-        print(f"      {cnt:4d}x  {w1!r} {w2!r} {w3!r}")
-
-    if len(ids) <= args.block_size + 1:
-        raise ValueError(
-            f"corpus has only {len(ids)} tokens, but --block-size={args.block_size} "
-            f"needs at least {args.block_size + 2}. Use a longer corpus or a smaller --block-size."
-        )
-
-    model = NeuroSymbolicNet(
-        vocab_size=len(vocab), dim=args.dim, hidden=args.hidden, n_layers=args.layers,
-        max_len=args.block_size,   # tie positional capacity exactly to --block-size
+    print(f"|-- Preparing {len(new_corpus)} samples for Causal LM training...")
+    
+    # Create Dataset
+    dataset = SimpleTextDataset(tokenizer, new_corpus)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    
+    # ----------------------------------------------------------------
+    # FIX: Updated TrainingArguments for broader library compatibility.
+    # Removed 'logging_dir' which caused the TypeError in newer 'transformers' versions.
+    # ----------------------------------------------------------------
+    training_args = TrainingArguments(
+        output_dir="./tmp_trainer_output",
+        per_device_train_batch_size=1,
+        num_train_epochs=3,
+        learning_rate=2e-5,
+        weight_decay=0.01,
+        logging_steps=1,
+        report_to="none" # Disable W&B etc.
     )
-    n_params = sum(p.numel() for p in model.parameters())
-    print(f"[*] model params: {n_params:,}")
 
-    train(model, ids, len(vocab), steps=args.steps, block_size=args.block_size,
-          batch_size=args.batch_size, lr=args.lr)
+    # Initialize Trainer
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        data_collator=data_collator,
+    )
 
-    torch.save({"model_state": model.state_dict(), "vocab_itos": vocab.itos,
-                "dim": args.dim, "hidden": args.hidden, "layers": args.layers,
-                "block_size": args.block_size}, args.save)
-    print(f"[+] saved checkpoint to {args.save}")
+    print("|-- Starting training run (fine-tuning on new data)...")
+    # Unfreeze model weights for training
+    model.train()
+    trainer.train()
+    print("|-- Training complete. Live weights updated in memory.")
+    
+    # Update the assembly time to reflect the new training state
+    agi_core['assembly_time'] = time.time()
+    
+    # Cleanup temp directory
+    if os.path.exists("./tmp_trainer_output"):
+        shutil.rmtree("./tmp_trainer_output")
+    if os.path.exists("./logs"):
+        shutil.rmtree("./logs")
+        
+    print("\n[SUCCESS] AGI Core adaptation complete.")
+    
+    # Save the adapted core to a NEW file to preserve the new state/data.
+    print(f"|-- System Policy: Saving adapted core state due to weight updates.")
+    
+    # Create a unique filename based on timestamp for the new core
+    time_str = time.strftime("%Y%m%d-%H%M%S")
+    new_core_filename = f"agi_core_adapted_{time_str}.pkl"
+    new_core_filepath = os.path.join(MODEL_STORAGE_DIR, new_core_filename)
+    
+    print(f"|-- Saving adapted AGI Core {agi_core['id']} to: {new_core_filename}...")
+    
+    try:
+        # Prepare state dictionary for serialization
+        core_to_save = {
+            'id': agi_core['id'], # Keep same ID, update state
+            'architecture_graph': agi_core['architecture_graph'],
+            'model_state_dict': agi_core['runtime_model'].state_dict(),
+            'tokenizer_init_kwargs': agi_core['runtime_tokenizer'].init_kwargs,
+            'assembly_time': agi_core['assembly_time']
+        }
+        
+        with open(new_core_filepath, 'wb') as f:
+            pickle.dump(core_to_save, f)
+        print(f"[SUCCESS] Adapted core saved successfully.")
+        
+        # Update the default 'active_agi_core.pkl' copy
+        # so it loads this new version next time.
+        active_path = os.path.join(MODEL_STORAGE_DIR, MODEL_FILENAME)
+        shutil.copyfile(new_core_filepath, active_path)
+        print(f"|-- Default active core updated to: {MODEL_FILENAME}")
+
+    except Exception as e:
+        print(f"[ERROR] Failed to save adapted core: {e}")
+        import traceback
+        traceback.print_exc()
+
+    # Run validation immediately after training to see effect
+    validate_agi_core(agi_core)
+
+# ==========================================
+# Main Execution Pipeline (Startup Logic)
+# ==========================================
+
+def run_hugging_face_pipeline():
+    start_time = time.time()
+    print("-" * 60)
+    print(f"AGI Synthesis, Optimization, and Adaptation System")
+    print("-" * 60)
+
+    model_id = "gpt2"
+    tokenizer = None
+    hf_model = None
+    
+    # 1. Startup: Try to load existing core
+    agi_core = load_agi_core_at_startup()
+    
+    if agi_core is None:
+        print("\n[Startup] Starting Full AI Synthesis Pipeline (Cold Boot)...")
+        
+        print(f"|-- Loading base model '{model_id}' from Hugging Face Hub...")
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(model_id)
+            # Ensure pad token is set
+            tokenizer = configure_tokenizer(tokenizer)
+            hf_model = GPT2LMHeadModel.from_pretrained(model_id)
+        except Exception as e:
+            print(f"[CRITICAL ERROR] Could not connect to Hugging Face: {e}")
+            return
+
+        # 2. Synthesis
+        synthesizer = ConceptualSynthesisEngine()
+        _ = synthesizer.abstract_from_model(hf_model)
+
+        # 3. Optimization
+        initial_graph = build_call_graph_from_hf_model(hf_model)
+        optimizer = ConceptualGraphOptimizer()
+        optimized_graph = optimizer.optimize_model_graph(initial_graph)
+        
+        # 4. Assembly
+        assembler = AGICoreAssembler()
+        agi_core = assembler.assemble(optimized_graph, hf_model, tokenizer)
+        
+        # Initial Save
+        save_agi_core(agi_core)
+
+    # 5. Operational Loop: Inference -> Adapt -> Save
     while True:
-        prompt = input("USER: ")
-        sample = generate(model, vocab, prompt, max_new_tokens=args.max_new_tokens,
-                           temperature=args.temperature, block_size=args.block_size)
-        print("\n--- SAMPLE ---")
-        print(sample)
+        print("\n--- AGI Core Operational Menu ---")
+        print("1. Run Inference Validation")
+        print("2. Provide New Data & Adapt Core (Train & Save New)")
+        print("3. Manual Save Current Core State")
+        print("4. Shutdown")
+        
+        choice = input("Enter choice (1-4): ").strip()
+        
+        if choice == '1':
+            validate_agi_core(agi_core)
+        elif choice == '2':
+            train_agi_core_on_new_data(agi_core)
+        elif choice == '3':
+            save_agi_core(agi_core)
+        elif choice == '4':
+            print("\nInitiating Shutdown Sequence.")
+            # Auto-save on shutdown
+            save_agi_core(agi_core)
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
 
+    end_time = time.time()
+    duration = end_time - start_time
+    print("-" * 60)
+    print(f"System lifecycle complete. Total runtime: {duration:.2f} seconds.")
+    print("-" * 60)
 
 if __name__ == "__main__":
-    main()
+    # To run this simulation, ensure libraries installed:
+    # pip install transformers torch networkx
+    try:
+        run_hugging_face_pipeline()
+    except ImportError:
+        print("\n[Error] This simulation requires the 'transformers', 'torch', and 'networkx' libraries.")
+        print("Please install them using: pip install transformers torch networkx")
+    except KeyboardInterrupt:
+        print("\n[System] Pipeline interrupted by user.")
+
+# ==========================================
+# Main Execution Pipeline (Startup Logic)
+# ==========================================
+
+def run_hugging_face_pipeline():
+    start_time = time.time()
+    print("-" * 60)
+    print(f"AGI Synthesis, Optimization, and Adaptation System")
+    print("-" * 60)
+
+    model_id = "gpt2"
+    tokenizer = None
+    hf_model = None
+    
+    # 1. Startup: Try to load existing core
+    agi_core = load_agi_core_at_startup()
+    
+    if agi_core is None:
+        print("\n[Startup] Starting Full AI Synthesis Pipeline (Cold Boot)...")
+        
+        print(f"|-- Loading base model '{model_id}' from Hugging Face Hub...")
+        try:
+            tokenizer = GPT2Tokenizer.from_pretrained(model_id)
+            
+            # ----------------------------------------------------------------
+            # CRITICAL FIX: Assign EOS token as PAD token.
+            # GPT-2 defaults to no pad token, causing training batching to fail.
+            # ----------------------------------------------------------------
+            tokenizer.pad_token = tokenizer.eos_token
+            print(f"|-- Tokenizer loaded and configured with pad_token: {tokenizer.pad_token}")
+
+            hf_model = GPT2LMHeadModel.from_pretrained(model_id)
+        except Exception as e:
+            print(f"[CRITICAL ERROR] Could not connect to Hugging Face: {e}")
+            return
+
+        # 2. Synthesis
+        synthesizer = ConceptualSynthesisEngine()
+        _ = synthesizer.abstract_from_model(hf_model)
+
+        # 3. Optimization
+        initial_graph = build_call_graph_from_hf_model(hf_model)
+        optimizer = ConceptualGraphOptimizer()
+        optimized_graph = optimizer.optimize_model_graph(initial_graph)
+        
+        # 4. Assembly
+        assembler = AGICoreAssembler()
+        agi_core = assembler.assemble(optimized_graph, hf_model, tokenizer)
+        
+        # Initial Save
+        save_agi_core(agi_core)
+
+    # 5. Operational Loop: Inference -> Adapt -> Save
+    while True:
+        print("\n--- AGI Core Operational Menu ---")
+        print("1. Run Inference Validation")
+        print("2. Provide New Data & Adapt Core (Train)")
+        print("3. Save Current Core State to Disk")
+        print("4. Shutdown")
+        
+        choice = input("Enter choice (1-4): ").strip()
+        
+        if choice == '1':
+            validate_agi_core(agi_core)
+        elif choice == '2':
+            train_agi_core_on_new_data(agi_core)
+        elif choice == '3':
+            save_agi_core(agi_core)
+        elif choice == '4':
+            print("\nInitiating Shutdown Sequence.")
+            # Auto-save on shutdown
+            save_agi_core(agi_core)
+            break
+        else:
+            print("Invalid choice. Please enter 1, 2, 3, or 4.")
+
+    end_time = time.time()
+    duration = end_time - start_time
+    print("-" * 60)
+    print(f"System lifecycle complete. Total runtime: {duration:.2f} seconds.")
+    print("-" * 60)
+
+if __name__ == "__main__":
+    # To run this simulation, ensure libraries installed:
+    # pip install transformers torch networkx
+    try:
+        run_hugging_face_pipeline()
+    except ImportError:
+        print("\n[Error] This simulation requires the 'transformers', 'torch', and 'networkx' libraries.")
+        print("Please install them using: pip install transformers torch networkx")
+    except KeyboardInterrupt:
+        print("\n[System] Pipeline interrupted by user.")
