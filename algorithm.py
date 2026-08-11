@@ -65,7 +65,7 @@ REFMODEL + PDN FIX (V18-CSNS-G-FIX2)
 """
 
 from __future__ import annotations
-import re, math, random, unicodedata, pickle, argparse, cmath
+import re, math, random, unicodedata, pickle, argparse, cmath, hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Dict, Tuple, Set, Optional
@@ -2578,6 +2578,77 @@ def generate_passage(
 # REVERSED: train() build stages executed in reversed order
 # ════════════════════════════════════════════════════════════════════════════
 
+
+@dataclass(frozen=True)
+class CubeCoord:
+    x: int
+    y: int
+    z: int
+    t: int
+
+@dataclass
+class CubeChunk:
+    index: int
+    text: str
+    tokens: List[str]
+    coord: CubeCoord
+    hash_hex: str
+    orbit: int
+    rho_mean: float
+    theta_mean: float
+    sigma_mean: float
+
+class CubeGardenResolver:
+    """Deterministic 4-D cube-garden corpus permutation."""
+    def __init__(self, geo, pdn, chunk_size=128, cube_side=8):
+        self.geo=geo; self.pdn=pdn; self.chunk_size=max(1,int(chunk_size)); self.cube_side=max(2,int(cube_side))
+    @staticmethod
+    def _u32(data, offset): return int.from_bytes(data[offset:offset+4], 'big')
+    def _hash_cube(self,text):
+        d=hashlib.sha256(text.encode('utf-8')).digest(); S=self.cube_side
+        return CubeCoord(*(self._u32(d,i)%S for i in (0,4,8,12)))
+    def _geometry_signature(self,tokens):
+        ts=[self.geo.triple(t) for t in tokens if t in self.geo._vecs]
+        if not ts: return 0.0,0.0,0.0
+        r=sum(t.rho for t in ts)/len(ts); s=sum(t.sigma for t in ts)/len(ts)
+        sn=sum(math.sin(t.theta) for t in ts)/len(ts); cs=sum(math.cos(t.theta) for t in ts)/len(ts)
+        return r, math.atan2(sn,cs)%math.pi, s
+    def _geometry_cube(self,index,tokens):
+        r,th,sg=self._geometry_signature(tokens); S=self.cube_side
+        return CubeCoord(index%S,min(S-1,int(max(0,min(1,r))*S)),min(S-1,int(th/math.pi*S)),min(S-1,int(math.tanh(abs(sg))*S)))
+    def _combine(self,a,b):
+        S=self.cube_side; return CubeCoord((a.x+b.x)%S,(a.y+b.y)%S,(a.z+b.z)%S,(a.t+b.t)%S)
+    def cube_distance(self,a,b):
+        S=self.cube_side
+        def d(x,y): q=abs(x-y); return min(q,S-q)
+        return d(a.x,b.x)+d(a.y,b.y)+d(a.z,b.z)+d(a.t,b.t)
+    def transitive_score(self,a,b):
+        d=self.cube_distance(a.coord,b.coord)
+        return (1/(1+d))*math.exp(-8*abs(a.rho_mean-b.rho_mean))*0.5*(1+math.cos(a.theta_mean-b.theta_mean))*math.exp(-4*abs(a.sigma_mean-b.sigma_mean))*(1 if a.orbit==b.orbit else .25)
+    def make_chunks(self,tokens):
+        out=[]
+        for start in range(0,len(tokens),self.chunk_size):
+            ct=tokens[start:start+self.chunk_size]; idx=start//self.chunk_size; text=' '.join(ct); hx=hashlib.sha256(text.encode()).hexdigest()
+            hc=self._hash_cube(text); gc=self._geometry_cube(idx,ct); c=self._combine(hc,gc); r,th,sg=self._geometry_signature(ct); orbit=0
+            for tok in ct:
+                if tok not in PUNCT_TOKENS: orbit=self.pdn.orbit_of(tok); break
+            out.append(CubeChunk(idx,text,ct,c,hx,orbit,r,th,sg))
+        return out
+    def resort(self,tokens):
+        chunks=self.make_chunks(tokens)
+        if len(chunks)<=1: return list(tokens),chunks
+        cur=min(chunks,key=lambda c:(c.hash_hex,c.index)); rem={c.index:c for c in chunks if c.index!=cur.index}; order=[cur]
+        while rem:
+            nxt=max(rem.values(),key=lambda c:(self.transitive_score(cur,c),-self.cube_distance(cur.coord,c.coord),c.hash_hex,-c.index)); order.append(nxt); del rem[nxt.index]; cur=nxt
+        result=[]
+        for c in order: result.extend(c.tokens)
+        return result,order
+    def report(self,chunks,max_rows=32):
+        lines=['','╔════════════════════════════════════════════════════════════════════╗','║                    CUBE GARDEN DATASET MAP                       ║','╠════════════════════════════════════════════════════════════════════╣',f'║ chunks={len(chunks):<55}║',f'║ cube_side={self.cube_side:<52}║',f'║ chunk_size={self.chunk_size:<50}║','╠════════════════════════════════════════════════════════════════════╣']
+        for i,c in enumerate(chunks[:max_rows]):
+            q=c.coord; lines.append(f'║ {i:03d} src={c.index:04d} C=({q.x},{q.y},{q.z},{q.t}) O={c.orbit:<2d} ρ={c.rho_mean:.3f} θ={c.theta_mean:.3f} σ={c.sigma_mean:.3f} ║')
+        lines.append('╚════════════════════════════════════════════════════════════════════╝'); return '\n'.join(lines)
+
 class V18Engine:
     def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8):
         self.device      = DEVICE
@@ -2600,89 +2671,56 @@ class V18Engine:
         self.syn_weight   = syn_weight
         self.trans_weight = trans_weight
         self.syn_k        = syn_k
+        self.cube_chunk_size=128
+        self.cube_side=8
+        self.cube_garden=None
+        self.cube_chunks=[]
 
     def train(self, corpus_text: str):
         print(f"[*-AR] Tokenizing corpus ({len(corpus_text)} chars)...")
-        self.corpus_snippet = corpus_text
-        tokens = tokenize(corpus_text)
+        self.corpus_snippet=corpus_text
+        tokens=tokenize(corpus_text)
+        provisional_freq={}
+        for tok in tokens: provisional_freq[tok]=provisional_freq.get(tok,0.0)+1.0
+        provisional_vocab=list(provisional_freq); max_freq=max(provisional_freq.values(),default=1.0); n=len(provisional_vocab)
+        print(f"[*-AR] Cube prepass registering {n} tokens...")
+        for idx,tok in enumerate(provisional_vocab): self.geo.register(tok,provisional_freq[tok],idx,max_freq,n)
+        pn=4; sector=2.0*math.pi/pn
+        for tok in provisional_vocab:
+            tr=self.geo.triple(tok); self.pdn._orbit_map[tok]=int((tr.theta*2.0)/sector)%pn
+        self.cube_garden=CubeGardenResolver(self.geo,self.pdn,self.cube_chunk_size,self.cube_side)
+        print("[*-AR] Building deterministic 4-D Cube Garden ordering...")
+        tokens,self.cube_chunks=self.cube_garden.resort(tokens)
+        print(self.cube_garden.report(self.cube_chunks))
         self.lm.ingest(tokens)
+        all_tokens=list(self.lm.raw_freq.keys()); max_freq=max(self.lm.raw_freq.values(),default=1.0); vocab_size=len(all_tokens)
+        print(f"[*-AR] Registering {vocab_size} tokens after Cube Garden resort...")
+        for idx,tok in enumerate(all_tokens): self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
 
-        all_tokens = list(self.lm.raw_freq.keys())
-        max_freq   = max(self.lm.raw_freq.values(), default=1.0)
-        vocab_size = len(all_tokens)
-
-        print(f"[*-AR] Registering {vocab_size} tokens...")
-        for idx, tok in enumerate(all_tokens):
-            self.geo.register(tok, self.lm.raw_freq[tok], idx, max_freq, vocab_size)
-
-        # REVERSED build order:
-        # Original: GPU tensors → LM finalise → graph → MRV → PDN → CoT → InstrDist → Mandate → RefModel → Walker
-        # Reversed: RefModel → Mandate → InstrDist → CoT → PDN → MRV → graph → LM finalise → GPU tensors → Walker
-
+        # REVERSED build order: retained from the original V18-CSNS-G pipeline.
         print("[*-AR] REVERSED build order: RefModel first (requires GPU tensors — building them now)...")
         print("[*-AR] Building GPU Tensor Caches (prerequisite for all stages)...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
-
-        # Sanity check
-        rho_nonzero = int((self.geo._rho_t > 0.01).sum().item())
-        rho_max     = float(self.geo._rho_t.max().item())
+        rho_nonzero=int((self.geo._rho_t>0.01).sum().item()); rho_max=float(self.geo._rho_t.max().item())
         print(f"[Geo-AR] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
-
-        # REVERSED stage order (GPU tensors already built above as prerequisite)
         print("[*-AR] Stage 1 (reversed): Building Formal Reference Model...")
-        self.ref_model = AtomismReferenceModel(
-            geo=self.geo, kernels=self.kernels, device=self.device,
-        )
-        self.ref_model.build(self.lm.vocab)
-        print(self.ref_model.reference_report())
-
+        self.ref_model=AtomismReferenceModel(geo=self.geo,kernels=self.kernels,device=self.device); self.ref_model.build(self.lm.vocab); print(self.ref_model.reference_report())
         print("[*-AR] Stage 2 (reversed): Building Semantic Mandate Scorer...")
-        self.mandate_scorer = SemanticMandateScorer(
-            geo=self.geo, kernels=self.kernels, device=self.device,
-        )
-
+        self.mandate_scorer=SemanticMandateScorer(geo=self.geo,kernels=self.kernels,device=self.device)
         print("[*-AR] Stage 3 (reversed): Building Instruction Distribution module...")
-        self.instr_dist = InstructionDistribution(
-            geo=self.geo, kernels=self.kernels, lm=self.lm, device=self.device,
-        )
-
+        self.instr_dist=InstructionDistribution(geo=self.geo,kernels=self.kernels,lm=self.lm,device=self.device)
         print("[*-AR] Stage 4 (reversed): Building CoT contextual stub library...")
-        self.stub_lib.build(self.geo, self.lm.vocab, self.lm.raw_freq)
-
-        self.cot = CoTReasoningEngine(
-            stub_library   = self.stub_lib,
-            kernels        = self.kernels,
-            pdn_engine     = self.pdn,
-            n_hops         = 3,
-            tokens_per_hop = 10,
-            device         = self.device,
-        )
-
+        self.stub_lib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
+        self.cot=CoTReasoningEngine(stub_library=self.stub_lib,kernels=self.kernels,pdn_engine=self.pdn,n_hops=3,tokens_per_hop=10,device=self.device)
         print("[*-AR] Stage 5 (reversed): Fitting PDN from corpus autocorrelation (reversed series)...")
-        self.pdn.fit_from_trigrams(self.geo, self.lm.tri_raw)
-        self.pdn.build_orbit_map(self.lm.vocab, self.geo)
-        print(self.pdn.theorem_bridge_report())
-
+        self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw); self.pdn.build_orbit_map(self.lm.vocab,self.geo); print(self.pdn.theorem_bridge_report())
         print("[*-AR] Stage 6 (reversed): Initializing MRV Filter...")
-        self.mrv.prime(self.lm.vocab, self.geo)
-
+        self.mrv.prime(self.lm.vocab,self.geo)
         print("[*-AR] Stage 7 (reversed): Building graph potentials...")
-        self.graph.build(self.lm)
-        self.graph.propagate(steps=2)
-
-        # Walker assembled last (same position — it wraps everything)
-        self.walker = ThebaultWalker(
-            self.geo, self.kernels, self.lm, self.orbit,
-            self.graph, self.mandate_scorer, self.mrv, self.chunk, self.iso_stacker,
-            self.pdn, self.cot, self.instr_dist,
-            ref_model    = self.ref_model,
-            device       = self.device,
-            syn_weight   = self.syn_weight,
-            trans_weight = self.trans_weight,
-            syn_k        = self.syn_k,
-        )
-        print("[+] Training complete. (V18-CSNS-G ABELIAN-REVERSED)")
+        self.graph.build(self.lm); self.graph.propagate(steps=2)
+        self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k)
+        print("[+] Training complete. (V18-CSNS-G ABELIAN-REVERSED + CUBE GARDEN)")
 
     def save_cache(self, filename: str = "v18_csns_g_ar_model.pkl"):
         print(f"[*-AR] Saving model state to {filename}...")
@@ -2702,6 +2740,9 @@ class V18Engine:
                 "cot_stubs"      : self.stub_lib.stubs,
                 "syn_weight"     : self.syn_weight,
                 "trans_weight"   : self.trans_weight,
+                "cube_chunk_size": self.cube_chunk_size,
+                "cube_side"      : self.cube_side,
+                "cube_chunks"    : self.cube_chunks,
                 "syn_k"          : self.syn_k,
                 "version"        : "V18-CSNS-G-AR",
                 "ref_tau_scores"  : (self.ref_model._tau_scores.cpu() if self.ref_model and self.ref_model._tau_scores is not None else None),
@@ -3006,6 +3047,8 @@ if __name__ == "__main__":
     parser.add_argument("--syn-weight",   type=float, default=2.0)
     parser.add_argument("--trans-weight", type=float, default=0.6)
     parser.add_argument("--syn-k",        type=int,   default=8)
+    parser.add_argument("--cube-chunk-size", type=int, default=128)
+    parser.add_argument("--cube-side",       type=int, default=8)
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -3023,6 +3066,8 @@ if __name__ == "__main__":
         trans_weight=args.trans_weight,
         syn_k=args.syn_k,
     )
+    engine.cube_chunk_size=max(1,args.cube_chunk_size)
+    engine.cube_side=max(2,args.cube_side)
     engine.train(corpus_text)
     engine.save_cache("v18_csns_g_ar_model.pkl")
 
