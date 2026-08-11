@@ -394,14 +394,21 @@ def train_agi_core_on_new_data(agi_core: Dict[str, Any]):
     # FIX: Updated TrainingArguments for broader library compatibility.
     # Removed 'logging_dir' which caused the TypeError in newer 'transformers' versions.
     # ----------------------------------------------------------------
+    # Define output directory safely using absolute path
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    output_dir = os.path.join(script_dir, "tmp_trainer_output")
+    
+    print(f"|-- Training output directory set to: {output_dir}")
+
+    # Define Training Arguments
     training_args = TrainingArguments(
-        output_dir="./tmp_trainer_output",
+        output_dir=output_dir, # Use the safe absolute path
         per_device_train_batch_size=1,
         num_train_epochs=3,
         learning_rate=2e-5,
         weight_decay=0.01,
         logging_steps=1,
-        report_to="none" # Disable W&B etc.
+        report_to="none" 
     )
 
     # Initialize Trainer
@@ -421,11 +428,6 @@ def train_agi_core_on_new_data(agi_core: Dict[str, Any]):
     # Update the assembly time to reflect the new training state
     agi_core['assembly_time'] = time.time()
     
-    # Cleanup temp directory
-    if os.path.exists("./tmp_trainer_output"):
-        shutil.rmtree("./tmp_trainer_output")
-    if os.path.exists("./logs"):
-        shutil.rmtree("./logs")
         
     print("\n[SUCCESS] AGI Core adaptation complete.")
     
@@ -543,17 +545,6 @@ def run_hugging_face_pipeline():
     print(f"System lifecycle complete. Total runtime: {duration:.2f} seconds.")
     print("-" * 60)
 
-if __name__ == "__main__":
-    # To run this simulation, ensure libraries installed:
-    # pip install transformers torch networkx
-    try:
-        run_hugging_face_pipeline()
-    except ImportError:
-        print("\n[Error] This simulation requires the 'transformers', 'torch', and 'networkx' libraries.")
-        print("Please install them using: pip install transformers torch networkx")
-    except KeyboardInterrupt:
-        print("\n[System] Pipeline interrupted by user.")
-
 # ==========================================
 # Main Execution Pipeline (Startup Logic)
 # ==========================================
@@ -636,13 +627,10 @@ def run_hugging_face_pipeline():
     print(f"System lifecycle complete. Total runtime: {duration:.2f} seconds.")
     print("-" * 60)
 
+
 if __name__ == "__main__":
     # To run this simulation, ensure libraries installed:
     # pip install transformers torch networkx
-    try:
-        run_hugging_face_pipeline()
-    except ImportError:
-        print("\n[Error] This simulation requires the 'transformers', 'torch', and 'networkx' libraries.")
-        print("Please install them using: pip install transformers torch networkx")
-    except KeyboardInterrupt:
-        print("\n[System] Pipeline interrupted by user.")
+
+    run_hugging_face_pipeline()
+
