@@ -2992,7 +2992,7 @@ def launch_gui():
                 sentences   = gr.Slider(1, 10,   value=4,   step=1,    label="Sentences")
                 tokens      = gr.Slider(20, 180, value=80,  step=1,    label="Tokens/sentence")
                 and_weight  = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 30.0, value=1.4, step=0.05, label="Temperature")
+                temperature = gr.Slider(0.1, 30.0, value=0.75, step=0.05, label="Temperature")
 
             instruction_input = gr.Textbox(
                 label="Instruction (AND distribution + kernel mandate source)",
