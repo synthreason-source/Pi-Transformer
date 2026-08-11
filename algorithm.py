@@ -246,7 +246,7 @@ def validate_agi_core(agi_core: Dict[str, Any]):
         else:
             test_prompt = user_prompt
             
-        generated_text = execution_engine.generate(test_prompt, max_length=50)
+        generated_text = execution_engine.generate(test_prompt, max_length=500)
         
         print("\n|-- Validation Results:")
         print("-" * 60)
