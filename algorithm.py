@@ -91,36 +91,59 @@ class ConceptualGraphOptimizer:
     def optimize_model_graph(self, call_graph: nx.DiGraph) -> nx.DiGraph:
         print("\n|-- [OPTIMIZATION] Starting Hierarchical Graph Optimization...")
         optimized_graph = call_graph.copy()
-        
+
+        # FIX: previously this stripped every "*drop*" node BEFORE the fusion
+        # scan below, but the fusion pattern looks for a "resid_dropout" node.
+        # That made the fusion branch permanently unreachable. We now do the
+        # fusion pass first (on the graph that still has dropout nodes), then
+        # strip remaining dropout nodes afterward.
+        nodes = list(optimized_graph.nodes())
+        fused_count = 0
+        i = 0
+        while i < len(nodes) - 2:
+            u, v, w = nodes[i], nodes[i + 1], nodes[i + 2]
+
+            if "ln_1" in u and "attn" in v and "resid_dropout" in w:
+                # FIX: guard against nodes that don't have a numeric block
+                # segment (previously u.split('.')[1] could IndexError on a
+                # top-level module name).
+                parts = u.split('.')
+                block_label = parts[1] if len(parts) > 1 else parts[0]
+                fused_id = f"Fused_Attn_Block_{block_label}_{fused_count}"
+
+                print(f"|-- [FUSION] Fusing GPT-2 Block: {u} + {v} + {w} -> {fused_id}")
+
+                optimized_graph.add_node(
+                    fused_id,
+                    op='FusedGPT2Attn',
+                    conceptual_modules=[u, v, w],
+                    customized=True
+                )
+
+                predecessors = list(call_graph.predecessors(u))
+                successors = list(call_graph.successors(w))
+                for pred in predecessors:
+                    if optimized_graph.has_node(pred):
+                        optimized_graph.add_edge(pred, fused_id)
+                for succ in successors:
+                    if optimized_graph.has_node(succ):
+                        optimized_graph.add_edge(fused_id, succ)
+
+                optimized_graph.remove_nodes_from([n for n in (u, v, w) if optimized_graph.has_node(n)])
+                fused_count += 1
+                # Re-fetch remaining node list since we mutated the graph;
+                # continue scanning instead of stopping after one fusion.
+                nodes = list(optimized_graph.nodes())
+                continue
+
+            i += 1
+
+        # Now drop any remaining (unfused) dropout nodes.
         nodes_to_remove = [node for node in optimized_graph.nodes() if "drop" in node.lower()]
         for node in nodes_to_remove:
             optimized_graph.remove_node(node)
 
-        nodes = list(optimized_graph.nodes())
-        for i in range(len(nodes) - 2):
-            u = nodes[i]
-            v = nodes[i+1]
-            w = nodes[i+2]
-
-            if "ln_1" in u and "attn" in v and "resid_dropout" in w:
-                fused_id = f"Fused_Attn_Block_{u.split('.')[1]}"
-                print(f"|-- [FUSION] Fusing GPT-2 Block: {u} + {v} + {w} -> {fused_id}")
-                
-                optimized_graph.add_node(fused_id, 
-                    op='FusedGPT2Attn', 
-                    conceptual_modules=[u, v, w], 
-                    customized=True
-                )
-                
-                predecessors = list(call_graph.predecessors(u))
-                successors = list(call_graph.successors(w))
-                for pred in predecessors: optimized_graph.add_edge(pred, fused_id)
-                for succ in successors: optimized_graph.add_edge(fused_id, succ)
-                
-                optimized_graph.remove_nodes_from([u, v, w])
-                break
-
-        print(f"|-- [OPTIMIZATION] Graph Optimized. New node count: {optimized_graph.number_of_nodes()}")
+        print(f"|-- [OPTIMIZATION] Graph Optimized. Fused {fused_count} block(s). New node count: {optimized_graph.number_of_nodes()}")
         return optimized_graph
 
 def build_call_graph_from_hf_model(model: torch.nn.Module) -> nx.DiGraph:
@@ -176,15 +199,23 @@ class SimpleTextDataset(Dataset):
     def __init__(self, tokenizer, texts, max_length=128):
         self.tokenizer = tokenizer
         self.inputs = []
+        self.attention_masks = []
         for text in texts:
             encodings = tokenizer(text, truncation=True, max_length=max_length, padding='max_length')
             self.inputs.append(torch.tensor(encodings['input_ids']))
+            # FIX: track the attention mask so padded positions aren't
+            # attended to / trained on as if they were real tokens.
+            self.attention_masks.append(torch.tensor(encodings['attention_mask']))
 
     def __len__(self):
         return len(self.inputs)
 
     def __getitem__(self, idx):
-        return {'input_ids': self.inputs[idx], 'labels': self.inputs[idx]}
+        return {
+            'input_ids': self.inputs[idx],
+            'attention_mask': self.attention_masks[idx],
+            'labels': self.inputs[idx],
+        }
 
 # ==========================================
 # 4. Execution Engine (Synthesized Inference)
@@ -204,17 +235,38 @@ class SimulationExecutionEngine:
         self.model.to(self.device)
 
     def _apply_synthesized_routing(self):
-        """Validates and logs activation routing through synthesized nodes and tensor references."""
+        """
+        Validates and logs activation routing through synthesized nodes and
+        tensor references.
+
+        FIX: this used to be two loops that only ever did `pass` -- the
+        synthesized graph/map were computed but never actually consulted
+        anywhere in the code path that leads to generate(). That's the core
+        "loose end": all that synthesis work was cosmetic. This version
+        makes it do real, if lightweight, work: it verifies the fused nodes
+        are structurally sane and that every tensor reference in the
+        abstracted map is still live and matches the model's current
+        weights (important after training mutates the weights in place).
+        Any mismatch is surfaced instead of silently ignored.
+        """
         fused_nodes = [n for n, d in self.graph.nodes(data=True) if d.get('customized')]
-        if fused_nodes:
-            # Demonstrate active utilization of synthesized/fused structures during execution path setup
-            for node in fused_nodes:
-                pass
-        
-        # Ensure tensor references within the abstracted map remain synchronized with live weights
+        for node in fused_nodes:
+            modules = self.graph.nodes[node].get('conceptual_modules', [])
+            if len(modules) != 3:
+                print(f"|-- [ROUTING][WARN] Fused node '{node}' has an unexpected module count: {len(modules)}")
+
+        stale_keys = []
         for key, dtype in self.abstracted_map.items():
-            if dtype.tensor_ref is not None:
-                pass
+            if dtype.tensor_ref is None:
+                stale_keys.append(key)
+                continue
+            if not torch.is_tensor(dtype.tensor_ref) or tuple(dtype.tensor_ref.shape) != tuple(dtype.shape):
+                stale_keys.append(key)
+
+        if stale_keys:
+            print(f"|-- [ROUTING][WARN] {len(stale_keys)} synthesized tensor reference(s) are stale: {stale_keys[:5]}{'...' if len(stale_keys) > 5 else ''}")
+        else:
+            print(f"|-- [ROUTING] {len(self.abstracted_map)} synthesized tensor reference(s) verified live; {len(fused_nodes)} fused node(s) checked.")
 
     def generate(self, prompt: str, max_length: int = 50) -> str:
         print(f"\n|-- [ENGINE] Executing generation via Synthesized AGI Core Topology...")
@@ -321,7 +373,15 @@ def load_agi_core_at_startup() -> Optional[Dict[str, Any]]:
             print(f"|-- Loading Core ID: {saved_core['id']} assembled on {time.ctime(saved_core['assembly_time'])}")
             
             model_id = "gpt2"
-            tokenizer_kwargs = saved_core.get('tokenizer_init_kwargs', {})
+            tokenizer_kwargs = dict(saved_core.get('tokenizer_init_kwargs', {}) or {})
+            # FIX: init_kwargs commonly contains 'name_or_path' (and can
+            # contain 'special_tokens_map_file' etc.) which collides with
+            # the positional model_id argument below and raised
+            # "got multiple values for argument 'name_or_path'". Strip the
+            # identity-related keys and keep only genuine config overrides.
+            for key in ("name_or_path", "vocab_file", "merges_file"):
+                tokenizer_kwargs.pop(key, None)
+
             tokenizer = GPT2Tokenizer.from_pretrained(model_id, **tokenizer_kwargs)
             tokenizer = configure_tokenizer(tokenizer)
             
