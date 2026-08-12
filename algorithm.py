@@ -385,10 +385,10 @@ class AtomismReferenceModel:
         self,
         geo                 : "ThebaultTokenGeometry",
         kernels             : "ThebaultKernels",
-        rho_atom_threshold  : float = 0.25,
-        kappa_ref           : float = 0.50,
-        kappa_def           : float = 0.15,
-        max_omega_steps     : int   = 6,
+        rho_atom_threshold  : float = 10.25,
+        kappa_ref           : float = 40.50,
+        kappa_def           : float = 990.15,
+        max_omega_steps     : int   = 60,
         device              : torch.device = DEVICE,
         dtype               : torch.dtype  = torch.float32,
     ):
@@ -2125,10 +2125,10 @@ class ThebaultWalker:
         instr_dist       : InstructionDistribution,
         ref_model        : "AtomismReferenceModel" = None,
         device           : torch.device = DEVICE,
-        syn_weight       : float = 2.0,
-        trans_weight     : float = 0.6,
-        syn_k            : int   = 8,
-        tau_weight       : float = 0.45,
+        syn_weight       : float = 12.0,
+        trans_weight     : float = 5070.6,
+        syn_k            : int   = 18,
+        tau_weight       : float = 70.45,
     ):
         self.geo          = geo
         self.kernels      = kernels
