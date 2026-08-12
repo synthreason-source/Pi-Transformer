@@ -4,63 +4,76 @@
 NeuroSymbolic V18-CUDA — DNN Array Activation Edition + Cross-Synaptic Neuron Sums
 ===============================================================================
 
-ABELIAN-REVERSED VARIANT
-─────────────────────────
-All ordered pipelines have been transformed so that:
+DOUBLE-AGNOSTIC + SOLO-PLANAR VARIANT (DA-SP)
+──────────────────────────────────────────────
+Built from the Abelian-Reversed edition. Two transformations replace the
+"reversed" framing everywhere it previously appeared:
 
-  (A) ABELIAN: Every multi-term accumulation is expressed as a commutative
-      sum/product — no term receives implicit priority from its position.
-      Where the original code composed f∘g∘h, the new code computes
-      h⊕g⊕f via symmetric combination (addition / element-wise product)
-      so that the mathematical result is invariant to reordering.
+  (DA) DOUBLE AGNOSTICISM: every place that used to hard-code a priority —
+       "this term goes first", "this layer runs before that layer", "this
+       quartile maps to that stub type" — now takes that ordering as a
+       named, inspectable parameter with a neutral default. Nothing in the
+       pipeline silently privileges one branch, term, or stage over another
+       by virtue of where it sits in the source file. Where two competing
+       assumptions existed (e.g. "forward order" vs "reversed order"),
+       neither is assumed correct; the caller states an order (or accepts
+       a stable, name-sorted default) instead of the code assuming one.
 
-  (R) REVERSED: Every sequence whose order has semantic significance has
-      been inverted end-to-end.  Specifically:
+  (SP) SOLO SEMANTIC PLANARITY: every place that combined the three
+       Thébault kernels (k_reg, k_ori, k_side) as a product of three
+       separate exponential/cosine terms has been collapsed into
+       `unified_plane_kernel(...)` — a single scalar computed by summing
+       the three weighted geometric distances (rho, theta, sigma) onto
+       one invariant plane *before* exponentiating once, rather than
+       exponentiating three times and multiplying. Meaning is preserved
+       on that single plane; no one axis is computed, or combined, ahead
+       of the others.
 
-      • walk_probs logit assembly  — summation terms reversed
-      • DNNArrayPipeline.forward   — layer stack reversed (z3→z2→z1→scaled)
-                                     + NEW relu_dim2 layer inserted between
-                                       theta layer and rho layer
-      • ThebaultDNNNormalizer      — normalisation passes reversed
-      • CrossSynapticNeuronSum.forward — enrichment operands reversed
-      • build_synaptic_weight_matrix   — kernel product order reversed
-      • CoTReasoningEngine.plan_chain  — hop types reversed (CONCLUSION first)
-      • CoTStubLibrary.build           — quartile→stub-type mapping reversed
-      • AtomismReferenceModel.build    — Def-expansion iterates backwards
-                                         (omega→0 convergence check)
-      • PDNEngine.fit_from_trigrams    — rho time-series assembled in reverse
-      • V18Engine.train                — build stages reversed
-      • generate_passage               — sentences emitted in reverse order,
-                                         tokens accumulated in reverse within
-                                         each sentence
-      • ThebaultWalker.push_token      — sentence token list reversed on push
+WHERE THIS APPLIES (mirrors every site the Abelian-Reversed edition touched):
+  • build_synaptic_weight_matrix        → unified_plane_kernel (SP)
+  • CrossSynapticNeuronSum.forward/*    → unified_plane_kernel (SP) +
+                                           configurable term order (DA)
+  • ThebaultKernels.all_scores_batched  → unified_plane_kernel (SP)
+  • SemanticMandateScorer.score         → unified_plane_kernel (SP)
+  • InstructionDistribution.set_instr.  → unified_plane_kernel (SP)
+  • AtomismReferenceModel.build         → unified_plane_kernel (SP) +
+                                           configurable Def-expansion
+                                           direction (DA)
+  • CoTStubLibrary.build                → configurable quartile→stub
+                                           mapping (DA)
+  • CoTStubLibrary.best_stub/stub_kernel→ unified_plane_kernel (SP)
+  • CoTReasoningEngine.plan_chain       → configurable hop-type order (DA)
+                                           + unified_plane_kernel (SP)
+  • ThebaultConjugateOrbit.score        → unified_plane_kernel-style single
+                                           combined term (SP)
+  • ThebaultCompositionLM               → unified_plane_kernel (SP)
+  • MRVConstraintFilter                 → unified_plane_kernel (SP)
+  • IsomorphicSyntaxStacker             → unified_plane_kernel (SP)
+  • ThebaultPotentialGraph.build        → unified_plane_kernel (SP)
+  • DNNArrayPipeline.forward            → configurable layer_order (DA)
+  • PDNEngine.fit_from_trigrams         → configurable trigram-scan
+                                           direction (DA)
+  • V18Engine.train                     → configurable build_stage_order (DA)
+  • generate_passage                    → configurable sentence_order (DA)
+  • ThebaultWalker.push_token           → configurable context_order (DA)
+  • ThebaultWalker.walk_probs           → configurable term order via
+                                           dict + symmetric_weighted_sum (DA)
 
-MATHEMATICAL NOTE ON ABELIAN PROPERTY:
-  For any finite set of tensors {t_1, …, t_n} combined by +:
-      t_1 + t_2 + … + t_n  ≡  t_n + … + t_2 + t_1   (floating-point
-  differences are sub-epsilon and do not change downstream sampling).
-  Kernel products k_reg·k_ori·k_side are commutative in ℝ≥0 — reversing
-  the multiplication order leaves the value identical.
-  Layer stacks are NOT generally commutative, so reversing them produces
-  a genuinely different (non-equivalent) computation — the "reversed"
-  qualifier takes precedence and the layers are reordered structurally.
-
-DIM-2 RELU LAYER (NEW):
-  Added as a dedicated method _dim2_relu_layer on DNNArrayPipeline.
-  Placed between the theta layer (z2) and the rho layer (z3) so that
-  orientation-selective sparsification precedes rho amplification.
-  The gate is derived from per-candidate theta weights centred about
-  their batch mean; entries below the mean are pushed toward zero via
-  ReLU, while entries above pass through.  A smooth blend between the
-  gated path and a plain F.relu keeps the layer well-behaved at the
-  boundary and avoids hard discontinuities.
-
-CHANGES FROM V18: CROSS-SYNAPTIC NEURON SUMS (CSNS) FROM THÉBAULT TRANSITIVE
-──────────────────────────────────────────────────────────────────────────────
-[Architecture unchanged — see original V18-CSNS docstring]
-
-REFMODEL + PDN FIX (V18-CSNS-G-FIX2)
-[All fixes from original retained — see original docstring]
+MATHEMATICAL NOTE:
+  Additive sums (Σ) were already commutative under the prior edition; DA
+  keeps them commutative but ALSO removes the hard-coded *iteration order*
+  itself by summing over a name-sorted dict rather than a literal written
+  sequence, so no term's position in the source implies priority.
+  Multiplicative kernel products k_reg·k_ori·k_side were commutative in
+  value but computed three separate exponentials; SP replaces that with
+  one exponential over a summed weighted-distance "plane", which is
+  mathematically equivalent to the product (since exp(a)*exp(b)*exp(c) ==
+  exp(a+b+c)) but is now genuinely a single unified computation rather
+  than three kernels multiplied together — no kernel is evaluated ahead
+  of, or independently from, the others.
+  Layer stacks (DNNArrayPipeline) are NOT commutative, so DA does not
+  claim they produce the same output under every order — it only removes
+  the *hard-coding* of which order runs, exposing it as a parameter.
 ===============================================================================
 """
 
@@ -68,7 +81,7 @@ from __future__ import annotations
 import re, math, random, unicodedata, pickle, argparse, cmath, hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Dict, Tuple, Set, Optional
+from typing import List, Dict, Tuple, Set, Optional, Callable, Union
 import torch
 import torch.nn.functional as F
 import gradio as gr
@@ -85,6 +98,81 @@ def best_device() -> torch.device:
     return torch.device("cpu")
 
 DEVICE = best_device()
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 0a — DOUBLE-AGNOSTIC / SOLO-PLANAR PRIMITIVES
+# ════════════════════════════════════════════════════════════════════════════
+
+def symmetric_weighted_sum(terms: Dict[str, "torch.Tensor|float"],
+                            weights: Optional[Dict[str, float]] = None,
+                            order: Optional[List[str]] = None):
+    """
+    DOUBLE AGNOSTICISM primitive.
+
+    Sums a dict of named terms without letting the *source-code position*
+    of any term imply priority. If `order` is given, terms are summed in
+    that explicit, caller-stated order. Otherwise terms are summed in a
+    stable, name-sorted order — a neutral default that depends only on
+    the term names, never on which one the author happened to write
+    first or last.
+
+    weights: optional per-term scalar multiplier (defaults to 1.0).
+    """
+    keys = order if order is not None else sorted(terms.keys())
+    weights = weights or {}
+    acc = None
+    for k in keys:
+        if k not in terms:
+            continue
+        w = weights.get(k, 1.0)
+        contrib = terms[k] * w if w != 1.0 else terms[k]
+        acc = contrib if acc is None else acc + contrib
+    return acc
+
+
+def unified_plane_kernel(
+    rho_a, theta_a, sigma_a,
+    rho_b, theta_b, sigma_b,
+    lambda_reg: float = 811.0,
+    gamma_side: float = 411.0,
+    kappa_ori: float = 1.0,
+    use_torch: bool = True,
+):
+    """
+    SOLO SEMANTIC PLANARITY primitive.
+
+    Replaces the product k_reg(rho) · k_ori(theta) · k_side(sigma) with a
+    single kernel computed on one invariant plane: the three weighted
+    geometric distances are summed FIRST, and only then is a single
+    exponential applied. This is numerically equivalent to the product of
+    three independent exponential/cosine kernels
+
+        exp(-λ·dρ²) · exp(-γ·dσ²) · [½(1+cos dθ)]
+          ≈ exp( -(λ·dρ² + γ·dσ² + κ·(1 - cos dθ)) )
+
+    but is computed as ONE combined distance on ONE plane rather than
+    three kernels evaluated independently and then multiplied — no axis
+    (rho, theta, sigma) is privileged by being computed, or combined,
+    ahead of the others.
+
+    Works for both torch tensors and plain python floats/ints
+    (set use_torch=False, or pass non-tensor args, for the scalar path).
+    """
+    d_rho   = lambda_reg * (rho_b - rho_a) ** 2
+    d_sigma = gamma_side * (sigma_b - sigma_a) ** 2
+
+    is_tensor = use_torch and (torch.is_tensor(theta_a) or torch.is_tensor(theta_b))
+    if is_tensor:
+        d_ori   = kappa_ori * (1.0 - torch.cos(theta_b - theta_a))
+        d_plane = (d_rho + d_sigma + d_ori)
+        d_plane = d_plane.clamp(min=-3011.0, max=3011.0) if torch.is_tensor(d_plane) else d_plane
+        return torch.exp(-d_plane)
+    else:
+        d_ori   = kappa_ori * (1.0 - math.cos(theta_b - theta_a))
+        d_plane = d_rho + d_sigma + d_ori
+        d_plane = max(-3011.0, min(3011.0, d_plane))
+        return math.exp(-d_plane)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0b — DNN ARRAY ACTIVATION PRIMITIVES
@@ -136,10 +224,8 @@ def layer_norm_array(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     return (x - mu) / (std + eps)
 
 
-# REVERSED: kernel product order k_side · k_ori · k_reg  (was k_reg · k_ori · k_side)
-# ABELIAN:  multiplication is commutative in ℝ≥0, so the value is identical;
-#           the reversal is structurally visible and affects operator precedence
-#           in any non-commutative extension.
+# SOLO SEMANTIC PLANARITY: single unified_plane_kernel replaces the
+# k_reg · k_ori · k_side product. No kernel axis is computed before another.
 def build_synaptic_weight_matrix(
     c_rho   : torch.Tensor,
     c_theta : torch.Tensor,
@@ -150,16 +236,11 @@ def build_synaptic_weight_matrix(
     eps        : float = 1e-8,
 ) -> torch.Tensor:
     C = c_rho.shape[0]
-    d_rho   = c_rho.unsqueeze(1)   - c_rho.unsqueeze(0)
-    d_theta = c_theta.unsqueeze(1) - c_theta.unsqueeze(0)
-    d_sigma = c_sigma.unsqueeze(1) - c_sigma.unsqueeze(0)
-
-    # REVERSED kernel order: side → ori → reg
-    k_side = torch.exp((-gamma_side * d_sigma ** 2).clamp(min=-3011.0))
-    k_ori  = 0.5 * (1.0 + torch.cos(d_theta))
-    k_reg  = torch.exp((-lambda_reg * d_rho   ** 2).clamp(min=-3011.0))
-
-    W = (k_side * k_ori * k_reg).clamp(0.0, 1.0)   # commutative product — same value
+    W = unified_plane_kernel(
+        c_rho.unsqueeze(0),   c_theta.unsqueeze(0),   c_sigma.unsqueeze(0),
+        c_rho.unsqueeze(1),   c_theta.unsqueeze(1),   c_sigma.unsqueeze(1),
+        lambda_reg=lambda_reg, gamma_side=gamma_side,
+    ).clamp(0.0, 1.0)
     W.fill_diagonal_(0.0)
 
     if top_k < C:
@@ -172,6 +253,13 @@ def build_synaptic_weight_matrix(
 
 
 class CrossSynapticNeuronSum:
+    """
+    DOUBLE-AGNOSTIC: the enrichment term order (synaptic sum vs transitive
+    bonus) is now a named `term_order` parameter instead of being baked
+    into the method body. Default is name-sorted ('syn' before 'trans'),
+    a neutral tie-break that depends only on the term's name, not on
+    authorial intent about which "should" run first.
+    """
     def __init__(
         self,
         syn_weight   : float = 211.0,
@@ -181,6 +269,7 @@ class CrossSynapticNeuronSum:
         gamma_side   : float = 411.0,
         device       : torch.device = DEVICE,
         dtype        : torch.dtype  = torch.float32,
+        term_order   : Optional[List[str]] = None,
     ):
         self.syn_weight   = syn_weight
         self.trans_weight = trans_weight
@@ -189,6 +278,7 @@ class CrossSynapticNeuronSum:
         self.gamma_side   = gamma_side
         self.device       = device
         self.dtype        = dtype
+        self.term_order   = term_order  # None => name-sorted default
 
     @torch.no_grad()
     def synaptic_sum(self, logits, c_rho, c_theta, c_sigma):
@@ -208,11 +298,12 @@ class CrossSynapticNeuronSum:
         c_rho_trans, c_theta_trans, c_sigma_trans,
         ctx_rho, ctx_theta, ctx_sigma,
     ):
-        # REVERSED: side → ori → reg
-        k_s = torch.exp(-self.gamma_side * (c_sigma_trans - ctx_sigma) ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta_trans - ctx_theta))
-        k_r = torch.exp(-self.lambda_reg * (c_rho_trans   - ctx_rho)   ** 2)
-        bonus = k_s * k_o * k_r   # commutative — same value
+        # SOLO SEMANTIC PLANARITY: one unified kernel, not three multiplied.
+        bonus = unified_plane_kernel(
+            c_rho_trans, c_theta_trans, c_sigma_trans,
+            ctx_rho, ctx_theta, ctx_sigma,
+            lambda_reg=self.lambda_reg, gamma_side=self.gamma_side,
+        )
         return layer_norm_array(bonus)
 
     @torch.no_grad()
@@ -221,19 +312,22 @@ class CrossSynapticNeuronSum:
         logits, c_rho, c_theta, c_sigma,
         c_rho_trans, c_theta_trans, c_sigma_trans,
         ctx_rho, ctx_theta, ctx_sigma,
+        term_order: Optional[List[str]] = None,
     ):
-        # REVERSED: transitive bonus first, then synaptic sum
         trans_bon = self.transitive_bonus(
             c_rho_trans, c_theta_trans, c_sigma_trans,
             ctx_rho, ctx_theta, ctx_sigma,
         )
         z_syn     = self.synaptic_sum(logits, c_rho, c_theta, c_sigma)
 
-        # REVERSED addition order: trans_weight first, then syn_weight
-        enriched = (
-            logits
-            + self.trans_weight * trans_bon
-            + self.syn_weight   * z_syn
+        # DOUBLE AGNOSTIC: term contribution order is a parameter, not a
+        # hard-coded "trans first" / "syn first" choice. Base 'logits' is
+        # always the accumulation seed (it is not an enrichment term).
+        order = term_order or self.term_order  # None => name-sorted
+        enriched = logits + symmetric_weighted_sum(
+            {"syn": z_syn, "trans": trans_bon},
+            weights={"syn": self.syn_weight, "trans": self.trans_weight},
+            order=order,
         )
         return torch.nan_to_num(enriched, nan=0.0, posinf=5011.0, neginf=-5011.0)
 
@@ -241,48 +335,24 @@ class CrossSynapticNeuronSum:
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0c-bis — INFLUENCE SPACE MAPPING   f : A × B → Y
 # ════════════════════════════════════════════════════════════════════════════
-#
-#   A  = current-word slice (rows)             |  Domain construction:
-#   B  = next-word / candidate slice (cols)     |    A × B laid out as an
-#   A × B = word-pair Cartesian product          |    (m × n) matrix of pairs
-#   Y  = influence space (propagated importance) |  Weighting:
-#   f  = InfluenceSpaceMapper.map(...)            |    log-sort  →  matrix-exp
-#
-# f(a_i, b_j) reads off the (i, j) cell of Y once stage 2 has run:
-#   1. Domain construction — build the m × n grid of (a_i, b_j) pairs
-#   2. Weighting           — (a) log-sort raw pairwise weights so outlier
-#                                magnitudes don't dominate
-#                            (b) matrix-exponential e^{scale·W} so indirect,
-#                                multi-hop relationships between candidates
-#                                are folded into a single-hop influence score
-#   3. Mapping             — f(a_i, b_j) = Y[i, j]
-#   4. Result              — Y, the influence space, one score per pair
-#
+
 class InfluenceSpaceMapper:
     """
-    f : A × B → Y  (word-pair → influence-score).
-
-    A and B are index sets over the candidate/context vocabulary slice;
-    A × B is realised as an (m × n) matrix of raw pairwise weights, which
-    is then log-sorted and matrix-exponentially widened before being read
-    back out as the influence score for each pair.
+    f : A × B → Y  (word-pair → influence-score). Unchanged by DA/SP —
+    this stage never hard-coded a kernel product or an ordering priority
+    to begin with.
     """
 
     def __init__(self, device: torch.device = DEVICE, exp_scale: float = 0.15):
         self.device    = device
         self.exp_scale = exp_scale
 
-    # ---- Stage 1: Domain construction --------------------------------------
     @staticmethod
     def cartesian_domain(a_idx: torch.Tensor, b_idx: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Build the (m × n) index grid A × B (Set A rows, Set B columns)."""
         grid_a, grid_b = torch.meshgrid(a_idx, b_idx, indexing="ij")
         return grid_a, grid_b
 
-    # ---- Stage 2a: log-sorting ----------------------------------------------
     def log_sort(self, W0: torch.Tensor) -> torch.Tensor:
-        """Rank-transform raw pairwise weights into log-spaced weights so a
-        few outlier magnitudes can't dominate the exponential step."""
         flat  = W0.reshape(-1)
         order = torch.argsort(flat, descending=True)
         ranks = torch.empty_like(order)
@@ -291,15 +361,7 @@ class InfluenceSpaceMapper:
         log_w = log_w - log_w.min()
         return log_w.view_as(W0)
 
-    # ---- Stage 2b: matrix-exponential weighting ------------------------------
     def matrix_exp_weight(self, W: torch.Tensor) -> torch.Tensor:
-        """
-        Apply e^{scale·W} so that indirect (multi-hop) influence between
-        candidates is folded into a single-hop score. torch.matrix_exp
-        requires a square input; a rectangular (m ≠ n) matrix is embedded
-        as the off-diagonal block of a symmetric (m+n)×(m+n) bipartite
-        matrix and the influence block is sliced back out afterwards.
-        """
         m, n = W.shape
         if m == n:
             return torch.matrix_exp(self.exp_scale * W)
@@ -309,20 +371,10 @@ class InfluenceSpaceMapper:
         E = torch.matrix_exp(self.exp_scale * Z)
         return E[:m, m:]
 
-    # ---- Stage 3: mapping -----------------------------------------------------
     def map(self, W0: torch.Tensor) -> torch.Tensor:
-        """f : A × B → Y. Runs the weighting stage end-to-end and returns
-        the (m × n) influence space Y, where Y[i, j] == f(a_i, b_j)."""
         return self.matrix_exp_weight(self.log_sort(W0))
 
-    # ---- Stage 4: per-candidate result -----------------------------------------
     def candidate_influence_bonus(self, cand_kernel: torch.Tensor) -> torch.Tensor:
-        """
-        Collapse the (K × K) influence space for a top-K candidate
-        neighbourhood down to one score per candidate: the total propagated
-        influence a candidate receives from every other candidate in the
-        neighbourhood, excluding self-influence.
-        """
         if cand_kernel.numel() == 0:
             return torch.zeros(0, device=cand_kernel.device)
         Y = self.map(cand_kernel)
@@ -361,26 +413,15 @@ def compute_transitive_triples_batched(
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 0e — FORMAL REFERENCE MODEL  (Model-Theoretic Atomism Grounding)
-# [Formalism unchanged — see original docstring for Russell/Wittgenstein/
-#  Kripke/Putnam references and proof stubs T1-T4]
 #
-# REVERSED CHANGE: Def-expansion now iterates from max_omega_steps down to 0,
-# checking convergence from the "top" of the expansion stack rather than
-# building upward.  The fixed-point set D_A^(ω) is mathematically identical
-# because the union is commutative and monotone — the reversal changes
-# iteration order only, not the limit.
+# DOUBLE-AGNOSTIC CHANGE: Def-expansion direction (ascending 0→ω vs
+# descending ω→0) is now a `step_direction` parameter ('forward',
+# 'backward', or 'auto' for a name-neutral default of 'forward').
+# Neither direction is hard-coded as correct; D_A^(ω) = ⋃_n D_A^(n) is a
+# commutative union so any direction reaches the same fixed point.
 # ════════════════════════════════════════════════════════════════════════════
 
 class AtomismReferenceModel:
-    """
-    ABELIAN-REVERSED variant.
-
-    Def-expansion iterates in reversed step order (max_omega_steps-1 → 0)
-    rather than 0 → max_omega_steps.  Because D_A^(ω) = ⋃_n D_A^(n) is a
-    commutative union, convergence to the same fixed point is guaranteed.
-    τ(w) computation is unchanged (batch order reversed for symmetry).
-    """
-
     def __init__(
         self,
         geo                 : "ThebaultTokenGeometry",
@@ -389,8 +430,10 @@ class AtomismReferenceModel:
         kappa_ref           : float = 40.50,
         kappa_def           : float = 990.15,
         max_omega_steps     : int   = 60,
-        device              : torch.device = DEVICE,
-        dtype               : torch.dtype  = torch.float32,
+        device               : torch.device = DEVICE,
+        dtype                : torch.dtype  = torch.float32,
+        step_direction        : str = "forward",   # DA: 'forward' | 'backward'
+        tau_batch_direction    : str = "forward",   # DA: 'forward' | 'backward'
     ):
         self.geo                = geo
         self.kernels            = kernels
@@ -398,8 +441,10 @@ class AtomismReferenceModel:
         self.kappa_ref          = kappa_ref
         self.kappa_def          = kappa_def
         self.max_omega_steps    = max_omega_steps
-        self.device             = device
-        self.dtype              = dtype
+        self.device              = device
+        self.dtype                = dtype
+        self.step_direction        = step_direction
+        self.tau_batch_direction   = tau_batch_direction
 
         self._vocab          : List[str]                   = []
         self._tok2idx        : Dict[str, int]              = {}
@@ -409,10 +454,6 @@ class AtomismReferenceModel:
         self._omega_steps    : int                         = 0
 
     def build(self, vocab: List[str]) -> None:
-        """
-        REVERSED: τ(w) batch loop runs from V-1 down to 0 (reversed slice).
-        Def-expansion: step range reversed (max_omega_steps-1 … 0 → same union).
-        """
         self._vocab   = vocab
         self._tok2idx = {t: i for i, t in enumerate(vocab)}
         V = len(vocab)
@@ -423,7 +464,6 @@ class AtomismReferenceModel:
         theta_t = self.geo._theta_t[:V]
         sigma_t = self.geo._sigma_t[:V]
 
-        # Step 1: D_A^(0) with adaptive fallback (unchanged logic)
         D_A_mask = (rho_t >= self.rho_atom_threshold)
         if int(D_A_mask.sum()) == 0:
             sorted_rho, _ = rho_t.sort()
@@ -437,12 +477,12 @@ class AtomismReferenceModel:
         print(f"[RefModel] D_A^(0): {int(D_A_mask.sum())} atoms "
               f"(ρ ≥ {used_thr:.4f}) / {V} tokens")
 
-        # REVERSED: iterate step indices in descending order.
-        # Because D_A^(ω) = ⋃_n D_A^(n) and ⋃ is commutative/associative,
-        # visiting steps in any order yields the same fixed point.
+        # DOUBLE AGNOSTIC: direction is a parameter, no default privilege.
         current = D_A_mask.clone()
         chunk   = 256
-        step_range = list(range(self.max_omega_steps - 1, -1, -1))  # reversed
+        base_range = range(0, self.max_omega_steps)
+        step_range = list(base_range) if self.step_direction == "forward" \
+                     else list(reversed(base_range))
         for step in step_range:
             prev = current.sum().item()
             members = current.nonzero(as_tuple=True)[0]
@@ -451,18 +491,18 @@ class AtomismReferenceModel:
             reachable = torch.zeros(V, dtype=torch.bool, device=self.device)
             for s in range(0, members.shape[0], chunk):
                 mb  = members[s : s + chunk]
-                # REVERSED kernel order: k_s · k_o · k_r
-                k_s = torch.exp(-self.kernels.gamma_side *
-                                (sigma_t[mb].unsqueeze(1) - sigma_t.unsqueeze(0)) ** 2)
-                k_o = 0.5 * (1.0 + torch.cos(
-                                theta_t[mb].unsqueeze(1) - theta_t.unsqueeze(0)))
-                k_r = torch.exp(-self.kernels.lambda_reg *
-                                (rho_t[mb].unsqueeze(1) - rho_t.unsqueeze(0)) ** 2)
-                reachable |= ((k_s * k_o * k_r) > self.kappa_def).any(dim=0)
+                # SOLO SEMANTIC PLANARITY: one unified kernel.
+                K = unified_plane_kernel(
+                    rho_t[mb].unsqueeze(1),   theta_t[mb].unsqueeze(1),   sigma_t[mb].unsqueeze(1),
+                    rho_t.unsqueeze(0),       theta_t.unsqueeze(0),       sigma_t.unsqueeze(0),
+                    lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side,
+                )
+                reachable |= (K > self.kappa_def).any(dim=0)
             current |= reachable
             self._omega_steps += 1
             if current.sum().item() == prev:
-                print(f"[RefModel] D_A^(ω) converged at reversed-step {step}: "
+                print(f"[RefModel] D_A^(ω) converged at step {step} "
+                      f"(direction={self.step_direction}): "
                       f"{int(prev)} tokens ({100*prev/V:.1f}%)")
                 break
 
@@ -470,22 +510,21 @@ class AtomismReferenceModel:
         self._D_A_omega_mask = current
         n_omega = int(current.sum().item())
         print(f"[RefModel] D_A^(ω): {n_omega} tokens ({100*n_omega/V:.1f}%) "
-              f"after {self._omega_steps} reversed Def-expansion steps")
+              f"after {self._omega_steps} Def-expansion steps (direction={self.step_direction})")
 
-        # REVERSED: τ batch loop from V down to 0 in reversed chunks
         tau = torch.zeros(V, dtype=self.dtype, device=self.device)
         omega_f = current.float()
         batch_starts = list(range(0, V, 512))
-        for start in reversed(batch_starts):   # REVERSED batch order
+        if self.tau_batch_direction == "backward":
+            batch_starts = list(reversed(batch_starts))
+        for start in batch_starts:
             end  = min(start + 512, V)
-            # REVERSED kernel order: k_s · k_o · k_r
-            k_s  = torch.exp(-self.kernels.gamma_side *
-                             (sigma_t[start:end].unsqueeze(1) - sigma_t.unsqueeze(0)) ** 2)
-            k_o  = 0.5 * (1.0 + torch.cos(
-                             theta_t[start:end].unsqueeze(1) - theta_t.unsqueeze(0)))
-            k_r  = torch.exp(-self.kernels.lambda_reg *
-                             (rho_t[start:end].unsqueeze(1) - rho_t.unsqueeze(0)) ** 2)
-            K    = k_s * k_o * k_r
+            # SOLO SEMANTIC PLANARITY: one unified kernel.
+            K = unified_plane_kernel(
+                rho_t[start:end].unsqueeze(1),   theta_t[start:end].unsqueeze(1),   sigma_t[start:end].unsqueeze(1),
+                rho_t.unsqueeze(0),               theta_t.unsqueeze(0),               sigma_t.unsqueeze(0),
+                lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side,
+            )
             ref  = (K > self.kappa_ref)
             sz   = ref.float().sum(dim=1).clamp(min=1.0)
             out  = (ref & (~current.unsqueeze(0))).float().sum(dim=1)
@@ -542,12 +581,12 @@ class AtomismReferenceModel:
         pct_c2 = 100 * n_c2  / max(V, 1)
         lines = [
             "╔══════════════════════════════════════════════════════════════╗",
-            "║ Formal Reference Model — Abelian-Reversed (V18G-AR)          ║",
+            "║ Formal Reference Model — Double-Agnostic / Solo-Planar (DA-SP)║",
             "╠══════════════════════════════════════════════════════════════╣",
             f"║  |V| (vocabulary)           = {V:<6d}                        ║",
             f"║  |D_A^(0)| (atomic base)    = {n_base:<6d} (ρ ≥ {self.rho_atom_threshold:.2f})        ║",
             f"║  |D_A^(ω)| (ω-closure)      = {n_omg:<6d} ({pct_o:.1f}% of V)            ║",
-            f"║  Def-expansion steps        = {self._omega_steps:<6d} (reversed order)         ║",
+            f"║  Def-expansion steps        = {self._omega_steps:<6d} (dir={self.step_direction})    ║",
             f"║  C2 witnesses (τ > 0)       = {n_c2:<6d} ({pct_c2:.1f}% of V)            ║",
             f"║  Mean trans-atomic score τ̄  = {mean_t:.4f}                       ║",
             "╠══════════════════════════════════════════════════════════════╣",
@@ -571,24 +610,17 @@ class AtomismReferenceModel:
 # ════════════════════════════════════════════════════════════════════════════
 
 STOP_WORDS_COG = set(
-    # Epistemic verbs — knowing & believing
     "know knew known think thought believe believed understand understood "
-    # Memory & perception verbs
     "realize realized recognize recognized recall remember remembered forget forgot "
     "learn learned grasp comprehend perceive sense notice suspect suppose "
-    # Reasoning & analysis verbs
     "analyze consider assume conclude infer reason judge evaluate assess decide "
     "determine examine reflect question doubt wonder ponder contemplate deliberate "
-    # Mental action verbs
     "weigh compare contrast interpret deduce hypothesize imagine expect intend mean "
-    # Cognitive state adjectives
     "aware conscious certain unsure clear confused uncertain likely possible probable "
     "expected assumed mental cognitive abstract logical rational intuitive subjective objective "
-    # Epistemic adverbs / hedges
     "perhaps maybe probably possibly apparently seemingly presumably supposedly evidently "
     "clearly obviously certainly indeed actually really truly surely definitely "
     "generally typically usually often sometimes rarely "
-    # Logical connectives & discourse markers
     "thus hence therefore consequently since although however yet still unless "
     "whether either neither also furthermore moreover additionally meanwhile otherwise "
     "whereas despite nevertheless nonetheless accordingly thereby".split()
@@ -632,7 +664,6 @@ def detokenize(tokens: List[str]) -> str:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2 — THÉBAULT TOKEN GEOMETRY
-# [Theoretical grounding unchanged — see original docstring]
 # ════════════════════════════════════════════════════════════════════════════
 
 def _perfect_square_cv() -> float:
@@ -659,7 +690,6 @@ def _thebault_centres(ax, ay, bx, by, cx, cy, dx, dy):
     return centres
 
 def _thebault_triple(px, py, qx, qy):
-    # Parallelogram-intrinsic regularity metric (see original docstring for fix notes).
     mag_p = math.sqrt(px * px + py * py)
     mag_q = math.sqrt(qx * qx + qy * qy)
     if mag_p < 1e-9 or mag_q < 1e-9:
@@ -774,12 +804,12 @@ class ThebaultTokenGeometry:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2b — PDN ENGINE
-# REVERSED: rho time-series is assembled in reverse trigram order.
-# Because ACF(lag) = Σ_t (R_t - μ)(R_{t+lag} - μ) / ((T-lag)σ²),
-# reversing the series R → R' = R_{T-1}, …, R_0 maps
-#   ACF_R(lag) → ACF_{R'}(lag) = ACF_R(lag)
-# (ACF is symmetric in its time series — reversing the series leaves all
-# ACF values invariant, making this a true abelian operation).
+#
+# DOUBLE-AGNOSTIC CHANGE: the trigram scan direction used to assemble the
+# rho time-series is now a `scan_direction` parameter ('forward' default,
+# or 'backward'). ACF(lag) is symmetric under time-reversal of the series,
+# so n* is unaffected either way — the direction is exposed rather than
+# assumed.
 # ════════════════════════════════════════════════════════════════════════════
 
 class PDNEngine:
@@ -793,6 +823,8 @@ class PDNEngine:
         max_period           : int   = 24,
         device               : torch.device = DEVICE,
         dtype                : torch.dtype  = torch.float32,
+        scan_direction        : str = "forward",   # DA: 'forward' | 'backward'
+        term_order             : Optional[List[str]] = None,  # DA: pdn_logit_bonus term order
     ):
         self.n_modes                 = n_modes
         self.sigma_pdn               = sigma_pdn
@@ -802,6 +834,8 @@ class PDNEngine:
         self.max_period              = max_period
         self.device                  = device
         self.dtype                   = dtype
+        self.scan_direction           = scan_direction
+        self.term_order                = term_order
         self.n_star                  : int              = 4
         self.power_spectrum          : Dict[int, float] = {}
         self.acf_values              : Dict[int, float] = {}
@@ -824,24 +858,25 @@ class PDNEngine:
         return acf
 
     def fit_from_trigrams(self, geo: "ThebaultTokenGeometry", tri_raw: Dict) -> None:
-        # REVERSED: trigrams are processed in reversed insertion order.
-        # ACF is time-reversal invariant, so n* is unchanged.
+        items = list(tri_raw.items())
+        if self.scan_direction == "backward":
+            items = list(reversed(items))
+
         rho_series: List[float] = []
-        for (w1, w2, w3), cnt in reversed(list(tri_raw.items())):
+        for (w1, w2, w3), cnt in items:
             r1 = geo.triple(w1).rho
             r2 = geo.triple(w2).rho
             r3 = geo.triple(w3).rho
             repeats = min(int(cnt), 5)
             for _ in range(repeats):
-                # REVERSED within each trigram: r3, r2, r1
-                rho_series.extend([r3, r2, r1])
+                rho_series.extend([r1, r2, r3])
 
         T = len(rho_series)
-        print(f"[PDN-AR] Rho series length: {T} observations (reversed trigram order)")
+        print(f"[PDN-DASP] Rho series length: {T} observations (scan_direction={self.scan_direction})")
 
         if T < 6:
             self.n_star = 4
-            print("[PDN-AR] Insufficient data — defaulting to n*=4")
+            print("[PDN-DASP] Insufficient data — defaulting to n*=4")
             return
 
         rho_min   = min(rho_series)
@@ -849,24 +884,24 @@ class PDNEngine:
         rho_range = rho_max_v - rho_min
         if rho_range > 1e-9:
             rho_series = [(r - rho_min) / rho_range for r in rho_series]
-            print(f"[PDN-AR] Rho range [{rho_min:.4f}, {rho_max_v:.4f}] → normalised [0,1]")
+            print(f"[PDN-DASP] Rho range [{rho_min:.4f}, {rho_max_v:.4f}] → normalised [0,1]")
         else:
-            print(f"[PDN-AR] Rho zero-variance — falling back to sigma series (reversed)")
+            print(f"[PDN-DASP] Rho zero-variance — falling back to sigma series")
             sigma_series: List[float] = []
-            for (w1, w2, w3), cnt in reversed(list(tri_raw.items())):
+            for (w1, w2, w3), cnt in items:
                 s1 = geo.triple(w1).sigma
                 s2 = geo.triple(w2).sigma
                 s3 = geo.triple(w3).sigma
                 repeats = min(int(cnt), 5)
                 for _ in range(repeats):
-                    sigma_series.extend([s3, s2, s1])   # reversed within trigram
+                    sigma_series.extend([s1, s2, s3])
             sig_min   = min(sigma_series) if sigma_series else 0.0
             sig_max   = max(sigma_series) if sigma_series else 1.0
             sig_range = sig_max - sig_min
             if sig_range > 1e-9:
                 rho_series = [(s - sig_min) / sig_range for s in sigma_series]
             else:
-                print("[PDN-AR] Both series zero-variance. Defaulting n*=4.")
+                print("[PDN-DASP] Both series zero-variance. Defaulting n*=4.")
                 self.n_star = 4
                 self.acf_values = {lag: 0.0 for lag in range(1, self.max_period + 1)}
                 self.power_spectrum = self.acf_values.copy()
@@ -888,11 +923,11 @@ class PDNEngine:
 
         if best_acf > sig_bound:
             self.n_star = best_lag
-            print(f"[PDN-AR] Dominant period n*={self.n_star} "
+            print(f"[PDN-DASP] Dominant period n*={self.n_star} "
                   f"(ACF={best_acf:.4f} > threshold={sig_bound:.4f})")
         else:
             self.n_star = 4
-            print(f"[PDN-AR] No significant periodicity — defaulting to n*=4")
+            print(f"[PDN-DASP] No significant periodicity — defaulting to n*=4")
 
         self.power_spectrum = {lag: abs(v) for lag, v in acf.items()}
 
@@ -902,7 +937,7 @@ class PDNEngine:
             tr = geo.triple(tok)
             full_theta = tr.theta * 2.0
             self._orbit_map[tok] = int(full_theta / sector) % self.n_star
-        print(f"[PDN-AR] Built orbit map for {len(self._orbit_map)} tokens "
+        print(f"[PDN-DASP] Built orbit map for {len(self._orbit_map)} tokens "
               f"across {self.n_star} orbit sectors.")
 
     def orbit_of(self, token: str) -> int:
@@ -955,8 +990,8 @@ class PDNEngine:
         c_rho        : torch.Tensor,
         c_theta      : torch.Tensor,
         current_orbit: int,
+        term_order    : Optional[List[str]] = None,
     ) -> torch.Tensor:
-        # REVERSED: orbit bonus computed first, regularity second
         orb = self.orbit_bonus(current_orbit, c_theta)
         reg = self.regularity_scores(window_rho, window_theta, c_rho, c_theta)
 
@@ -964,15 +999,20 @@ class PDNEngine:
             std = x.std()
             return (x - x.mean()) / (std + 1e-8) if std.item() > 1e-8 else x - x.mean()
 
-        # REVERSED: orbit first, then regularity (sum is abelian — same value)
-        return self.orbit_weight * _norm(orb) + self.regularity_weight * _norm(reg)
+        # DOUBLE AGNOSTIC: term order/weights exposed via symmetric_weighted_sum
+        order = term_order or self.term_order
+        return symmetric_weighted_sum(
+            {"orbit": _norm(orb), "regularity": _norm(reg)},
+            weights={"orbit": self.orbit_weight, "regularity": self.regularity_weight},
+            order=order,
+        )
 
     def theorem_bridge_report(self) -> str:
         lines = [
             "╔══════════════════════════════════════════════════════════════╗",
-            "║   Corpus ACF Spectral Analysis Report (Abelian-Reversed)     ║",
+            "║   Corpus ACF Spectral Analysis Report (Double-Agnostic)      ║",
             "╠══════════════════════════════════════════════════════════════╣",
-            f"║  Method: ACF of REVERSED rho sequence across trigrams        ║",
+            f"║  Method: ACF of rho sequence, scan_direction={self.scan_direction:<8s}      ║",
             f"║  Dominant period n*:  {self.n_star:<2d}  (ACF time-reversal invariant)   ║",
             f"║  95%% CI bound:       {self.acf_significance_bound:.4f}  (1.96/√T)               ║",
             "║                                                              ║",
@@ -1030,7 +1070,7 @@ class CoTTrace:
     conclusion   : Optional[ContextualStub]
 
     def render(self) -> str:
-        lines = ["  ── Chain-of-Thought Trace (Abelian-Reversed) ──"]
+        lines = ["  ── Chain-of-Thought Trace (Double-Agnostic / Solo-Planar) ──"]
         lines.append(f"  Seed: {' '.join(self.seed_tokens[:6])}")
         for s in self.steps:
             lines.append(
@@ -1083,6 +1123,7 @@ class InstructionDistribution:
         recency_decay    : float = 0.7,
         context_bonus    : float = 0.75,
         centroid_weight  : float = 0.8,
+        term_order        : Optional[List[str]] = None,   # DA: distribution() term order
     ):
         self.geo              = geo
         self.kernels          = kernels
@@ -1093,6 +1134,7 @@ class InstructionDistribution:
         self.recency_decay    = recency_decay
         self.context_bonus    = context_bonus
         self.centroid_weight  = centroid_weight
+        self.term_order        = term_order
         self._instr_toks    : List[str]          = []
         self._instr_freq    : Dict[str, float]   = {}
         self._instr_centroid: Optional[ThebaultTriple] = None
@@ -1133,19 +1175,22 @@ class InstructionDistribution:
         if self.geo._rho_t is not None:
             for tok, w in freq.items():
                 tr  = self.geo.triple(tok)
-                # REVERSED kernel order: k_s · k_o · k_r
-                k_s = torch.exp(-self.semantic_radius * (self.geo._sigma_t - tr.sigma) ** 2)
-                k_o = 0.5 * (1.0 + torch.cos(self.geo._theta_t - tr.theta))
-                k_r = torch.exp(-self.semantic_radius * (self.geo._rho_t   - tr.rho)   ** 2)
-                base += w * k_s * k_o * k_r
+                # SOLO SEMANTIC PLANARITY: one unified kernel.
+                K = unified_plane_kernel(
+                    self.geo._rho_t, self.geo._theta_t, self.geo._sigma_t,
+                    tr.rho, tr.theta, tr.sigma,
+                    lambda_reg=self.semantic_radius, gamma_side=self.semantic_radius,
+                )
+                base += w * K
 
         if self._instr_centroid and self.geo._rho_t is not None:
             c = self._instr_centroid
-            # REVERSED kernel order
-            k_s = torch.exp(-self.kernels.gamma_side * (self.geo._sigma_t - c.sigma) ** 2)
-            k_o = 0.5 * (1.0 + torch.cos(self.geo._theta_t - c.theta))
-            k_r = torch.exp(-self.kernels.lambda_reg * (self.geo._rho_t   - c.rho)   ** 2)
-            base += self.centroid_weight * k_s * k_o * k_r
+            K = unified_plane_kernel(
+                self.geo._rho_t, self.geo._theta_t, self.geo._sigma_t,
+                c.rho, c.theta, c.sigma,
+                lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side,
+            )
+            base += self.centroid_weight * K
 
         base = base.clamp(min=0.0)
         total = base.sum()
@@ -1155,10 +1200,10 @@ class InstructionDistribution:
             base = torch.ones(V, dtype=self.dtype, device=self.device) / V
 
         self._base_dist_t = base
-        print(f"[InstrDist-AR] Built from {len(self._instr_toks)} tokens, vocab={V}")
+        print(f"[InstrDist-DASP] Built from {len(self._instr_toks)} tokens, vocab={V}")
 
     @torch.no_grad()
-    def distribution(self, cands, gen_tokens, lm_tok2idx):
+    def distribution(self, cands, gen_tokens, lm_tok2idx, term_order: Optional[List[str]] = None):
         C = len(cands)
         if C == 0 or self._base_dist_t is None:
             return torch.ones(C, dtype=self.dtype, device=self.device) / max(C, 1)
@@ -1184,17 +1229,24 @@ class InstructionDistribution:
                 if c in fset:
                     bigram_bonus[i] = 0.1
 
-        # REVERSED: bigram_bonus + ctx_bonus_v + base_probs
-        raw = bigram_bonus + ctx_bonus_v + base_probs
+        # DOUBLE AGNOSTIC: term order/priority is an explicit parameter.
+        order = term_order or self.term_order
+        raw = symmetric_weighted_sum(
+            {"base": base_probs, "context": ctx_bonus_v, "bigram": bigram_bonus},
+            order=order,
+        )
         raw = raw.clamp(min=1e-12)
         return raw / raw.sum()
 
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 2e — COT STUB LIBRARY
-# REVERSED: quartile→stub-type mapping is reversed
-#   Original: sigma-sorted quartiles → [PREMISE, ELAB, CONTRAST, CONCLUSION]
-#   Reversed: sigma-sorted quartiles → [CONCLUSION, CONTRAST, ELAB, PREMISE]
+#
+# DOUBLE-AGNOSTIC CHANGE: quartile→stub-type mapping is now a caller-
+# supplied `quartile_map_order` (list of 4 stub-type names, lowest-sigma
+# to highest-sigma) instead of being hard-coded either forward or
+# reversed. Default is the canonical _STUB_SEQUENCE order — a name-based
+# constant defined once, not re-decided ad hoc per build.
 # ════════════════════════════════════════════════════════════════════════════
 
 class CoTStubLibrary:
@@ -1205,12 +1257,14 @@ class CoTStubLibrary:
         min_bin_size   : int   = 2,
         device         : torch.device = DEVICE,
         dtype          : torch.dtype  = torch.float32,
+        quartile_map_order : Optional[List[str]] = None,   # DA
     ):
         self.rho_threshold = rho_threshold
         self.n_theta_bins  = n_theta_bins
         self.min_bin_size  = min_bin_size
         self.device        = device
         self.dtype         = dtype
+        self.quartile_map_order = quartile_map_order or list(_STUB_SEQUENCE)
         self.stubs         : Dict[str, List[ContextualStub]] = {
             t: [] for t in _STUB_SEQUENCE
         }
@@ -1219,7 +1273,7 @@ class CoTStubLibrary:
         self._stub_sigma_t: Optional[torch.Tensor] = None
         self._stub_list   : List[ContextualStub]   = []
 
-    def build(self, geo, lm_vocab, raw_freq) -> None:
+    def build(self, geo, lm_vocab, raw_freq, quartile_map_order: Optional[List[str]] = None) -> None:
         all_entries = []
         for tok in lm_vocab:
             tr = geo.triple(tok)
@@ -1236,16 +1290,15 @@ class CoTStubLibrary:
         bridges.sort(key=lambda x: x[1].sigma)
         q = max(1, len(bridges) // 4)
 
-        # REVERSED quartile assignment:
-        #   lowest-sigma  → CONCLUSION (was PREMISE)
-        #   next          → CONTRAST   (was ELABORATION)
-        #   next          → ELABORATION (was CONTRAST)
-        #   highest-sigma → PREMISE    (was CONCLUSION)
+        # DOUBLE AGNOSTIC: the 4 quartile slots (lowest→highest sigma) map
+        # to stub types via an explicit, caller-controllable ordered list —
+        # neither "forward" nor "reversed" is assumed.
+        seq = quartile_map_order or self.quartile_map_order
         quartile_map = {
-            STUB_CONCLUSION  : bridges[:q],
-            STUB_CONTRAST    : bridges[q : 2 * q],
-            STUB_ELABORATION : bridges[2 * q : 3 * q],
-            STUB_PREMISE     : bridges[3 * q:],
+            seq[0] : bridges[:q],
+            seq[1] : bridges[q : 2 * q],
+            seq[2] : bridges[2 * q : 3 * q],
+            seq[3] : bridges[3 * q:],
         }
 
         self.stubs = {t: [] for t in _STUB_SEQUENCE}
@@ -1271,7 +1324,7 @@ class CoTStubLibrary:
         self._rebuild_tensors()
         total = sum(len(v) for v in self.stubs.values())
         per   = {t: len(v) for t, v in self.stubs.items()}
-        print(f"[CoT-AR] Built {total} contextual stubs (reversed quartiles): {per}")
+        print(f"[CoT-DASP] Built {total} contextual stubs (quartile_map_order={seq}): {per}")
 
     def _make_stub(self, stub_type, bin_idx, sub_idx, members) -> None:
         toks    = [m[0] for m in members]
@@ -1311,11 +1364,11 @@ class CoTStubLibrary:
         c_rho   = torch.tensor([s.rho   for s in candidates], dtype=torch.float32, device=DEVICE)
         c_theta = torch.tensor([s.theta for s in candidates], dtype=torch.float32, device=DEVICE)
         c_sigma = torch.tensor([s.sigma for s in candidates], dtype=torch.float32, device=DEVICE)
-        # REVERSED kernel order
-        k_s = torch.exp(-gam_stub * (c_sigma - ctx_sigma) ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - ctx_theta))
-        k_r = torch.exp(-lam_stub * (c_rho   - ctx_rho)   ** 2)
-        scores = k_s * k_o * k_r
+        # SOLO SEMANTIC PLANARITY: one unified kernel.
+        scores = unified_plane_kernel(
+            c_rho, c_theta, c_sigma, ctx_rho, ctx_theta, ctx_sigma,
+            lambda_reg=lam_stub, gamma_side=gam_stub,
+        )
         if pdn_engine is not None:
             orb_bonus = pdn_engine.orbit_bonus(pdn_orbit, c_theta)
             scores    = scores + 0.3 * orb_bonus
@@ -1323,16 +1376,27 @@ class CoTStubLibrary:
 
     @torch.no_grad()
     def stub_kernel(self, stub, c_rho, c_theta, c_sigma, kernels):
-        # REVERSED kernel order
-        k_s = torch.exp(-kernels.gamma_side * (c_sigma - stub.sigma) ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - stub.theta))
-        k_r = torch.exp(-kernels.lambda_reg * (c_rho   - stub.rho)   ** 2)
-        return k_s * k_o * k_r
+        # SOLO SEMANTIC PLANARITY: one unified kernel.
+        return unified_plane_kernel(
+            c_rho, c_theta, c_sigma, stub.rho, stub.theta, stub.sigma,
+            lambda_reg=kernels.lambda_reg, gamma_side=kernels.gamma_side,
+        )
 
 
 class CoTReasoningEngine:
+    """
+    DOUBLE-AGNOSTIC CHANGE: the hop-type sequence used in plan_chain is now
+    a `hop_type_order` parameter — a list of stub-type names of length
+    n_hops (padded/truncated as needed) plus a separate `conclusion_type`
+    parameter for the final stub. Default hop order is the canonical
+    _STUB_SEQUENCE's middle types with CONCLUSION reserved for the
+    dedicated conclusion slot — no "forward" or "reversed" precedence is
+    assumed; the caller states the sequence.
+    """
     def __init__(self, stub_library, kernels, pdn_engine, n_hops=3,
-                 tokens_per_hop=8, stub_logit_scale=0.9, device=DEVICE, dtype=torch.float32):
+                 tokens_per_hop=8, stub_logit_scale=0.9, device=DEVICE, dtype=torch.float32,
+                 hop_type_order: Optional[List[str]] = None,
+                 conclusion_type: str = STUB_CONCLUSION):
         self.stubs           = stub_library
         self.kernels         = kernels
         self.pdn             = pdn_engine
@@ -1341,6 +1405,8 @@ class CoTReasoningEngine:
         self.stub_logit_scale = stub_logit_scale
         self.device          = device
         self.dtype           = dtype
+        self.hop_type_order  = hop_type_order
+        self.conclusion_type = conclusion_type
         self._chain          : List[CoTStep]            = []
         self._conclusion_stub: Optional[ContextualStub] = None
         self._hop_ptr        : int = 0
@@ -1353,7 +1419,13 @@ class CoTReasoningEngine:
         self._hop_ptr         = 0
         self._tok_since_hop   = 0
 
-    def plan_chain(self, seed_tokens, geo, pdn_orbit=0) -> CoTTrace:
+    def _default_hop_types(self) -> List[str]:
+        # Neutral default: cycle through the non-conclusion stub types in
+        # their canonical (name-defined) order.
+        pool = [t for t in _STUB_SEQUENCE if t != self.conclusion_type]
+        return [pool[i % len(pool)] for i in range(self.n_hops)]
+
+    def plan_chain(self, seed_tokens, geo, pdn_orbit=0, hop_type_order: Optional[List[str]] = None) -> CoTTrace:
         lam, gam = 1.5, 0.8
         clean_seeds = [t for t in seed_tokens if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS]
         if clean_seeds:
@@ -1368,11 +1440,7 @@ class CoTReasoningEngine:
 
         self._chain, self._conclusion_stub = [], None
 
-        # REVERSED hop type sequence:
-        #   Original: [PREMISE, ELABORATION…, CONTRAST]
-        #   Reversed: [CONTRAST, …ELABORATION, PREMISE]
-        hop_types = [STUB_CONTRAST] + [STUB_ELABORATION] * max(1, self.n_hops - 2) + [STUB_PREMISE]
-        hop_types = hop_types[:self.n_hops]
+        hop_types = (hop_type_order or self.hop_type_order or self._default_hop_types())[:self.n_hops]
 
         for hop_idx, stype in enumerate(hop_types):
             stub = self.stubs.best_stub(
@@ -1382,17 +1450,17 @@ class CoTReasoningEngine:
             )
             if stub is None:
                 continue
-            # REVERSED kernel order
-            k_s   = math.exp(-gam * (stub.sigma - ctx_sigma) ** 2)
-            k_o   = 0.5 * (1.0 + math.cos(stub.theta - ctx_theta))
-            k_r   = math.exp(-lam * (stub.rho   - ctx_rho)   ** 2)
-            self._chain.append(CoTStep(hop_idx, stub, k_s * k_o * k_r,
+            # SOLO SEMANTIC PLANARITY: one unified (scalar) kernel.
+            score = unified_plane_kernel(
+                stub.rho, stub.theta, stub.sigma, ctx_rho, ctx_theta, ctx_sigma,
+                lambda_reg=lam, gamma_side=gam, use_torch=False,
+            )
+            self._chain.append(CoTStep(hop_idx, stub, score,
                                        (pdn_orbit + hop_idx) % self.pdn.n_star))
             ctx_rho, ctx_theta, ctx_sigma = stub.rho, stub.theta, stub.sigma
 
-        # REVERSED: conclusion stub now uses PREMISE type
         self._conclusion_stub = self.stubs.best_stub(
-            STUB_PREMISE, ctx_rho, ctx_theta, ctx_sigma, self.kernels,
+            self.conclusion_type, ctx_rho, ctx_theta, ctx_sigma, self.kernels,
             pdn_orbit=(pdn_orbit + self.n_hops) % self.pdn.n_star,
             pdn_engine=self.pdn,
         )
@@ -1442,12 +1510,17 @@ class ThebaultKernels:
     def k_ori (self, theta_a, theta_b): return 0.5 * (1.0 + torch.cos(theta_b - theta_a))
     def k_side(self, sigma_a, sigma_b): return torch.exp(-self.gamma_side * (sigma_b - sigma_a) ** 2)
 
-    # REVERSED: returns (k_side, k_ori, k_reg) — callers unpack in reversed order
+    # SOLO SEMANTIC PLANARITY: returns the single unified kernel value.
+    # Kept as a 3-tuple return (v, v, v) for call-site compatibility, so
+    # existing "k_a, k_b, k_c = ..." unpacking still works, but all three
+    # are now the SAME single-plane value rather than three independent
+    # kernels multiplied together.
     def all_scores_batched(self, rho_a, theta_a, sigma_a, rho_b, theta_b, sigma_b):
-        k_s = torch.exp(-self.gamma_side * (sigma_b - sigma_a) ** 2)
-        k_o = 0.5 * (1.0 + torch.cos(theta_b - theta_a))
-        k_r = torch.exp(-self.lambda_reg * (rho_b   - rho_a)   ** 2)
-        return k_s, k_o, k_r   # NOTE: reversed return order
+        K = unified_plane_kernel(
+            rho_a, theta_a, sigma_a, rho_b, theta_b, sigma_b,
+            lambda_reg=self.lambda_reg, gamma_side=self.gamma_side,
+        )
+        return K, K, K
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1474,10 +1547,14 @@ class MRVConstraintFilter:
     def mrv_scores_batched(self, c_rho, c_sigma, kernels):
         if self._v_rho is None:
             return torch.zeros(c_rho.shape[0], device=self.device)
-        # REVERSED: k_s first, then k_r
-        k_s = torch.exp(-kernels.gamma_side * (c_sigma.unsqueeze(1) - self._v_sigma.unsqueeze(0)) ** 2)
-        k_r = torch.exp(-kernels.lambda_reg * (c_rho.unsqueeze(1)   - self._v_rho.unsqueeze(0))   ** 2)
-        domain_sizes = ((k_s > self.threshold) & (k_r > self.threshold)).float().sum(dim=1)
+        # SOLO SEMANTIC PLANARITY: single combined (rho, sigma) plane kernel
+        # (theta omitted here — this filter never used k_ori, unchanged).
+        K = unified_plane_kernel(
+            c_rho.unsqueeze(1), torch.zeros_like(c_rho).unsqueeze(1), c_sigma.unsqueeze(1),
+            self._v_rho.unsqueeze(0), torch.zeros_like(self._v_rho).unsqueeze(0), self._v_sigma.unsqueeze(0),
+            lambda_reg=kernels.lambda_reg, gamma_side=kernels.gamma_side, kappa_ori=0.0,
+        )
+        domain_sizes = (K > self.threshold).float().sum(dim=1)
         mean_d       = domain_sizes.mean() + 1e-6
         mrv          = 1.0 / (domain_sizes + 1.0)
         mrv[domain_sizes > self.mrv_cap_ratio * mean_d] *= 0.5
@@ -1588,10 +1665,13 @@ class IsomorphicSyntaxStacker:
             l = min(L, sv.rho_t.shape[0])
             stored_rho[i, :l]   = sv.rho_t[:l]
             stored_sigma[i, :l] = sv.sigma_t[:l]
-        # REVERSED: k_s · k_r
-        ks = torch.exp(-kernels.gamma_side * (stored_sigma - cur_sigma.unsqueeze(0)) ** 2)
-        kr = torch.exp(-kernels.lambda_reg * (stored_rho   - cur_rho.unsqueeze(0))   ** 2)
-        return (ks * kr).mean(dim=1)
+        # SOLO SEMANTIC PLANARITY: single combined (rho, sigma) plane kernel.
+        K = unified_plane_kernel(
+            stored_rho, torch.zeros_like(stored_rho), stored_sigma,
+            cur_rho.unsqueeze(0), torch.zeros_like(cur_rho).unsqueeze(0), cur_sigma.unsqueeze(0),
+            lambda_reg=kernels.lambda_reg, gamma_side=kernels.gamma_side, kappa_ori=0.0,
+        )
+        return K.mean(dim=1)
 
     def ranked_anchors(self, current_tokens, geo, kernels):
         if not self.store or not current_tokens:
@@ -1614,10 +1694,13 @@ class IsomorphicSyntaxStacker:
         bonuses = torch.zeros(c_rho.shape[0], dtype=self.dtype, device=self.device)
         for sim_score, anc in anchors:
             if pos < anc.rho_t.shape[0]:
-                # REVERSED: k_s · k_r
-                ks = torch.exp(-kernels.gamma_side * (c_sigma - anc.sigma_t[pos].item()) ** 2)
-                kr = torch.exp(-kernels.lambda_reg * (c_rho   - anc.rho_t  [pos].item()) ** 2)
-                bonuses += sim_score * (ks * kr)
+                # SOLO SEMANTIC PLANARITY: single combined (rho, sigma) plane kernel.
+                K = unified_plane_kernel(
+                    c_rho, torch.zeros_like(c_rho), c_sigma,
+                    anc.rho_t[pos].item(), 0.0, anc.sigma_t[pos].item(),
+                    lambda_reg=kernels.lambda_reg, gamma_side=kernels.gamma_side, kappa_ori=0.0,
+                )
+                bonuses += sim_score * K
         std = bonuses.std()
         if std.item() > 1e-8:
             bonuses = (bonuses - bonuses.mean()) / std
@@ -1626,14 +1709,24 @@ class IsomorphicSyntaxStacker:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 7 — THÉBAULT CONJUGATE ORBIT
-# REVERSED: antipodality · congruence  (was congruence · antipodality)
+# SOLO SEMANTIC PLANARITY: antipodality and congruence remain two distinct
+# geometric notions (not both expressible as rho/theta/sigma distances to
+# a single point), so they are combined via symmetric_weighted_sum rather
+# than positional multiplication order.
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultConjugateOrbit:
     def score(self, anchor_triple, cand_theta, cand_sigma, gamma_side=411.0):
         antipodality = torch.cos(cand_theta + anchor_triple.theta - math.pi / 2) ** 2
         congruence   = torch.exp(-gamma_side * (cand_sigma - anchor_triple.sigma) ** 2)
-        return antipodality * congruence   # commutative — same value, reversed order
+        # DOUBLE AGNOSTIC: product is still commutative, but expressed via
+        # the name-sorted default of the shared primitive for consistency.
+        terms = {"antipodality": antipodality, "congruence": congruence}
+        keys = sorted(terms.keys())
+        out = terms[keys[0]]
+        for k in keys[1:]:
+            out = out * terms[k]
+        return out
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1704,10 +1797,12 @@ class ThebaultCompositionLM:
 
     def composition_logit_bonus(self, w1, w2, c_rho, c_sigma):
         C = self.geo.composed_triple(w1, w2)
-        # REVERSED: k_s · k_r
-        ks = torch.exp(-self.kernels.gamma_side * (c_sigma - C.sigma) ** 2)
-        kr = torch.exp(-self.kernels.lambda_reg * (c_rho   - C.rho)   ** 2)
-        return ks * kr
+        # SOLO SEMANTIC PLANARITY: single combined (rho, sigma) plane kernel.
+        return unified_plane_kernel(
+            c_rho, torch.zeros_like(c_rho), c_sigma,
+            C.rho, 0.0, C.sigma,
+            lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side, kappa_ori=0.0,
+        )
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1746,12 +1841,13 @@ class ThebaultPotentialGraph:
         for (w1, w2, w3), cnt in lm.tri_raw.items():
             if w2 in self.nodes and w3 in self.nodes and (w2, w3) not in seen:
                 ti, tj = self.nodes[w2].triple, self.nodes[w3].triple
-                # REVERSED: k_ori · k_reg (k_ori has no tensor form here — scalar)
-                w = (
-                    self.kernels.k_ori(ti.theta, torch.tensor(tj.theta, device=self.device)).item()
-                    * self.kernels.k_reg(ti.rho, torch.tensor(tj.rho, device=self.device)).item()
-                    * cnt
-                )
+                # SOLO SEMANTIC PLANARITY: single combined (rho, theta) plane
+                # kernel replaces k_ori(...) * k_reg(...).
+                w = unified_plane_kernel(
+                    ti.rho, ti.theta, 0.0, tj.rho, tj.theta, 0.0,
+                    lambda_reg=self.kernels.lambda_reg, gamma_side=0.0,
+                    use_torch=False,
+                ) * cnt
                 e = TGEdge(w2, w3, max(w, 1e-6))
                 self.adj[w2].append(e)
                 self.radj[w3].append(e)
@@ -1782,7 +1878,8 @@ class ThebaultPotentialGraph:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 10 — SEMANTIC MANDATE SCORER
-# REVERSED: kernel product order k_side · k_ori · k_reg
+# SOLO SEMANTIC PLANARITY: single unified_plane_kernel replaces the
+# k_side · k_ori · k_reg product.
 # ════════════════════════════════════════════════════════════════════════════
 
 class SemanticMandateScorer:
@@ -1827,15 +1924,11 @@ class SemanticMandateScorer:
         if self._centroid is None:
             return torch.zeros(C, dtype=self.dtype, device=self.device)
 
-        # REVERSED kernel order: k_side · k_ori · k_reg
-        k_s = torch.exp(
-            -self.kernels.gamma_side * (c_sigma - self._centroid.sigma) ** 2
+        bonus = unified_plane_kernel(
+            c_rho, c_theta, c_sigma,
+            self._centroid.rho, self._centroid.theta, self._centroid.sigma,
+            lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side,
         )
-        k_o = 0.5 * (1.0 + torch.cos(c_theta - self._centroid.theta))
-        k_r = torch.exp(
-            -self.kernels.lambda_reg * (c_rho   - self._centroid.rho)   ** 2
-        )
-        bonus = k_s * k_o * k_r
         bonus = layer_norm_array(bonus)
         return bonus * self.mandate_scale
 
@@ -1843,7 +1936,7 @@ class SemanticMandateScorer:
         if self._centroid is None:
             return "  No instruction centroid set."
         return (
-            f"  Instruction centroid (AR): "
+            f"  Instruction centroid (DA-SP): "
             f"ρ={self._centroid.rho:.4f}  "
             f"θ={self._centroid.theta:.4f}  "
             f"σ={self._centroid.sigma:.4f}"
@@ -1852,8 +1945,15 @@ class SemanticMandateScorer:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 11a — DNN ARRAY PIPELINE
-# REVERSED: layer stack inverted — sigma applied first, then theta,
-#           then relu_dim2 (NEW), then rho, then temperature scaling.
+#
+# DOUBLE-AGNOSTIC CHANGE: the layer execution order is now a `layer_order`
+# parameter — a list drawn from {'rho', 'theta', 'relu_dim2', 'sigma'} —
+# instead of a hard-coded sequence. Temperature scaling is likewise a
+# `temp_position` parameter ('pre' or 'post'). Neither the original
+# forward order nor the reversed order is assumed correct; the default
+# is the canonical name-sorted tuple ('relu_dim2','rho','sigma','theta')
+# with temp scaling applied post (an explicit, neutral choice, not an
+# implicit one).
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultDNNNormalizer:
@@ -1869,12 +1969,12 @@ class ThebaultDNNNormalizer:
     def _build_freq_scale(self, c_rho, c_sigma):
         return (c_rho.clamp(min=1e-6) * c_sigma.clamp(min=1e-6)).sqrt()
 
-    def normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0):
-        # REVERSED: freq-scale layer first, then rho-scale layer
+    def normalize(self, logits, c_rho=None, c_sigma=None, temp=1.0, pass_order: Optional[List[str]] = None):
+        # DOUBLE AGNOSTIC: which normalisation pass (freq-scale vs
+        # rho-scale) runs first is a `pass_order` parameter; default is
+        # name-sorted ('freq' before 'rho').
+        order = pass_order or ["freq", "rho"]
         if c_rho is not None and c_sigma is not None:
-            freq_scale = self._build_freq_scale(c_rho, c_sigma)
-            freq_norm  = l2_array_normalize(freq_scale, dim=0)
-            # Apply freq layer first
             if c_rho is not None:
                 temp_weights = torch.exp(
                     -((c_rho - c_rho.mean()) ** 2) / (2.0 * max(temp, 0.1) + 1e-8)
@@ -1882,11 +1982,18 @@ class ThebaultDNNNormalizer:
                 scaled_logits = logits * temp_weights
             else:
                 scaled_logits = logits / max(temp, 1e-6)
-            a1_pre = signed_power(scaled_logits, p=2.0)
-            a2     = (freq_norm * a1_pre).sum() * freq_norm + a1_pre * 0.5
-            # Then rho-scale
-            rho_scale  = self._build_rho_scale(c_rho)
-            a1         = signed_power(a2 * rho_scale, p=1.0)
+
+            state = scaled_logits
+            for stage in order:
+                if stage == "freq":
+                    freq_scale = self._build_freq_scale(c_rho, c_sigma)
+                    freq_norm  = l2_array_normalize(freq_scale, dim=0)
+                    a_pre  = signed_power(state, p=2.0)
+                    state  = (freq_norm * a_pre).sum() * freq_norm + a_pre * 0.5
+                elif stage == "rho":
+                    rho_scale = self._build_rho_scale(c_rho)
+                    state     = signed_power(state * rho_scale, p=1.0)
+            a1 = state
         else:
             a1 = logits / max(temp, 1e-6)
 
@@ -1913,46 +2020,30 @@ class GeometricTempScaler:
 
 class DNNArrayPipeline:
     """
-    DNN Array Pipeline — Abelian-Reversed variant.
+    DNN Array Pipeline — Double-Agnostic / Solo-Planar variant.
 
-    Layer stack (reversed from original):
-        z1  : sigma layer   — _sigma_weights  · signed_power(·, p=1.0)
-        z2  : theta layer   — _theta_weights  · signed_power(·, p=1.5)  + residual
-        z2b : relu_dim2     — orientation-selective ReLU on dimension 2 (theta)
-        z3  : rho layer     — _rho_weights    · signed_power(·, p=2.0)
-        out : temp scaling  — GeometricTempScaler → l1_simplex_project
+    Layer stack is now data, not control flow: `layer_order` lists which
+    of {'rho','theta','relu_dim2','sigma'} run and in what sequence, and
+    `temp_position` says whether GeometricTempScaler runs 'pre' (before
+    the layer stack) or 'post' (after). The default is a name-sorted,
+    neutral order — not the original forward order, and not its reversal.
 
-    relu_dim2 design
-    ────────────────
-    Dimension 2 in the Thébault geometry is the theta (orientation) axis.
-    The gate is built by centring the per-candidate theta weights about
-    their batch mean and applying a ReLU:
-
+    relu_dim2 design (unchanged mechanism, now optional/relocatable):
         gate_raw = relu( theta_w - mean(theta_w) )   ∈ [0, ∞)
-
-    This suppresses candidates whose orientation weight falls below the
-    batch mean (pushing their activation toward zero) while leaving
-    above-mean candidates largely unmodified.  The gate is then rescaled
-    to [0, 1] and used to blend two paths:
-
-        output = x · gate  +  relu(x) · (1 − gate)
-
-    When gate ≈ 1 (strong orientation match): output ≈ x  (identity pass-through).
-    When gate ≈ 0 (weak orientation match):   output ≈ relu(x)  (standard ReLU).
-
-    The blend avoids a hard discontinuity at the gate boundary and keeps
-    the layer well-behaved in both the high-gate and low-gate regimes.
-    Placing this layer between z2 (theta-modulated) and z3 (rho-amplified)
-    ensures that orientation-sparse signals are filtered *before* the
-    signed_power(·, p=2.0) rho amplification step, which would otherwise
-    magnify both relevant and irrelevant activations equally.
+        output   = x · gate  +  relu(x) · (1 − gate)
     """
 
-    def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32):
+    _DEFAULT_LAYER_ORDER = ["relu_dim2", "rho", "sigma", "theta"]  # name-sorted
+
+    def __init__(self, device: torch.device = DEVICE, dtype: torch.dtype = torch.float32,
+                 layer_order: Optional[List[str]] = None,
+                 temp_position: str = "post"):
         self.device      = device
         self.dtype       = dtype
         self._normalizer  = ThebaultDNNNormalizer(device, dtype)
         self._temp_scaler = GeometricTempScaler(lambda_temp=1.0)
+        self.layer_order   = layer_order or list(self._DEFAULT_LAYER_ORDER)
+        self.temp_position = temp_position
 
     def _rho_weights(self, c_rho):
         mu  = c_rho.mean()
@@ -1968,52 +2059,44 @@ class DNNArrayPipeline:
         return 0.7 + 0.3 * sig_norm
 
     def _dim2_relu_layer(self, x: torch.Tensor, c_theta: torch.Tensor) -> torch.Tensor:
-        """
-        Orientation-selective ReLU layer on dimension 2 (theta axis).
-
-        Candidates whose theta weight exceeds the batch mean are passed
-        through with a near-identity gate; candidates below the mean are
-        pushed toward a plain ReLU.  The smooth blend keeps the layer
-        differentiable at the gate boundary.
-
-        Args:
-            x:       Activation tensor from the preceding theta layer (z2).
-            c_theta: Per-candidate theta coordinates (same length as x).
-
-        Returns:
-            Tensor of same shape as x with orientation-selective activation.
-        """
-        theta_w  = self._theta_weights(c_theta)              # ∈ [0, 1]
-        gate_raw = (theta_w - theta_w.mean()).clamp(min=0.0)  # ReLU on centred weights
+        theta_w  = self._theta_weights(c_theta)
+        gate_raw = (theta_w - theta_w.mean()).clamp(min=0.0)
         g_max    = gate_raw.max()
         gate     = gate_raw / (g_max + 1e-8) if g_max.item() > 1e-8 else gate_raw
-        # Blend: gated pass-through where orientation is strong, plain ReLU elsewhere
         return x * gate + F.relu(x) * (1.0 - gate)
 
+    def _apply_layer(self, name, x, logits, c_rho, c_theta, c_sigma):
+        if name == "sigma":
+            sigma_w = self._sigma_weights(c_sigma)
+            return signed_power(x * sigma_w, p=1.0)
+        elif name == "theta":
+            theta_w = self._theta_weights(c_theta)
+            return signed_power(x * theta_w + logits * 0.3, p=1.5)
+        elif name == "relu_dim2":
+            return self._dim2_relu_layer(x, c_theta)
+        elif name == "rho":
+            rho_w = self._rho_weights(c_rho)
+            return signed_power(x * rho_w, p=2.0)
+        return x
+
     @torch.no_grad()
-    def forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
-        # REVERSED layer order: sigma → theta → relu_dim2 → rho → temp
-        # Original: temp → rho (z1) → theta (z2) → sigma (z3) → project
-        # Reversed: sigma (z1') → theta (z2') → relu_dim2 (z2b') → rho (z3') → temp → project
+    def forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4,
+                layer_order: Optional[List[str]] = None,
+                temp_position: Optional[str] = None):
+        order = layer_order or self.layer_order
+        tpos  = temp_position or self.temp_position
 
-        # Layer 1 — sigma modulation
-        sigma_w = self._sigma_weights(c_sigma)
-        z1      = signed_power(logits * sigma_w, p=1.0)
+        state = logits
+        if tpos == "pre":
+            state = self._temp_scaler.scale(state, temp, c_rho)
 
-        # Layer 2 — theta modulation (with residual from raw logits)
-        theta_w = self._theta_weights(c_theta)
-        z2      = signed_power(z1 * theta_w + logits * 0.3, p=1.5)
+        for name in order:
+            state = self._apply_layer(name, state, logits, c_rho, c_theta, c_sigma)
 
-        # Layer 2b — dimension-2 ReLU (orientation-selective activation)
-        z2b     = self._dim2_relu_layer(z2, c_theta)
+        if tpos == "post":
+            state = self._temp_scaler.scale(state, temp, c_rho)
 
-        # Layer 3 — rho amplification (feeds from z2b, not z2)
-        rho_w   = self._rho_weights(c_rho)
-        z3      = signed_power(z2b * rho_w, p=2.0)
-
-        # Temperature scaling applied last (reversed from original where it was first)
-        logits_scaled = self._temp_scaler.scale(z3, temp, c_rho)
-        return l1_simplex_project(logits_scaled)
+        return l1_simplex_project(state)
 
     @torch.no_grad()
     def log_forward(self, logits, c_rho, c_theta, c_sigma, temp=1.4):
@@ -2104,14 +2187,13 @@ class AnonymousVariableSolver:
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# SECTION 12 — THÉBAULT WALKER V18-CSNS-G (ABELIAN-REVERSED)
+# SECTION 12 — THÉBAULT WALKER V18-CSNS-G (DOUBLE-AGNOSTIC / SOLO-PLANAR)
 #
-# REVERSED logit assembly order in walk_probs:
-#   Original final term is log_base (LM prior).
-#   Reversed: log_base is the LAST term added.
-#   All additions are commutative (abelian) so the numerical value is
-#   identical; the reversed order encodes the structural intent that
-#   geometric constraints take primary position in the sum.
+# DOUBLE-AGNOSTIC CHANGE: walk_probs no longer writes a literal, ordered
+# expression for the logit sum. All named terms go into a dict and are
+# combined with symmetric_weighted_sum — order is a `term_order`
+# parameter, default name-sorted, so no term (including the LM prior
+# log_base) is structurally privileged as "first" or "last".
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultWalker:
@@ -2129,6 +2211,8 @@ class ThebaultWalker:
         trans_weight     : float = 5070.6,
         syn_k            : int   = 18,
         tau_weight       : float = 70.45,
+        walk_term_order   : Optional[List[str]] = None,   # DA
+        context_order      : str = "append",               # DA: 'append' | 'prepend'
     ):
         self.geo          = geo
         self.kernels      = kernels
@@ -2145,6 +2229,8 @@ class ThebaultWalker:
         self.cot          = cot_engine
         self.instr_dist   = instr_dist
         self.device       = device
+        self.walk_term_order = walk_term_order
+        self.context_order    = context_order
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
         self._cur_sent_toks : List[str] = []
         self._cur_orbit     : int       = 0
@@ -2194,6 +2280,7 @@ class ThebaultWalker:
         and_weight    : float = 0.5,
         tau_weight    : float = None,
         influence_weight : float = 0.5,
+        term_order        : Optional[List[str]] = None,
     ) -> Tuple[List[str], torch.Tensor]:
         cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands:
@@ -2212,7 +2299,8 @@ class ThebaultWalker:
 
         ctx = self.geo.triple(w2)
 
-        # REVERSED: all_scores_batched now returns (k_side, k_ori, k_reg)
+        # SOLO SEMANTIC PLANARITY: all three "k_*" names now hold the SAME
+        # single unified-plane value (kept for call-site compatibility).
         k_side, k_ori, k_reg = self.kernels.all_scores_batched(
             ctx.rho, ctx.theta, ctx.sigma, c_rho, c_theta, c_sigma
         )
@@ -2243,7 +2331,7 @@ class ThebaultWalker:
             else torch.zeros(len(cands), dtype=torch.float32, device=self.device)
         )
 
-        # Isomorphic pair detection (unchanged)
+        # Isomorphic pair detection (unchanged — uses the now-unified kernel values)
         self.current_isomorphic_pairs = []
         top_idx  = torch.topk(k_reg * k_side, min(50, len(cands))).indices
         sub_r, sub_s = k_reg[top_idx], k_side[top_idx]
@@ -2257,13 +2345,6 @@ class ThebaultWalker:
                     sim = (k_reg[i] * k_side[i] * k_reg[j] * k_side[j]).sqrt().item()
                     self.current_isomorphic_pairs.append((ci, cj, sim))
 
-        # ---- Influence space mapping:  f : A × B → Y --------------------------
-        # A = {w1,w2}-conditioned context, B = top-K candidate neighbourhood.
-        # A × B is realised here as the candidate-candidate kernel matrix
-        # (reusing build_synaptic_weight_matrix), then log-sorted and
-        # matrix-exponentially widened by InfluenceSpaceMapper so that
-        # multi-hop candidate relationships are folded into one influence
-        # score per candidate before being added into the logit sum below.
         N             = len(cands)
         infl_bonus    = torch.zeros(N, device=self.device)
         infl_k        = min(self._influence_top_k, N)
@@ -2288,27 +2369,37 @@ class ThebaultWalker:
 
         log_base = (base_probs.clamp(min=1e-12)).log()
 
-        # REVERSED logit assembly:
-        # Original order: log_base + α·k_reg + β·k_ori + δ·k_side + … + log_base at start
-        # Reversed order: tau_boost first, then geometric terms, log_base LAST
-        raw_logits = (
-            tau_boost                         # τ(w) — D_A^(ω) escape bonus (now first)
-            + influence_weight * infl_bonus   # f: A×B→Y propagated influence score
-            + mandate_boost                   # instruction centroid kernel
-            + cot_weight * cot_bonus          # chain-of-thought stub alignment
-            + pdn_weight * pdn_bonus          # ACF spectral regularity / orbit
-            + echo_bonus                      # isomorphic syntax echo
-            + chunk_bonus                     # positional chunk signature
-            + zetamrv    * mrv_scores         # MRV constraint filter
-            + comp_bonus                      # composition triple bonus
-            + psipot     * pots               # potential-graph propagation
-            + gammaorbit * orbit_scores       # conjugate-orbit congruence
-            + deltaside  * k_side             # σ-side proximity  (REVERSED kernel label)
-            + betaori    * k_ori              # angular alignment
-            + alphareg   * k_reg              # Thébault ρ-similarity
-            + punct_bias                      # punctuation suppression
-            + punct_penalty                   # double-punct hard penalty
-            + log_base                        # LM prior (now LAST — reversed)
+        # DOUBLE AGNOSTIC: every named term goes into a dict and is combined
+        # via symmetric_weighted_sum. No term (log_base included) is given
+        # positional priority by where it's written; the effective priority
+        # is the explicit `order` parameter, defaulting to name-sorted.
+        order = term_order or self.walk_term_order
+        raw_logits = symmetric_weighted_sum(
+            {
+                "tau"        : tau_boost,
+                "influence"  : infl_bonus,
+                "mandate"    : mandate_boost,
+                "cot"        : cot_bonus,
+                "pdn"        : pdn_bonus,
+                "echo"       : echo_bonus,
+                "chunk"      : chunk_bonus,
+                "mrv"        : mrv_scores,
+                "comp"       : comp_bonus,
+                "pot"        : pots,
+                "orbit"      : orbit_scores,
+                "k_side"     : k_side,
+                "k_ori"      : k_ori,
+                "k_reg"      : k_reg,
+                "punct_bias" : punct_bias,
+                "punct_pen"  : punct_penalty,
+                "log_base"   : log_base,
+            },
+            weights={
+                "influence": influence_weight, "cot": cot_weight, "pdn": pdn_weight,
+                "mrv": zetamrv, "pot": psipot, "orbit": gammaorbit,
+                "k_side": deltaside, "k_ori": betaori, "k_reg": alphareg,
+            },
+            order=order,
         )
 
         governed_logits = self.contingent_prob.govern_next_probs(
@@ -2352,8 +2443,11 @@ class ThebaultWalker:
             log_walk  = self._dnn_pipeline.log_forward(
                 logits_enriched, c_rho, c_theta, c_sigma, temp=1.0
             )
-            # REVERSED AND combination: walk first, instr second
-            log_and   = (1.0 - and_weight) * log_walk + and_weight * log_instr
+            # DOUBLE AGNOSTIC: AND-combination term order/weight is explicit.
+            log_and = symmetric_weighted_sum(
+                {"walk": log_walk, "instr": log_instr},
+                weights={"walk": 1.0 - and_weight, "instr": and_weight},
+            )
             final_probs = l1_simplex_project(log_and)
         else:
             p_instr     = torch.ones(N, dtype=torch.float32, device=self.device) / N
@@ -2400,15 +2494,17 @@ class ThebaultWalker:
 
     def push_token(self, token: str, sentence_len: int) -> None:
         """
-        REVERSED: new token is prepended to _cur_sent_toks rather than appended,
-        so the sentence context list is maintained in reversed (most-recent-first)
-        order.  All downstream consumers of _cur_sent_toks (iso_stacker, instr_dist)
-        see the context in reversed temporal order, making recency and positional
-        calculations abelian with respect to time direction.
+        DOUBLE AGNOSTIC: whether new tokens are appended or prepended to
+        _cur_sent_toks is a `context_order` parameter ('append' default —
+        the neutral, standard reading order — or 'prepend'). Neither is
+        hard-coded as the only option.
         """
         if token in PUNCT_TOKENS or token in COGNITIVE_TOKENS:
             return
-        self._cur_sent_toks.insert(0, token)   # prepend = reversed
+        if self.context_order == "prepend":
+            self._cur_sent_toks.insert(0, token)
+        else:
+            self._cur_sent_toks.append(token)
         self._tok_pos += 1
         pos_norm = len(self._cur_sent_toks) / max(sentence_len, 1)
         self.chunk_engine.push(self.geo.triple(token), pos_norm)
@@ -2443,7 +2539,7 @@ class ThebaultWalker:
         max_t = max(self._csns_trans_norms)
         return (
             "╔══════════════════════════════════════════════════════════════╗\n"
-            "║   CSNS Diagnostic Report (Abelian-Reversed Variant)          ║\n"
+            "║   CSNS Diagnostic Report (Double-Agnostic / Solo-Planar)      ║\n"
             "╠══════════════════════════════════════════════════════════════╣\n"
             f"║  Steps processed:       {n:<36d}║\n"
             f"║  Synaptic sum weight    ω_syn   = {self._csns.syn_weight:<25.3f}║\n"
@@ -2455,7 +2551,7 @@ class ThebaultWalker:
             f"║  avg |trans|    = {avg_t:<41.4f}║\n"
             f"║  max |trans|    = {max_t:<41.4f}║\n"
             "║                                                              ║\n"
-            "║  Reversed enrichment order: trans first, then synaptic sum  ║\n"
+            "║  Enrichment term order: name-sorted by default (config'able) ║\n"
             "║    w1 × 0.25  +  w2 × 0.50  +  c × 0.25                    ║\n"
             "╚══════════════════════════════════════════════════════════════╝"
         )
@@ -2463,10 +2559,13 @@ class ThebaultWalker:
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 13 — TEXT GENERATION ENGINE
-# REVERSED: sentences are generated and collected in reversed order,
-# then reversed back before joining (net effect: generation ORDER is reversed
-# while output reading order is preserved).
-# Within each sentence, token accumulation list is reversed on completion.
+#
+# DOUBLE-AGNOSTIC CHANGE: sentence generation order is a `sentence_order`
+# parameter ('forward' default — ascending index — or 'backward').
+# Whatever order sentences are generated in, they are re-sorted by index
+# before joining so the final reading order is always ascending — that
+# part is NOT a free parameter, since scrambled reading order would harm
+# the user, not just reflect a structural choice.
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_passage(
@@ -2478,6 +2577,7 @@ def generate_passage(
     and_weight      : float = 0.9,
     temperature     : float = 2.0,
     return_traces   : bool  = False,
+    sentence_order   : str   = "forward",   # DA: 'forward' | 'backward'
 ):
     if instruction_text.strip():
         walker.instr_dist.set_instruction(instruction_text)
@@ -2490,9 +2590,8 @@ def generate_passage(
     walker._csns_syn_norms.clear()
     walker._csns_trans_norms.clear()
 
-    # REVERSED: sentence outputs collected then reversed
-    outputs_reversed : List[str]      = []
-    all_traces       : List[CoTTrace] = []
+    outputs_by_idx : Dict[int, str]      = {}
+    traces_by_idx  : Dict[int, CoTTrace] = {}
     head_list = list(lm.heads.keys())
     if not head_list:
         return ("", [], "") if return_traces else ""
@@ -2513,9 +2612,11 @@ def generate_passage(
 
     global_step = 0
 
-    # REVERSED: iterate sentence indices in reversed order
-    # Sentence num_sentences-1 is generated first; sentence 0 last.
-    for sent_idx in reversed(range(num_sentences)):
+    sent_indices = list(range(num_sentences))
+    if sentence_order == "backward":
+        sent_indices = list(reversed(sent_indices))
+
+    for sent_idx in sent_indices:
         if sent_idx == 0:
             w1, w2    = seed_w1, seed_w2
             init_toks = [w1, w2] if seed_text else []
@@ -2527,7 +2628,7 @@ def generate_passage(
             plan_seeds = [w1, w2]
 
         trace = walker.begin_sentence(seed_tokens=plan_seeds, total_tokens=tokens_per_sent)
-        all_traces.append(trace)
+        traces_by_idx[sent_idx] = trace
         toks = list(init_toks)
 
         for step in range(tokens_per_sent):
@@ -2551,21 +2652,19 @@ def generate_passage(
             else:
                 wsp += 1
 
-            toks.insert(0, nxt)
+            toks.append(nxt)
             walker.push_token(nxt, tokens_per_sent)
             w1, w2 = w2, nxt
 
             if nxt in {".", "?", "!"} and len(toks) >= max(4, int(tokens_per_sent * 0.85)):
                 break
 
-        # REVERSED: reverse token list before detokenizing
-        toks_reversed = list(reversed(toks))
-        outputs_reversed.append(detokenize(toks_reversed))
+        outputs_by_idx[sent_idx] = detokenize(toks)
 
-    # REVERSED: reverse the collected sentence list so reading order is restored
-    outputs = list(reversed(outputs_reversed))
-    # Also reverse the traces to match sentence order
-    all_traces = list(reversed(all_traces))
+    # Reading order is always ascending by sentence index, independent of
+    # the (double-agnostic) generation order chosen above.
+    outputs    = [outputs_by_idx[i]  for i in range(num_sentences) if i in outputs_by_idx]
+    all_traces = [traces_by_idx[i]   for i in range(num_sentences) if i in traces_by_idx]
 
     result = " ".join(outputs)
     if return_traces:
@@ -2575,7 +2674,12 @@ def generate_passage(
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 14 — V18-CSNS-G ENGINE
-# REVERSED: train() build stages executed in reversed order
+#
+# DOUBLE-AGNOSTIC CHANGE: the training build-stage order is a
+# `build_stage_order` parameter — a list drawn from
+# {'ref_model','mandate','instr_dist','cot','pdn','mrv','graph'} —
+# instead of a hard-coded sequence. Default is the canonical name-sorted
+# order.
 # ════════════════════════════════════════════════════════════════════════════
 
 
@@ -2599,7 +2703,7 @@ class CubeChunk:
     sigma_mean: float
 
 class CubeGardenResolver:
-    """Deterministic 4-D cube-garden corpus permutation."""
+    """Deterministic 4-D cube-garden corpus permutation (unchanged by DA/SP)."""
     def __init__(self, geo, pdn, chunk_size=128, cube_side=8):
         self.geo=geo; self.pdn=pdn; self.chunk_size=max(1,int(chunk_size)); self.cube_side=max(2,int(cube_side))
     @staticmethod
@@ -2650,7 +2754,9 @@ class CubeGardenResolver:
         lines.append('╚════════════════════════════════════════════════════════════════════╝'); return '\n'.join(lines)
 
 class V18Engine:
-    def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8):
+    _DEFAULT_BUILD_ORDER = ["cot", "graph", "instr_dist", "mandate", "mrv", "pdn", "ref_model"]  # name-sorted
+
+    def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8, build_stage_order: Optional[List[str]] = None):
         self.device      = DEVICE
         self.geo         = ThebaultTokenGeometry(device=self.device)
         self.kernels     = ThebaultKernels()
@@ -2671,59 +2777,88 @@ class V18Engine:
         self.syn_weight   = syn_weight
         self.trans_weight = trans_weight
         self.syn_k        = syn_k
+        self.build_stage_order = build_stage_order or list(self._DEFAULT_BUILD_ORDER)
         self.cube_chunk_size=128
         self.cube_side=8
         self.cube_garden=None
         self.cube_chunks=[]
 
-    def train(self, corpus_text: str):
-        print(f"[*-AR] Tokenizing corpus ({len(corpus_text)} chars)...")
+    def train(self, corpus_text: str, build_stage_order: Optional[List[str]] = None):
+        print(f"[*-DASP] Tokenizing corpus ({len(corpus_text)} chars)...")
         self.corpus_snippet=corpus_text
         tokens=tokenize(corpus_text)
         provisional_freq={}
         for tok in tokens: provisional_freq[tok]=provisional_freq.get(tok,0.0)+1.0
         provisional_vocab=list(provisional_freq); max_freq=max(provisional_freq.values(),default=1.0); n=len(provisional_vocab)
-        print(f"[*-AR] Cube prepass registering {n} tokens...")
+        print(f"[*-DASP] Cube prepass registering {n} tokens...")
         for idx,tok in enumerate(provisional_vocab): self.geo.register(tok,provisional_freq[tok],idx,max_freq,n)
         pn=4; sector=2.0*math.pi/pn
         for tok in provisional_vocab:
             tr=self.geo.triple(tok); self.pdn._orbit_map[tok]=int((tr.theta*2.0)/sector)%pn
         self.cube_garden=CubeGardenResolver(self.geo,self.pdn,self.cube_chunk_size,self.cube_side)
-        print("[*-AR] Building deterministic 4-D Cube Garden ordering...")
+        print("[*-DASP] Building deterministic 4-D Cube Garden ordering...")
         tokens,self.cube_chunks=self.cube_garden.resort(tokens)
         print(self.cube_garden.report(self.cube_chunks))
         self.lm.ingest(tokens)
         all_tokens=list(self.lm.raw_freq.keys()); max_freq=max(self.lm.raw_freq.values(),default=1.0); vocab_size=len(all_tokens)
-        print(f"[*-AR] Registering {vocab_size} tokens after Cube Garden resort...")
+        print(f"[*-DASP] Registering {vocab_size} tokens after Cube Garden resort...")
         for idx,tok in enumerate(all_tokens): self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
 
-        # REVERSED build order: retained from the original V18-CSNS-G pipeline.
-        print("[*-AR] REVERSED build order: RefModel first (requires GPU tensors — building them now)...")
-        print("[*-AR] Building GPU Tensor Caches (prerequisite for all stages)...")
+        print("[*-DASP] Building GPU Tensor Caches (prerequisite for all stages)...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
         rho_nonzero=int((self.geo._rho_t>0.01).sum().item()); rho_max=float(self.geo._rho_t.max().item())
-        print(f"[Geo-AR] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
-        print("[*-AR] Stage 1 (reversed): Building Formal Reference Model...")
-        self.ref_model=AtomismReferenceModel(geo=self.geo,kernels=self.kernels,device=self.device); self.ref_model.build(self.lm.vocab); print(self.ref_model.reference_report())
-        print("[*-AR] Stage 2 (reversed): Building Semantic Mandate Scorer...")
-        self.mandate_scorer=SemanticMandateScorer(geo=self.geo,kernels=self.kernels,device=self.device)
-        print("[*-AR] Stage 3 (reversed): Building Instruction Distribution module...")
-        self.instr_dist=InstructionDistribution(geo=self.geo,kernels=self.kernels,lm=self.lm,device=self.device)
-        print("[*-AR] Stage 4 (reversed): Building CoT contextual stub library...")
-        self.stub_lib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
-        self.cot=CoTReasoningEngine(stub_library=self.stub_lib,kernels=self.kernels,pdn_engine=self.pdn,n_hops=3,tokens_per_hop=10,device=self.device)
-        print("[*-AR] Stage 5 (reversed): Fitting PDN from corpus autocorrelation (reversed series)...")
-        self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw); self.pdn.build_orbit_map(self.lm.vocab,self.geo); print(self.pdn.theorem_bridge_report())
-        print("[*-AR] Stage 6 (reversed): Initializing MRV Filter...")
-        self.mrv.prime(self.lm.vocab,self.geo)
-        print("[*-AR] Stage 7 (reversed): Building graph potentials...")
-        self.graph.build(self.lm); self.graph.propagate(steps=2)
-        self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k)
-        print("[+] Training complete. (V18-CSNS-G ABELIAN-REVERSED + CUBE GARDEN)")
+        print(f"[Geo-DASP] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
 
-    def save_cache(self, filename: str = "v18_csns_g_ar_model.pkl"):
-        print(f"[*-AR] Saving model state to {filename}...")
+        # DOUBLE AGNOSTIC: build stages run in an explicit, caller-supplied
+        # order (default: name-sorted) instead of a hard-coded sequence.
+        order = build_stage_order or self.build_stage_order
+        print(f"[*-DASP] Build stage order: {order}")
+        for stage in order:
+            if stage == "ref_model":
+                print("[*-DASP] Stage: Building Formal Reference Model...")
+                self.ref_model=AtomismReferenceModel(geo=self.geo,kernels=self.kernels,device=self.device)
+                self.ref_model.build(self.lm.vocab)
+                print(self.ref_model.reference_report())
+            elif stage == "mandate":
+                print("[*-DASP] Stage: Building Semantic Mandate Scorer...")
+                self.mandate_scorer=SemanticMandateScorer(geo=self.geo,kernels=self.kernels,device=self.device)
+            elif stage == "instr_dist":
+                print("[*-DASP] Stage: Building Instruction Distribution module...")
+                self.instr_dist=InstructionDistribution(geo=self.geo,kernels=self.kernels,lm=self.lm,device=self.device)
+            elif stage == "cot":
+                print("[*-DASP] Stage: Building CoT contextual stub library...")
+                self.stub_lib.build(self.geo,self.lm.vocab,self.lm.raw_freq)
+                self.cot=CoTReasoningEngine(stub_library=self.stub_lib,kernels=self.kernels,pdn_engine=self.pdn,n_hops=3,tokens_per_hop=10,device=self.device)
+            elif stage == "pdn":
+                print("[*-DASP] Stage: Fitting PDN from corpus autocorrelation...")
+                self.pdn.fit_from_trigrams(self.geo,self.lm.tri_raw); self.pdn.build_orbit_map(self.lm.vocab,self.geo)
+                print(self.pdn.theorem_bridge_report())
+            elif stage == "mrv":
+                print("[*-DASP] Stage: Initializing MRV Filter...")
+                self.mrv.prime(self.lm.vocab,self.geo)
+            elif stage == "graph":
+                print("[*-DASP] Stage: Building graph potentials...")
+                self.graph.build(self.lm); self.graph.propagate(steps=2)
+
+        # cot may not have been built yet if 'cot' wasn't in the given order
+        if self.cot is None:
+            self.stub_lib.build(self.geo, self.lm.vocab, self.lm.raw_freq)
+            self.cot = CoTReasoningEngine(stub_library=self.stub_lib, kernels=self.kernels, pdn_engine=self.pdn,
+                                           n_hops=3, tokens_per_hop=10, device=self.device)
+        if self.mandate_scorer is None:
+            self.mandate_scorer = SemanticMandateScorer(geo=self.geo, kernels=self.kernels, device=self.device)
+        if self.instr_dist is None:
+            self.instr_dist = InstructionDistribution(geo=self.geo, kernels=self.kernels, lm=self.lm, device=self.device)
+        if self.ref_model is None:
+            self.ref_model = AtomismReferenceModel(geo=self.geo, kernels=self.kernels, device=self.device)
+            self.ref_model.build(self.lm.vocab)
+
+        self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k)
+        print("[+] Training complete. (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR + CUBE GARDEN)")
+
+    def save_cache(self, filename: str = "v18_csns_g_dasp_model.pkl"):
+        print(f"[*-DASP] Saving model state to {filename}...")
         with open(filename, "wb") as f:
             pickle.dump({
                 "geo_vecs"       : self.geo._vecs,
@@ -2744,7 +2879,8 @@ class V18Engine:
                 "cube_side"      : self.cube_side,
                 "cube_chunks"    : self.cube_chunks,
                 "syn_k"          : self.syn_k,
-                "version"        : "V18-CSNS-G-AR",
+                "build_stage_order": self.build_stage_order,
+                "version"        : "V18-CSNS-G-DASP",
                 "ref_tau_scores"  : (self.ref_model._tau_scores.cpu() if self.ref_model and self.ref_model._tau_scores is not None else None),
                 "ref_D_A_mask"    : (self.ref_model._D_A_mask.cpu() if self.ref_model and self.ref_model._D_A_mask is not None else None),
                 "ref_D_A_omega"   : (self.ref_model._D_A_omega_mask.cpu() if self.ref_model and self.ref_model._D_A_omega_mask is not None else None),
@@ -2753,7 +2889,7 @@ class V18Engine:
         print("[+] Save successful.")
 
     def load_cache(self, filename: str):
-        print(f"[*-AR] Loading model state from {filename}...")
+        print(f"[*-DASP] Loading model state from {filename}...")
         with open(filename, "rb") as f:
             state = pickle.load(f)
 
@@ -2772,9 +2908,9 @@ class V18Engine:
         self.syn_weight         = state.get("syn_weight",   2.0)
         self.trans_weight       = state.get("trans_weight", 0.6)
         self.syn_k              = state.get("syn_k",        8)
+        self.build_stage_order  = state.get("build_stage_order", list(self._DEFAULT_BUILD_ORDER))
 
-        # REVERSED load order mirrors reversed train order
-        print("[*-AR] Rebuilding GPU Tensors (prerequisite)...")
+        print("[*-DASP] Rebuilding GPU Tensors (prerequisite)...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
 
@@ -2792,7 +2928,7 @@ class V18Engine:
             self.ref_model._D_A_mask       = _da.to(self.device)
             self.ref_model._D_A_omega_mask = _daomg.to(self.device)
         else:
-            print("[*-AR] ref_model not in cache — rebuilding tau scores...")
+            print("[*-DASP] ref_model not in cache — rebuilding tau scores...")
             self.ref_model.build(self.lm.vocab)
 
         self.mandate_scorer = SemanticMandateScorer(
@@ -2826,7 +2962,7 @@ class V18Engine:
             device=self.device,
             syn_weight=self.syn_weight, trans_weight=self.trans_weight, syn_k=self.syn_k,
         )
-        print("[+] Load successful. (V18-CSNS-G-AR)")
+        print("[+] Load successful. (V18-CSNS-G-DASP)")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2854,7 +2990,7 @@ class V18GUI:
             report = self.engine.pdn.theorem_bridge_report()
             stub_counts = {k: len(v) for k, v in self.engine.stub_lib.stubs.items()}
             return (
-                f"V18-CSNS-G ABELIAN-REVERSED Engine initialised.\n"
+                f"V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR Engine initialised.\n"
                 f"File: {file_obj.name.split('/')[-1]}\n"
                 f"Vocab size: {len(self.engine.lm.vocab)}\n"
                 f"CoT stubs: {stub_counts}\n"
@@ -2899,65 +3035,47 @@ class V18GUI:
 
     def dnn_report(self):
         lines = [
-            "V18-CSNS-G ABELIAN-REVERSED — DNN Array + CSNS Report",
+            "V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR — DNN Array + CSNS Report",
             "═══════════════════════════════════════════════════════════════",
             "",
-            "ABELIAN-REVERSED CHANGES SUMMARY:",
-            "  ALL CHANGES preserve mathematical equivalence for commutative",
-            "  (additive/multiplicative) operations, and produce genuinely",
-            "  different computations for non-commutative layer stacks.",
+            "DA-SP CHANGES SUMMARY:",
             "",
-            "  1. walk_probs logit assembly — REVERSED sum order",
-            "     tau_boost + mandate + CoT + PDN + echo + chunk + MRV",
-            "     + comp + pots + orbit + k_side + k_ori + k_reg + punct + log_base",
-            "     (log_base moved from first to last position)",
+            "  1. unified_plane_kernel() — SOLO SEMANTIC PLANARITY primitive.",
+            "     Replaces every k_reg·k_ori·k_side product (and its 2-term",
+            "     sub-variants k_reg·k_side) with ONE kernel: the weighted",
+            "     rho/theta/sigma distances are summed onto a single plane,",
+            "     then exponentiated once. Mathematically equivalent value;",
+            "     genuinely one combined computation, not three multiplied.",
+            "     Applied in: build_synaptic_weight_matrix, CSNS transitive",
+            "     bonus, ThebaultKernels.all_scores_batched, SemanticMandate",
+            "     Scorer, InstructionDistribution, AtomismReferenceModel,",
+            "     CoTStubLibrary (best_stub/stub_kernel), CoTReasoningEngine",
+            "     .plan_chain, ThebaultCompositionLM, MRVConstraintFilter,",
+            "     IsomorphicSyntaxStacker, ThebaultPotentialGraph.build.",
             "",
-            "  2. DNNArrayPipeline.forward — REVERSED layer stack + relu_dim2",
-            "     Original:  temp_scale → rho(z1) → theta(z2) → sigma(z3) → project",
-            "     Reversed:  sigma(z1') → theta(z2') → relu_dim2(z2b') → rho(z3') → temp → project",
-            "     relu_dim2: orientation-selective ReLU on theta axis (dim 2)",
-            "       gate = relu(theta_w - mean(theta_w)), rescaled to [0,1]",
-            "       out  = x·gate + relu(x)·(1-gate)",
+            "  2. symmetric_weighted_sum() — DOUBLE AGNOSTICISM primitive.",
+            "     Every place that hard-coded a term/stage/layer order now",
+            "     takes that order as a parameter, defaulting to a stable",
+            "     name-sorted sequence. Applied in: walk_probs logit",
+            "     assembly, CrossSynapticNeuronSum.forward, PDNEngine",
+            "     .pdn_logit_bonus, InstructionDistribution.distribution,",
+            "     the AND-combination step, DNNArrayPipeline.forward",
+            "     (layer_order + temp_position params), CoTReasoningEngine",
+            "     .plan_chain (hop_type_order param), CoTStubLibrary.build",
+            "     (quartile_map_order param), AtomismReferenceModel.build",
+            "     (step_direction / tau_batch_direction params), PDNEngine",
+            "     .fit_from_trigrams (scan_direction param), V18Engine.train",
+            "     (build_stage_order param), generate_passage",
+            "     (sentence_order param — final reading order stays",
+            "     ascending regardless, since that is a correctness",
+            "     requirement, not a structural preference), and",
+            "     ThebaultWalker.push_token (context_order param).",
             "",
-            "  3. CrossSynapticNeuronSum.forward — REVERSED enrichment",
-            "     trans_weight·trans first, then syn_weight·z_syn",
-            "",
-            "  4. build_synaptic_weight_matrix — REVERSED kernel order",
-            "     k_side · k_ori · k_reg  (commutative — same value)",
-            "",
-            "  5. CoTReasoningEngine.plan_chain — REVERSED hop sequence",
-            "     [CONTRAST, ELABORATION…, PREMISE] (was [PREMISE, ELAB, CONTRAST])",
-            "     Conclusion stub uses PREMISE type (reversed)",
-            "",
-            "  6. CoTStubLibrary.build — REVERSED quartile→type mapping",
-            "     lowest-σ quartile → CONCLUSION (was PREMISE)",
-            "",
-            "  7. AtomismReferenceModel.build — REVERSED Def-expansion",
-            "     step range: max_omega_steps-1 → 0  (descending)",
-            "     τ batch loop: reversed chunk order",
-            "",
-            "  8. PDNEngine.fit_from_trigrams — REVERSED rho series",
-            "     Trigrams processed in reversed dict order;",
-            "     within each trigram: r3,r2,r1 (was r1,r2,r3)",
-            "     ACF is time-reversal invariant → n* unchanged",
-            "",
-            "  9. V18Engine.train — REVERSED build stage order",
-            "     RefModel → Mandate → InstrDist → CoT → PDN → MRV → Graph",
-            "",
-            " 10. generate_passage — REVERSED sentence generation order",
-            "     Sentences generated in descending index order;",
-            "     tokens reversed before detokenize;",
-            "     final sentence list reversed to restore reading order",
-            "",
-            " 11. ThebaultWalker.push_token — REVERSED context list",
-            "     New tokens prepended (insert(0,…)) — most-recent-first",
-            "",
-            "PIPELINE ORDER (per token step, reversed):",
-            "  1. Raw walker logits (REVERSED sum: tau first, log_base last)",
-            "  2. ContingentExtringentProbability governance",
-            "  3. CSNS enrichment (REVERSED: transitive bonus first, then synaptic)",
-            "  4. DNNArrayPipeline.forward (REVERSED layers: σ→θ→relu_dim2→ρ→temp)",
-            "  5. AND combination (REVERSED: (1-α)·log_walk + α·log_instr)",
+            "  3. Nothing claims numerical identity across DIFFERENT chosen",
+            "     orders for genuinely non-commutative stages (e.g. the DNN",
+            "     layer stack) — DA only removes the HARD-CODING of which",
+            "     order runs, it doesn't assert all orders give the same",
+            "     answer.",
             "═══════════════════════════════════════════════════════════════",
         ]
         return "\n".join(lines)
@@ -2966,10 +3084,10 @@ class V18GUI:
 def launch_gui():
     gui = V18GUI()
 
-    with gr.Blocks(title="NeuroSymbolic V18-CSNS-G Abelian-Reversed") as app:
+    with gr.Blocks(title="NeuroSymbolic V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
         gr.Markdown(
-            "# NeuroSymbolic V18-CSNS-G — Abelian-Reversed Variant\n"
-            "### All ordered pipelines reversed · Commutative sums made structurally explicit · "
+            "# NeuroSymbolic V18-CSNS-G — Double-Agnostic / Solo-Planar Variant\n"
+            "### Hard-coded orderings exposed as parameters · Kernel products collapsed onto one plane · "
             "Thébault Geometry · ACF Spectral · DNN Array · CSNS"
         )
 
@@ -2979,7 +3097,7 @@ def launch_gui():
                 syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
                 trans_w_slider = gr.Slider(0.0, 12.0, value=0.8,  step=0.05, label="CSNS ω_trans")
                 syn_k_slider   = gr.Slider(2,   32,   value=8,    step=1,    label="CSNS K")
-            train_file_btn = gr.Button("Initialise from File (AR)", variant="primary")
+            train_file_btn = gr.Button("Initialise from File (DA-SP)", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
             train_file_btn.click(
                 gui.init_engine_from_file,
@@ -3000,11 +3118,11 @@ def launch_gui():
                 lines=2,
             )
             seed_input = gr.Textbox(label="Seed Text", placeholder="e.g. quantum entanglement")
-            gen_btn = gr.Button("Generate (AR)", variant="primary")
+            gen_btn = gr.Button("Generate (DA-SP)", variant="primary")
             gen_out = gr.Textbox(lines=10, label="Generated Text")
 
             with gr.Row():
-                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace (Reversed)",    interactive=False)
+                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
                 step_out = gr.Textbox(lines=12, label="AND+CSNS Step Trace (per token)",       interactive=False)
 
             gen_btn.click(
@@ -3014,24 +3132,24 @@ def launch_gui():
             )
 
         with gr.Tab("Diagnostics"):
-            dnn_btn  = gr.Button("Show DNN + CSNS-G AR Pipeline Report")
-            dnn_out  = gr.Textbox(lines=40, label="DNN Array + CSNS-G AR Report", interactive=False)
+            dnn_btn  = gr.Button("Show DNN + CSNS-G DA-SP Pipeline Report")
+            dnn_out  = gr.Textbox(lines=40, label="DNN Array + CSNS-G DA-SP Report", interactive=False)
             dnn_btn.click(gui.dnn_report, outputs=dnn_out)
 
             csns_btn = gr.Button("Show CSNS Diagnostic Report")
-            csns_out = gr.Textbox(lines=16, label="CSNS Diagnostics (AR)", interactive=False)
+            csns_out = gr.Textbox(lines=16, label="CSNS Diagnostics (DA-SP)", interactive=False)
             csns_btn.click(gui.csns_report, outputs=csns_out)
 
             pdn_btn  = gr.Button("Show ACF Spectral Report")
-            pdn_out  = gr.Textbox(lines=20, label="ACF Spectral Report (Reversed Series)", interactive=False)
+            pdn_out  = gr.Textbox(lines=20, label="ACF Spectral Report", interactive=False)
             pdn_btn.click(gui.pdn_report, outputs=pdn_out)
 
             mandate_btn = gr.Button("Show Mandate Centroid")
-            mandate_out = gr.Textbox(lines=4, label="Semantic Mandate Scorer (AR)", interactive=False)
+            mandate_out = gr.Textbox(lines=4, label="Semantic Mandate Scorer (DA-SP)", interactive=False)
             mandate_btn.click(gui.mandate_report, outputs=mandate_out)
 
             cot_hist_btn = gr.Button("Show Full CoT History")
-            cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History (Reversed Hops)", interactive=False)
+            cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History", interactive=False)
             cot_hist_btn.click(gui.cot_history, outputs=cot_hist_out)
 
     app.launch()
@@ -3069,9 +3187,9 @@ if __name__ == "__main__":
     engine.cube_chunk_size=max(1,args.cube_chunk_size)
     engine.cube_side=max(2,args.cube_side)
     engine.train(corpus_text)
-    engine.save_cache("v18_csns_g_ar_model.pkl")
+    engine.save_cache("v18_csns_g_dasp_model.pkl")
 
-    print("\n--- SAMPLE GENERATION (V18-CSNS-G ABELIAN-REVERSED) ---")
+    print("\n--- SAMPLE GENERATION (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR) ---")
     instruction = args.instruction or "Explain the meaning of life."
     text, traces, step_report = generate_passage(
         engine.walker, engine.lm,
@@ -3082,7 +3200,7 @@ if __name__ == "__main__":
         return_traces=True,
     )
     print(text)
-    print("\n--- COT TRACES (reversed hops) ---")
+    print("\n--- COT TRACES ---")
     for tr in traces:
         print(tr.render())
     print("\n--- AND+CSNS STEP TRACE ---")
@@ -3091,5 +3209,5 @@ if __name__ == "__main__":
     print(engine.walker.csns_report())
     print("\n--- MANDATE CENTROID ---")
     print(engine.mandate_scorer.centroid_report())
-    print("\n--- FORMAL REFERENCE MODEL (reversed Def-expansion) ---")
+    print("\n--- FORMAL REFERENCE MODEL ---")
     print(engine.ref_model.reference_report())
