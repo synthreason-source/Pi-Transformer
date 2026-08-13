@@ -2194,6 +2194,14 @@ class AnonymousVariableSolver:
 # combined with symmetric_weighted_sum — order is a `term_order`
 # parameter, default name-sorted, so no term (including the LM prior
 # log_base) is structurally privileged as "first" or "last".
+#
+# GRADIENT-GUIDED DECODING (steered generation): walk_probs can now run a
+# short, explicit `torch.autograd` ascent on the pre-softmax logits at
+# each generation step, pushing the candidate distribution toward higher
+# alignment with the active instruction/mandate centroid. This is a real
+# backward pass (loss.backward() via torch.autograd.grad) through the
+# softmax → alignment objective — distinct from the rest of the pipeline,
+# which stays a fixed (non-learned) heuristic scorer under @torch.no_grad().
 # ════════════════════════════════════════════════════════════════════════════
 
 class ThebaultWalker:
@@ -2213,6 +2221,9 @@ class ThebaultWalker:
         tau_weight       : float = 70.45,
         walk_term_order   : Optional[List[str]] = None,   # DA
         context_order      : str = "append",               # DA: 'append' | 'prepend'
+        guidance_weight    : float = 0.0,   # gradient-guided decoding blend, 0 = off
+        guidance_steps     : int   = 3,     # inner ascent steps per generation step
+        guidance_lr        : float = 0.15,  # inner ascent learning rate
     ):
         self.geo          = geo
         self.kernels      = kernels
@@ -2231,6 +2242,9 @@ class ThebaultWalker:
         self.device       = device
         self.walk_term_order = walk_term_order
         self.context_order    = context_order
+        self.guidance_weight  = guidance_weight
+        self.guidance_steps   = guidance_steps
+        self.guidance_lr      = guidance_lr
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
         self._cur_sent_toks : List[str] = []
         self._cur_orbit     : int       = 0
@@ -2252,6 +2266,7 @@ class ThebaultWalker:
         )
         self._csns_syn_norms   : List[float] = []
         self._csns_trans_norms : List[float] = []
+        self._last_guidance_delta : float = 0.0
 
     def begin_sentence(self, seed_tokens=None, total_tokens=40) -> CoTTrace:
         self.chunk_engine.reset()
@@ -2262,6 +2277,63 @@ class ThebaultWalker:
         seeds = seed_tokens or []
         self.cot.begin_sentence()
         return self.cot.plan_chain(seeds, self.geo, pdn_orbit=self._cur_orbit)
+
+    def _gradient_guided_steer(
+        self,
+        logits      : torch.Tensor,
+        c_rho       : torch.Tensor,
+        c_theta     : torch.Tensor,
+        c_sigma     : torch.Tensor,
+        steps       : int,
+        lr          : float,
+    ) -> torch.Tensor:
+        """
+        Gradient-guided decoding (a real backward pass, not a heuristic).
+
+        Treats the current step's pre-softmax `logits` as a leaf tensor and
+        runs `steps` iterations of gradient ASCENT on an alignment
+        objective:
+
+            probs      = softmax(logits)
+            alignment  = unified_plane_kernel(candidate, instruction_centroid)
+            objective  = Σ_i probs[i] * alignment[i]   (expected alignment)
+
+        Each iteration computes ∂objective/∂logits via torch.autograd.grad
+        (an explicit backward pass through the softmax → kernel objective)
+        and takes a step `logits ← logits + lr * grad`. This nudges the
+        distribution toward candidates that are geometrically closer to
+        the instruction/mandate centroid, without touching any of the
+        model's fixed heuristic weights.
+
+        Returns the steered logits (same shape as input, detached from any
+        outer graph). If there's no active instruction centroid, or
+        steps <= 0, this is a no-op and the input is returned unchanged.
+        """
+        if self.mandate._centroid is None or steps <= 0:
+            self._last_guidance_delta = 0.0
+            return logits
+
+        centroid = self.mandate._centroid
+        base = logits.detach()
+
+        with torch.enable_grad():
+            z = base.clone().requires_grad_(True)
+            for _ in range(steps):
+                probs = F.softmax(z, dim=-1)
+                alignment = unified_plane_kernel(
+                    c_rho, c_theta, c_sigma,
+                    centroid.rho, centroid.theta, centroid.sigma,
+                    lambda_reg=self.kernels.lambda_reg,
+                    gamma_side=self.kernels.gamma_side,
+                )
+                objective = (probs * alignment).sum()
+                grad, = torch.autograd.grad(objective, z)
+                grad = torch.nan_to_num(grad, nan=0.0, posinf=0.0, neginf=0.0)
+                z = (z + lr * grad).detach().requires_grad_(True)
+            steered = z.detach()
+
+        self._last_guidance_delta = (steered - base).norm().item()
+        return steered
 
     @torch.no_grad()
     def walk_probs(
@@ -2281,6 +2353,9 @@ class ThebaultWalker:
         tau_weight    : float = None,
         influence_weight : float = 0.5,
         term_order        : Optional[List[str]] = None,
+        guidance_weight    : Optional[float] = None,
+        guidance_steps     : Optional[int]   = None,
+        guidance_lr        : Optional[float] = None,
     ) -> Tuple[List[str], torch.Tensor]:
         cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands:
@@ -2429,6 +2504,22 @@ class ThebaultWalker:
         self._csns_syn_norms.append(syn_norm)
         self._csns_trans_norms.append(trans_norm)
 
+        # GRADIENT-GUIDED DECODING: a real torch.autograd backward pass,
+        # run on top of the (otherwise fixed/heuristic) enriched logits.
+        # `gw` blends between the un-steered logits (gw=0) and the fully
+        # gradient-ascended ones (gw=1); `gs`/`glr` control the inner
+        # autograd loop above.
+        gw  = guidance_weight if guidance_weight is not None else self.guidance_weight
+        gs  = guidance_steps  if guidance_steps  is not None else self.guidance_steps
+        glr = guidance_lr     if guidance_lr     is not None else self.guidance_lr
+        if gw > 0.0 and gs > 0:
+            steered_logits = self._gradient_guided_steer(
+                logits_enriched, c_rho, c_theta, c_sigma, steps=gs, lr=glr,
+            )
+            logits_enriched = logits_enriched * (1.0 - gw) + steered_logits * gw
+        else:
+            self._last_guidance_delta = 0.0
+
         self._pending_instr_probs = None
         self._pending_walk_logits = logits_enriched
         self._pending_c_rho       = c_rho
@@ -2566,6 +2657,11 @@ class ThebaultWalker:
 # before joining so the final reading order is always ascending — that
 # part is NOT a free parameter, since scrambled reading order would harm
 # the user, not just reflect a structural choice.
+#
+# GRADIENT-GUIDED DECODING: `guidance_weight` / `guidance_steps` /
+# `guidance_lr` are threaded through to ThebaultWalker.walk_probs, so a
+# real backward pass steers each step's candidate distribution toward the
+# active instruction/mandate centroid before sampling.
 # ════════════════════════════════════════════════════════════════════════════
 
 def generate_passage(
@@ -2578,6 +2674,9 @@ def generate_passage(
     temperature     : float = 2.0,
     return_traces   : bool  = False,
     sentence_order   : str   = "forward",   # DA: 'forward' | 'backward'
+    guidance_weight  : Optional[float] = None,  # gradient-guided decoding blend (0..1), None = walker default
+    guidance_steps   : Optional[int]   = None,  # inner autograd ascent steps per token
+    guidance_lr      : Optional[float] = None,  # inner autograd ascent learning rate
 ):
     if instruction_text.strip():
         walker.instr_dist.set_instruction(instruction_text)
@@ -2632,7 +2731,12 @@ def generate_passage(
         toks = list(init_toks)
 
         for step in range(tokens_per_sent):
-            cands, probs = walker.walk_probs(w1, w2, temp=temperature, and_weight=and_weight)
+            cands, probs = walker.walk_probs(
+                w1, w2, temp=temperature, and_weight=and_weight,
+                guidance_weight=guidance_weight,
+                guidance_steps=guidance_steps,
+                guidance_lr=guidance_lr,
+            )
             if not cands:
                 break
 
@@ -3000,7 +3104,8 @@ class V18GUI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight, temperature):
+    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight, temperature,
+                       guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15):
         if not self.engine or not self.engine.walker:
             return "Engine not initialised.", "", ""
         text, traces, step_report = generate_passage(
@@ -3009,9 +3114,18 @@ class V18GUI:
             seed_text=seed_text.strip(), instruction_text=instruction_text.strip(),
             and_weight=float(and_weight), temperature=float(temperature),
             return_traces=True,
+            guidance_weight=float(guidance_weight),
+            guidance_steps=int(guidance_steps),
+            guidance_lr=float(guidance_lr),
         )
         trace_text = "\n".join(tr.render() for tr in traces)
-        return text, trace_text, step_report
+        guidance_note = (
+            f"\n[Gradient-guided decoding: weight={guidance_weight:.2f}  "
+            f"steps={int(guidance_steps)}  lr={guidance_lr:.3f}  "
+            f"last |Δlogits|={self.engine.walker._last_guidance_delta:.4f}]"
+            if float(guidance_weight) > 0.0 else ""
+        )
+        return text, trace_text, step_report + guidance_note
 
     def pdn_report(self):
         if not self.engine:
@@ -3076,6 +3190,16 @@ class V18GUI:
             "     layer stack) — DA only removes the HARD-CODING of which",
             "     order runs, it doesn't assert all orders give the same",
             "     answer.",
+            "",
+            "  4. _gradient_guided_steer() / walk_probs(guidance_weight=...)",
+            "     — a REAL backward pass (torch.autograd.grad through a",
+            "     softmax → instruction-alignment objective), run per token",
+            "     during generation to steer candidate logits toward the",
+            "     active instruction/mandate centroid. guidance_weight=0",
+            "     (default) leaves generation exactly as before; >0 blends",
+            "     in `guidance_steps` autograd-ascent updates at learning",
+            "     rate `guidance_lr`. This is separate from, and does not",
+            "     alter, the fixed heuristic weights used everywhere else.",
             "═══════════════════════════════════════════════════════════════",
         ]
         return "\n".join(lines)
@@ -3088,7 +3212,7 @@ def launch_gui():
         gr.Markdown(
             "# NeuroSymbolic V18-CSNS-G — Double-Agnostic / Solo-Planar Variant\n"
             "### Hard-coded orderings exposed as parameters · Kernel products collapsed onto one plane · "
-            "Thébault Geometry · ACF Spectral · DNN Array · CSNS"
+            "Thébault Geometry · ACF Spectral · DNN Array · CSNS · Gradient-Guided Decoding"
         )
 
         with gr.Tab("Train"):
@@ -3118,6 +3242,15 @@ def launch_gui():
                 lines=2,
             )
             seed_input = gr.Textbox(label="Seed Text", placeholder="e.g. quantum entanglement")
+
+            with gr.Row():
+                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.0, step=0.05,
+                                                    label="Gradient-guided decoding weight")
+                guidance_steps_slider  = gr.Slider(0, 10, value=3, step=1,
+                                                    label="Guidance ascent steps")
+                guidance_lr_slider     = gr.Slider(0.0, 1.0, value=0.15, step=0.01,
+                                                    label="Guidance ascent LR")
+
             gen_btn = gr.Button("Generate (DA-SP)", variant="primary")
             gen_out = gr.Textbox(lines=10, label="Generated Text")
 
@@ -3127,7 +3260,8 @@ def launch_gui():
 
             gen_btn.click(
                 gui.generate_text,
-                inputs=[sentences, tokens, seed_input, instruction_input, and_weight, temperature],
+                inputs=[sentences, tokens, seed_input, instruction_input, and_weight, temperature,
+                        guidance_weight_slider, guidance_steps_slider, guidance_lr_slider],
                 outputs=[gen_out, cot_out, step_out],
             )
 
@@ -3167,6 +3301,12 @@ if __name__ == "__main__":
     parser.add_argument("--syn-k",        type=int,   default=8)
     parser.add_argument("--cube-chunk-size", type=int, default=128)
     parser.add_argument("--cube-side",       type=int, default=8)
+    parser.add_argument("--guidance-weight", type=float, default=0.0,
+                         help="Gradient-guided decoding blend weight (0=off, real backward pass toward instruction centroid)")
+    parser.add_argument("--guidance-steps",  type=int,   default=3,
+                         help="Inner autograd ascent steps per generation step for gradient-guided decoding")
+    parser.add_argument("--guidance-lr",     type=float, default=0.15,
+                         help="Inner autograd ascent learning rate for gradient-guided decoding")
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -3198,6 +3338,9 @@ if __name__ == "__main__":
         and_weight=args.and_weight,
         temperature=args.temperature,
         return_traces=True,
+        guidance_weight=args.guidance_weight,
+        guidance_steps=args.guidance_steps,
+        guidance_lr=args.guidance_lr,
     )
     print(text)
     print("\n--- COT TRACES ---")
