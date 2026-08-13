@@ -193,6 +193,26 @@ def l2_array_normalize(x: torch.Tensor, dim: int = 0, eps: float = 1e-8) -> torc
     return x / norm
 
 
+def parabolic_arc_1d(position: int, total: int, curvature: float = 1.0) -> float:
+    """Center-peaked 1D parabolic arc over the total generation span."""
+    if total <= 1:
+        return max(0.0, float(curvature))
+    u = min(max(float(position) / float(total - 1), 0.0), 1.0)
+    x = 2.0 * u - 1.0
+    return max(0.0, float(curvature)) * max(0.0, 1.0 - x * x)
+
+
+def parabolic_manifold_scale(
+    position: int, total: int,
+    strength: float = 0.35,
+    curvature: float = 1.0,
+) -> float:
+    """Scalar gain for the 1D parabolic generation manifold."""
+    return 1.0 + max(0.0, float(strength)) * parabolic_arc_1d(
+        position, total, curvature
+    )
+
+
 def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     x = torch.nan_to_num(x, nan=0.0, posinf=5011.0, neginf=-5011.0)
     x_shifted = x - x.min()
@@ -2221,9 +2241,11 @@ class ThebaultWalker:
         tau_weight       : float = 70.45,
         walk_term_order   : Optional[List[str]] = None,   # DA
         context_order      : str = "append",               # DA: 'append' | 'prepend'
-        guidance_weight    : float = 0.0,   # gradient-guided decoding blend, 0 = off
-        guidance_steps     : int   = 3,     # inner ascent steps per generation step
-        guidance_lr        : float = 0.15,  # inner ascent learning rate
+        guidance_weight    : float = 0.3,   # gradient-guided decoding blend, 0 = off
+        guidance_steps     : int   = 9,     # inner ascent steps per generation step
+        guidance_lr        : float = 0.63,  # inner ascent learning rate
+        parabolic_manifold_strength : float = 0.35,
+        parabolic_manifold_curvature: float = 1.0,
     ):
         self.geo          = geo
         self.kernels      = kernels
@@ -2245,6 +2267,9 @@ class ThebaultWalker:
         self.guidance_weight  = guidance_weight
         self.guidance_steps   = guidance_steps
         self.guidance_lr      = guidance_lr
+        self.parabolic_manifold_strength = max(0.0, float(parabolic_manifold_strength))
+        self.parabolic_manifold_curvature = max(0.0, float(parabolic_manifold_curvature))
+        self._parabolic_arc = 0.0
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
         self._cur_sent_toks : List[str] = []
         self._cur_orbit     : int       = 0
@@ -2361,6 +2386,14 @@ class ThebaultWalker:
         if not cands:
             return cands, base_probs
 
+        # Center-origin 1D parabolic generation manifold.
+        # A(x)=1-x²: strongest at the center, smoothly decaying to both edges.
+        self._parabolic_arc = parabolic_arc_1d(
+            self._tok_pos,
+            getattr(self, "_total_tokens", 1),
+            self.parabolic_manifold_curvature,
+        )
+
         try:
             tok_idx = self.geo.tok_indices(cands)
             c_rho, c_theta, c_sigma = self.geo.batch_triples(tok_idx)
@@ -2476,6 +2509,14 @@ class ThebaultWalker:
             },
             order=order,
         )
+
+        manifold_scale = parabolic_manifold_scale(
+            self._tok_pos,
+            getattr(self, "_total_tokens", 1),
+            strength=self.parabolic_manifold_strength,
+            curvature=self.parabolic_manifold_curvature,
+        )
+        raw_logits = raw_logits * manifold_scale
 
         governed_logits = self.contingent_prob.govern_next_probs(
             raw_logits, c_rho, c_theta, c_sigma
@@ -2860,7 +2901,15 @@ class CubeGardenResolver:
 class V18Engine:
     _DEFAULT_BUILD_ORDER = ["cot", "graph", "instr_dist", "mandate", "mrv", "pdn", "ref_model"]  # name-sorted
 
-    def __init__(self, syn_weight=2.0, trans_weight=0.6, syn_k=8, build_stage_order: Optional[List[str]] = None):
+    def __init__(
+        self,
+        syn_weight=2.0,
+        trans_weight=0.6,
+        syn_k=8,
+        build_stage_order: Optional[List[str]] = None,
+        parabolic_manifold_strength: float = 0.35,
+        parabolic_manifold_curvature: float = 1.0,
+    ):
         self.device      = DEVICE
         self.geo         = ThebaultTokenGeometry(device=self.device)
         self.kernels     = ThebaultKernels()
@@ -2881,6 +2930,8 @@ class V18Engine:
         self.syn_weight   = syn_weight
         self.trans_weight = trans_weight
         self.syn_k        = syn_k
+        self.parabolic_manifold_strength = max(0.0, float(parabolic_manifold_strength))
+        self.parabolic_manifold_curvature = max(0.0, float(parabolic_manifold_curvature))
         self.build_stage_order = build_stage_order or list(self._DEFAULT_BUILD_ORDER)
         self.cube_chunk_size=128
         self.cube_side=8
@@ -2958,7 +3009,9 @@ class V18Engine:
             self.ref_model = AtomismReferenceModel(geo=self.geo, kernels=self.kernels, device=self.device)
             self.ref_model.build(self.lm.vocab)
 
-        self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k)
+        self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k,
+            parabolic_manifold_strength=self.parabolic_manifold_strength,
+            parabolic_manifold_curvature=self.parabolic_manifold_curvature)
         print("[+] Training complete. (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR + CUBE GARDEN)")
 
     def save_cache(self, filename: str = "v18_csns_g_dasp_model.pkl"):
@@ -3065,6 +3118,8 @@ class V18Engine:
             ref_model=self.ref_model,
             device=self.device,
             syn_weight=self.syn_weight, trans_weight=self.trans_weight, syn_k=self.syn_k,
+            parabolic_manifold_strength=self.parabolic_manifold_strength,
+            parabolic_manifold_curvature=self.parabolic_manifold_curvature,
         )
         print("[+] Load successful. (V18-CSNS-G-DASP)")
 
@@ -3307,6 +3362,10 @@ if __name__ == "__main__":
                          help="Inner autograd ascent steps per generation step for gradient-guided decoding")
     parser.add_argument("--guidance-lr",     type=float, default=0.15,
                          help="Inner autograd ascent learning rate for gradient-guided decoding")
+    parser.add_argument("--parabolic-manifold-strength", type=float, default=0.35,
+                         help="Strength of the center-peaked 1D parabolic generation manifold")
+    parser.add_argument("--parabolic-manifold-curvature", type=float, default=1.0,
+                         help="Curvature of the 1D parabolic generation manifold")
     args = parser.parse_args()
 
     if args.gui or not args.corpus:
@@ -3323,6 +3382,8 @@ if __name__ == "__main__":
         syn_weight=args.syn_weight,
         trans_weight=args.trans_weight,
         syn_k=args.syn_k,
+        parabolic_manifold_strength=args.parabolic_manifold_strength,
+        parabolic_manifold_curvature=args.parabolic_manifold_curvature,
     )
     engine.cube_chunk_size=max(1,args.cube_chunk_size)
     engine.cube_side=max(2,args.cube_side)
