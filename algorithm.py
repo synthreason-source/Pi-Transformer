@@ -3301,7 +3301,7 @@ if __name__ == "__main__":
     parser.add_argument("--syn-k",        type=int,   default=8)
     parser.add_argument("--cube-chunk-size", type=int, default=128)
     parser.add_argument("--cube-side",       type=int, default=8)
-    parser.add_argument("--guidance-weight", type=float, default=0.0,
+    parser.add_argument("--guidance-weight", type=float, default=0.3,
                          help="Gradient-guided decoding blend weight (0=off, real backward pass toward instruction centroid)")
     parser.add_argument("--guidance-steps",  type=int,   default=3,
                          help="Inner autograd ascent steps per generation step for gradient-guided decoding")
