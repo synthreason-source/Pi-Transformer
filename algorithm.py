@@ -3418,7 +3418,7 @@ def launch_gui():
             seed_input = gr.Textbox(label="Seed Text", placeholder="e.g. quantum entanglement")
 
             with gr.Row():
-                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.0, step=0.05,
+                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.3, step=0.05,
                                                     label="Gradient-guided decoding weight")
                 guidance_steps_slider  = gr.Slider(0, 10, value=3, step=1,
                                                     label="Guidance ascent steps")
