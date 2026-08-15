@@ -213,6 +213,46 @@ def parabolic_manifold_scale(
     )
 
 
+@dataclass
+class MechanicalFoldState:
+    """Live frequency-driven mechanical fold state."""
+    frequency: float = 1.0
+    fold_index: int = 0
+    fold_count: int = 1
+    phase: float = 0.0
+    depth: float = 0.0
+    tension: float = 0.0
+    momentum: float = 0.0
+    last_frequency: float = 1.0
+
+    def update(self, frequency: float, position: int = 0,
+               total: int = 1, smoothing: float = 0.35) -> None:
+        frequency = max(float(frequency), 1e-9)
+        smoothing = min(max(float(smoothing), 0.0), 1.0)
+        self.last_frequency = self.frequency
+        self.frequency = (1.0 - smoothing) * self.frequency + smoothing * frequency
+        self.fold_count = max(1, int(math.floor(math.log2(self.frequency + 1.0))) + 1)
+        self.fold_index = int(position) % self.fold_count
+        ratio = self.frequency / max(float(self.fold_count), 1.0)
+        self.phase = (2.0 * math.pi * ((float(position) + ratio) /
+                       max(float(total), 1.0))) % (2.0 * math.pi)
+        self.depth = abs(math.sin(self.phase)) * math.log1p(self.frequency)
+        self.tension = self.frequency / (1.0 + self.frequency + float(self.fold_count))
+        self.momentum = self.frequency - self.last_frequency
+
+    def gain(self) -> float:
+        fold_position = (self.fold_index / max(self.fold_count - 1, 1)
+                         if self.fold_count > 1 else 0.0)
+        fold_shape = 1.0 - abs(2.0 * fold_position - 1.0)
+        return 1.0 + 0.10 * fold_shape + 0.05 * math.tanh(self.tension)
+
+    def report(self) -> str:
+        return (f"freq={self.frequency:.4f} last={self.last_frequency:.4f} "
+                f"fold={self.fold_index}/{self.fold_count} phase={self.phase:.4f} "
+                f"depth={self.depth:.4f} tension={self.tension:.4f} "
+                f"momentum={self.momentum:.4f}")
+
+
 def l1_simplex_project(x: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     x = torch.nan_to_num(x, nan=0.0, posinf=5011.0, neginf=-5011.0)
     x_shifted = x - x.min()
@@ -2270,6 +2310,14 @@ class ThebaultWalker:
         self.parabolic_manifold_strength = max(0.0, float(parabolic_manifold_strength))
         self.parabolic_manifold_curvature = max(0.0, float(parabolic_manifold_curvature))
         self._parabolic_arc = 0.0
+        self.mechanical_fold = MechanicalFoldState()
+        self.fold_frequency: float = 1.0
+        self.fold_index: int = 0
+        self.fold_count: int = 1
+        self.fold_phase: float = 0.0
+        self.fold_depth: float = 0.0
+        self.fold_tension: float = 0.0
+        self.fold_momentum: float = 0.0
         self.current_isomorphic_pairs: List[Tuple[str, str, float]] = []
         self._cur_sent_toks : List[str] = []
         self._cur_orbit     : int       = 0
@@ -2299,9 +2347,29 @@ class ThebaultWalker:
         self._cur_orbit    = 0
         self._tok_pos      = 0
         self._total_tokens = total_tokens
+        self.mechanical_fold = MechanicalFoldState()
+        self._sync_mechanical_fold(1.0, position=0, total=total_tokens)
         seeds = seed_tokens or []
         self.cot.begin_sentence()
         return self.cot.plan_chain(seeds, self.geo, pdn_orbit=self._cur_orbit)
+
+    def _sync_mechanical_fold(self, frequency: float,
+                              position: Optional[int] = None,
+                              total: Optional[int] = None) -> None:
+        position = self._tok_pos if position is None else int(position)
+        total = getattr(self, "_total_tokens", 1) if total is None else int(total)
+        self.mechanical_fold.update(float(frequency), position=position, total=max(total, 1))
+        self.fold_frequency = float(self.mechanical_fold.frequency)
+        self.fold_index = int(self.mechanical_fold.fold_index)
+        self.fold_count = int(self.mechanical_fold.fold_count)
+        self.fold_phase = float(self.mechanical_fold.phase)
+        self.fold_depth = float(self.mechanical_fold.depth)
+        self.fold_tension = float(self.mechanical_fold.tension)
+        self.fold_momentum = float(self.mechanical_fold.momentum)
+
+    def _candidate_frequency(self, cands: List[str]) -> torch.Tensor:
+        return torch.tensor([float(self.lm.raw_freq.get(c, 1.0)) for c in cands],
+                            dtype=torch.float32, device=self.device)
 
     def _gradient_guided_steer(
         self,
@@ -2385,6 +2453,11 @@ class ThebaultWalker:
         cands, base_probs = self.lm.next_dist(w1, w2)
         if not cands:
             return cands, base_probs
+
+        c_freq = self._candidate_frequency(cands)
+        live_frequency = float(c_freq.mean().item()) if c_freq.numel() else 1.0
+        self._sync_mechanical_fold(live_frequency, position=self._tok_pos,
+                                   total=getattr(self, "_total_tokens", 1))
 
         # Center-origin 1D parabolic generation manifold.
         # A(x)=1-x²: strongest at the center, smoothly decaying to both edges.
@@ -2517,6 +2590,7 @@ class ThebaultWalker:
             curvature=self.parabolic_manifold_curvature,
         )
         raw_logits = raw_logits * manifold_scale
+        raw_logits = raw_logits * float(self.mechanical_fold.gain())
 
         governed_logits = self.contingent_prob.govern_next_probs(
             raw_logits, c_rho, c_theta, c_sigma
@@ -2641,6 +2715,8 @@ class ThebaultWalker:
         pos_norm = len(self._cur_sent_toks) / max(sentence_len, 1)
         self.chunk_engine.push(self.geo.triple(token), pos_norm)
         self._cur_orbit = self.pdn.orbit_of(token)
+        self._sync_mechanical_fold(float(self.lm.raw_freq.get(token, 1.0)),
+                                   position=self._tok_pos, total=sentence_len)
 
     def step_trace_report(self, max_steps: int = 30) -> str:
         if not self._step_traces:
@@ -2659,6 +2735,7 @@ class ThebaultWalker:
             avg_trans = sum(self._csns_trans_norms) / len(self._csns_trans_norms)
             lines.append(f"\n  CSNS summary: avg |z_syn|={avg_syn:.4f}  avg |trans|={avg_trans:.4f}  "
                          f"steps={len(self._csns_syn_norms)}")
+        lines.append(f"\n  Mechanical fold: {self.mechanical_fold.report()}")
         return "\n".join(lines)
 
     def csns_report(self) -> str:
@@ -2937,6 +3014,14 @@ class V18Engine:
         self.cube_side=8
         self.cube_garden=None
         self.cube_chunks=[]
+        self.mechanical_fold = MechanicalFoldState()
+        self.fold_frequency: float = 1.0
+        self.fold_index: int = 0
+        self.fold_count: int = 1
+        self.fold_phase: float = 0.0
+        self.fold_depth: float = 0.0
+        self.fold_tension: float = 0.0
+        self.fold_momentum: float = 0.0
 
     def train(self, corpus_text: str, build_stage_order: Optional[List[str]] = None):
         print(f"[*-DASP] Tokenizing corpus ({len(corpus_text)} chars)...")
@@ -2955,6 +3040,15 @@ class V18Engine:
         tokens,self.cube_chunks=self.cube_garden.resort(tokens)
         print(self.cube_garden.report(self.cube_chunks))
         self.lm.ingest(tokens)
+        corpus_frequency = float(sum(self.lm.raw_freq.values()))
+        self.mechanical_fold.update(corpus_frequency, position=0, total=max(len(tokens), 1))
+        self.fold_frequency = float(self.mechanical_fold.frequency)
+        self.fold_index = int(self.mechanical_fold.fold_index)
+        self.fold_count = int(self.mechanical_fold.fold_count)
+        self.fold_phase = float(self.mechanical_fold.phase)
+        self.fold_depth = float(self.mechanical_fold.depth)
+        self.fold_tension = float(self.mechanical_fold.tension)
+        self.fold_momentum = float(self.mechanical_fold.momentum)
         all_tokens=list(self.lm.raw_freq.keys()); max_freq=max(self.lm.raw_freq.values(),default=1.0); vocab_size=len(all_tokens)
         print(f"[*-DASP] Registering {vocab_size} tokens after Cube Garden resort...")
         for idx,tok in enumerate(all_tokens): self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
@@ -3013,6 +3107,31 @@ class V18Engine:
             parabolic_manifold_strength=self.parabolic_manifold_strength,
             parabolic_manifold_curvature=self.parabolic_manifold_curvature)
         print("[+] Training complete. (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR + CUBE GARDEN)")
+
+    def _sync_engine_fold(self) -> None:
+        if self.walker is None:
+            return
+        self.fold_frequency = float(self.walker.fold_frequency)
+        self.fold_index = int(self.walker.fold_index)
+        self.fold_count = int(self.walker.fold_count)
+        self.fold_phase = float(self.walker.fold_phase)
+        self.fold_depth = float(self.walker.fold_depth)
+        self.fold_tension = float(self.walker.fold_tension)
+        self.fold_momentum = float(self.walker.fold_momentum)
+
+    def mechanical_fold_report(self) -> str:
+        self._sync_engine_fold()
+        return (
+            "Mechanical Fold State\n"
+            "─────────────────────\n"
+            f"frequency : {self.fold_frequency:.6f} (float)\n"
+            f"fold_index: {self.fold_index} (int)\n"
+            f"fold_count: {self.fold_count} (int)\n"
+            f"phase     : {self.fold_phase:.6f} (float)\n"
+            f"depth     : {self.fold_depth:.6f} (float)\n"
+            f"tension   : {self.fold_tension:.6f} (float)\n"
+            f"momentum  : {self.fold_momentum:.6f} (float)"
+        )
 
     def save_cache(self, filename: str = "v18_csns_g_dasp_model.pkl"):
         print(f"[*-DASP] Saving model state to {filename}...")
