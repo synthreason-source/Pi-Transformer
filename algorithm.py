@@ -39,7 +39,7 @@ def optical_mac_reference(A, B):
 #    table that will later be pushed through the optical MAC).
 # ----------------------------------------------------------------------
 
-with open("science_corpus.txt", 'r', encoding='utf-8') as f:
+with open(input("Dataset filename:"), 'r', encoding='utf-8') as f:
     CORPUS = f.read()
 
 def tokenize(text):
