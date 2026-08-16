@@ -3243,6 +3243,182 @@ class V18Engine:
         print("[+] Load successful. (V18-CSNS-G-DASP)")
 
 
+
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 14b — SYNTHREASON DATASET → PROMPT SUBSET → GENERATE FLOW
+#
+# Dataset → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output
+# → Contextual Prompt Subset → New Dataset From Output → Prompt Subset
+# → Generate Out
+# ════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class PromptCandidate:
+    text: str
+    isolate_score: float = 0.0
+    reasoning_score: float = 0.0
+    contextual_score: float = 0.0
+    final_score: float = 0.0
+
+
+class SynthReasonFlow:
+    """Dataset-driven prompt selection and generation pipeline."""
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.last_report = ""
+        self.last_outputs: List[str] = []
+
+    @staticmethod
+    def _clean_prompt(text: str) -> str:
+        text = re.sub(r"^\s*(?:prompt|instruction|question|query)\s*[:\-]\s*", "", text, flags=re.I)
+        return re.sub(r"\s+", " ", text).strip()
+
+    def prompt_isolate(self, dataset: str, max_chars: int = 900) -> List[PromptCandidate]:
+        """Extract prompt-like units from the Dataset node."""
+        raw_units = re.split(r"\n\s*\n|\n|(?<=[.!?])\s+(?=[A-Z\[])", dataset)
+        out: List[PromptCandidate] = []
+        seen: Set[str] = set()
+        for raw in raw_units:
+            text = self._clean_prompt(raw)
+            if len(text) < 8 or len(text) > max_chars:
+                continue
+            key = text.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            toks = tokenize(text)
+            lexical = min(len(toks) / 24.0, 1.0)
+            question = 1.0 if "?" in text else 0.0
+            directive = 1.0 if re.match(
+                r"(?i)\s*(explain|describe|compare|analyze|derive|why|how|what|evaluate|discuss|identify|reason)\b",
+                text,
+            ) else 0.0
+            score = 0.55 * lexical + 0.25 * question + 0.20 * directive
+            out.append(PromptCandidate(text=text, isolate_score=score))
+        out.sort(key=lambda x: (-x.isolate_score, x.text.casefold()))
+        return out
+
+    @staticmethod
+    def _reasoning_score(text: str) -> float:
+        words = re.findall(r"[a-zA-Z]+", text.lower())
+        if not words:
+            return 0.0
+        cog = sum(1 for w in words if w in STOP_WORDS_COG)
+        question = 1.0 if "?" in text else 0.0
+        causal = sum(1 for w in words if w in {
+            "because", "therefore", "cause", "effect", "implies", "if", "then",
+            "why", "how", "compare", "contrast", "derive", "reason"
+        })
+        depth = min(cog / max(len(words), 1), 1.0)
+        causal_density = min(causal / max(len(words), 1), 1.0)
+        return 0.50 * depth + 0.25 * question + 0.25 * causal_density
+
+    def reasoning_prompt_subset(
+        self, prompts: List[PromptCandidate], fraction: float = 0.50, minimum: int = 4
+    ) -> List[PromptCandidate]:
+        """Select prompts whose wording carries the strongest reasoning signal."""
+        for p in prompts:
+            p.reasoning_score = self._reasoning_score(p.text)
+        prompts = sorted(prompts, key=lambda x: (-x.reasoning_score, -x.isolate_score, x.text.casefold()))
+        n = min(len(prompts), max(minimum, int(math.ceil(len(prompts) * fraction))))
+        return prompts[:n]
+
+    @staticmethod
+    def _token_set(text: str) -> Set[str]:
+        return {t for t in tokenize(text) if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS}
+
+    def _context_score(self, text: str, anchors: List[str]) -> float:
+        a = self._token_set(text)
+        if not a or not anchors:
+            return 0.0
+        best = 0.0
+        for anchor in anchors:
+            b = self._token_set(anchor)
+            if not b:
+                continue
+            best = max(best, len(a & b) / max(len(a | b), 1))
+        return best
+
+    def contextual_prompt_subset(
+        self, prompts: List[PromptCandidate], reasoning_prompts: List[PromptCandidate],
+        fraction: float = 0.60, minimum: int = 3,
+    ) -> List[PromptCandidate]:
+        """Use the reasoning subset as the contextual anchor set."""
+        anchors = [p.text for p in reasoning_prompts]
+        for p in prompts:
+            p.contextual_score = self._context_score(p.text, anchors)
+            p.final_score = 0.55 * p.contextual_score + 0.30 * p.reasoning_score + 0.15 * p.isolate_score
+        prompts = sorted(prompts, key=lambda x: (-x.final_score, x.text.casefold()))
+        n = min(len(prompts), max(minimum, int(math.ceil(len(prompts) * fraction))))
+        return prompts[:n]
+
+    def final_prompt_subset(self, contextual_prompts: List[PromptCandidate], max_prompts: int = 6) -> List[PromptCandidate]:
+        ranked = sorted(contextual_prompts, key=lambda x: (-x.final_score, x.text.casefold()))
+        return ranked[:max(1, int(max_prompts))]
+
+    @staticmethod
+    def dataset_from_output(prompts: List[PromptCandidate]) -> str:
+        return "\n".join(p.text for p in prompts)
+
+    def run(
+        self, dataset: str, num_sentences: int = 1, tokens_per_sent: int = 40,
+        and_weight: float = 0.5, temperature: float = 0.75,
+        guidance_weight: float = 0.3, guidance_steps: int = 3, guidance_lr: float = 0.15,
+        reasoning_fraction: float = 0.50, contextual_fraction: float = 0.60,
+        max_prompts: int = 6, generations_per_prompt: int = 1,
+    ):
+        if not dataset.strip():
+            return "", "", "", "", "No Dataset supplied."
+        if not self.engine or not self.engine.walker:
+            return "", "", "", "", "Engine not initialised."
+
+        isolated = self.prompt_isolate(dataset)
+        reasoning = self.reasoning_prompt_subset(isolated, fraction=reasoning_fraction)
+        reasoning_dataset = self.dataset_from_output(reasoning)
+        contextual = self.contextual_prompt_subset(isolated, reasoning, fraction=contextual_fraction)
+        contextual_dataset = self.dataset_from_output(contextual)
+        final_subset = self.final_prompt_subset(contextual, max_prompts=max_prompts)
+        final_dataset = self.dataset_from_output(final_subset)
+
+        generated: List[str] = []
+        for p in final_subset:
+            seed_tokens = tokenize(p.text)
+            seed = " ".join(seed_tokens[-2:]) if len(seed_tokens) >= 2 else p.text
+            for _ in range(max(1, int(generations_per_prompt))):
+                try:
+                    text = generate_passage(
+                        self.engine.walker, self.engine.lm,
+                        num_sentences=max(1, int(num_sentences)),
+                        tokens_per_sent=max(4, int(tokens_per_sent)),
+                        seed_text=seed, instruction_text=p.text,
+                        and_weight=float(and_weight), temperature=float(temperature),
+                        return_traces=False, guidance_weight=float(guidance_weight),
+                        guidance_steps=int(guidance_steps), guidance_lr=float(guidance_lr),
+                    )
+                    generated.append(f"[{p.text}]\n{text}")
+                except Exception as exc:
+                    generated.append(f"[{p.text}]\nGeneration error: {exc}")
+
+        report = (
+            "SynthReason-2026 FLOW\n"
+            "══════════════════════════════════════════════════════════════\n"
+            f"Dataset: {len(dataset)} chars\n"
+            f"Prompt Isolate: {len(isolated)} candidates\n"
+            f"Reasoning Prompt Subset: {len(reasoning)} prompts\n"
+            f"New Dataset From Output #1: {len(reasoning_dataset)} chars\n"
+            f"Contextual Prompt Subset: {len(contextual)} prompts\n"
+            f"New Dataset From Output #2: {len(contextual_dataset)} chars\n"
+            f"Prompt Subset: {len(final_subset)} prompts\n"
+            f"Generate Out: {len(generated)} generations\n\n"
+            "Dataset → Prompt Isolate → Reasoning Prompt Subset →\n"
+            "New Dataset From Output → Contextual Prompt Subset →\n"
+            "New Dataset From Output → Prompt Subset → Generate Out\n"
+        )
+        self.last_outputs = generated
+        self.last_report = report
+        return reasoning_dataset, contextual_dataset, final_dataset, "\n\n".join(generated), report
+
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — GRADIO GUI
 # ════════════════════════════════════════════════════════════════════════════
@@ -3278,28 +3454,49 @@ class V18GUI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight, temperature,
-                       guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15):
+    def generate_text(self, sentences, tokens, and_weight, temperature,
+                       guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15,
+                       reasoning_fraction=0.50, contextual_fraction=0.60,
+                       max_prompts=6, generations_per_prompt=1):
+        """Run SynthReason-2026 using the dataset loaded in the Dataset tab.
+
+        The generation tab deliberately has no dataset textbox.  The corpus
+        trained into ``self.engine`` is the single source of truth, preventing
+        the Gradio input ordering from accidentally feeding an empty string
+        into the sentence/token controls.
+        """
         if not self.engine or not self.engine.walker:
-            return "Engine not initialised.", "", ""
-        text, traces, step_report = generate_passage(
-            self.engine.walker, self.engine.lm,
-            num_sentences=int(sentences), tokens_per_sent=int(tokens),
-            seed_text=seed_text.strip(), instruction_text=instruction_text.strip(),
-            and_weight=float(and_weight), temperature=float(temperature),
-            return_traces=True,
-            guidance_weight=float(guidance_weight),
-            guidance_steps=int(guidance_steps),
-            guidance_lr=float(guidance_lr),
+            return "", "", "", "", "Engine not initialised. Load a dataset first."
+
+        dataset_text = getattr(self.engine, "corpus_snippet", "") or ""
+        if not dataset_text.strip():
+            return "", "", "", "", "Dataset is empty. Load a dataset in the Dataset tab first."
+
+        # Defensive conversion: Gradio normally supplies numeric slider values,
+        # but never let a blank UI value become int("").
+        try:
+            num_sentences = max(1, int(sentences))
+            tokens_per_sent = max(4, int(tokens))
+            aw = float(and_weight)
+            temp = float(temperature)
+            gw = float(guidance_weight)
+            gs = int(guidance_steps)
+            glr = float(guidance_lr)
+            rf = float(reasoning_fraction)
+            cf = float(contextual_fraction)
+            mp = max(1, int(max_prompts))
+            gpp = max(1, int(generations_per_prompt))
+        except (TypeError, ValueError) as exc:
+            return "", "", "", "", f"Invalid generation control value: {exc}"
+
+        flow = SynthReasonFlow(self.engine)
+        return flow.run(
+            dataset=dataset_text, num_sentences=num_sentences, tokens_per_sent=tokens_per_sent,
+            and_weight=aw, temperature=temp,
+            guidance_weight=gw, guidance_steps=gs, guidance_lr=glr,
+            reasoning_fraction=rf, contextual_fraction=cf,
+            max_prompts=mp, generations_per_prompt=gpp,
         )
-        trace_text = "\n".join(tr.render() for tr in traces)
-        guidance_note = (
-            f"\n[Gradient-guided decoding: weight={guidance_weight:.2f}  "
-            f"steps={int(guidance_steps)}  lr={guidance_lr:.3f}  "
-            f"last |Δlogits|={self.engine.walker._last_guidance_delta:.4f}]"
-            if float(guidance_weight) > 0.0 else ""
-        )
-        return text, trace_text, step_report + guidance_note
 
     def pdn_report(self):
         if not self.engine:
@@ -3382,20 +3579,19 @@ class V18GUI:
 def launch_gui():
     gui = V18GUI()
 
-    with gr.Blocks(title="NeuroSymbolic V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
+    with gr.Blocks(title="SynthReason-2026 — V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
         gr.Markdown(
-            "# NeuroSymbolic V18-CSNS-G — Double-Agnostic / Solo-Planar Variant\n"
-            "### Hard-coded orderings exposed as parameters · Kernel products collapsed onto one plane · "
-            "Thébault Geometry · ACF Spectral · DNN Array · CSNS · Gradient-Guided Decoding"
+            "# SynthReason-2026 — V18-CSNS-G\n"
+            "### Dataset tab → Prompt Isolate → Reasoning → Contextual → Prompt Subset → Generate Out"
         )
 
-        with gr.Tab("Train"):
+        with gr.Tab("Dataset"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
                 syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
                 trans_w_slider = gr.Slider(0.0, 12.0, value=0.8,  step=0.05, label="CSNS ω_trans")
                 syn_k_slider   = gr.Slider(2,   32,   value=8,    step=1,    label="CSNS K")
-            train_file_btn = gr.Button("Initialise from File (DA-SP)", variant="primary")
+            train_file_btn = gr.Button("Load Dataset / Initialise Engine (DA-SP)", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
             train_file_btn.click(
                 gui.init_engine_from_file,
@@ -3403,40 +3599,43 @@ def launch_gui():
                 outputs=init_out,
             )
 
-        with gr.Tab("Generate"):
-            with gr.Row():
-                sentences   = gr.Slider(1, 10,   value=4,   step=1,    label="Sentences")
-                tokens      = gr.Slider(20, 180, value=80,  step=1,    label="Tokens/sentence")
-                and_weight  = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 30.0, value=0.75, step=0.05, label="Temperature")
-
-            instruction_input = gr.Textbox(
-                label="Instruction (AND distribution + kernel mandate source)",
-                value="Explain the meaning of life and human consciousness.",
-                lines=2,
+        with gr.Tab("SynthReason Flow"):
+            gr.Markdown(
+                "## SynthReason-2026\n"
+                "`Dataset tab → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output "
+                "→ Contextual Prompt Subset → New Dataset From Output → Prompt Subset → Generate Out`"
             )
-            seed_input = gr.Textbox(label="Seed Text", placeholder="e.g. quantum entanglement")
-
+            gr.Markdown(
+                "**Dataset source:** the corpus loaded in the **Dataset** tab is used automatically. "
+                "No second dataset textbox is used in this flow."
+            )
             with gr.Row():
-                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.3, step=0.05,
-                                                    label="Gradient-guided decoding weight")
-                guidance_steps_slider  = gr.Slider(0, 10, value=3, step=1,
-                                                    label="Guidance ascent steps")
-                guidance_lr_slider     = gr.Slider(0.0, 1.0, value=0.15, step=0.01,
-                                                    label="Guidance ascent LR")
-
-            gen_btn = gr.Button("Generate (DA-SP)", variant="primary")
-            gen_out = gr.Textbox(lines=10, label="Generated Text")
-
+                sentences = gr.Slider(1, 4, value=1, step=1, label="Sentences / prompt")
+                tokens = gr.Slider(20, 120, value=40, step=1, label="Tokens / sentence")
+                and_weight = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 10.0, value=0.75, step=0.05, label="Temperature")
             with gr.Row():
-                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
-                step_out = gr.Textbox(lines=12, label="AND+CSNS Step Trace (per token)",       interactive=False)
-
-            gen_btn.click(
+                reasoning_fraction = gr.Slider(0.1, 1.0, value=0.50, step=0.05, label="Reasoning subset fraction")
+                contextual_fraction = gr.Slider(0.1, 1.0, value=0.60, step=0.05, label="Contextual subset fraction")
+                max_prompts = gr.Slider(1, 20, value=6, step=1, label="Final prompt subset size")
+                generations = gr.Slider(1, 5, value=1, step=1, label="Generations / prompt")
+            with gr.Row():
+                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="Gradient-guided decoding weight")
+                guidance_steps_slider = gr.Slider(0, 10, value=3, step=1, label="Guidance ascent steps")
+                guidance_lr_slider = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="Guidance ascent LR")
+            flow_btn = gr.Button("Generate Out — SynthReason-2026", variant="primary")
+            with gr.Row():
+                reasoning_out = gr.Textbox(lines=8, label="Reasoning Prompt Subset → New Dataset From Output #1", interactive=False)
+                contextual_out = gr.Textbox(lines=8, label="Contextual Prompt Subset → New Dataset From Output #2", interactive=False)
+            final_out = gr.Textbox(lines=8, label="Prompt Subset", interactive=False)
+            generated_out = gr.Textbox(lines=14, label="Generate Out", interactive=False)
+            flow_report = gr.Textbox(lines=10, label="SynthReason-2026 Flow Report", interactive=False)
+            flow_btn.click(
                 gui.generate_text,
-                inputs=[sentences, tokens, seed_input, instruction_input, and_weight, temperature,
-                        guidance_weight_slider, guidance_steps_slider, guidance_lr_slider],
-                outputs=[gen_out, cot_out, step_out],
+                inputs=[sentences, tokens, and_weight, temperature,
+                        guidance_weight_slider, guidance_steps_slider, guidance_lr_slider,
+                        reasoning_fraction, contextual_fraction, max_prompts, generations],
+                outputs=[reasoning_out, contextual_out, final_out, generated_out, flow_report],
             )
 
         with gr.Tab("Diagnostics"):
