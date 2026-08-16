@@ -3472,8 +3472,8 @@ class V18GUI:
         if not dataset_text.strip():
             return "", "", "", "", "Dataset is empty. Load a dataset in the Dataset tab first."
 
+        # Handle user prompt
         user_prompt = (user_prompt or "").strip()
-       
 
         # Defensive conversion: Gradio normally supplies numeric slider values,
         # but never let a blank UI value become int("").
@@ -3493,14 +3493,25 @@ class V18GUI:
             return "", "", "", "", f"Invalid generation control value: {exc}"
 
         flow = SynthReasonFlow(self.engine)
+
+        # Prepend user prompt to dataset if provided
+        flow_dataset = dataset_text
+        if user_prompt:
+            flow_dataset = f"{user_prompt}\n\n{dataset_text}"
+
         return flow.run(
             dataset=flow_dataset,
             num_sentences=num_sentences,
             tokens_per_sent=tokens_per_sent,
-            and_weight=aw, temperature=temp,
-            guidance_weight=gw, guidance_steps=gs, guidance_lr=glr,
-            reasoning_fraction=rf, contextual_fraction=cf,
-            max_prompts=mp, generations_per_prompt=gpp,
+            and_weight=aw,
+            temperature=temp,
+            guidance_weight=gw,
+            guidance_steps=gs,
+            guidance_lr=glr,
+            reasoning_fraction=rf,
+            contextual_fraction=cf,
+            max_prompts=mp,
+            generations_per_prompt=gpp,
         )
 
     def pdn_report(self):
