@@ -150,7 +150,7 @@ def run():
     print(f"Transition matrix B shape (contexts x vocab): {B.shape}")
 
     seed_context = ("it", "is")
-    generated = generate(seed_context, n_tokens=20, vocab=vocab,
+    generated = generate(seed_context, n_tokens=200, vocab=vocab,
                           context_to_idx=context_to_idx, B=B, seed=42)
 
     print("\nSeed context:", seed_context)
