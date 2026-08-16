@@ -3778,11 +3778,7 @@ def launch_gui():
             )
 
         with gr.Tab("SynthReason Flow"):
-            gr.Markdown(
-                "## SynthReason-2026\\n"
-                "`Dataset tab → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output "
-                "→ Contextual Prompt Subset → New Dataset From Output → Prompt Subset → Generate Out`"
-            )
+
 
             user_prompt = gr.Textbox(
                 label="User input prompt",
