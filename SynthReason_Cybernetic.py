@@ -3454,20 +3454,53 @@ class V18GUI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def generate_text(self, sentences, tokens, dataset_text, and_weight, temperature,
+    def generate_text(self, user_prompt, sentences, tokens, and_weight, temperature,
                        guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15,
                        reasoning_fraction=0.50, contextual_fraction=0.60,
                        max_prompts=6, generations_per_prompt=1):
+        """Run SynthReason-2026 using the dataset loaded in the Dataset tab.
+
+        The generation tab deliberately has no dataset textbox.  The corpus
+        trained into ``self.engine`` is the single source of truth, preventing
+        the Gradio input ordering from accidentally feeding an empty string
+        into the sentence/token controls.
+        """
         if not self.engine or not self.engine.walker:
-            return "", "", "", "", "Engine not initialised."
+            return "", "", "", "", "Engine not initialised. Load a dataset first."
+
+        dataset_text = getattr(self.engine, "corpus_snippet", "") or ""
+        if not dataset_text.strip():
+            return "", "", "", "", "Dataset is empty. Load a dataset in the Dataset tab first."
+
+        user_prompt = (user_prompt or "").strip()
+       
+
+        # Defensive conversion: Gradio normally supplies numeric slider values,
+        # but never let a blank UI value become int("").
+        try:
+            num_sentences = max(1, int(sentences))
+            tokens_per_sent = max(4, int(tokens))
+            aw = float(and_weight)
+            temp = float(temperature)
+            gw = float(guidance_weight)
+            gs = int(guidance_steps)
+            glr = float(guidance_lr)
+            rf = float(reasoning_fraction)
+            cf = float(contextual_fraction)
+            mp = max(1, int(max_prompts))
+            gpp = max(1, int(generations_per_prompt))
+        except (TypeError, ValueError) as exc:
+            return "", "", "", "", f"Invalid generation control value: {exc}"
+
         flow = SynthReasonFlow(self.engine)
         return flow.run(
-            dataset=dataset_text, num_sentences=int(sentences), tokens_per_sent=int(tokens),
-            and_weight=float(and_weight), temperature=float(temperature),
-            guidance_weight=float(guidance_weight), guidance_steps=int(guidance_steps),
-            guidance_lr=float(guidance_lr), reasoning_fraction=float(reasoning_fraction),
-            contextual_fraction=float(contextual_fraction), max_prompts=int(max_prompts),
-            generations_per_prompt=int(generations_per_prompt),
+            dataset=flow_dataset,
+            num_sentences=num_sentences,
+            tokens_per_sent=tokens_per_sent,
+            and_weight=aw, temperature=temp,
+            guidance_weight=gw, guidance_steps=gs, guidance_lr=glr,
+            reasoning_fraction=rf, contextual_fraction=cf,
+            max_prompts=mp, generations_per_prompt=gpp,
         )
 
     def pdn_report(self):
@@ -3554,16 +3587,16 @@ def launch_gui():
     with gr.Blocks(title="SynthReason-2026 — V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
         gr.Markdown(
             "# SynthReason-2026 — V18-CSNS-G\n"
-            "### Dataset → Prompt Isolate → Reasoning → Contextual → Prompt Subset → Generate Out"
+            "### Dataset tab → Prompt Isolate → Reasoning → Contextual → Prompt Subset → Generate Out"
         )
 
-        with gr.Tab("Train"):
+        with gr.Tab("Dataset"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
                 syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
                 trans_w_slider = gr.Slider(0.0, 12.0, value=0.8,  step=0.05, label="CSNS ω_trans")
                 syn_k_slider   = gr.Slider(2,   32,   value=8,    step=1,    label="CSNS K")
-            train_file_btn = gr.Button("Initialise from File (DA-SP)", variant="primary")
+            train_file_btn = gr.Button("Load Dataset / Initialise Engine (DA-SP)", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
             train_file_btn.click(
                 gui.init_engine_from_file,
@@ -3573,14 +3606,22 @@ def launch_gui():
 
         with gr.Tab("SynthReason Flow"):
             gr.Markdown(
-                "## SynthReason-2026\n"
-                "`Dataset → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output "
+                "## SynthReason-2026\\n"
+                "`Dataset tab → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output "
                 "→ Contextual Prompt Subset → New Dataset From Output → Prompt Subset → Generate Out`"
             )
-            flow_dataset = gr.Textbox(
-                label="Dataset", placeholder="Paste a dataset/corpus here, or use the trained corpus below.", lines=10
+
+            user_prompt = gr.Textbox(
+                label="User input prompt",
+                placeholder="Enter the prompt or instruction to guide generation...",
+                lines=4,
+                value="",
             )
-            use_corpus_btn = gr.Button("Use Trained Dataset", variant="secondary")
+
+            gr.Markdown(
+                "**Dataset source:** the corpus loaded in the **Dataset** tab is used automatically. "
+                "No second dataset textbox is used in this flow."
+            )
             with gr.Row():
                 sentences = gr.Slider(1, 4, value=1, step=1, label="Sentences / prompt")
                 tokens = gr.Slider(20, 120, value=40, step=1, label="Tokens / sentence")
@@ -3599,18 +3640,33 @@ def launch_gui():
             with gr.Row():
                 reasoning_out = gr.Textbox(lines=8, label="Reasoning Prompt Subset → New Dataset From Output #1", interactive=False)
                 contextual_out = gr.Textbox(lines=8, label="Contextual Prompt Subset → New Dataset From Output #2", interactive=False)
-            final_out = gr.Textbox(lines=8, label="Prompt Subset", interactive=False)
-            generated_out = gr.Textbox(lines=14, label="Generate Out", interactive=False)
-            flow_report = gr.Textbox(lines=10, label="SynthReason-2026 Flow Report", interactive=False)
-            use_corpus_btn.click(
-                lambda: (gui.engine.corpus_snippet if gui.engine else "Engine not initialised."), outputs=flow_dataset
-            )
+                final_out = gr.Textbox(lines=8, label="Prompt Subset", interactive=False)
+                generated_out = gr.Textbox(lines=14, label="Generate Out", interactive=False)
+                flow_report = gr.Textbox(lines=10, label="SynthReason-2026 Flow Report", interactive=False)
+
             flow_btn.click(
                 gui.generate_text,
-                inputs=[flow_dataset, sentences, tokens, and_weight, temperature,
-                        guidance_weight_slider, guidance_steps_slider, guidance_lr_slider,
-                        reasoning_fraction, contextual_fraction, max_prompts, generations],
-                outputs=[reasoning_out, contextual_out, final_out, generated_out, flow_report],
+                inputs=[
+                    user_prompt,
+                    sentences,
+                    tokens,
+                    and_weight,
+                    temperature,
+                    guidance_weight_slider,
+                    guidance_steps_slider,
+                    guidance_lr_slider,
+                    reasoning_fraction,
+                    contextual_fraction,
+                    max_prompts,
+                    generations,
+                ],
+                outputs=[
+                    reasoning_out,
+                    contextual_out,
+                    final_out,
+                    generated_out,
+                    flow_report,
+                ],
             )
 
         with gr.Tab("Diagnostics"):
