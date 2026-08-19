@@ -1864,7 +1864,335 @@ class ThebaultCompositionLM:
             lambda_reg=self.kernels.lambda_reg, gamma_side=self.kernels.gamma_side, kappa_ori=0.0,
         )
 
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 8b — TOPIC BIGRAM SCORER (NO NLTK)
+# ════════════════════════════════════════════════════════════════════════════
 
+FUNCTION_POS = {
+    "ADP", "DET", "AUX", "PRON", "CCONJ", "SCONJ",
+    "PART", "INTJ", "PUNCT", "SYM", "SPACE"
+}
+
+# Prefer content-word patterns for topic phrases
+ALLOWED_PATTERNS = {
+    ("NOUN", "NOUN"),
+    ("PROPN", "PROPN"),
+    ("PROPN", "NOUN"),
+    ("ADJ", "NOUN"),
+    ("NOUN", "PROPN"),
+    ("VERB", "NOUN"),
+    ("NOUN", "VERB"),
+    ("ADJ", "ADJ"),
+    ("NOUN", "ADJ"),
+}
+
+# Strongly grammatical patterns to penalize
+GRAMMATICAL_PATTERNS = {
+    ("ADP", "DET"),
+    ("DET", "ADP"),
+    ("AUX", "DET"),
+    ("AUX", "AUX"),
+    ("PRON", "AUX"),
+    ("PART", "VERB"),
+    ("CCONJ", "PRON"),
+    ("SCONJ", "PRON"),
+    ("DET", "NOUN"),
+    ("ADP", "NOUN"),
+}
+
+def _pmi(pair_count: int, w1_count: int, w2_count: int, total_bigrams: int) -> float:
+    if total_bigrams == 0 or w1_count == 0 or w2_count == 0 or pair_count == 0:
+        return 0.0
+    p_xy = pair_count / total_bigrams
+    p_x = w1_count / total_bigrams
+    p_y = w2_count / total_bigrams
+    return math.log2((p_xy / (p_x * p_y)) + 1e-12)
+
+
+class TopicBigramScorer:
+    """
+    Identifies and scores topic-bearing bigrams vs grammatical bigrams
+    without using NLTK. Uses:
+      - simple POS-like tagging based on your existing token categories
+      - PMI with frequency discounting
+      - document specificity (IDF-like)
+      - grammar penalty based on POS patterns
+    """
+
+    def __init__(
+        self,
+        min_count: int = 5,
+        min_doc_count: int = 3,
+        pmi_weight: float = 1.0,
+        idf_weight: float = 1.5,
+        grammar_penalty_weight: float = 1.0,
+        pattern_bonus_weight: float = 0.5,
+    ):
+        self.min_count = min_count
+        self.min_doc_count = min_doc_count
+        self.pmi_weight = pmi_weight
+        self.idf_weight = idf_weight
+        self.grammar_penalty_weight = grammar_penalty_weight
+        self.pattern_bonus_weight = pattern_bonus_weight
+
+        self.unigram_counts: Dict[str, int] = Counter()
+        self.bigram_counts: Dict[Tuple[str, str], int] = Counter()
+        self.document_counts: Dict[Tuple[str, str], int] = Counter()
+        self.pair_pos: Dict[Tuple[str, str], Tuple[str, str]] = {}
+        self.total_bigrams: int = 0
+        self.scores: Dict[Tuple[str, str], dict] = {}
+
+    def _simple_pos_tag(self, token: str) -> str:
+        """
+        Very coarse POS-like tagging without NLTK.
+        This is heuristic and can be refined.
+        """
+        t = token.lower().strip("[]")
+        if t in STOP_WORDS_COG:
+            return "COG"
+        if t in {"the", "a", "an", "this", "that", "these", "those"}:
+            return "DET"
+        if t in {"in", "on", "at", "to", "for", "of", "with", "by", "from"}:
+            return "ADP"
+        if t in {"is", "are", "was", "were", "be", "been", "being", "have", "has", "had", "do", "does", "did"}:
+            return "AUX"
+        if t in {"i", "you", "he", "she", "it", "we", "they", "me", "him", "her", "us", "them"}:
+            return "PRON"
+        if t in {"and", "or", "but", "nor", "yet", "so"}:
+            return "CCONJ"
+        if t in {".", ",", "!", "?", ";", ":"}:
+            return "PUNCT"
+        if t and t[0].isupper():
+            return "PROPN"
+        if t.endswith("ing") or t.endswith("ed") or t.endswith("ly"):
+            return "VERB" if "ing" in t or "ed" in t else "ADJ"
+        return "NOUN"
+
+    def ingest_document(self, tokens: List[str]) -> None:
+        """
+        tokens: list of surface tokens (e.g. from your tokenize() function).
+        """
+        seen_pairs = set()
+
+        for w in tokens:
+            self.unigram_counts[w] += 1
+
+        for (w1, w2) in zip(tokens, tokens[1:]):
+            pair = (w1, w2)
+            self.bigram_counts[pair] += 1
+            self.pair_pos[pair] = (
+                self._simple_pos_tag(w1),
+                self._simple_pos_tag(w2),
+            )
+            seen_pairs.add(pair)
+
+        for pair in seen_pairs:
+            self.document_counts[pair] += 1
+
+        self.total_bigrams += max(0, len(tokens) - 1)
+
+    def ingest_documents(self, documents: List[List[str]]) -> None:
+        for doc in documents:
+            self.ingest_document(doc)
+
+    def compute_scores(self) -> None:
+        scores = {}
+
+        for pair, count in self.bigram_counts.items():
+            p1, p2 = self.pair_pos[pair]
+
+            if count < self.min_count:
+                continue
+            if self.document_counts[pair] < self.min_doc_count:
+                continue
+
+            association = _pmi(
+                count,
+                self.unigram_counts[pair[0]],
+                self.unigram_counts[pair[1]],
+                self.total_bigrams,
+            )
+
+            frequency_discount = 1.0 - math.exp(-count / 10.0)
+            association *= frequency_discount
+
+            grammar_penalty = 0.0
+
+            if p1 in FUNCTION_POS or p2 in FUNCTION_POS:
+                grammar_penalty += 2.0
+
+            if (p1, p2) in GRAMMATICAL_PATTERNS:
+                grammar_penalty += 5.0
+
+            if (p1, p2) not in ALLOWED_PATTERNS:
+                grammar_penalty += 1.0
+
+            document_specificity = math.log(
+                (len(self.document_counts) + 1) /
+                (self.document_counts[pair] + 1)
+            )
+
+            pattern_bonus = 0.0
+            if (p1, p2) in ALLOWED_PATTERNS:
+                pattern_bonus = 1.0
+
+            score = (
+                self.pmi_weight * association
+                + self.idf_weight * document_specificity
+                - self.grammar_penalty_weight * grammar_penalty
+                + self.pattern_bonus_weight * pattern_bonus
+            )
+
+            scores[pair] = {
+                "score": score,
+                "count": count,
+                "document_count": self.document_counts[pair],
+                "pmi": association,
+                "pos": (p1, p2),
+            }
+
+        self.scores = dict(
+            sorted(
+                scores.items(),
+                key=lambda item: item[1]["score"],
+                reverse=True,
+            )
+        )
+
+    def is_topic_bigram(
+        self,
+        w1: str,
+        w2: str,
+        score_threshold: float = 0.0,
+    ) -> bool:
+        pair = (w1, w2)
+        if pair not in self.scores:
+            return False
+        return self.scores[pair]["score"] >= score_threshold
+
+    def topic_score(self, w1: str, w2: str) -> float:
+        pair = (w1, w2)
+        if pair not in self.scores:
+            return 0.0
+        return self.scores[pair]["score"]
+
+    def top_topic_bigrams(self, n: int = 50):
+        return list(self.scores.items())[:n]
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 8c — TOPIC-BIGRAM AWARE COMPOSITION LM
+# ════════════════════════════════════════════════════════════════════════════
+
+def attach_topic_bigram_scorer_to_lm(
+    lm: ThebaultCompositionLM,
+    scorer: TopicBigramScorer,
+    topic_bigram_weight: float = 1.5,
+) -> None:
+    """
+    Attaches a TopicBigramScorer to an existing ThebaultCompositionLM
+    and modifies its composition_logit_bonus to include topic-bigram scores.
+    """
+    lm._topic_bigram_scorer = scorer
+    lm._topic_bigram_weight = topic_bigram_weight
+
+    original_bonus = lm.composition_logit_bonus
+
+    @torch.no_grad()
+    def composition_logit_bonus_with_topic(
+        self,
+        w1: str,
+        w2: str,
+        c_rho: torch.Tensor,
+        c_sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        base_bonus = original_bonus(w1, w2, c_rho, c_sigma)
+
+        scorer = getattr(self, "_topic_bigram_scorer", None)
+        if scorer is None:
+            return base_bonus
+
+        topic_score = scorer.topic_score(w1, w2)
+        if topic_score <= 0.0:
+            return base_bonus
+
+        topic_factor = math.tanh(topic_score / 2.0)
+        return base_bonus + self._topic_bigram_weight * topic_factor
+
+    import types
+    lm.composition_logit_bonus = types.MethodType(
+        composition_logit_bonus_with_topic, lm
+    )
+# ════════════════════════════════════════════════════════════════════════════
+# SECTION 8d — TOPIC-BIGRAM AWARE INSTRUCTION DISTRIBUTION
+# ════════════════════════════════════════════════════════════════════════════
+
+def attach_topic_bigram_to_instruction_dist(
+    instr_dist: InstructionDistribution,
+    scorer: TopicBigramScorer,
+    topic_bigram_weight: float = 1.5,
+) -> None:
+    """
+    Modifies InstructionDistribution.distribution to use topic-bigram scores
+    instead of a fixed 0.1 bonus for followers.
+    """
+    instr_dist._topic_bigram_scorer = scorer
+    instr_dist._topic_bigram_weight = topic_bigram_weight
+
+    original_distribution = instr_dist.distribution
+
+    @torch.no_grad()
+    def distribution_with_topic_bigrams(
+        self,
+        cands,
+        gen_tokens,
+        lm_tok2idx,
+        term_order=None,
+    ):
+        C = len(cands)
+        if C == 0 or self._base_dist_t is None:
+            return torch.ones(C, dtype=self.dtype, device=self.device) / max(C, 1)
+
+        cand_idx = torch.tensor(
+            [lm_tok2idx.get(c, 0) for c in cands],
+            dtype=torch.long, device=self.device,
+        )
+        base_probs = self._base_dist_t[cand_idx]
+
+        instr_set = set(self._instr_toks)
+        ctx_bonus_v = torch.tensor(
+            [self.context_bonus if c in instr_set else 0.0 for c in cands],
+            dtype=self.dtype, device=self.device,
+        )
+
+        bigram_bonus = torch.zeros(C, dtype=self.dtype, device=self.device)
+        scorer = getattr(self, "_topic_bigram_scorer", None)
+
+        if self._instr_toks and gen_tokens:
+            w1, w2 = self._instr_toks[-1], gen_tokens[-1]
+
+            if scorer is not None:
+                for i, c in enumerate(cands):
+                    score = scorer.topic_score(w1, c)
+                    if score > 0.0:
+                        bigram_bonus[i] = score
+            else:
+                followers = self.lm.heads.get((w1, w2), [])
+                fset = set(followers)
+                for i, c in enumerate(cands):
+                    if c in fset:
+                        bigram_bonus[i] = 0.1
+
+        order = term_order or self.term_order
+        raw = symmetric_weighted_sum(
+            {"base": base_probs, "context": ctx_bonus_v, "bigram": bigram_bonus},
+            order=order,
+        )
+        raw = raw.clamp(min=1e-12)
+        return raw / raw.sum()
+
+    import types
+    instr_dist.distribution = types.MethodType(
+        distribution_with_topic_bigrams, instr_dist
+    )
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 9 — THÉBAULT POTENTIAL GRAPH
 # ════════════════════════════════════════════════════════════════════════════
@@ -3211,9 +3539,34 @@ class V18Engine:
             geo=self.geo, kernels=self.kernels, device=self.device,
         )
         self.instr_dist = InstructionDistribution(
-            geo=self.geo, kernels=self.kernels, lm=self.lm, device=self.device,
+            geo=geo,
+            kernels=kernels,
+            lm=lm,
+            semantic_radius=2.0,
+            recency_decay=0.7,
+            context_bonus=0.75,
+            centroid_weight=0.8,
+        )
+        # Build topic-bigram scorer from your tokenized corpus
+        scorer = TopicBigramScorer(
+            min_count=5,
+            min_doc_count=3,
+            pmi_weight=1.0,
+            idf_weight=1.5,
+            grammar_penalty_weight=1.0,
+            pattern_bonus_weight=0.5,
         )
 
+        # documents: List[List[str]] of tokenized texts
+        scorer.ingest_documents(documents)
+        scorer.compute_scores()
+
+        # Attach topic-bigram scoring to the instruction distribution
+        attach_topic_bigram_to_instruction_dist(
+            instr_dist,
+            scorer,
+            topic_bigram_weight=1.5,
+        )
         if "cot_stubs" in state:
             self.stub_lib.stubs = state["cot_stubs"]
             self.stub_lib._rebuild_tensors()
@@ -3242,320 +3595,6 @@ class V18Engine:
         )
         print("[+] Load successful. (V18-CSNS-G-DASP)")
 
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# SECTION 14b — SYNTHREASON DATASET → PROMPT SUBSET → GENERATE FLOW
-#
-# Dataset → Prompt Isolate → Reasoning Prompt Subset → New Dataset From Output
-# → Contextual Prompt Subset → New Dataset From Output → Prompt Subset
-# → Generate Out
-# ════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class PromptCandidate:
-    text: str
-    isolate_score: float = 0.0
-    reasoning_score: float = 0.0
-    contextual_score: float = 0.0
-    final_score: float = 0.0
-
-
-class SynthReasonFlow:
-    """Dataset-driven prompt selection and generation pipeline.
-
-    Sequential 7-stage flow with pooled intermediate datasets:
-
-      Dataset â†’ Prompt Isolate â†’ Reasoning Prompt Subset
-               â†’ Generate (New Dataset #1, pool into corpus)
-               â†’ Contextual Prompt Subset
-               â†’ Generate (New Dataset #2, pool into corpus)
-               â†’ Final Prompt Subset â†’ Generate Out
-
-    At each intermediate stage the newly generated text is POOLED with
-    the accumulated corpus so earlier signal is never discarded, while
-    each generation step steers prompts further from the original seed.
-    """
-
-    def __init__(self, engine):
-        self.engine = engine
-        self.last_report = ""
-        self.last_outputs: List[str] = []
-
-    @staticmethod
-    def _clean_prompt(text: str) -> str:
-        text = re.sub(r"^\s*(?:prompt|instruction|question|query)\s*[:\-]\s*", "", text, flags=re.I)
-        return re.sub(r"\s+", " ", text).strip()
-
-    def prompt_isolate(self, dataset: str, max_chars: int = 900) -> List[PromptCandidate]:
-        """Extract prompt-like units from the Dataset node."""
-        raw_units = re.split(r"\n\s*\n|\n|(?<=[.!?])\s+(?=[A-Z\[])", dataset)
-        out: List[PromptCandidate] = []
-        seen: Set[str] = set()
-        for raw in raw_units:
-            text = self._clean_prompt(raw)
-            if len(text) < 8 or len(text) > max_chars:
-                continue
-            key = text.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            toks = tokenize(text)
-            lexical = min(len(toks) / 24.0, 1.0)
-            question = 1.0 if "?" in text else 0.0
-            directive = 1.0 if re.match(
-                r"(?i)\s*(explain|describe|compare|analyze|derive|why|how|what|evaluate|discuss|identify|reason)\b",
-                text,
-            ) else 0.0
-            score = 0.55 * lexical + 0.25 * question + 0.20 * directive
-            out.append(PromptCandidate(text=text, isolate_score=score))
-        out.sort(key=lambda x: (-x.isolate_score, x.text.casefold()))
-        return out
-
-    @staticmethod
-    def _reasoning_score(text: str) -> float:
-        words = re.findall(r"[a-zA-Z]+", text.lower())
-        if not words:
-            return 0.0
-        cog = sum(1 for w in words if w in STOP_WORDS_COG)
-        question = 1.0 if "?" in text else 0.0
-        causal = sum(1 for w in words if w in {
-            "because", "therefore", "cause", "effect", "implies", "if", "then",
-            "why", "how", "compare", "contrast", "derive", "reason"
-        })
-        depth = min(cog / max(len(words), 1), 1.0)
-        causal_density = min(causal / max(len(words), 1), 1.0)
-        return 0.50 * depth + 0.25 * question + 0.25 * causal_density
-
-    def reasoning_prompt_subset(
-        self, prompts: List[PromptCandidate], fraction: float = 0.50, minimum: int = 4
-    ) -> List[PromptCandidate]:
-        for p in prompts:
-            p.reasoning_score = self._reasoning_score(p.text)
-        prompts = sorted(prompts, key=lambda x: (-x.reasoning_score, -x.isolate_score, x.text.casefold()))
-        n = min(len(prompts), max(minimum, int(math.ceil(len(prompts) * fraction))))
-        return prompts[:n]
-
-    @staticmethod
-    def _token_set(text: str) -> Set[str]:
-        return {t for t in tokenize(text) if t not in PUNCT_TOKENS and t not in COGNITIVE_TOKENS}
-
-    def _context_score(self, text: str, anchors: List[str]) -> float:
-        a = self._token_set(text)
-        if not a or not anchors:
-            return 0.0
-        best = 0.0
-        for anchor in anchors:
-            b = self._token_set(anchor)
-            if not b:
-                continue
-            best = max(best, len(a & b) / max(len(a | b), 1))
-        return best
-
-    def contextual_prompt_subset(
-        self, prompts: List[PromptCandidate], reasoning_prompts: List[PromptCandidate],
-        fraction: float = 0.60, minimum: int = 3,
-    ) -> List[PromptCandidate]:
-        anchors = [p.text for p in reasoning_prompts]
-        for p in prompts:
-            p.contextual_score = self._context_score(p.text, anchors)
-            p.final_score = 0.55 * p.contextual_score + 0.30 * p.reasoning_score + 0.15 * p.isolate_score
-        prompts = sorted(prompts, key=lambda x: (-x.final_score, x.text.casefold()))
-        n = min(len(prompts), max(minimum, int(math.ceil(len(prompts) * fraction))))
-        return prompts[:n]
-
-    def final_prompt_subset(self, prompts: List[PromptCandidate], max_prompts: int = 6) -> List[PromptCandidate]:
-        ranked = sorted(prompts, key=lambda x: (-x.final_score, x.text.casefold()))
-        return ranked[:max(1, int(max_prompts))]
-
-    @staticmethod
-    def dataset_from_output(prompts: List[PromptCandidate]) -> str:
-        return "\n".join(p.text for p in prompts)
-
-    @staticmethod
-    def _pool_datasets(*datasets: str) -> str:
-        """Concatenate any number of dataset strings, separated by double newlines.
-
-        Duplicate paragraphs (case-folded) are silently dropped so the
-        pooled corpus does not inflate with repeated sentences.
-        """
-        seen: Set[str] = set()
-        parts: List[str] = []
-        for ds in datasets:
-            for para in re.split(r"\n\s*\n", ds):
-                para = para.strip()
-                if not para:
-                    continue
-                key = para.casefold()
-                if key not in seen:
-                    seen.add(key)
-                    parts.append(para)
-        return "\n\n".join(parts)
-
-    def _generate_from_prompts(
-        self,
-        prompts: List[PromptCandidate],
-        num_sentences: int,
-        tokens_per_sent: int,
-        and_weight: float,
-        temperature: float,
-        guidance_weight: float,
-        guidance_steps: int,
-        guidance_lr: float,
-        generations_per_prompt: int = 1,
-        label_prefix: bool = True,
-    ) -> List[str]:
-        """Generate text from each prompt via generate_passage().
-
-        Returns plain texts (label_prefix=False) for intermediate datasets,
-        or labelled outputs (label_prefix=True) for the final Generate Out.
-        Failures are caught per-generation so one error cannot abort the chain.
-        """
-        results: List[str] = []
-        for p in prompts:
-            seed_tokens = tokenize(p.text)
-            seed = " ".join(seed_tokens[-2:]) if len(seed_tokens) >= 2 else p.text
-            for _ in range(max(1, int(generations_per_prompt))):
-                try:
-                    text = generate_passage(
-                        self.engine.walker,
-                        self.engine.lm,
-                        num_sentences=max(1, int(num_sentences)),
-                        tokens_per_sent=max(4, int(tokens_per_sent)),
-                        seed_text=seed,
-                        instruction_text=p.text,
-                        and_weight=float(and_weight),
-                        temperature=float(temperature),
-                        return_traces=False,
-                        guidance_weight=float(guidance_weight),
-                        guidance_steps=int(guidance_steps),
-                        guidance_lr=float(guidance_lr),
-                    )
-                    results.append(f"[{p.text}]\n{text}" if label_prefix else text)
-                except Exception as exc:
-                    results.append(
-                        f"[{p.text}]\nGeneration error: {exc}" if label_prefix
-                        else f"Generation error: {exc}"
-                    )
-        return results
-
-    def run(
-        self,
-        dataset: str,
-        num_sentences: int = 1,
-        tokens_per_sent: int = 40,
-        and_weight: float = 0.5,
-        temperature: float = 0.75,
-        guidance_weight: float = 0.3,
-        guidance_steps: int = 3,
-        guidance_lr: float = 0.15,
-        reasoning_fraction: float = 0.50,
-        contextual_fraction: float = 0.60,
-        max_prompts: int = 6,
-        generations_per_prompt: int = 1,
-    ):
-        if not dataset.strip():
-            return "", "", "", "", "No Dataset supplied."
-        if not self.engine or not self.engine.walker:
-            return "", "", "", "", "Engine not initialised."
-
-        gen_kwargs = dict(
-            num_sentences=num_sentences,
-            tokens_per_sent=tokens_per_sent,
-            and_weight=and_weight,
-            temperature=temperature,
-            guidance_weight=guidance_weight,
-            guidance_steps=guidance_steps,
-            guidance_lr=guidance_lr,
-        )
-
-        # â”€â”€ Stage 1: Dataset â†’ prompt_isolate() â†’ isolated_1
-        isolated_1 = self.prompt_isolate(dataset)
-
-        # â”€â”€ Stage 2: isolated_1 â†’ reasoning_prompt_subset() â†’ reasoning_subset
-        reasoning_subset = self.reasoning_prompt_subset(isolated_1, fraction=reasoning_fraction)
-
-        # â”€â”€ Stage 3: reasoning_subset â†’ generate â†’ gen_dataset_1
-        #    Pool: original dataset + gen_dataset_1 â†’ pooled_1
-        #    (NEW DATASET FROM OUTPUT #1)
-        gen_1_texts = self._generate_from_prompts(
-            reasoning_subset, **gen_kwargs, generations_per_prompt=1, label_prefix=False
-        )
-        gen_dataset_1 = "\n\n".join(gen_1_texts)
-        pooled_1 = self._pool_datasets(dataset, gen_dataset_1)
-
-        # â”€â”€ Stage 4: pooled_1 â†’ prompt_isolate() â†’ isolated_2
-        #    Prompts now blend original signal with generated deviation.
-        isolated_2 = self.prompt_isolate(pooled_1)
-        isolated_2_source = isolated_2 if len(isolated_2) >= 3 else reasoning_subset
-
-        # â”€â”€ Stage 5: isolated_2 â†’ contextual_prompt_subset() â†’ contextual_subset
-        #    Anchored to reasoning_subset so contextual scoring measures
-        #    how much the deviated prompts still relate to the original theme.
-        contextual_subset = self.contextual_prompt_subset(
-            isolated_2_source, reasoning_subset, fraction=contextual_fraction
-        )
-
-        # â”€â”€ Stage 6: contextual_subset â†’ generate â†’ gen_dataset_2
-        #    Pool: pooled_1 + gen_dataset_2 â†’ pooled_2
-        #    (NEW DATASET FROM OUTPUT #2)
-        gen_2_texts = self._generate_from_prompts(
-            contextual_subset, **gen_kwargs, generations_per_prompt=1, label_prefix=False
-        )
-        gen_dataset_2 = "\n\n".join(gen_2_texts)
-        pooled_2 = self._pool_datasets(pooled_1, gen_dataset_2)
-
-        # â”€â”€ Stage 7: pooled_2 â†’ prompt_isolate() â†’ isolated_3
-        isolated_3 = self.prompt_isolate(pooled_2)
-        isolated_3_source = isolated_3 if len(isolated_3) >= 3 else contextual_subset
-
-        #    isolated_3 â†’ final_prompt_subset() â†’ final_subset
-        final_subset = self.final_prompt_subset(isolated_3_source, max_prompts=max_prompts)
-
-        #    final_subset â†’ generate â†’ Generate Out
-        final_generations = self._generate_from_prompts(
-            final_subset, **gen_kwargs,
-            generations_per_prompt=generations_per_prompt, label_prefix=True
-        )
-
-        # â”€â”€ Return values (positions unchanged for Gradio compatibility)
-        reasoning_dataset_text  = gen_dataset_1
-        contextual_dataset_text = gen_dataset_2
-        final_dataset_text      = "\n".join(p.text for p in final_subset)
-        generated_out_text      = "\n\n".join(final_generations)
-
-        report = (
-            "SynthReason-2026 FLOW  (pooled datasets)\n"
-            f"Dataset (original):               {len(dataset)} chars\n"
-            f"Stage 1  Prompt Isolate:         {len(isolated_1)} candidates\n"
-            f"Stage 2  Reasoning Subset:       {len(reasoning_subset)} prompts\n"
-            f"Stage 3  New Dataset #1:         {len(gen_dataset_1)} chars  "
-            f"({len(gen_1_texts)} gen)\n"
-            f"          Pooled corpus #1:        {len(pooled_1)} chars\n"
-            f"Stage 4  Prompt Isolate (pool1): {len(isolated_2)} candidates\n"
-            f"Stage 5  Contextual Subset:      {len(contextual_subset)} prompts\n"
-            f"Stage 6  New Dataset #2:         {len(gen_dataset_2)} chars  "
-            f"({len(gen_2_texts)} gen)\n"
-            f"          Pooled corpus #2:        {len(pooled_2)} chars\n"
-            f"Stage 7  Prompt Isolate (pool2): {len(isolated_3)} candidates\n"
-            f"          Final Prompt Subset:     {len(final_subset)} prompts\n"
-            f"          Generate Out:            {len(final_generations)} total generations\n\n"
-            "Dataset Prompt Isolate Reasoning Subset\n"
-            "  â†’ Generate (pool New Dataset #1)\n"
-            "  â†’ Prompt Isolate Contextual Subset\n"
-            "  â†’ Generate (pool New Dataset #2)\n"
-            "  â†’ Prompt Isolate Final Subset â†’ Generate Out\n"
-        )
-
-        self.last_outputs = final_generations
-        self.last_report  = report
-        return (
-            reasoning_dataset_text,
-            contextual_dataset_text,
-            final_dataset_text,
-            generated_out_text,
-            report,
-        )
 
 # ════════════════════════════════════════════════════════════════════════════
 # SECTION 15 — GRADIO GUI
@@ -3592,89 +3631,28 @@ class V18GUI:
         except Exception as e:
             return f"Error: {str(e)}"
 
-    def generate_text(self, user_prompt, sentences, tokens, and_weight, temperature,
-                       guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15,
-                       reasoning_fraction=0.50, contextual_fraction=0.60,
-                       max_prompts=6, generations_per_prompt=1):
+    def generate_text(self, sentences, tokens, seed_text, instruction_text, and_weight, temperature,
+                       guidance_weight=0.0, guidance_steps=3, guidance_lr=0.15):
         if not self.engine or not self.engine.walker:
-            return "", "", "", "", "Engine not initialised. Load a dataset first."
-
-        dataset_text = getattr(self.engine, "corpus_snippet", "") or ""
-        if not dataset_text.strip():
-            return "", "", "", "", "Dataset is empty. Load a dataset in the Dataset tab first."
-
-        user_prompt = (user_prompt or "").strip()
-
-        try:
-            num_sentences = max(1, int(sentences))
-            tokens_per_sent = max(4, int(tokens))
-            aw = float(and_weight)
-            temp = float(temperature)
-            gw = float(guidance_weight)
-            gs = int(guidance_steps)
-            glr = float(guidance_lr)
-            rf = float(reasoning_fraction)
-            cf = float(contextual_fraction)
-            mp = max(1, int(max_prompts))
-            gpp = max(1, int(generations_per_prompt))
-        except (TypeError, ValueError) as exc:
-            return "", "", "", "", f"Invalid generation control value: {exc}"
-
-        flow = SynthReasonFlow(self.engine)
-        
-        # Use dataset for prompt isolation, but pass user_prompt as instruction
-        reasoning_dataset, contextual_dataset, final_dataset, generated, report = flow.run(
-            dataset=dataset_text,
-            num_sentences=num_sentences,
-            tokens_per_sent=tokens_per_sent,
-            and_weight=aw,
-            temperature=temp,
-            guidance_weight=gw,
-            guidance_steps=gs,
-            guidance_lr=glr,
-            reasoning_fraction=rf,
-            contextual_fraction=cf,
-            max_prompts=mp,
-            generations_per_prompt=gpp,
+            return "Engine not initialised.", "", ""
+        text, traces, step_report = generate_passage(
+            self.engine.walker, self.engine.lm,
+            num_sentences=int(sentences), tokens_per_sent=int(tokens),
+            seed_text=seed_text.strip(), instruction_text=instruction_text.strip(),
+            and_weight=float(and_weight), temperature=float(temperature),
+            return_traces=True,
+            guidance_weight=float(guidance_weight),
+            guidance_steps=int(guidance_steps),
+            guidance_lr=float(guidance_lr),
         )
-        
-        # If user provided a prompt, regenerate with it as instruction
-        if user_prompt:
-            # Run generate_passage directly with user_prompt as instruction
-            from pathlib import Path
-            seed_tokens = tokenize(user_prompt)
-            seed = " ".join(seed_tokens[-2:]) if len(seed_tokens) >= 2 else user_prompt
-            
-            generated_outputs = []
-            for _ in range(max(1, int(gpp))):
-                try:
-                    text = generate_passage(
-                        self.engine.walker, self.engine.lm,
-                        num_sentences=max(1, int(num_sentences)),
-                        tokens_per_sent=max(4, int(tokens_per_sent)),
-                        seed_text=seed,
-                        instruction_text=user_prompt,
-                        and_weight=aw,
-                        temperature=temp,
-                        return_traces=False,
-                        guidance_weight=gw,
-                        guidance_steps=gs,
-                        guidance_lr=glr,
-                    )
-                    generated_outputs.append(f"[{user_prompt}]\n{text}")
-                except Exception as exc:
-                    generated_outputs.append(f"[{user_prompt}]\nGeneration error: {exc}")
-            
-            generated = "\n\n".join(generated_outputs)
-            report = (
-                f"SynthReason-2026 FLOW (with user prompt)\n"
-                f"{'='*60}\n"
-                f"User Prompt: {user_prompt[:100]}{'...' if len(user_prompt) > 100 else ''}\n"
-                f"Dataset: {len(dataset_text)} chars\n"
-                f"Generations: {len(generated_outputs)}\n"
-            )
-
-        return reasoning_dataset, contextual_dataset, final_dataset, generated, report
+        trace_text = "\n".join(tr.render() for tr in traces)
+        guidance_note = (
+            f"\n[Gradient-guided decoding: weight={guidance_weight:.2f}  "
+            f"steps={int(guidance_steps)}  lr={guidance_lr:.3f}  "
+            f"last |Δlogits|={self.engine.walker._last_guidance_delta:.4f}]"
+            if float(guidance_weight) > 0.0 else ""
+        )
+        return text, trace_text, step_report + guidance_note
 
     def pdn_report(self):
         if not self.engine:
@@ -3757,19 +3735,20 @@ class V18GUI:
 def launch_gui():
     gui = V18GUI()
 
-    with gr.Blocks(title="SynthReason-2026 — V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
+    with gr.Blocks(title="NeuroSymbolic V18-CSNS-G Double-Agnostic / Solo-Planar") as app:
         gr.Markdown(
-            "# SynthReason-2026 — V18-CSNS-G\n"
-            "### Dataset tab → Prompt Isolate → Reasoning → Contextual → Prompt Subset → Generate Out"
+            "# NeuroSymbolic V18-CSNS-G — Double-Agnostic / Solo-Planar Variant\n"
+            "### Hard-coded orderings exposed as parameters · Kernel products collapsed onto one plane · "
+            "Thébault Geometry · ACF Spectral · DNN Array · CSNS · Gradient-Guided Decoding"
         )
 
-        with gr.Tab("Dataset"):
+        with gr.Tab("Train"):
             file_input     = gr.File(label="Upload .txt Corpus File", file_types=[])
             with gr.Row():
                 syn_w_slider   = gr.Slider(0.0, 12.0, value=2.0,  step=0.05, label="CSNS ω_syn")
                 trans_w_slider = gr.Slider(0.0, 12.0, value=0.8,  step=0.05, label="CSNS ω_trans")
                 syn_k_slider   = gr.Slider(2,   32,   value=8,    step=1,    label="CSNS K")
-            train_file_btn = gr.Button("Load Dataset / Initialise Engine (DA-SP)", variant="primary")
+            train_file_btn = gr.Button("Initialise from File (DA-SP)", variant="primary")
             init_out       = gr.Textbox(label="Engine Status / ACF Spectral Report", lines=22, interactive=False)
             train_file_btn.click(
                 gui.init_engine_from_file,
@@ -3777,65 +3756,40 @@ def launch_gui():
                 outputs=init_out,
             )
 
-        with gr.Tab("SynthReason Flow"):
+        with gr.Tab("Generate"):
+            with gr.Row():
+                sentences   = gr.Slider(1, 10,   value=4,   step=1,    label="Sentences")
+                tokens      = gr.Slider(20, 180, value=80,  step=1,    label="Tokens/sentence")
+                and_weight  = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
+                temperature = gr.Slider(0.1, 30.0, value=0.75, step=0.05, label="Temperature")
 
-
-            user_prompt = gr.Textbox(
-                label="User input prompt",
-                placeholder="Enter the prompt or instruction to guide generation...",
-                lines=4,
-                value="",
+            instruction_input = gr.Textbox(
+                label="Instruction (AND distribution + kernel mandate source)",
+                value="Explain the meaning of life and human consciousness.",
+                lines=2,
             )
+            seed_input = gr.Textbox(label="Seed Text", placeholder="e.g. quantum entanglement")
 
-            gr.Markdown(
-                "**Dataset source:** the corpus loaded in the **Dataset** tab is used automatically. "
-                "No second dataset textbox is used in this flow."
-            )
             with gr.Row():
-                sentences = gr.Slider(1, 4, value=1, step=1, label="Sentences / prompt")
-                tokens = gr.Slider(20, 120, value=40, step=1, label="Tokens / sentence")
-                and_weight = gr.Slider(0.0, 1.0, value=0.5, step=0.05, label="AND weight α")
-                temperature = gr.Slider(0.1, 10.0, value=0.75, step=0.05, label="Temperature")
-            with gr.Row():
-                reasoning_fraction = gr.Slider(0.1, 1.0, value=0.1, step=0.05, label="Reasoning subset fraction")
-                contextual_fraction = gr.Slider(0.1, 1.0, value=0.1, step=0.05, label="Contextual subset fraction")
-                max_prompts = gr.Slider(1, 20, value=1, step=1, label="Final prompt subset size")
-                generations = gr.Slider(1, 5, value=1, step=1, label="Generations / prompt")
-            with gr.Row():
-                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.3, step=0.05, label="Gradient-guided decoding weight")
-                guidance_steps_slider = gr.Slider(0, 10, value=3, step=1, label="Guidance ascent steps")
-                guidance_lr_slider = gr.Slider(0.0, 1.0, value=0.15, step=0.01, label="Guidance ascent LR")
-            flow_btn = gr.Button("Generate Out — SynthReason-2026", variant="primary")
-            with gr.Row():
-                reasoning_out = gr.Textbox(lines=8, label="Reasoning Prompt Subset → New Dataset From Output #1", interactive=False)
-                contextual_out = gr.Textbox(lines=8, label="Contextual Prompt Subset → New Dataset From Output #2", interactive=False)
-                final_out = gr.Textbox(lines=8, label="Prompt Subset", interactive=False)
-                generated_out = gr.Textbox(lines=14, label="Generate Out", interactive=False)
-                flow_report = gr.Textbox(lines=10, label="SynthReason-2026 Flow Report", interactive=False)
+                guidance_weight_slider = gr.Slider(0.0, 1.0, value=0.3, step=0.05,
+                                                    label="Gradient-guided decoding weight")
+                guidance_steps_slider  = gr.Slider(0, 10, value=3, step=1,
+                                                    label="Guidance ascent steps")
+                guidance_lr_slider     = gr.Slider(0.0, 1.0, value=0.15, step=0.01,
+                                                    label="Guidance ascent LR")
 
-            flow_btn.click(
+            gen_btn = gr.Button("Generate (DA-SP)", variant="primary")
+            gen_out = gr.Textbox(lines=10, label="Generated Text")
+
+            with gr.Row():
+                cot_out  = gr.Textbox(lines=12, label="Chain-of-Thought Trace",    interactive=False)
+                step_out = gr.Textbox(lines=12, label="AND+CSNS Step Trace (per token)",       interactive=False)
+
+            gen_btn.click(
                 gui.generate_text,
-                inputs=[
-                    user_prompt,
-                    sentences,
-                    tokens,
-                    and_weight,
-                    temperature,
-                    guidance_weight_slider,
-                    guidance_steps_slider,
-                    guidance_lr_slider,
-                    reasoning_fraction,
-                    contextual_fraction,
-                    max_prompts,
-                    generations,
-                ],
-                outputs=[
-                    reasoning_out,
-                    contextual_out,
-                    final_out,
-                    generated_out,
-                    flow_report,
-                ],
+                inputs=[sentences, tokens, seed_input, instruction_input, and_weight, temperature,
+                        guidance_weight_slider, guidance_steps_slider, guidance_lr_slider],
+                outputs=[gen_out, cot_out, step_out],
             )
 
         with gr.Tab("Diagnostics"):
