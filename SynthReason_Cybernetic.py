@@ -3230,78 +3230,63 @@ def generate_passage(
 # {'ref_model','mandate','instr_dist','cot','pdn','mrv','graph'} —
 # instead of a hard-coded sequence. Default is the canonical name-sorted
 # order.
+#
+# CUBE GARDEN REMOVED: the deterministic 4-D hash-based corpus reordering
+# stage (CubeCoord / CubeChunk / CubeGardenResolver) has been removed.
+# Corpus tokens are ingested in their natural, as-written order.
+#
+# DERIVED FREQUENCY SETTINGS ADDED: in place of the cube-garden prepass,
+# training now generates a small set of recommended engine settings
+# (temperature, recency decay, synaptic top-K, mechanical-fold baseline
+# frequency) purely from the shape of the corpus's own token-frequency
+# distribution — see DerivedFrequencySettings /
+# V18Engine.generate_derived_frequency_settings().
 # ════════════════════════════════════════════════════════════════════════════
 
 
-@dataclass(frozen=True)
-class CubeCoord:
-    x: int
-    y: int
-    z: int
-    t: int
-
 @dataclass
-class CubeChunk:
-    index: int
-    text: str
-    tokens: List[str]
-    coord: CubeCoord
-    hash_hex: str
-    orbit: int
-    rho_mean: float
-    theta_mean: float
-    sigma_mean: float
+class DerivedFrequencySettings:
+    """
+    Settings derived purely from the corpus's own token-frequency
+    distribution — how peaked or flat it is, how many one-off (hapax)
+    tokens it has, etc. — and used to recommend sensible engine defaults
+    instead of leaving them as fixed magic numbers.
+    """
+    vocab_size                : int   = 0
+    total_tokens               : int   = 0
+    mean_freq                  : float = 0.0
+    median_freq                 : float = 0.0
+    max_freq                    : float = 0.0
+    min_freq                    : float = 0.0
+    hapax_ratio                  : float = 0.0   # fraction of vocab occurring exactly once
+    freq_entropy                  : float = 0.0   # Shannon entropy (bits) of the frequency distribution
+    freq_entropy_norm              : float = 0.0   # entropy normalised to [0,1] by log2(vocab_size)
+    recommended_temperature         : float = 1.4
+    recommended_recency_decay        : float = 0.7
+    recommended_syn_k                : int   = 8
+    recommended_fold_frequency        : float = 1.0
 
-class CubeGardenResolver:
-    """Deterministic 4-D cube-garden corpus permutation (unchanged by DA/SP)."""
-    def __init__(self, geo, pdn, chunk_size=128, cube_side=8):
-        self.geo=geo; self.pdn=pdn; self.chunk_size=max(1,int(chunk_size)); self.cube_side=max(2,int(cube_side))
-    @staticmethod
-    def _u32(data, offset): return int.from_bytes(data[offset:offset+4], 'big')
-    def _hash_cube(self,text):
-        d=hashlib.sha256(text.encode('utf-8')).digest(); S=self.cube_side
-        return CubeCoord(*(self._u32(d,i)%S for i in (0,4,8,12)))
-    def _geometry_signature(self,tokens):
-        ts=[self.geo.triple(t) for t in tokens if t in self.geo._vecs]
-        if not ts: return 0.0,0.0,0.0
-        r=sum(t.rho for t in ts)/len(ts); s=sum(t.sigma for t in ts)/len(ts)
-        sn=sum(math.sin(t.theta) for t in ts)/len(ts); cs=sum(math.cos(t.theta) for t in ts)/len(ts)
-        return r, math.atan2(sn,cs)%math.pi, s
-    def _geometry_cube(self,index,tokens):
-        r,th,sg=self._geometry_signature(tokens); S=self.cube_side
-        return CubeCoord(index%S,min(S-1,int(max(0,min(1,r))*S)),min(S-1,int(th/math.pi*S)),min(S-1,int(math.tanh(abs(sg))*S)))
-    def _combine(self,a,b):
-        S=self.cube_side; return CubeCoord((a.x+b.x)%S,(a.y+b.y)%S,(a.z+b.z)%S,(a.t+b.t)%S)
-    def cube_distance(self,a,b):
-        S=self.cube_side
-        def d(x,y): q=abs(x-y); return min(q,S-q)
-        return d(a.x,b.x)+d(a.y,b.y)+d(a.z,b.z)+d(a.t,b.t)
-    def transitive_score(self,a,b):
-        d=self.cube_distance(a.coord,b.coord)
-        return (1/(1+d))*math.exp(-8*abs(a.rho_mean-b.rho_mean))*0.5*(1+math.cos(a.theta_mean-b.theta_mean))*math.exp(-4*abs(a.sigma_mean-b.sigma_mean))*(1 if a.orbit==b.orbit else .25)
-    def make_chunks(self,tokens):
-        out=[]
-        for start in range(0,len(tokens),self.chunk_size):
-            ct=tokens[start:start+self.chunk_size]; idx=start//self.chunk_size; text=' '.join(ct); hx=hashlib.sha256(text.encode()).hexdigest()
-            hc=self._hash_cube(text); gc=self._geometry_cube(idx,ct); c=self._combine(hc,gc); r,th,sg=self._geometry_signature(ct); orbit=0
-            for tok in ct:
-                if tok not in PUNCT_TOKENS: orbit=self.pdn.orbit_of(tok); break
-            out.append(CubeChunk(idx,text,ct,c,hx,orbit,r,th,sg))
-        return out
-    def resort(self,tokens):
-        chunks=self.make_chunks(tokens)
-        if len(chunks)<=1: return list(tokens),chunks
-        cur=min(chunks,key=lambda c:(c.hash_hex,c.index)); rem={c.index:c for c in chunks if c.index!=cur.index}; order=[cur]
-        while rem:
-            nxt=max(rem.values(),key=lambda c:(self.transitive_score(cur,c),-self.cube_distance(cur.coord,c.coord),c.hash_hex,-c.index)); order.append(nxt); del rem[nxt.index]; cur=nxt
-        result=[]
-        for c in order: result.extend(c.tokens)
-        return result,order
-    def report(self,chunks,max_rows=32):
-        lines=['','╔════════════════════════════════════════════════════════════════════╗','║                    CUBE GARDEN DATASET MAP                       ║','╠════════════════════════════════════════════════════════════════════╣',f'║ chunks={len(chunks):<55}║',f'║ cube_side={self.cube_side:<52}║',f'║ chunk_size={self.chunk_size:<50}║','╠════════════════════════════════════════════════════════════════════╣']
-        for i,c in enumerate(chunks[:max_rows]):
-            q=c.coord; lines.append(f'║ {i:03d} src={c.index:04d} C=({q.x},{q.y},{q.z},{q.t}) O={c.orbit:<2d} ρ={c.rho_mean:.3f} θ={c.theta_mean:.3f} σ={c.sigma_mean:.3f} ║')
-        lines.append('╚════════════════════════════════════════════════════════════════════╝'); return '\n'.join(lines)
+    def report(self) -> str:
+        return (
+            "╔══════════════════════════════════════════════════════════════╗\n"
+            "║        Derived Frequency Settings (Corpus-Driven)             ║\n"
+            "╠══════════════════════════════════════════════════════════════╣\n"
+            f"║  vocab_size                 = {self.vocab_size:<35d}║\n"
+            f"║  total_tokens                = {self.total_tokens:<34d}║\n"
+            f"║  mean_freq                    = {self.mean_freq:<33.4f}║\n"
+            f"║  median_freq                   = {self.median_freq:<32.4f}║\n"
+            f"║  max_freq / min_freq            = {self.max_freq:.1f} / {self.min_freq:<24.1f}║\n"
+            f"║  hapax_ratio (freq==1)          = {self.hapax_ratio:<30.4f}║\n"
+            f"║  freq_entropy (bits)             = {self.freq_entropy:<29.4f}║\n"
+            f"║  freq_entropy_norm [0,1]          = {self.freq_entropy_norm:<27.4f}║\n"
+            "╠══════════════════════════════════════════════════════════════╣\n"
+            f"║  → recommended_temperature         = {self.recommended_temperature:<25.4f}║\n"
+            f"║  → recommended_recency_decay         = {self.recommended_recency_decay:<23.4f}║\n"
+            f"║  → recommended_syn_k                  = {self.recommended_syn_k:<22d}║\n"
+            f"║  → recommended_fold_frequency          = {self.recommended_fold_frequency:<20.4f}║\n"
+            "╚══════════════════════════════════════════════════════════════╝"
+        )
+
 
 class V18Engine:
     _DEFAULT_BUILD_ORDER = ["cot", "graph", "instr_dist", "mandate", "mrv", "pdn", "ref_model"]  # name-sorted
@@ -3338,10 +3323,7 @@ class V18Engine:
         self.parabolic_manifold_strength = max(0.0, float(parabolic_manifold_strength))
         self.parabolic_manifold_curvature = max(0.0, float(parabolic_manifold_curvature))
         self.build_stage_order = build_stage_order or list(self._DEFAULT_BUILD_ORDER)
-        self.cube_chunk_size=128
-        self.cube_side=8
-        self.cube_garden=None
-        self.cube_chunks=[]
+        self.derived_freq_settings : Optional[DerivedFrequencySettings] = None
         self.mechanical_fold = MechanicalFoldState()
         self.fold_frequency: float = 1.0
         self.fold_index: int = 0
@@ -3351,22 +3333,65 @@ class V18Engine:
         self.fold_tension: float = 0.0
         self.fold_momentum: float = 0.0
 
+    def generate_derived_frequency_settings(self) -> "DerivedFrequencySettings":
+        """
+        Inspects self.lm.raw_freq — built purely from the corpus in its
+        natural token order — and derives a small set of recommended
+        engine settings from the *shape* of the frequency distribution:
+        how peaked/flat it is (Shannon entropy), how many hapax legomena
+        there are, etc. Nothing here reorders or rewrites the corpus; it
+        only reads back summary statistics and turns them into sensible
+        defaults for temperature, recency decay, synaptic top-K, and the
+        mechanical-fold baseline frequency.
+        """
+        freqs = list(self.lm.raw_freq.values())
+        V = len(freqs)
+        settings = DerivedFrequencySettings(vocab_size=V)
+        if V == 0:
+            self.derived_freq_settings = settings
+            return settings
+
+        total = sum(freqs)
+        settings.total_tokens = int(total)
+        settings.mean_freq    = total / V
+
+        sorted_freqs = sorted(freqs)
+        mid = V // 2
+        settings.median_freq = (
+            sorted_freqs[mid] if V % 2 == 1
+            else (sorted_freqs[mid - 1] + sorted_freqs[mid]) / 2.0
+        )
+        settings.max_freq    = max(freqs)
+        settings.min_freq    = min(freqs)
+        settings.hapax_ratio = sum(1 for f in freqs if f <= 1.0) / V
+
+        probs = [f / total for f in freqs if f > 0]
+        entropy = -sum(p * math.log2(p) for p in probs) if probs else 0.0
+        settings.freq_entropy = entropy
+        max_entropy = math.log2(V) if V > 1 else 1.0
+        settings.freq_entropy_norm = min(1.0, entropy / max_entropy) if max_entropy > 0 else 0.0
+
+        # A flatter (higher-entropy) frequency distribution suggests a bit
+        # more exploration (higher temperature); a peakier one, less.
+        settings.recommended_temperature = round(0.8 + 1.6 * settings.freq_entropy_norm, 4)
+        # Many hapax legomena means repeats are rare, so instruction
+        # attention should decay more gently over position.
+        settings.recommended_recency_decay = round(0.5 + 0.4 * (1.0 - settings.hapax_ratio), 4)
+        # A flatter distribution can support a wider synaptic top-K.
+        settings.recommended_syn_k = max(4, min(32, int(round(4 + 24 * settings.freq_entropy_norm))))
+        settings.recommended_fold_frequency = round(settings.mean_freq, 4)
+
+        self.derived_freq_settings = settings
+        return settings
+
+    def derived_frequency_report(self) -> str:
+        settings = self.derived_freq_settings or self.generate_derived_frequency_settings()
+        return settings.report()
+
     def train(self, corpus_text: str, build_stage_order: Optional[List[str]] = None):
         print(f"[*-DASP] Tokenizing corpus ({len(corpus_text)} chars)...")
         self.corpus_snippet=corpus_text
         tokens=tokenize(corpus_text)
-        provisional_freq={}
-        for tok in tokens: provisional_freq[tok]=provisional_freq.get(tok,0.0)+1.0
-        provisional_vocab=list(provisional_freq); max_freq=max(provisional_freq.values(),default=1.0); n=len(provisional_vocab)
-        print(f"[*-DASP] Cube prepass registering {n} tokens...")
-        for idx,tok in enumerate(provisional_vocab): self.geo.register(tok,provisional_freq[tok],idx,max_freq,n)
-        pn=4; sector=2.0*math.pi/pn
-        for tok in provisional_vocab:
-            tr=self.geo.triple(tok); self.pdn._orbit_map[tok]=int((tr.theta*2.0)/sector)%pn
-        self.cube_garden=CubeGardenResolver(self.geo,self.pdn,self.cube_chunk_size,self.cube_side)
-        print("[*-DASP] Building deterministic 4-D Cube Garden ordering...")
-        tokens,self.cube_chunks=self.cube_garden.resort(tokens)
-        print(self.cube_garden.report(self.cube_chunks))
         self.lm.ingest(tokens)
         corpus_frequency = float(sum(self.lm.raw_freq.values()))
         self.mechanical_fold.update(corpus_frequency, position=0, total=max(len(tokens), 1))
@@ -3378,7 +3403,7 @@ class V18Engine:
         self.fold_tension = float(self.mechanical_fold.tension)
         self.fold_momentum = float(self.mechanical_fold.momentum)
         all_tokens=list(self.lm.raw_freq.keys()); max_freq=max(self.lm.raw_freq.values(),default=1.0); vocab_size=len(all_tokens)
-        print(f"[*-DASP] Registering {vocab_size} tokens after Cube Garden resort...")
+        print(f"[*-DASP] Registering {vocab_size} tokens...")
         for idx,tok in enumerate(all_tokens): self.geo.register(tok,self.lm.raw_freq[tok],idx,max_freq,vocab_size)
 
         print("[*-DASP] Building GPU Tensor Caches (prerequisite for all stages)...")
@@ -3386,6 +3411,10 @@ class V18Engine:
         self.lm.finalise()
         rho_nonzero=int((self.geo._rho_t>0.01).sum().item()); rho_max=float(self.geo._rho_t.max().item())
         print(f"[Geo-DASP] ρ > 0.01: {rho_nonzero}/{vocab_size}  max ρ = {rho_max:.4f}")
+
+        print("[*-DASP] Generating derived frequency settings...")
+        self.generate_derived_frequency_settings()
+        print(self.derived_frequency_report())
 
         # DOUBLE AGNOSTIC: build stages run in an explicit, caller-supplied
         # order (default: name-sorted) instead of a hard-coded sequence.
@@ -3434,7 +3463,7 @@ class V18Engine:
         self.walker=ThebaultWalker(self.geo,self.kernels,self.lm,self.orbit,self.graph,self.mandate_scorer,self.mrv,self.chunk,self.iso_stacker,self.pdn,self.cot,self.instr_dist,ref_model=self.ref_model,device=self.device,syn_weight=self.syn_weight,trans_weight=self.trans_weight,syn_k=self.syn_k,
             parabolic_manifold_strength=self.parabolic_manifold_strength,
             parabolic_manifold_curvature=self.parabolic_manifold_curvature)
-        print("[+] Training complete. (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR + CUBE GARDEN)")
+        print("[+] Training complete. (V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR)")
 
     def _sync_engine_fold(self) -> None:
         if self.walker is None:
@@ -3479,11 +3508,9 @@ class V18Engine:
                 "cot_stubs"      : self.stub_lib.stubs,
                 "syn_weight"     : self.syn_weight,
                 "trans_weight"   : self.trans_weight,
-                "cube_chunk_size": self.cube_chunk_size,
-                "cube_side"      : self.cube_side,
-                "cube_chunks"    : self.cube_chunks,
                 "syn_k"          : self.syn_k,
                 "build_stage_order": self.build_stage_order,
+                "derived_freq_settings": self.derived_freq_settings,
                 "version"        : "V18-CSNS-G-DASP",
                 "ref_tau_scores"  : (self.ref_model._tau_scores.cpu() if self.ref_model and self.ref_model._tau_scores is not None else None),
                 "ref_D_A_mask"    : (self.ref_model._D_A_mask.cpu() if self.ref_model and self.ref_model._D_A_mask is not None else None),
@@ -3513,10 +3540,15 @@ class V18Engine:
         self.trans_weight       = state.get("trans_weight", 0.6)
         self.syn_k              = state.get("syn_k",        8)
         self.build_stage_order  = state.get("build_stage_order", list(self._DEFAULT_BUILD_ORDER))
+        self.derived_freq_settings = state.get("derived_freq_settings", None)
 
         print("[*-DASP] Rebuilding GPU Tensors (prerequisite)...")
         self.geo.build_cuda_tensors(self.lm.vocab)
         self.lm.finalise()
+
+        if self.derived_freq_settings is None:
+            print("[*-DASP] derived_freq_settings not in cache — recomputing...")
+            self.generate_derived_frequency_settings()
 
         self.ref_model = AtomismReferenceModel(
             geo=self.geo, kernels=self.kernels, device=self.device,
@@ -3539,34 +3571,15 @@ class V18Engine:
             geo=self.geo, kernels=self.kernels, device=self.device,
         )
         self.instr_dist = InstructionDistribution(
-            geo=geo,
-            kernels=kernels,
-            lm=lm,
+            geo=self.geo,
+            kernels=self.kernels,
+            lm=self.lm,
             semantic_radius=2.0,
             recency_decay=0.7,
             context_bonus=0.75,
             centroid_weight=0.8,
         )
-        # Build topic-bigram scorer from your tokenized corpus
-        scorer = TopicBigramScorer(
-            min_count=5,
-            min_doc_count=3,
-            pmi_weight=1.0,
-            idf_weight=1.5,
-            grammar_penalty_weight=1.0,
-            pattern_bonus_weight=0.5,
-        )
 
-        # documents: List[List[str]] of tokenized texts
-        scorer.ingest_documents(documents)
-        scorer.compute_scores()
-
-        # Attach topic-bigram scoring to the instruction distribution
-        attach_topic_bigram_to_instruction_dist(
-            instr_dist,
-            scorer,
-            topic_bigram_weight=1.5,
-        )
         if "cot_stubs" in state:
             self.stub_lib.stubs = state["cot_stubs"]
             self.stub_lib._rebuild_tensors()
@@ -3674,6 +3687,11 @@ class V18GUI:
             return "Engine not initialised."
         return self.engine.mandate_scorer.centroid_report()
 
+    def derived_frequency_report(self):
+        if not self.engine:
+            return "Engine not initialised."
+        return self.engine.derived_frequency_report()
+
     def dnn_report(self):
         lines = [
             "V18-CSNS-G DOUBLE-AGNOSTIC / SOLO-PLANAR — DNN Array + CSNS Report",
@@ -3727,6 +3745,14 @@ class V18GUI:
             "     in `guidance_steps` autograd-ascent updates at learning",
             "     rate `guidance_lr`. This is separate from, and does not",
             "     alter, the fixed heuristic weights used everywhere else.",
+            "",
+            "  5. Cube Garden (deterministic 4-D hash-based corpus reorder)",
+            "     has been REMOVED. In its place, V18Engine now generates",
+            "     Derived Frequency Settings: a small, corpus-driven report",
+            "     (Shannon entropy of the frequency distribution, hapax",
+            "     ratio, etc.) that recommends temperature / recency-decay",
+            "     / synaptic-K / fold-frequency defaults from the corpus's",
+            "     own statistics, without reordering or hashing any tokens.",
             "═══════════════════════════════════════════════════════════════",
         ]
         return "\n".join(lines)
@@ -3739,7 +3765,7 @@ def launch_gui():
         gr.Markdown(
             "# NeuroSymbolic V18-CSNS-G — Double-Agnostic / Solo-Planar Variant\n"
             "### Hard-coded orderings exposed as parameters · Kernel products collapsed onto one plane · "
-            "Thébault Geometry · ACF Spectral · DNN Array · CSNS · Gradient-Guided Decoding"
+            "Thébault Geometry · ACF Spectral · DNN Array · CSNS · Gradient-Guided Decoding · Derived Frequency Settings"
         )
 
         with gr.Tab("Train"):
@@ -3809,6 +3835,10 @@ def launch_gui():
             mandate_out = gr.Textbox(lines=4, label="Semantic Mandate Scorer (DA-SP)", interactive=False)
             mandate_btn.click(gui.mandate_report, outputs=mandate_out)
 
+            freq_btn = gr.Button("Show Derived Frequency Settings")
+            freq_out = gr.Textbox(lines=16, label="Derived Frequency Settings (Corpus-Driven)", interactive=False)
+            freq_btn.click(gui.derived_frequency_report, outputs=freq_out)
+
             cot_hist_btn = gr.Button("Show Full CoT History")
             cot_hist_out = gr.Textbox(lines=20, label="CoT Trace History", interactive=False)
             cot_hist_btn.click(gui.cot_history, outputs=cot_hist_out)
@@ -3826,8 +3856,6 @@ if __name__ == "__main__":
     parser.add_argument("--syn-weight",   type=float, default=2.0)
     parser.add_argument("--trans-weight", type=float, default=0.6)
     parser.add_argument("--syn-k",        type=int,   default=8)
-    parser.add_argument("--cube-chunk-size", type=int, default=128)
-    parser.add_argument("--cube-side",       type=int, default=8)
     parser.add_argument("--guidance-weight", type=float, default=0.3,
                          help="Gradient-guided decoding blend weight (0=off, real backward pass toward instruction centroid)")
     parser.add_argument("--guidance-steps",  type=int,   default=3,
@@ -3857,8 +3885,6 @@ if __name__ == "__main__":
         parabolic_manifold_strength=args.parabolic_manifold_strength,
         parabolic_manifold_curvature=args.parabolic_manifold_curvature,
     )
-    engine.cube_chunk_size=max(1,args.cube_chunk_size)
-    engine.cube_side=max(2,args.cube_side)
     engine.train(corpus_text)
     engine.save_cache("v18_csns_g_dasp_model.pkl")
 
@@ -3885,5 +3911,7 @@ if __name__ == "__main__":
     print(engine.walker.csns_report())
     print("\n--- MANDATE CENTROID ---")
     print(engine.mandate_scorer.centroid_report())
+    print("\n--- DERIVED FREQUENCY SETTINGS ---")
+    print(engine.derived_frequency_report())
     print("\n--- FORMAL REFERENCE MODEL ---")
     print(engine.ref_model.reference_report())
