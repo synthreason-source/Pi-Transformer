@@ -518,7 +518,7 @@ class SparseSymbolManifest:
 # -----------------------------
 
 if __name__ == "__main__":
-    with open("singlekb.txt", "r", encoding="utf-8") as file:
+    with open(input("Filename: "), "r", encoding="utf-8") as file:
         text = file.read()
 
     # Split the file into sentence-like sequences.
@@ -534,7 +534,7 @@ if __name__ == "__main__":
             dataset.append(words)
 
     manifest = SparseSymbolManifest(
-        max_symbols=64000,
+        max_symbols=640,
         max_beams=8,
         max_states=8,
     )
@@ -586,9 +586,9 @@ if __name__ == "__main__":
     print("\nGenerated trigram word sequences")
     print("-" * 90)
 
-    for _ in range(5):
+    for _ in range(50):
         sequence = manifest.generate_sequence_words(
-            max_len=1000,
+            max_len=10000,
             temperature=1.0,
         )
 
