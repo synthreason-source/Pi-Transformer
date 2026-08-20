@@ -534,7 +534,7 @@ if __name__ == "__main__":
             dataset.append(words)
 
     manifest = SparseSymbolManifest(
-        max_symbols=640,
+        max_symbols=640000,
         max_beams=8,
         max_states=8,
     )
