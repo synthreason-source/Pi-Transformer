@@ -5,7 +5,7 @@ from collections import defaultdict, Counter
 from qiskit import QuantumCircuit
 from qiskit.circuit import Parameter
 from qiskit.quantum_info import Statevector, Pauli
-
+KB_LEN = 20000
 # --- 1. QUANTUM FEATURE SEEDER ---
 class QuantumFeatureSeeder(nn.Module):
     def __init__(self, script_lines: list[str], num_qubits: int = 13):
@@ -141,7 +141,7 @@ if __name__ == "__main__":
     # Load dataset corpus
     try:
         with open("singlekb.txt", "r", encoding="utf-8") as file:
-            dataset_corpus = file.read()
+            dataset_corpus = file.read()[:KB_LEN]
     except FileNotFoundError:
         dataset_corpus = "quantum computing and neural networks integration allows hybrid workflow optimization cascades. quantum machines process data using superposition and entanglement principles."
 
