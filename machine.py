@@ -140,7 +140,7 @@ def generate_correlated_text(model, prompt_str, trigrams, bigrams, vocab_to_int,
 if __name__ == "__main__":
     # Load dataset corpus
     try:
-        with open("singlekb.txt", "r", encoding="utf-8") as file:
+        with open("science_corpus.txt", "r", encoding="utf-8") as file:
             dataset_corpus = file.read()[:KB_LEN]
     except FileNotFoundError:
         dataset_corpus = "quantum computing and neural networks integration allows hybrid workflow optimization cascades. quantum machines process data using superposition and entanglement principles."
