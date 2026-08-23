@@ -141,7 +141,7 @@ if __name__ == "__main__":
     # Load dataset corpus
     try:
         with open("singlekb.txt", "r", encoding="utf-8") as file:
-            dataset_corpus = file.read()[:20000]
+            dataset_corpus = file.read()
     except FileNotFoundError:
         dataset_corpus = "quantum computing and neural networks integration allows hybrid workflow optimization cascades. quantum machines process data using superposition and entanglement principles."
 
