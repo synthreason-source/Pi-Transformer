@@ -125,7 +125,7 @@ class SparseSymbolManifest:
             self.total_symbols += 1
 
         for current, nxt in zip(seq, seq[1:]):
-            self.transition_counts[current][nxt] += 1
+            self.transition_counts[current][nxt] += nxt
             self.successors[current].add(nxt)
 
         for i in range(len(seq) - 2):
