@@ -706,22 +706,18 @@ def main():
     )
     while True:
         # --- Step 1: get the top-k topic clusters ---------------------------
-        if args.prompt:
-            clusters = get_topk_prompt_clusters(
-                manifest,
-                input("USER: "),
-                topk=args.topk,
-                assoc_depth=args.assoc_depth,
-                assoc_breadth=args.assoc_breadth,
-            )
-            print(
-                f"Top-{args.topk} clusters found after {args.assoc_depth}-hop "
-                f"association from prompt words: {len(clusters)}"
-            )
-        else:
-            clusters = get_topk_vocabulary_clusters(manifest, topk=args.topk)
-            print(f"Top-{args.topk} clusters found in whole vocabulary: {len(clusters)}")
-
+        clusters = get_topk_prompt_clusters(
+            manifest,
+            input("USER: "),
+            topk=args.topk,
+            assoc_depth=args.assoc_depth,
+            assoc_breadth=args.assoc_breadth,
+        )
+        print(
+            f"Top-{args.topk} clusters found after {args.assoc_depth}-hop "
+            f"association from prompt words: {len(clusters)}"
+        )
+       
         if not clusters:
             print("No usable topic clusters found (none of the words are in the learned vocabulary).")
             return
