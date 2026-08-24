@@ -648,13 +648,7 @@ def main():
         description="Trigram symbol manifest generation sampled through an optical bench."
     )
     parser.add_argument("--file", type=str, required=True, help="Path to a text corpus file.")
-    parser.add_argument(
-        "--prompt",
-        type=str,
-        default=None,
-        help="If given, topic start words are extracted from this prompt's words "
-             "(ranked by learned weight) instead of clustering the whole vocabulary.",
-    )
+   
     parser.add_argument("--max-len", type=int, default=30)
     parser.add_argument(
         "--assoc-depth",
@@ -710,51 +704,50 @@ def main():
         optical_topk=args.optical_topk,
         seed=args.seed,
     )
+    while True:
+        # --- Step 1: get the top-k topic clusters ---------------------------
+        if args.prompt:
+            clusters = get_topk_prompt_clusters(
+                manifest,
+                input("USER: "),
+                topk=args.topk,
+                assoc_depth=args.assoc_depth,
+                assoc_breadth=args.assoc_breadth,
+            )
+            print(
+                f"Top-{args.topk} clusters found after {args.assoc_depth}-hop "
+                f"association from prompt words: {len(clusters)}"
+            )
+        else:
+            clusters = get_topk_vocabulary_clusters(manifest, topk=args.topk)
+            print(f"Top-{args.topk} clusters found in whole vocabulary: {len(clusters)}")
 
-    # --- Step 1: get the top-k topic clusters ---------------------------
-    if args.prompt:
-        clusters = get_topk_prompt_clusters(
-            manifest,
-            args.prompt,
-            topk=args.topk,
-            assoc_depth=args.assoc_depth,
-            assoc_breadth=args.assoc_breadth,
+        if not clusters:
+            print("No usable topic clusters found (none of the words are in the learned vocabulary).")
+            return
+
+        # --- Step 2: explore each top-k cluster ------------------------------
+        print()
+        print("=" * 70)
+        print("OPTICAL-BENCH CLUSTER EXPLORATION")
+        print("=" * 70)
+
+        print()
+
+        exploration = explore_clusters(
+            generator, clusters, max_len=args.max_len, lines_per_cluster=args.lines_per_cluster
         )
-        print(
-            f"Top-{args.topk} clusters found after {args.assoc_depth}-hop "
-            f"association from prompt words: {len(clusters)}"
-        )
-    else:
-        clusters = get_topk_vocabulary_clusters(manifest, topk=args.topk)
-        print(f"Top-{args.topk} clusters found in whole vocabulary: {len(clusters)}")
 
-    if not clusters:
-        print("No usable topic clusters found (none of the words are in the learned vocabulary).")
-        return
+        all_lines: List[List[str]] = []
+        for cluster_num, (cluster, lines) in enumerate(exploration, start=1):
+            for start_word, words in lines:
+                if not words:
+                    continue
+                all_lines.append(words)
 
-    # --- Step 2: explore each top-k cluster ------------------------------
-    print()
-    print("=" * 70)
-    print("OPTICAL-BENCH CLUSTER EXPLORATION")
-    print("=" * 70)
-
-    print()
-
-    exploration = explore_clusters(
-        generator, clusters, max_len=args.max_len, lines_per_cluster=args.lines_per_cluster
-    )
-
-    all_lines: List[List[str]] = []
-    for cluster_num, (cluster, lines) in enumerate(exploration, start=1):
-        for start_word, words in lines:
-            if not words:
-                continue
-            all_lines.append(words)
-
-    # print in reverse order of appearance: last-generated line first
-    for words in reversed(all_lines):
-        print(" ".join(words), end=" ")
-
+        # print in reverse order of appearance: last-generated line first
+        for words in reversed(all_lines):
+            print(" ".join(words), end=" ")
 
 if __name__ == "__main__":
     main()
