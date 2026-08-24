@@ -706,6 +706,8 @@ def main():
     )
     while True:
         # --- Step 1: get the top-k topic clusters ---------------------------
+        print()
+        print()
         clusters = get_topk_prompt_clusters(
             manifest,
             input("USER: "),
