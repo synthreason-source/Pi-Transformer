@@ -704,29 +704,29 @@ def main() -> None:
     if unknown:
         print(f"Unknown prompt words: {unknown}")
     print(f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; fallback={not args.no_fallback}")
-
-    try:
-        words, min_cosine, diagnostics = manifest.generate_from_seed_prompt(
-            seed_prompt=args.prompt,
-            max_new_words=args.new_words,
-            temperature=args.temperature,
-            tau=args.tau,
-            candidate_count=args.candidate_count,
-            stochastic=not args.greedy,
-            preserve_prompt=True,
-            adaptive_tau=not args.no_adaptive_tau,
-            tau_floor=args.tau_floor,
-            tau_step=args.tau_step,
-            fallback_to_unfiltered=not args.no_fallback,
-        )
-    except ValueError as exc:
-        print(f"Generation failed: {exc}")
-        return
-
-    generated_count = sum(1 for row in diagnostics if "next_word" in row)
-    print("\nGenerated text")
-    print("-" * 100)
-    print(" ".join(words))
+    while True:
+        try:
+            words, min_cosine, diagnostics = manifest.generate_from_seed_prompt(
+                seed_prompt=input("USER: "),
+                max_new_words=args.new_words,
+                temperature=args.temperature,
+                tau=args.tau,
+                candidate_count=args.candidate_count,
+                stochastic=not args.greedy,
+                preserve_prompt=True,
+                adaptive_tau=not args.no_adaptive_tau,
+                tau_floor=args.tau_floor,
+                tau_step=args.tau_step,
+                fallback_to_unfiltered=not args.no_fallback,
+            )
+        except ValueError as exc:
+            print(f"Generation failed: {exc}")
+            return
+        
+        generated_count = sum(1 for row in diagnostics if "next_word" in row)
+        print("\nGenerated text")
+        print("-" * 100)
+        print(" ".join(words))
    
 
 if __name__ == "__main__":
