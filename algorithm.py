@@ -110,6 +110,11 @@ class SparseSymbolManifest:
         )
         self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
 
+        # Stem -> set of symbol indices sharing that stem (e.g. "state"/"states").
+        # Populated as words are registered; used to propagate a plural word's
+        # statistics to the rest of its word-family ("set") during processing.
+        self.stem_groups: DefaultDict[str, Set[SymbolIndex]] = defaultdict(set)
+
     # -----------------------------------------------------------------
     # Tokenization, registration, training
     # -----------------------------------------------------------------
@@ -127,6 +132,36 @@ class SparseSymbolManifest:
                 sequences.append(tokens)
         return sequences
 
+    @staticmethod
+    def _stem(word: str) -> str:
+        """Very small heuristic stemmer, just enough to relate a plural to
+        its singular (and other same-stem) forms: states -> state,
+        studies -> study, boxes -> box, glasses -> glass."""
+        w = word.lower()
+        if len(w) > 4 and w.endswith("ies"):
+            return w[:-3] + "y"
+        if len(w) > 4 and w.endswith(("ches", "shes", "xes", "zes", "ses")):
+            return w[:-2]
+        if len(w) > 3 and w.endswith("s") and not w.endswith("ss"):
+            return w[:-1]
+        return w
+
+    @classmethod
+    def _is_plural(cls, word: str) -> bool:
+        w = word.lower()
+        special = {cls.START_TOKEN.lower(), cls.END_TOKEN.lower()}
+        if w in special:
+            return False
+        return cls._stem(w) != w
+
+    def _stem_family(self, idx: SymbolIndex) -> Set[SymbolIndex]:
+        """All other currently-known symbol indices sharing idx's stem."""
+        word = self.index_to_word.get(idx)
+        if word is None:
+            return set()
+        stem = self._stem(word)
+        return self.stem_groups.get(stem, set()) - {idx}
+
     def _ensure_entry(self, idx: SymbolIndex) -> None:
         if idx not in self.entries:
             self.entries[idx] = SymbolManifestEntry()
@@ -141,6 +176,8 @@ class SparseSymbolManifest:
         self.word_to_index[word] = idx
         self.index_to_word[idx] = word
         self._ensure_entry(idx)
+        if word not in (self.START_TOKEN, self.END_TOKEN):
+            self.stem_groups[self._stem(word)].add(idx)
         return idx
 
     def add_sequence_words(self, words: List[str]) -> List[SymbolIndex]:
@@ -155,15 +192,50 @@ class SparseSymbolManifest:
         for idx in sequence:
             self.symbol_counts[idx] += 1
             self.total_symbols += 1
+            # Whenever a plural is encountered, the rest of its stem-family
+            # ("set") is pulled into processing too, so e.g. "state" gains
+            # unigram density whenever "states" is seen in the corpus.
+            word = self.index_to_word[idx]
+            if self._is_plural(word):
+                for related_idx in self._stem_family(idx):
+                    self.symbol_counts[related_idx] += 1
+                    self.total_symbols += 1
 
         for current_idx, next_idx in zip(sequence, sequence[1:]):
             self.transition_counts[current_idx][next_idx] += 1
             self.successors[current_idx].add(next_idx)
 
+            current_word = self.index_to_word[current_idx]
+            if self._is_plural(current_word):
+                for related_idx in self._stem_family(current_idx):
+                    self.transition_counts[related_idx][next_idx] += 1
+                    self.successors[related_idx].add(next_idx)
+
         for position in range(len(sequence) - 2):
-            self.trigram_counts[(sequence[position], sequence[position + 1])][
-                sequence[position + 2]
-            ] += 1
+            previous_idx, current_idx, target_idx = (
+                sequence[position],
+                sequence[position + 1],
+                sequence[position + 2],
+            )
+            self.trigram_counts[(previous_idx, current_idx)][target_idx] += 1
+
+            # Propagate the trigram observation across whichever context
+            # position(s) are plural, so their stem-siblings see the same
+            # continuation statistics.
+            previous_word = self.index_to_word[previous_idx]
+            current_word = self.index_to_word[current_idx]
+            previous_family = (
+                self._stem_family(previous_idx) if self._is_plural(previous_word) else set()
+            )
+            current_family = (
+                self._stem_family(current_idx) if self._is_plural(current_word) else set()
+            )
+
+            for related_previous in previous_family or {previous_idx}:
+                for related_current in current_family or {current_idx}:
+                    if related_previous == previous_idx and related_current == current_idx:
+                        continue
+                    self.trigram_counts[(related_previous, related_current)][target_idx] += 1
         return sequence
 
     def ingest_dataset_words(self, sequences: Iterable[List[str]]) -> None:
