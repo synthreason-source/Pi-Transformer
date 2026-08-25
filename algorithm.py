@@ -623,24 +623,9 @@ class SparseSymbolManifest:
 
 
 def get_corpus(path: Optional[str]) -> str:
-    if path:
-        with open(path, "r", encoding="utf-8") as file:
-            return file.read()
-    if os.path.exists("singlekb.txt"):
-        with open("singlekb.txt", "r", encoding="utf-8") as file:
-            return file.read()
-    return (
-        "adiabatic dark state transfer moves population between quantum sites. "
-        "adiabatic dark state transfer protects coherence from a lossy middle site. "
-        "quantum computing processes information through coherent quantum states. "
-        "quantum computing uses superposition to process information. "
-        "neural networks learn patterns from data through optimization. "
-        "neural networks optimize parameters using gradient descent. "
-        "the quick brown fox jumps over the lazy dog. "
-        "the quick brown fox runs past the lazy cat."
-    )
-
-
+    with open(input("Filename: "), "r", encoding="utf-8") as file:
+        return file.read()
+   
 def print_diagnostics(rows: List[Dict[str, object]]) -> None:
     print("\nStep diagnostics")
     print("-" * 100)
