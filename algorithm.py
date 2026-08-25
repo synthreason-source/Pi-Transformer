@@ -43,7 +43,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-KB_LEN = -1
+KB_LEN = 30000
 MAX_SEED_WORDS = 12          # how many recent words form the adiabatic chain
 STEPS_PER_LEG = 10           # RK4 steps per half-leg (forward or backward)
 
