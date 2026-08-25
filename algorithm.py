@@ -116,7 +116,7 @@ class SparseSymbolManifest:
 
     @staticmethod
     def tokenize(text: str) -> List[str]:
-        return re.findall(r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", text.lower())
+        return text.lower().split()
 
     @classmethod
     def split_sentences(cls, text: str) -> List[List[str]]:
@@ -665,10 +665,10 @@ def main() -> None:
     parser.add_argument("--load", help="Load manifest JSON")
     parser.add_argument("--save", help="Save manifest JSON")
     parser.add_argument("--prompt", default="adiabatic dark state", help="Seed prompt")
-    parser.add_argument("--new-words", type=int, default=30)
+    parser.add_argument("--new-words", type=int, default=300)
     parser.add_argument("--tau", type=float, default=0.60, help="Requested cosine lower bound")
     parser.add_argument("--tau-floor", type=float, default=0.05, help="Adaptive minimum cosine lower bound")
-    parser.add_argument("--tau-step", type=float, default=0.05, help="Adaptive tau decrement")
+    parser.add_argument("--tau-step", type=float, default=0.65, help="Adaptive tau decrement")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--candidate-count", type=int, default=32)
     parser.add_argument("--greedy", action="store_true")
