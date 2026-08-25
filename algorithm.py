@@ -35,7 +35,6 @@ feedback path.
 """
 
 from __future__ import annotations
-import hashlib
 import math
 from collections import defaultdict, Counter
 
@@ -52,23 +51,64 @@ STEPS_PER_LEG = 10           # RK4 steps per half-leg (forward or backward)
 # 1. WORD -> PULSE PARAMETERS
 # ════════════════════════════════════════════════════════════════════════
 
-def word_to_pulse_params(word: str) -> tuple[float, float, float, float, float]:
+_GOLDEN = 0.6180339887498949  # golden-ratio conjugate: spreads small integers evenly over [0, 1)
+
+
+def _spread(h: float, salt: float) -> float:
+    """Map h deterministically into [0, 1) via golden-ratio multiplicative
+    spreading. A different `salt` per call decorrelates the several
+    parameters drawn from the same underlying h."""
+    return math.modf((h + salt) * _GOLDEN)[0]
+
+
+def word_to_pulse_params(word: str, trigram_freq: int = 0) -> tuple[float, float, float, float, float]:
     """
-    Deterministically hash a word into one round-trip leg's parameters:
+    Deterministically turn a word into one round-trip leg's parameters:
     (T, TR, TL, J0, sigma), with TR < TL always preserved so every leg
     keeps the paper's counter-intuitive pulse order (JR peaks first).
+
+    No hashing here -- `h` is built directly from the word's own
+    per-character frequencies (each distinct character's code point,
+    weighted by how many times that character appears in the word,
+    summed together), then scaled by `trigram_freq`: how many times
+    this word shows up across the corpus's trigrams (as w1, w2, or w3).
+    A word that appears often in the trigram statistics gets a
+    proportionally larger combined feature -- its pulse legs are shaped
+    by its corpus-level frequency, not just its own spelling. Words with
+    no trigram frequency (unseen during training, e.g. in a fresh
+    prompt) fall back to the character-only feature, since the scaling
+    factor is `(1 + trigram_freq)`.
     """
     cleaned = word.lower().strip(".,!?;:\"'()[]{}") or "_"
-    h = int(hashlib.md5(cleaned.encode("utf-8")).hexdigest(), 16)
+    char_freqs = Counter(cleaned)  # frequency of each character in the word
+    h_char = sum(ord(ch) * count for ch, count in char_freqs.items())
+    h = h_char * (1 + max(0, trigram_freq))
 
-    T      = 10.0 + (h % 1000) / 1000.0 * 10.0                       # T in [10, 20]
-    frac_r = 0.20 + ((h // 1_000)       % 100) / 100.0 * 0.30         # TR/T in [0.20, 0.50]
-    frac_l = 0.55 + ((h // 100_000)     % 100) / 100.0 * 0.30         # TL/T in [0.55, 0.85]
-    J0     = 4.0  + ((h // 10_000_000)  % 100) / 100.0 * 4.0          # J0 in [4, 8]
-    sig_f  = 0.12 + ((h // 1_000_000_000) % 100) / 100.0 * 0.08       # sigma/T in [0.12, 0.20]
+    T      = 10.0 + _spread(h, 0.0) * 10.0   # T in [10, 20]
+    frac_r = 0.20 + _spread(h, 1.0) * 0.30   # TR/T in [0.20, 0.50]
+    frac_l = 0.55 + _spread(h, 2.0) * 0.30   # TL/T in [0.55, 0.85]
+    J0     = 4.0  + _spread(h, 3.0) * 4.0    # J0 in [4, 8]
+    sig_f  = 0.12 + _spread(h, 4.0) * 0.08   # sigma/T in [0.12, 0.20]
 
     TR, TL, sigma = frac_r * T, frac_l * T, sig_f * T
     return T, TR, TL, J0, sigma
+
+
+def build_trigram_word_freq(trigrams: dict) -> dict[str, int]:
+    """
+    Aggregate a per-word frequency count directly from the trigram
+    dictionary: for every ((w1, w2) -> Counter({w3: count})) entry, w1,
+    w2, and w3 each accumulate `count`. This is the "per trigram word
+    freq" feature -- how often a word participates in the corpus's
+    trigrams -- independent of the word's own spelling.
+    """
+    freq: dict[str, int] = defaultdict(int)
+    for (w1, w2), followers in trigrams.items():
+        for w3, count in followers.items():
+            freq[w1] += count
+            freq[w2] += count
+            freq[w3] += count
+    return dict(freq)
 
 
 # ════════════════════════════════════════════════════════════════════════
@@ -82,14 +122,20 @@ class AdiabaticFeatureSeeder(nn.Module):
     differentiable (complex-valued autograd) w.r.t. `adiabatic_weight`.
     """
 
-    def __init__(self, seed_words: list[str], steps_per_leg: int = STEPS_PER_LEG):
+    def __init__(self, seed_words: list[str], steps_per_leg: int = STEPS_PER_LEG,
+                 trigram_word_freq: dict[str, int] | None = None):
         super().__init__()
         self.steps_per_leg = steps_per_leg
         # Trainable global coupling-strength modulation -- the analogue of
         # the previous quantum_weight, learned end-to-end with the LSTM.
         self.adiabatic_weight = nn.Parameter(torch.tensor(0.0, dtype=torch.float32))
+        self.trigram_word_freq: dict[str, int] = trigram_word_freq or {}
         self.seed_words: list[str] = []
         self.update_words(seed_words)
+
+    def set_trigram_freq(self, trigram_word_freq: dict[str, int]) -> None:
+        """Install the corpus-wide per-word trigram frequency table."""
+        self.trigram_word_freq = trigram_word_freq or {}
 
     def update_words(self, seed_words: list[str]) -> None:
         """Feed the seeder off whatever text has been generated so far."""
@@ -154,7 +200,9 @@ class AdiabaticFeatureSeeder(nn.Module):
             return populations.to(torch.float32)
 
         for word in self.seed_words:
-            T, TR, TL, J0_base, sigma = word_to_pulse_params(word)
+            cleaned = word.lower().strip(".,!?;:\"'()[]{}") or "_"
+            freq = self.trigram_word_freq.get(cleaned, 0)
+            T, TR, TL, J0_base, sigma = word_to_pulse_params(word, trigram_freq=freq)
             J0 = torch.as_tensor(J0_base, dtype=torch.float32) * factor
             psi = self.evolve_leg(psi, T, TR, TL, J0, sigma)
 
@@ -167,13 +215,17 @@ class AdiabaticFeatureSeeder(nn.Module):
 # ════════════════════════════════════════════════════════════════════════
 
 class AdiabaticCorrelatedTextGenerator(nn.Module):
-    def __init__(self, seed_words: list[str], vocab_size: int, embed_dim: int, hidden_dim: int):
+    def __init__(self, seed_words: list[str], vocab_size: int, embed_dim: int, hidden_dim: int,
+                 trigram_word_freq: dict[str, int] | None = None):
         super().__init__()
-        self.adiabatic_seeder = AdiabaticFeatureSeeder(seed_words)
+        self.adiabatic_seeder = AdiabaticFeatureSeeder(seed_words, trigram_word_freq=trigram_word_freq)
 
         self.embedding = nn.Embedding(vocab_size, embed_dim)
         self.lstm = nn.LSTM(embed_dim + 3, hidden_dim, batch_first=True)  # +3 = P0,P1,P2
         self.fc = nn.Linear(hidden_dim, vocab_size)
+
+    def set_trigram_freq(self, trigram_word_freq: dict[str, int]) -> None:
+        self.adiabatic_seeder.set_trigram_freq(trigram_word_freq)
 
     def refresh_seeder(self, words: list[str]) -> None:
         """Feed the adiabatic chain the words generated so far, without
@@ -281,6 +333,7 @@ if __name__ == "__main__":
     int_to_vocab = {i: word for i, word in enumerate(vocab)}
 
     trigrams, bigrams = build_correlation_matrix(words)
+    trigram_word_freq = build_trigram_word_freq(trigrams)
 
     seq_length = 8
     inputs, targets = [], []
@@ -295,7 +348,8 @@ if __name__ == "__main__":
 
     initial_seed_words = words[:MAX_SEED_WORDS]
 
-    model = AdiabaticCorrelatedTextGenerator(initial_seed_words, vocab_size, embed_dim=32, hidden_dim=64)
+    model = AdiabaticCorrelatedTextGenerator(initial_seed_words, vocab_size, embed_dim=32, hidden_dim=64,
+                                              trigram_word_freq=trigram_word_freq)
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()
 
