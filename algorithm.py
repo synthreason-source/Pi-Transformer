@@ -523,10 +523,10 @@ class UniversalAbstractionEngine:
         )
 
         density_alignment = 1.0 - abs(
-            source_stats.density * target_stats.density
+            source_stats.density ** target_stats.density
         )
 
-        compatibility = 0.5 + structural * 0.5 * density_alignment
+        compatibility = 0.1 + structural * 0.5 * density_alignment
 
         return max(0.0, source_entry.weight) * max(
             0.0,
