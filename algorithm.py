@@ -14,6 +14,14 @@ Influence workflow:
     retain     : c_ij >= tau
     Y          : retained influence space
 
+Feature families (used for cosine similarity and can be selectively
+zeroed out via `exclude_family`):
+    intrinsic    : indices 0-4  (density, relation, coherence, volatility, depth)
+    beam_state   : indices 5-7  (beam affinity, beam id, markov state id)
+    frequency    : index 8      (max-normalized raw symbol count -- NEW dimension)
+    transitions  : indices 9..9+N (per-symbol transition-probability block)
+    lexical      : indices >= 100000 (character n-gram hash buckets)
+
 Prompt generation recovery path:
     exact trigram -> bigram -> merged compatible trigrams -> unigram
     -> adaptive cosine threshold relaxation -> optional unfiltered fallback
@@ -27,6 +35,10 @@ Examples:
 
     python robust_sparse_symbol_manifest.py --load manifest.json \
       --prompt "neural networks" --tau 0.50 --greedy
+
+    # Ignore the lexical (character n-gram) feature family when scoring:
+    python robust_sparse_symbol_manifest.py --input corpus.txt \
+      --prompt "quantum computing" --exclude-family lexical
 """
 
 from __future__ import annotations
@@ -45,6 +57,17 @@ from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 SymbolIndex = int
 SparseVector = Dict[int, float]
 Context = Tuple[SymbolIndex, SymbolIndex]
+
+# Feature family layout for the sparse influence vector. `transitions` and
+# `lexical` are open-ended ranges handled separately in `_zero_family`.
+FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
+    "intrinsic": (0, 4),
+    "beam_state": (5, 7),
+    "frequency": (8, 8),
+}
+TRANSITIONS_OFFSET = 9
+LEXICAL_OFFSET = 100000
+VALID_FAMILIES = ("intrinsic", "beam_state", "frequency", "transitions", "lexical")
 
 
 @dataclass
@@ -73,12 +96,13 @@ class SymbolManifestEntry:
     beam: SymbolBeam = field(default_factory=SymbolBeam)
     markov: MarkovState = field(default_factory=MarkovState)
     weight: float = 1.0
+    raw_count: int = 0
 
 
 class SparseSymbolManifest:
     START_TOKEN = "<START>"
     END_TOKEN = "<END>"
-    VERSION = 2
+    VERSION = 3
 
     def __init__(
         self,
@@ -109,6 +133,10 @@ class SparseSymbolManifest:
             defaultdict(lambda: defaultdict(int))
         )
         self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
+
+        # Tracks the highest raw symbol_counts value seen, used to
+        # max-normalize the new standalone `frequency` dimension.
+        self._max_symbol_count: int = 0
 
     # -----------------------------------------------------------------
     # Tokenization, registration, training
@@ -155,6 +183,8 @@ class SparseSymbolManifest:
         for idx in sequence:
             self.symbol_counts[idx] += 1
             self.total_symbols += 1
+            if self.symbol_counts[idx] > self._max_symbol_count:
+                self._max_symbol_count = self.symbol_counts[idx]
 
         for current_idx, next_idx in zip(sequence, sequence[1:]):
             self.transition_counts[current_idx][next_idx] += 1
@@ -211,6 +241,7 @@ class SparseSymbolManifest:
 
         for idx, entry in self.entries.items():
             entry.intrinsic.density = self.symbol_counts[idx] / self.total_symbols
+            entry.raw_count = self.symbol_counts[idx]
             out_degree = len(self.successors[idx])
             entry.intrinsic.relation = out_degree / max_degree
             entry.intrinsic.volatility = out_degree / max_degree
@@ -271,7 +302,14 @@ class SparseSymbolManifest:
         return {key: value / norm for key, value in vector.items()}
 
     @staticmethod
-    def cosine_similarity(vec_a: SparseVector, vec_b: SparseVector) -> float:
+    def cosine_similarity(
+        vec_a: SparseVector,
+        vec_b: SparseVector,
+        exclude_family: Optional[str] = None,
+    ) -> float:
+        if exclude_family:
+            vec_a = SparseSymbolManifest._zero_family(vec_a, exclude_family)
+            vec_b = SparseSymbolManifest._zero_family(vec_b, exclude_family)
         if not vec_a or not vec_b:
             return 0.0
         if len(vec_a) > len(vec_b):
@@ -280,6 +318,34 @@ class SparseSymbolManifest:
         norm_a = math.sqrt(sum(value * value for value in vec_a.values()))
         norm_b = math.sqrt(sum(value * value for value in vec_b.values()))
         return dot / (norm_a * norm_b) if norm_a and norm_b else 0.0
+
+    @staticmethod
+    def _zero_family(vector: SparseVector, family: str) -> SparseVector:
+        """Return a copy of `vector` with one feature family's dimensions zeroed.
+
+        `family` must be one of VALID_FAMILIES. `transitions` and `lexical`
+        are open-ended ranges (per-vocabulary and per-hash-bucket
+        respectively), so they're matched by offset rather than a fixed
+        (start, end) pair.
+        """
+        if family not in VALID_FAMILIES:
+            raise ValueError(f"Unknown feature family: {family!r}. Valid: {VALID_FAMILIES}")
+
+        if family in FEATURE_FAMILY_RANGES:
+            start, end = FEATURE_FAMILY_RANGES[family]
+            return {key: value for key, value in vector.items() if not (start <= key <= end)}
+
+        if family == "transitions":
+            return {
+                key: value
+                for key, value in vector.items()
+                if not (TRANSITIONS_OFFSET <= key < LEXICAL_OFFSET)
+            }
+
+        if family == "lexical":
+            return {key: value for key, value in vector.items() if key < LEXICAL_OFFSET}
+
+        return dict(vector)
 
     def _lexical_vector(self, word: str) -> SparseVector:
         vector: DefaultDict[int, float] = defaultdict(float)
@@ -291,13 +357,23 @@ class SparseSymbolManifest:
                     hashlib.blake2b(gram, digest_size=8).digest(),
                     "big",
                 ) % 8192
-                vector[100000 + bucket] += 1.0
+                vector[LEXICAL_OFFSET + bucket] += 1.0
         return self._normalize(dict(vector))
 
-    def influence_vector(self, idx: SymbolIndex) -> SparseVector:
+    def influence_vector(
+        self,
+        idx: SymbolIndex,
+        exclude_family: Optional[str] = None,
+    ) -> SparseVector:
         entry = self.entries.get(idx)
         if entry is None:
             return {}
+
+        # frequency: max-normalized raw symbol count. This is a NEW,
+        # standalone dimension distinct from `density` (index 0), which is
+        # normalized against total_symbols rather than the single most
+        # frequent symbol.
+        frequency = entry.raw_count / self._max_symbol_count if self._max_symbol_count else 0.0
 
         vector: SparseVector = {
             0: entry.intrinsic.density,
@@ -308,13 +384,17 @@ class SparseSymbolManifest:
             5: entry.beam.affinity,
             6: entry.beam.beam_id / max(1, self.max_beams - 1),
             7: entry.markov.state_id / max(1, self.max_states - 1),
+            8: frequency,
         }
 
         for next_idx, probability in self.transition_probs.get(idx, {}).items():
-            vector[8 + next_idx] = probability
+            vector[TRANSITIONS_OFFSET + next_idx] = probability
 
         for feature, value in self._lexical_vector(self.index_to_word[idx]).items():
             vector[feature] = vector.get(feature, 0.0) + value
+
+        if exclude_family:
+            vector = self._zero_family(vector, exclude_family)
 
         return self._normalize(vector)
 
@@ -341,10 +421,14 @@ class SparseSymbolManifest:
         special = {self.START_TOKEN, self.END_TOKEN}
         return [idx for idx, word in self.index_to_word.items() if word not in special]
 
-    def influence_matrix(self, tau: float = 0.60) -> Dict[str, object]:
+    def influence_matrix(
+        self,
+        tau: float = 0.60,
+        exclude_family: Optional[str] = None,
+    ) -> Dict[str, object]:
         tau = max(-1.0, min(1.0, float(tau)))
         indices = self.content_indices()
-        vectors = {idx: self.influence_vector(idx) for idx in indices}
+        vectors = {idx: self.influence_vector(idx, exclude_family=exclude_family) for idx in indices}
         rows: List[Dict[str, object]] = []
 
         for source in indices:
@@ -366,6 +450,7 @@ class SparseSymbolManifest:
         kept.sort(key=lambda row: (float(row["cosine_similarity"]), float(row["influence_score"])), reverse=True)
         return {
             "tau": tau,
+            "exclude_family": exclude_family,
             "domain_size": len(indices) * len(indices),
             "rows": rows,
             "kept_rows": kept,
@@ -451,8 +536,15 @@ class SparseSymbolManifest:
         tau_floor: float = 0.05,
         tau_step: float = 0.05,
         fallback_to_unfiltered: bool = True,
+        exclude_family: Optional[str] = None,
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
-        """Generate a continuation, preventing zero-token failures via backoff."""
+        """Generate a continuation, preventing zero-token failures via backoff.
+
+        `exclude_family`, if given, zeroes one feature family (see
+        VALID_FAMILIES) out of every influence vector used for cosine
+        similarity during candidate scoring -- e.g. pass "lexical" to
+        make the generator ignore character n-gram similarity entirely.
+        """
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
             raise ValueError(
@@ -493,12 +585,15 @@ class SparseSymbolManifest:
                 })
                 break
 
-            source_vector = self.influence_vector(current_idx)
+            source_vector = self.influence_vector(current_idx, exclude_family=exclude_family)
             candidates: List[Tuple[float, float, float, float, SymbolIndex]] = []
             ranked = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:max(1, candidate_count)]
 
             for next_idx, probability in ranked:
-                cosine = self.cosine_similarity(source_vector, self.influence_vector(next_idx))
+                cosine = self.cosine_similarity(
+                    source_vector,
+                    self.influence_vector(next_idx, exclude_family=exclude_family),
+                )
                 influence = self.influence_score(current_idx, next_idx)
                 combined = 0.45 * cosine + 0.35 * influence + 0.20 * probability
                 candidates.append((combined, cosine, influence, probability, next_idx))
@@ -553,6 +648,7 @@ class SparseSymbolManifest:
                 "combined_score": combined,
                 "passed_cosine_filter": not used_fallback,
                 "used_unfiltered_fallback": used_fallback,
+                "exclude_family": exclude_family,
             })
             previous_idx, current_idx = current_idx, next_idx
 
@@ -606,6 +702,7 @@ class SparseSymbolManifest:
             {int(index): int(count) for index, count in state["symbol_counts"].items()},
         )
         manifest.total_symbols = sum(manifest.symbol_counts.values())
+        manifest._max_symbol_count = max(manifest.symbol_counts.values(), default=0)
 
         for source, targets in state["transition_counts"].items():
             for target, count in targets.items():
@@ -625,7 +722,7 @@ class SparseSymbolManifest:
 def get_corpus(path: Optional[str]) -> str:
     with open(input("Filename: "), "r", encoding="utf-8") as file:
         return file.read()
-   
+
 def print_diagnostics(rows: List[Dict[str, object]]) -> None:
     print("\nStep diagnostics")
     print("-" * 100)
@@ -661,6 +758,12 @@ def main() -> None:
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--show-mapping", type=int, default=10)
     parser.add_argument("--seed", type=int)
+    parser.add_argument(
+        "--exclude-family",
+        choices=VALID_FAMILIES,
+        default=None,
+        help="Zero out one feature family (intrinsic, beam_state, frequency, transitions, lexical) before cosine scoring",
+    )
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -689,6 +792,8 @@ def main() -> None:
     if unknown:
         print(f"Unknown prompt words: {unknown}")
     print(f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; fallback={not args.no_fallback}")
+    if args.exclude_family:
+        print(f"Excluding feature family from cosine scoring: {args.exclude_family}")
     while True:
         try:
             words, min_cosine, diagnostics = manifest.generate_from_seed_prompt(
@@ -703,16 +808,17 @@ def main() -> None:
                 tau_floor=args.tau_floor,
                 tau_step=args.tau_step,
                 fallback_to_unfiltered=not args.no_fallback,
+                exclude_family=args.exclude_family,
             )
         except ValueError as exc:
             print(f"Generation failed: {exc}")
             return
-        
+
         generated_count = sum(1 for row in diagnostics if "next_word" in row)
         print("\nGenerated text")
         print("-" * 100)
         print(" ".join(words))
-   
+
 
 if __name__ == "__main__":
     main()
