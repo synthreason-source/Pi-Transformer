@@ -761,7 +761,7 @@ def main() -> None:
     parser.add_argument(
         "--exclude-family",
         choices=VALID_FAMILIES,
-        default=None,
+        default="frequency",
         help="Zero out one feature family (intrinsic, beam_state, frequency, transitions, lexical) before cosine scoring",
     )
     args = parser.parse_args()
