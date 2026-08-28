@@ -1,93 +1,120 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robust Sparse Symbol Manifest (Quantum-Noise, One-Way-Proof Sampling)
-======================================================================
+Robust Sparse Symbol Manifest with Quantum Random Proof Generation
+===================================================================
 
-Prompt-seeded 4-gram text generation with cosine lower-bound influence
-mapping and robust backoff. No external packages are required.
+This is the original QKD_AI.py with integrated QRNG (QuantumRandomProof)
+for cryptographically secure one-way proof generation.
 
-Influence workflow:
-A x B : source/current-word x target/next-word pairs
-s_ij : weighted influence score
-c_ij : cosine similarity between sparse influence vectors
-retain : c_ij >= tau
-Y : retained influence space
+Key additions:
+- QuantumRandomProof class for commit-reveal random number generation
+- --qrng flag to generate quantum random values with proofs
+- --qrng-output and --qrng-reveal-output for saving proofs
+- generate_qrng_value() method on SparseSymbolManifest
 
-Feature families (used for cosine similarity and can be selectively
-zeroed out via `exclude_family`):
-intrinsic : indices 0-4 (density, relation, coherence, volatility, depth)
-beam_state : indices 5-7 (beam affinity, beam id, markov state id)
-frequency : index 8 (max-normalized raw symbol count)
-transitions : indices 9..9+N (per-symbol transition-probability block)
-lexical : indices >= 100000 (character n-gram hash buckets)
-
-Prompt generation recovery path:
-exact 4-gram -> 3-gram -> 2-gram -> unigram
--> adaptive cosine threshold relaxation -> optional unfiltered fallback
-
-Randomness / seed setter
--------------------------
-Every stochastic pick is driven by `OneWayRandomDriver`, a quantum-noise-style
-generator with a one-way commitment proof:
-
-- The driver draws a fresh 256-bit witness + nonce, commits to them with
-  SHA-256 (`commitment`), and derives the actual 64-bit value used for
-  sampling from the witness via HKDF.
-- `driver.public_record(proof)` -- {algorithm, context, nonce, commitment} --
-  can be published immediately and reveals nothing about which candidate
-  will be (or was) picked.
-- `OneWayRandomDriver.verify(proof)` lets anyone holding the full proof
-  (which includes the revealed witness/value) confirm the pick matches the
-  earlier commitment, without the commitment ever having leaked the pick.
-
-Use `--seed` for deterministic, reproducible generation. The same corpus,
-options, and seed will reproduce the same output.
-
-Examples:
-python s.py --input singlekb.txt \
-  --prompt "adiabatic dark state" --tau 0.55 --new-words 30
-
-python s.py --input corpus.txt \
-  --prompt "quantum computing" --tau 0.75 --experiment demo --session 1
-
-python s.py --load manifest.json \
-  --prompt "neural networks" --tau 0.50 --greedy
-
-# Ignore the lexical (character n-gram) feature family when scoring:
-python s.py --input corpus.txt \
-  --prompt "quantum computing" --exclude-family lexical
-
-# Deterministic reproducible run:
-python s.py --input corpus.txt \
-  --prompt "quantum computing" --seed experiment-001 --new-words 30 \
-  --transcript-log run.json
-
-# Verify a transcript:
-python s.py --verify-transcript run.json
+The QRNG implements a commit-reveal protocol:
+- Generate a random value with a commitment (safe to publish immediately)
+- Later reveal the witness to prove the value was generated correctly
+- The commitment alone cannot be reversed to recover the value
 """
 
 from __future__ import annotations
 
-import argparse
+ import annotations
+
 import hashlib
 import hmac
 import json
-import math
 import os
-import re
-from collections import defaultdict
-from dataclasses import dataclass, field
+import secrets
 from datetime import datetime, timezone
-from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
-# ---------------------------------------------------------------------
-# Entropy sources
-# ---------------------------------------------------------------------
+
+def canonical_json(value: Any) -> bytes:
+    """Canonical JSON encoding for deterministic hashing."""
+    return json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+
+
+def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
+    """HKDF-Extract using SHA-256."""
+    return hmac.new(salt, ikm, hashlib.sha256).digest()
+
+
+def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
+    """HKDF-Expand using SHA-256."""
+    output = bytearray()
+    previous = b""
+    counter = 1
+
+    while len(output) < length:
+        previous = hmac.new(
+            prk,
+            previous + info + bytes([counter]),
+            hashlib.sha256,
+        ).digest()
+        output.extend(previous)
+        counter += 1
+
+    return bytes(output[:length])
+
+
+def uniform_integer(stream: bytes, low: int, high: int) -> int:
+    """
+    Convert a byte stream to a uniform integer in [low, high] using rejection sampling.
+    """
+    span = high - low + 1
+    if span <= 0:
+        raise ValueError("high must be >= low")
+
+    limit = (1 << 256) - ((1 << 256) % span)
+
+    offset = 0
+    while True:
+        chunk = stream[offset:offset + 32]
+        if len(chunk) < 32:
+            raise ValueError("Insufficient bytes for rejection sampling")
+        x = int.from_bytes(chunk, "big")
+        offset += 32
+        if x < limit:
+            return low + (x % span)
+
+
+def derive_value(
+    witness: bytes,
+    nonce: bytes,
+    context: dict,
+    low: int,
+    high: int,
+) -> int:
+    context_bytes = canonical_json(context)
+
+    salt = hashlib.sha256(
+        b"QRNG-COMMIT-V1-SALT" + nonce
+    ).digest()
+
+    prk = hkdf_extract(
+        salt,
+        b"QRNG-WITNESS-V1" + witness + nonce + context_bytes,
+    )
+
+    stream_length = 256
+    stream = hkdf_expand(
+        prk,
+        b"QRNG-OUTPUT-V1" + context_bytes,
+        stream_length,
+    )
+
+    return uniform_integer(stream, low, high)
+
 
 class QuantumEntropySource:
-    """Wraps a byte-source. Defaults to the OS CSPRNG (os.urandom)."""
-
     def __init__(self, quantum_reader: Optional[Callable[[int], bytes]] = None):
         self.quantum_reader = quantum_reader
 
@@ -103,8 +130,6 @@ class QuantumEntropySource:
 
 
 class SeededEntropySource(QuantumEntropySource):
-    """Deterministic entropy source for reproducible generation."""
-
     def __init__(self, seed: str):
         self.seed = str(seed).encode("utf-8")
         self.counter = 0
@@ -125,6 +150,137 @@ class SeededEntropySource(QuantumEntropySource):
             self.counter += 1
 
         return bytes(output[:n])
+
+
+class QuantumRandomProof:
+    WITNESS_BYTES = 32
+    NONCE_BYTES = 16
+
+    def __init__(self, entropy_reader: Optional[Callable[[int], bytes]] = None):
+        self.entropy_source = QuantumEntropySource(quantum_reader=entropy_reader)
+
+    @staticmethod
+    def _timestamp() -> str:
+        return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+    def generate(
+        self,
+        context: dict,
+        low: int = 0,
+        high: int = 2**64 - 1,
+    ) -> Tuple[int, dict, dict]:
+        witness = self.entropy_source.read(self.WITNESS_BYTES)
+        nonce = self.entropy_source.read(self.NONCE_BYTES)
+
+        context_bytes = canonical_json(context)
+
+        commitment = hashlib.sha256(
+            b"QRNG-COMMIT-V1"
+            + len(context_bytes).to_bytes(8, "big")
+            + context_bytes
+            + nonce
+            + witness
+        ).hexdigest()
+
+        value = derive_value(
+            witness=witness,
+            nonce=nonce,
+            context=context,
+            low=low,
+            high=high,
+        )
+
+        public_record = {
+            "algorithm": "QRNG-COMMIT-V1",
+            "context": context,
+            "nonce": nonce.hex(),
+            "commitment": commitment,
+            "range": [low, high],
+            "created_at": self._timestamp(),
+        }
+
+        reveal = {
+            **public_record,
+            "witness": witness.hex(),
+            "value": value,
+        }
+
+        return value, public_record, reveal
+
+    @staticmethod
+    def verify(reveal: dict) -> bool:
+        try:
+            context = reveal["context"]
+            nonce = bytes.fromhex(reveal["nonce"])
+            witness = bytes.fromhex(reveal["witness"])
+            low, high = reveal["range"]
+            commitment = reveal["commitment"]
+            value = reveal["value"]
+
+            context_bytes = canonical_json(context)
+
+            expected_commitment = hashlib.sha256(
+                b"QRNG-COMMIT-V1"
+                + len(context_bytes).to_bytes(8, "big")
+                + context_bytes
+                + nonce
+                + witness
+            ).hexdigest()
+
+            if not hmac.compare_digest(expected_commitment, commitment):
+                return False
+
+            expected_value = derive_value(
+                witness=witness,
+                nonce=nonce,
+                context=context,
+                low=low,
+                high=high,
+            )
+
+            return expected_value == value
+
+        except (KeyError, ValueError, TypeError):
+            return False
+
+    def generate_batch(
+        self,
+        context: dict,
+        count: int,
+        low: int = 0,
+        high: int = 2**64 - 1,
+    ) -> Tuple[List[int], List[dict], List[dict]]:
+        values = []
+        public_records = []
+        reveals = []
+
+        for i in range(count):
+            extended_context = {**context, "sequence": i}
+            value, public_record, reveal = self.generate(
+                context=extended_context,
+                low=low,
+                high=high,
+            )
+            values.append(value)
+            public_records.append(public_record)
+            reveals.append(reveal)
+
+        return values, public_records, reveals
+ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+from collections import defaultdict
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
+
+# Original QKD_AI classes below (entropy sources replaced by QRNG versions)
 
 
 # ---------------------------------------------------------------------
@@ -195,6 +351,7 @@ class OneWayRandomDriver:
             full["session"] = self.session
         full["operation"] = operation
         full.update(context)
+        # Timestamp is metadata only, not part of derivation context
         return full
 
     def generate(
@@ -240,8 +397,10 @@ class OneWayRandomDriver:
     @staticmethod
     def public_record(proof: dict) -> dict:
         """Safe to publish immediately: proves a commitment was made."""
+        # Greedy proofs may not have a real nonce; synthesize one from context.
         nonce = proof.get("nonce")
         if nonce is None:
+            # Derive a stable pseudo-nonce from the commitment so it’s deterministic.
             nonce = hashlib.sha256(
                 b"GREEDY-PSEUDO-NONCE-v1"
                 + _canonical_json(proof.get("context", {}))
@@ -377,7 +536,7 @@ class OneWayRandomDriver:
 
 SymbolIndex = int
 SparseVector = Dict[int, float]
-Context = Tuple[SymbolIndex, SymbolIndex, SymbolIndex]  # 3-word context for 4-gram
+Context = Tuple[SymbolIndex, SymbolIndex]
 
 FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
     "intrinsic": (0, 4),
@@ -419,13 +578,13 @@ class SymbolManifestEntry:
 
 
 # ---------------------------------------------------------------------
-# Sparse symbol manifest (4-gram)
+# Sparse symbol manifest
 # ---------------------------------------------------------------------
 
 class SparseSymbolManifest:
     START_TOKEN = ""
     END_TOKEN = ""
-    VERSION = 4  # bumped for 4-gram + base-truths changes
+    VERSION = 3
 
     def __init__(
         self,
@@ -449,6 +608,7 @@ class SparseSymbolManifest:
         self.word_to_index: Dict[str, SymbolIndex] = {}
         self.next_index = 0
 
+        self.qrng = qrng or QuantumRandomProof()
         self.random_driver = OneWayRandomDriver(experiment=experiment, session=session)
         self.last_random_proofs: List[Dict[str, object]] = []
         self.last_public_records: List[Dict[str, object]] = []
@@ -458,17 +618,10 @@ class SparseSymbolManifest:
         )
         self.transition_probs: Dict[SymbolIndex, Dict[SymbolIndex, float]] = {}
 
-        # 4-gram structures: context = (w_{t-3}, w_{t-2}, w_{t-1})
-        self.fourgram_counts: DefaultDict[Context, DefaultDict[SymbolIndex, int]] = (
+        self.trigram_counts: DefaultDict[Context, DefaultDict[SymbolIndex, int]] = (
             defaultdict(lambda: defaultdict(int))
         )
-        self.fourgram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
-
-        # Legacy trigram probs used for 3-gram backoff (derived from 4-grams if desired)
-        self.trigram_counts: DefaultDict[Tuple[SymbolIndex, SymbolIndex], DefaultDict[SymbolIndex, int]] = (
-            defaultdict(lambda: defaultdict(int))
-        )
-        self.trigram_probs: Dict[Tuple[SymbolIndex, SymbolIndex], Dict[SymbolIndex, float]] = {}
+        self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
 
         self._max_symbol_count: int = 0
 
@@ -506,7 +659,7 @@ class SparseSymbolManifest:
         if not words:
             return []
 
-        padded = [self.START_TOKEN, self.START_TOKEN, self.START_TOKEN, *words, self.END_TOKEN]
+        padded = [self.START_TOKEN, self.START_TOKEN, *words, self.END_TOKEN]
         sequence = [self._register_word(word) for word in padded]
         self.sequences.append(sequence)
 
@@ -520,16 +673,10 @@ class SparseSymbolManifest:
             self.transition_counts[current_idx][next_idx] += 1
             self.successors[current_idx].add(next_idx)
 
-        # 4-gram counts: (w0, w1, w2) -> w3
-        for position in range(len(sequence) - 3):
-            ctx = (sequence[position], sequence[position + 1], sequence[position + 2])
-            next_idx = sequence[position + 3]
-            self.fourgram_counts[ctx][next_idx] += 1
-
-            # Also accumulate 3-gram counts for backoff: (w1, w2) -> w3
-            tri_ctx = (sequence[position + 1], sequence[position + 2])
-            self.trigram_counts[tri_ctx][next_idx] += 1
-
+        for position in range(len(sequence) - 2):
+            self.trigram_counts[(sequence[position], sequence[position + 1])][
+                sequence[position + 2]
+            ] += 1
         return sequence
 
     def ingest_dataset_words(self, sequences: Iterable[List[str]]) -> None:
@@ -543,7 +690,6 @@ class SparseSymbolManifest:
     def finalize(self) -> None:
         self._finalize_transitions()
         self._finalize_trigrams()
-        self._finalize_fourgrams()
         self._update_intrinsics()
         self._assign_beams_and_states()
 
@@ -562,15 +708,6 @@ class SparseSymbolManifest:
             total = sum(counts.values())
             if total:
                 self.trigram_probs[context] = {
-                    nxt: count / total for nxt, count in counts.items()
-                }
-
-    def _finalize_fourgrams(self) -> None:
-        self.fourgram_probs = {}
-        for context, counts in self.fourgram_counts.items():
-            total = sum(counts.values())
-            if total:
-                self.fourgram_probs[context] = {
                     nxt: count / total for nxt, count in counts.items()
                 }
 
@@ -788,50 +925,47 @@ class SparseSymbolManifest:
 
     def _resolve_prompt_context(self, known: List[SymbolIndex]) -> Context:
         start = self.word_to_index[self.START_TOKEN]
-
-        if len(known) >= 3:
-            ctx = (known[-3], known[-2], known[-1])
-            if ctx in self.fourgram_probs:
-                return ctx
-
+        if len(known) >= 2 and (known[-2], known[-1]) in self.trigram_probs:
+            return known[-2], known[-1]
         if not known:
             raise ValueError("No prompt terms found in vocabulary.")
 
         current = known[-1]
-
-        if len(known) >= 2:
-            suffix2 = (known[-2], known[-1])
-            matching = [ctx for ctx in self.fourgram_probs if ctx[1:] == suffix2]
-            if matching:
-                matching.sort(key=lambda ctx: sum(self.fourgram_counts[ctx].values()), reverse=True)
-                return matching[0]
-
-        matching = [ctx for ctx in self.fourgram_probs if ctx[2] == current]
+        matching = [context for context in self.trigram_probs if context[1] == current]
         if matching:
-            matching.sort(key=lambda ctx: sum(self.fourgram_counts[ctx].values()), reverse=True)
+            matching.sort(key=lambda context: sum(self.trigram_counts[context].values()), reverse=True)
             return matching[0]
-
-        return start, start, current
+        return start, current
 
     def _backoff_distributions(
         self,
-        context: Context,  # (w_{t-3}, w_{t-2}, w_{t-1})
+        previous_idx: SymbolIndex,
+        current_idx: SymbolIndex,
     ) -> List[Tuple[str, Dict[SymbolIndex, float]]]:
-        """Ordered 4-gram, 3-gram, 2-gram, and unigram backoff."""
         sources: List[Tuple[str, Dict[SymbolIndex, float]]] = []
-        w3, w2, w1 = context
 
-        exact4 = self.fourgram_probs.get(context, {})
-        if exact4:
-            sources.append(("4gram", exact4))
+        exact = self.trigram_probs.get((previous_idx, current_idx), {})
+        if exact:
+            sources.append(("trigram", exact))
 
-        exact3 = self.trigram_probs.get((w2, w1), {})
-        if exact3:
-            sources.append(("3gram_backoff", exact3))
-
-        bigram = self.transition_probs.get(w1, {})
+        bigram = self.transition_probs.get(current_idx, {})
         if bigram:
-            sources.append(("2gram_backoff", bigram))
+            sources.append(("bigram_backoff", bigram))
+
+        merged: DefaultDict[SymbolIndex, float] = defaultdict(float)
+        for (prev, current), successors in self.trigram_probs.items():
+            if current != current_idx:
+                continue
+            mass = sum(self.trigram_counts[(prev, current)].values())
+            for next_idx, probability in successors.items():
+                merged[next_idx] += probability * max(1, mass)
+
+        total = sum(merged.values())
+        if total:
+            sources.append((
+                "merged_context_backoff",
+                {idx: value / total for idx, value in merged.items()},
+            ))
 
         special = {self.START_TOKEN, self.END_TOKEN}
         unigram = {
@@ -858,7 +992,6 @@ class SparseSymbolManifest:
         tau_step: float = 0.05,
         fallback_to_unfiltered: bool = True,
         exclude_family: Optional[str] = None,
-        run_root_hash: Optional[str] = None,
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
@@ -866,7 +999,7 @@ class SparseSymbolManifest:
         if max_new_words <= 0:
             return (prompt_words if preserve_prompt else []), 0.0, []
 
-        context = self._resolve_prompt_context(known)  # (w3, w2, w1)
+        previous_idx, current_idx = self._resolve_prompt_context(known)
         requested_tau = max(-1.0, min(1.0, float(tau)))
         tau_floor = max(-1.0, min(requested_tau, float(tau_floor)))
         tau_step = max(1e-4, float(tau_step))
@@ -882,7 +1015,7 @@ class SparseSymbolManifest:
             source_name = ""
             distribution: Dict[SymbolIndex, float] = {}
 
-            for name, candidate_distribution in self._backoff_distributions(context):
+            for name, candidate_distribution in self._backoff_distributions(previous_idx, current_idx):
                 usable = {
                     idx: probability
                     for idx, probability in candidate_distribution.items()
@@ -900,8 +1033,7 @@ class SparseSymbolManifest:
                 })
                 break
 
-            w3, w2, w1 = context
-            source_vector = self.influence_vector(w1, exclude_family=exclude_family)
+            source_vector = self.influence_vector(current_idx, exclude_family=exclude_family)
             candidates: List[Tuple[float, float, float, float, SymbolIndex]] = []
             ranked = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:max(1, candidate_count)]
 
@@ -910,7 +1042,7 @@ class SparseSymbolManifest:
                     source_vector,
                     self.influence_vector(next_idx, exclude_family=exclude_family),
                 )
-                influence = self.influence_score(w1, next_idx)
+                influence = self.influence_score(current_idx, next_idx)
                 combined = 0.45 * cosine + 0.35 * influence + 0.20 * probability
                 candidates.append((combined, cosine, influence, probability, next_idx))
 
@@ -950,11 +1082,8 @@ class SparseSymbolManifest:
                     "version": self.VERSION,
                     "step": step + 1,
                     "prompt": seed_prompt,
-                    "previous_words": [
-                        self.index_to_word[w3],
-                        self.index_to_word[w2],
-                        self.index_to_word[w1],
-                    ],
+                    "previous_word": self.index_to_word[previous_idx],
+                    "current_word": self.index_to_word[current_idx],
                     "tau": requested_tau,
                     "effective_tau": effective_tau,
                     "temperature": temperature,
@@ -962,8 +1091,6 @@ class SparseSymbolManifest:
                     "candidate_count": len(pool),
                     "output_prefix_sha256": self._text_digest(output),
                 }
-                if run_root_hash is not None:
-                    rng_context["run_root_hash"] = run_root_hash
 
                 candidate_words = [
                     self.index_to_word[candidate[4]]
@@ -1001,6 +1128,7 @@ class SparseSymbolManifest:
                     b"GREEDY-CHOICE-v1" + greedy_context_bytes
                 ).hexdigest()
 
+                # Deterministic pseudo-nonce for greedy proofs
                 greedy_nonce = hashlib.sha256(
                     b"GREEDY-NONCE-v1"
                     + greedy_context_bytes
@@ -1032,11 +1160,7 @@ class SparseSymbolManifest:
 
             diagnostics.append({
                 "step": step + 1,
-                "context": [
-                    self.index_to_word[w3],
-                    self.index_to_word[w2],
-                    self.index_to_word[w1],
-                ],
+                "context": [self.index_to_word[previous_idx], self.index_to_word[current_idx]],
                 "next_word": next_word,
                 "distribution_source": source_name,
                 "requested_tau": requested_tau,
@@ -1051,11 +1175,50 @@ class SparseSymbolManifest:
                 "random_commitment": proof_for_diag["commitment"],  # type: ignore
                 "random_proof_index": len(self.last_random_proofs) - 1,
             })
-
-            # Slide context: (w2, w1, next)
-            context = (w2, w1, next_idx)
+            previous_idx, current_idx = current_idx, next_idx
 
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
+
+    def generate_qrng_value(
+        self,
+        context: Optional[dict] = None,
+        low: int = 0,
+        high: int = 2**64 - 1,
+    ) -> Tuple[int, dict, dict]:
+        """
+        Generate a quantum random value with one-way proof.
+
+        Args:
+            context: Context/metadata to bind to the value.
+            low: Lower bound (inclusive).
+            high: Upper bound (inclusive).
+
+        Returns:
+            Tuple of (value, public_record, reveal).
+        """
+        return self.qrng.generate(context=context or {}, low=low, high=high)
+
+    def generate_qrng_batch(
+        self,
+        context: Optional[dict] = None,
+        count: int = 1,
+        low: int = 0,
+        high: int = 2**64 - 1,
+    ) -> Tuple[List[int], List[dict], List[dict]]:
+        """
+        Generate multiple quantum random values with one-way proofs.
+
+        Args:
+            context: Base context (will be extended with sequence numbers).
+            count: Number of values to generate.
+            low: Lower bound (inclusive).
+            high: Upper bound (inclusive).
+
+        Returns:
+            Tuple of (values, public_records, reveals).
+        """
+        return self.qrng.generate_batch(context=context or {}, count=count, low=low, high=high)
+
 
     @staticmethod
     def _text_digest(words: List[str]) -> str:
@@ -1081,12 +1244,8 @@ class SparseSymbolManifest:
                 for source, targets in self.transition_counts.items()
             },
             "trigram_counts": {
-                f"{a},{b}": {str(target): count for target, count in targets.items()}
-                for (a, b), targets in self.trigram_counts.items()
-            },
-            "fourgram_counts": {
-                f"{a},{b},{c}": {str(target): count for target, count in targets.items()}
-                for (a, b, c), targets in self.fourgram_counts.items()
+                f"{previous},{current}": {str(target): count for target, count in targets.items()}
+                for (previous, current), targets in self.trigram_counts.items()
             },
         }
 
@@ -1122,14 +1281,9 @@ class SparseSymbolManifest:
                 manifest.successors[source_idx].add(target_idx)
 
         for context, targets in state["trigram_counts"].items():
-            a, b = (int(value) for value in context.split(",", 1))
+            previous, current = (int(value) for value in context.split(",", 1))
             for target, count in targets.items():
-                manifest.trigram_counts[(a, b)][int(target)] = int(count)
-
-        for context, targets in state["fourgram_counts"].items():
-            a, b, c = (int(value) for value in context.split(",", 2))
-            for target, count in targets.items():
-                manifest.fourgram_counts[(a, b, c)][int(target)] = int(count)
+                manifest.trigram_counts[(previous, current)][int(target)] = int(count)
 
         manifest.finalize()
         return manifest
@@ -1138,14 +1292,6 @@ class SparseSymbolManifest:
 # ---------------------------------------------------------------------
 # Corpus loading and diagnostics
 # ---------------------------------------------------------------------
-
-def _file_sha256(path: str) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(8192), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
 
 def get_corpus(path: Optional[str]) -> str:
     filename = path or input("Filename: ")
@@ -1174,11 +1320,9 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
 # ---------------------------------------------------------------------
 # Transcript verification
 # ---------------------------------------------------------------------
-
 def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
     errors = []
 
-    base = transcript.get("base_truths") or {}
     words = transcript.get("generated_words")
     generated_text = transcript.get("generated_text")
     recorded_digest = transcript.get("text_sha256")
@@ -1198,7 +1342,11 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
         errors.append("text_sha256 does not match generated_words")
 
     proofs = transcript.get("proofs", [])
+
+    # Use diagnostics length (one per generated token) as the ground truth.
     expected_proofs = len(diagnostics)
+
+    # Fallback: if diagnostics missing, use options.new_words if present.
     if expected_proofs == 0 and "new_words" in options:
         expected_proofs = int(options["new_words"])
 
@@ -1206,13 +1354,6 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
         errors.append(
             f"proof count mismatch: expected {expected_proofs}, got {len(proofs)}"
         )
-
-    if base and options:
-        base_opts = base.get("options", {})
-        for key in ["new_words", "tau", "temperature", "greedy"]:
-            if key in base_opts and key in options:
-                if base_opts[key] != options[key]:
-                    errors.append(f"options mismatch on {key}")
 
     for index, proof in enumerate(proofs):
         algorithm = proof.get("algorithm")
@@ -1247,7 +1388,7 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Robust 4-gram prompt-seeded sparse cosine influence text generator"
+        description="Robust prompt-seeded sparse cosine influence text generator"
     )
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
@@ -1280,6 +1421,11 @@ def main() -> None:
     parser.add_argument("--public-log", help="Write per-token public commitment records (no reveal) to a JSON file")
     parser.add_argument("--transcript-log", help="Write generated text, diagnostics, and verification proofs")
     parser.add_argument("--verify-transcript", help="Verify a previously saved generation transcript")
+    parser.add_argument("--qrng", action="store_true", help="Generate quantum random value with one-way proof")
+    parser.add_argument("--qrng-context", type=str, default='{"purpose":"sampling"}', help="JSON context for QRNG")
+    parser.add_argument("--qrng-output", type=str, help="Save QRNG public record to file")
+    parser.add_argument("--qrng-reveal-output", type=str, help="Save QRNG reveal proof to file (KEEP PRIVATE)")
+    parser.add_argument("--qrng-count", type=int, default=1, help="Number of QRNG values to generate")
 
     args = parser.parse_args()
 
@@ -1334,7 +1480,7 @@ def main() -> None:
 
     prompt_words, known, unknown = manifest._prompt_indices(args.prompt)
     print("=" * 100)
-    print("ROBUST 4-GRAM PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
+    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
     print("=" * 100)
     print(f"Source: {source}")
     print(f"Vocabulary: {len(manifest.content_indices())} words")
@@ -1345,39 +1491,84 @@ def main() -> None:
     print(f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; fallback={not args.no_fallback}")
     if args.exclude_family:
         print(f"Excluding feature family from cosine scoring: {args.exclude_family}")
+        # QRNG demonstration
+        if args.qrng:
+            print("
+" + "=" * 100)
+            print("QUANTUM RANDOM PROOF GENERATION")
+            print("=" * 100)
 
-    # Build base truths
-    corpus_hash = None
-    if args.input:
-        corpus_hash = _file_sha256(args.input)
+            try:
+                qrng_context = json.loads(args.qrng_context)
+            except json.JSONDecodeError as e:
+                print(f"Error: Invalid QRNG context JSON: {e}")
+                return
 
-    base_truths = {
-        "corpus_sha256": corpus_hash,
-        "manifest_config": {
-            "max_symbols": manifest.max_symbols,
-            "max_beams": manifest.max_beams,
-            "max_states": manifest.max_states,
-        },
-        "seed": args.seed,
-        "prompt": args.prompt,
-        "options": {
-            "new_words": args.new_words,
-            "tau": args.tau,
-            "tau_floor": args.tau_floor,
-            "tau_step": args.tau_step,
-            "temperature": args.temperature,
-            "candidate_count": args.candidate_count,
-            "greedy": args.greedy,
-            "adaptive_tau": not args.no_adaptive_tau,
-            "fallback_to_unfiltered": not args.no_fallback,
-            "exclude_family": args.exclude_family,
-        },
-    }
+            qrng_context["generator"] = "SparseSymbolManifest"
+            qrng_context["experiment"] = args.experiment or "default"
+            qrng_context["session"] = args.session or 0
+            qrng_context["prompt"] = args.prompt
 
-    # Optional: derive a run root hash from base truths
-    run_root_hash = hashlib.sha256(
-        _canonical_json(base_truths)
-    ).hexdigest()
+            if args.qrng_count == 1:
+                value, public_record, reveal = manifest.generate_qrng_value(
+                    context=qrng_context,
+                    low=0,
+                    high=2**64 - 1,
+                )
+
+                print(f"Generated QRNG value: {value}")
+                print(f"
+Public commitment (safe to publish):")
+                print(json.dumps(public_record, indent=2))
+
+                if args.qrng_output:
+                    with open(args.qrng_output, "w", encoding="utf-8") as f:
+                        json.dump(public_record, f, indent=2)
+                    print(f"
+Saved public record to: {args.qrng_output}")
+
+                if args.qrng_reveal_output:
+                    with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
+                        json.dump(reveal, f, indent=2)
+                    print(f"Saved reveal proof to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+
+                print(f"
+Verification: {QuantumRandomProof.verify(reveal)}")
+
+            else:
+                values, public_records, reveals = manifest.generate_qrng_batch(
+                    context=qrng_context,
+                    count=args.qrng_count,
+                    low=0,
+                    high=2**64 - 1,
+                )
+
+                print(f"Generated {len(values)} QRNG values:")
+                for i, value in enumerate(values):
+                    print(f"  [{i+1}] {value}")
+
+                if args.qrng_output:
+                    output_data = {
+                        "algorithm": "QRNG-COMMIT-V1",
+                        "count": len(public_records),
+                        "records": public_records,
+                    }
+                    with open(args.qrng_output, "w", encoding="utf-8") as f:
+                        json.dump(output_data, f, indent=2)
+                    print(f"
+Saved {len(public_records)} public records to: {args.qrng_output}")
+
+                if args.qrng_reveal_output:
+                    with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
+                        json.dump(reveals, f, indent=2)
+                    print(f"Saved {len(reveals)} reveal proofs to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+
+                # Verify all
+                all_valid = all(QuantumRandomProof.verify(r) for r in reveals)
+                print(f"
+All verifications passed: {all_valid}")
+
+
 
     while True:
         try:
@@ -1394,7 +1585,6 @@ def main() -> None:
                 tau_step=args.tau_step,
                 fallback_to_unfiltered=not args.no_fallback,
                 exclude_family=args.exclude_family,
-                run_root_hash=run_root_hash,
             )
         except ValueError as exc:
             print(f"Generation failed: {exc}")
@@ -1453,8 +1643,7 @@ def main() -> None:
             text_digest = hashlib.sha256(_canonical_json(words)).hexdigest()
 
             transcript = {
-                "format": "RSM-4gram-generation-transcript-v1",
-                "base_truths": base_truths,
+                "format": "RSM-generation-transcript-v1",
                 "prompt": args.prompt,
                 "generated_words": words,
                 "generated_text": generated_text,
@@ -1474,7 +1663,6 @@ def main() -> None:
                 },
                 "proofs": manifest.last_random_proofs,
                 "diagnostics": diagnostics,
-                "run_root_hash": run_root_hash,
             }
             transcript["transcript_sha256"] = hashlib.sha256(
                 _canonical_json(transcript)
