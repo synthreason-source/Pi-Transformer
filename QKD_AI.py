@@ -433,163 +433,94 @@ class SymbolManifestEntry:
 # =============================================================================
 
 def canonical_json(value):
-    """Canonical JSON encoding for deterministic hashing."""
     import json
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
-
 def hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
-    """HKDF-Extract using SHA-256."""
-    import hmac
-    import hashlib
+    import hmac, hashlib
     return hmac.new(salt, ikm, hashlib.sha256).digest()
 
-
 def hkdf_expand(prk: bytes, info: bytes, length: int) -> bytes:
-    """HKDF-Expand using SHA-256."""
-    import hmac
-    import hashlib
-    output = bytearray()
-    previous = b""
-    counter = 1
+    import hmac, hashlib
+    output, previous, counter = bytearray(), b"", 1
     while len(output) < length:
         previous = hmac.new(prk, previous + info + bytes([counter]), hashlib.sha256).digest()
         output.extend(previous)
         counter += 1
     return bytes(output[:length])
 
-
 def uniform_integer(stream: bytes, low: int, high: int) -> int:
-    """Convert a byte stream to a uniform integer using rejection sampling."""
     span = high - low + 1
-    if span <= 0:
-        raise ValueError("high must be >= low")
+    if span <= 0: raise ValueError("high must be >= low")
     limit = (1 << 256) - ((1 << 256) % span)
     offset = 0
     while True:
         chunk = stream[offset:offset + 32]
-        if len(chunk) < 32:
-            raise ValueError("Insufficient bytes")
+        if len(chunk) < 32: raise ValueError("Insufficient bytes")
         x = int.from_bytes(chunk, "big")
         offset += 32
-        if x < limit:
-            return low + (x % span)
-
+        if x < limit: return low + (x % span)
 
 def derive_value(witness: bytes, nonce: bytes, context: dict, low: int, high: int) -> int:
-    """Derive a random value from a witness using HKDF."""
     context_bytes = canonical_json(context)
     salt = hashlib.sha256(b"QRNG-COMMIT-V1-SALT" + nonce).digest()
     prk = hkdf_extract(salt, b"QRNG-WITNESS-V1" + witness + nonce + context_bytes)
     stream = hkdf_expand(prk, b"QRNG-OUTPUT-V1" + context_bytes, 256)
     return uniform_integer(stream, low, high)
 
-
 class QuantumEntropySource:
-    """Wraps a byte-source for quantum randomness."""
-    def __init__(self, quantum_reader=None):
-        self.quantum_reader = quantum_reader
-
+    def __init__(self, quantum_reader=None): self.quantum_reader = quantum_reader
     def read(self, n: int) -> bytes:
-        if n <= 0:
-            raise ValueError("n must be positive")
+        if n <= 0: raise ValueError("n must be positive")
         if self.quantum_reader is not None:
             data = self.quantum_reader(n)
-            if not isinstance(data, bytes) or len(data) != n:
-                raise ValueError("quantum_reader must return exactly n bytes")
+            if not isinstance(data, bytes) or len(data) != n: raise ValueError("quantum_reader must return exactly n bytes")
             return data
         return os.urandom(n)
 
-
 class SeededEntropySource(QuantumEntropySource):
-    """Deterministic entropy source for reproducible generation."""
     def __init__(self, seed: str):
         self.seed = str(seed).encode("utf-8")
         self.counter = 0
-
     def read(self, n: int) -> bytes:
-        if n <= 0:
-            raise ValueError("n must be positive")
+        if n <= 0: raise ValueError("n must be positive")
         output = bytearray()
         while len(output) < n:
-            block = hashlib.sha256(
-                b"REPRODUCIBLE-ENTROPY-v1"
-                + len(self.seed).to_bytes(8, "big")
-                + self.seed
-                + self.counter.to_bytes(8, "big")
-            ).digest()
+            block = hashlib.sha256(b"REPRODUCIBLE-ENTROPY-v1" + len(self.seed).to_bytes(8, "big") + self.seed + self.counter.to_bytes(8, "big")).digest()
             output.extend(block)
             self.counter += 1
         return bytes(output[:n])
 
-
 class QuantumRandomProof:
-    """Quantum random number generator with one-way commitment proofs."""
     WITNESS_BYTES = 32
     NONCE_BYTES = 16
-
-    def __init__(self, entropy_reader=None):
-        self.entropy_source = QuantumEntropySource(quantum_reader=entropy_reader)
-
+    def __init__(self, entropy_reader=None): self.entropy_source = QuantumEntropySource(quantum_reader=entropy_reader)
     @staticmethod
-    def _timestamp() -> str:
-        return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
-
+    def _timestamp() -> str: return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
     def generate(self, context: dict, low: int = 0, high: int = 2**64 - 1) -> Tuple[int, dict, dict]:
-        """Generate a random value with a one-way commitment proof."""
         witness = self.entropy_source.read(self.WITNESS_BYTES)
         nonce = self.entropy_source.read(self.NONCE_BYTES)
         context_bytes = canonical_json(context)
-        commitment = hashlib.sha256(
-            b"QRNG-COMMIT-V1"
-            + len(context_bytes).to_bytes(8, "big")
-            + context_bytes
-            + nonce
-            + witness
-        ).hexdigest()
+        commitment = hashlib.sha256(b"QRNG-COMMIT-V1" + len(context_bytes).to_bytes(8, "big") + context_bytes + nonce + witness).hexdigest()
         value = derive_value(witness=witness, nonce=nonce, context=context, low=low, high=high)
-        public_record = {
-            "algorithm": "QRNG-COMMIT-V1",
-            "context": context,
-            "nonce": nonce.hex(),
-            "commitment": commitment,
-            "range": [low, high],
-            "created_at": self._timestamp(),
-        }
+        public_record = {"algorithm": "QRNG-COMMIT-V1", "context": context, "nonce": nonce.hex(), "commitment": commitment, "range": [low, high], "created_at": self._timestamp()}
         reveal = {**public_record, "witness": witness.hex(), "value": value}
         return value, public_record, reveal
-
     @staticmethod
     def verify(reveal: dict) -> bool:
-        """Verify a reveal proof."""
         try:
-            context = reveal["context"]
-            nonce = bytes.fromhex(reveal["nonce"])
-            witness = bytes.fromhex(reveal["witness"])
-            low, high = reveal["range"]
-            commitment = reveal["commitment"]
-            value = reveal["value"]
+            context, nonce, witness = reveal["context"], bytes.fromhex(reveal["nonce"]), bytes.fromhex(reveal["witness"])
+            low, high, commitment, value = reveal["range"], reveal["commitment"], reveal["value"]
             context_bytes = canonical_json(context)
-            expected_commitment = hashlib.sha256(
-                b"QRNG-COMMIT-V1"
-                + len(context_bytes).to_bytes(8, "big")
-                + context_bytes
-                + nonce
-                + witness
-            ).hexdigest()
-            if not hmac.compare_digest(expected_commitment, commitment):
-                return False
+            expected_commitment = hashlib.sha256(b"QRNG-COMMIT-V1" + len(context_bytes).to_bytes(8, "big") + context_bytes + nonce + witness).hexdigest()
+            if not hmac.compare_digest(expected_commitment, commitment): return False
             expected_value = derive_value(witness=witness, nonce=nonce, context=context, low=low, high=high)
             return expected_value == value
-        except (KeyError, ValueError, TypeError):
-            return False
-
+        except (KeyError, ValueError, TypeError): return False
     def generate_batch(self, context: dict, count: int, low: int = 0, high: int = 2**64 - 1) -> Tuple[List[int], List[dict], List[dict]]:
-        """Generate multiple random values with individual commitment proofs."""
         values, public_records, reveals = [], [], []
         for i in range(count):
-            extended_context = {**context, "sequence": i}
-            value, public_record, reveal = self.generate(context=extended_context, low=low, high=high)
+            value, public_record, reveal = self.generate(context={**context, "sequence": i}, low=low, high=high)
             values.append(value)
             public_records.append(public_record)
             reveals.append(reveal)
@@ -1194,13 +1125,9 @@ class SparseSymbolManifest:
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
 
     def generate_qrng_value(self, context: Optional[dict] = None, low: int = 0, high: int = 2**64 - 1) -> Tuple[int, dict, dict]:
-        """Generate a quantum random value with one-way proof."""
         return self.qrng.generate(context=context or {}, low=low, high=high)
-
     def generate_qrng_batch(self, context: Optional[dict] = None, count: int = 1, low: int = 0, high: int = 2**64 - 1) -> Tuple[List[int], List[dict], List[dict]]:
-        """Generate multiple quantum random values with one-way proofs."""
         return self.qrng.generate_batch(context=context or {}, count=count, low=low, high=high)
-
 
     @staticmethod
     def _text_digest(words: List[str]) -> str:
@@ -1493,14 +1420,21 @@ def main() -> None:
                 print(f"Generated QRNG value: {value}")
                 print(f"\nPublic commitment (safe to publish):")
                 print(json.dumps(public_record, indent=2))
+                # FIXED: Save files BEFORE the verification print
                 if args.qrng_output:
-                    with open(args.qrng_output, "w", encoding="utf-8") as f:
-                        json.dump(public_record, f, indent=2)
-                    print(f"\nSaved public record to: {args.qrng_output}")
+                    try:
+                        with open(args.qrng_output, "w", encoding="utf-8") as f:
+                            json.dump(public_record, f, indent=2)
+                        print(f"\n[OK] Saved public record to: {args.qrng_output}")
+                    except Exception as e:
+                        print(f"\n[ERROR] Failed to save {args.qrng_output}: {e}")
                 if args.qrng_reveal_output:
-                    with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
-                        json.dump(reveal, f, indent=2)
-                    print(f"Saved reveal proof to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+                    try:
+                        with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
+                            json.dump(reveal, f, indent=2)
+                        print(f"[OK] Saved reveal proof to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to save {args.qrng_reveal_output}: {e}")
                 print(f"\nVerification: {QuantumRandomProof.verify(reveal)}")
             else:
                 values, public_records, reveals = manifest.generate_qrng_batch(context=qrng_context, count=args.qrng_count, low=0, high=2**64 - 1)
@@ -1508,14 +1442,20 @@ def main() -> None:
                 for i, val in enumerate(values):
                     print(f"  [{i+1}] {val}")
                 if args.qrng_output:
-                    output_data = {"algorithm": "QRNG-COMMIT-V1", "count": len(public_records), "records": public_records}
-                    with open(args.qrng_output, "w", encoding="utf-8") as f:
-                        json.dump(output_data, f, indent=2)
-                    print(f"\nSaved {len(public_records)} public records to: {args.qrng_output}")
+                    try:
+                        output_data = {"algorithm": "QRNG-COMMIT-V1", "count": len(public_records), "records": public_records}
+                        with open(args.qrng_output, "w", encoding="utf-8") as f:
+                            json.dump(output_data, f, indent=2)
+                        print(f"\n[OK] Saved {len(public_records)} public records to: {args.qrng_output}")
+                    except Exception as e:
+                        print(f"\n[ERROR] Failed to save {args.qrng_output}: {e}")
                 if args.qrng_reveal_output:
-                    with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
-                        json.dump(reveals, f, indent=2)
-                    print(f"Saved {len(reveals)} reveal proofs to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+                    try:
+                        with open(args.qrng_reveal_output, "w", encoding="utf-8") as f:
+                            json.dump(reveals, f, indent=2)
+                        print(f"[OK] Saved {len(reveals)} reveal proofs to: {args.qrng_reveal_output} (KEEP PRIVATE)")
+                    except Exception as e:
+                        print(f"[ERROR] Failed to save {args.qrng_reveal_output}: {e}")
                 all_valid = all(QuantumRandomProof.verify(r) for r in reveals)
                 print(f"\nAll verifications passed: {all_valid}")
 
