@@ -242,10 +242,19 @@ class OneWayRandomDriver:
     @staticmethod
     def public_record(proof: dict) -> dict:
         """Safe to publish immediately: proves a commitment was made."""
+        # Greedy proofs may not have a real nonce; synthesize one from context.
+        nonce = proof.get("nonce")
+        if nonce is None:
+            # Derive a stable pseudo-nonce from the commitment so it’s deterministic.
+            nonce = hashlib.sha256(
+                b"GREEDY-PSEUDO-NONCE-v1"
+                + _canonical_json(proof.get("context", {}))
+            ).hexdigest()
+
         return {
             "algorithm": proof["algorithm"],
             "context": proof["context"],
-            "nonce": proof["nonce"],
+            "nonce": nonce,
             "commitment": proof["commitment"],
             "range": proof["range"],
         }
@@ -963,9 +972,16 @@ class SparseSymbolManifest:
                     b"GREEDY-CHOICE-v1" + greedy_context_bytes
                 ).hexdigest()
 
+                # Deterministic pseudo-nonce for greedy proofs
+                greedy_nonce = hashlib.sha256(
+                    b"GREEDY-NONCE-v1"
+                    + greedy_context_bytes
+                ).hexdigest()
+
                 greedy_proof = {
                     "algorithm": "GREEDY-SHA256-v1",
                     "context": greedy_context,
+                    "nonce": greedy_nonce,
                     "range": [0, 0],
                     "value": 0,
                     "candidate_words": [self.index_to_word[idx] for _, _, _, _, idx in pool],
