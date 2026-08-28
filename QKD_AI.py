@@ -1123,13 +1123,14 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
 # ---------------------------------------------------------------------
 # Transcript verification
 # ---------------------------------------------------------------------
-
 def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
     errors = []
 
     words = transcript.get("generated_words")
     generated_text = transcript.get("generated_text")
     recorded_digest = transcript.get("text_sha256")
+    diagnostics = transcript.get("diagnostics", [])
+    options = transcript.get("options", {})
 
     if not isinstance(words, list):
         errors.append("generated_words is missing or invalid")
@@ -1144,8 +1145,13 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
         errors.append("text_sha256 does not match generated_words")
 
     proofs = transcript.get("proofs", [])
-    prompt_words = transcript.get("prompt", "").split()
-    expected_proofs = max(0, len(words) - len(prompt_words))
+
+    # Use diagnostics length (one per generated token) as the ground truth.
+    expected_proofs = len(diagnostics)
+
+    # Fallback: if diagnostics missing, use options.new_words if present.
+    if expected_proofs == 0 and "new_words" in options:
+        expected_proofs = int(options["new_words"])
 
     if len(proofs) != expected_proofs:
         errors.append(
