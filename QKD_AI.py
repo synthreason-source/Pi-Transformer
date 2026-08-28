@@ -8,59 +8,63 @@ Prompt-seeded trigram text generation with cosine lower-bound influence
 mapping and robust backoff. No external packages are required.
 
 Influence workflow:
-    A x B      : source/current-word x target/next-word pairs
-    s_ij       : weighted influence score
-    c_ij       : cosine similarity between sparse influence vectors
-    retain     : c_ij >= tau
-    Y          : retained influence space
+A x B : source/current-word x target/next-word pairs
+s_ij : weighted influence score
+c_ij : cosine similarity between sparse influence vectors
+retain : c_ij >= tau
+Y : retained influence space
 
 Feature families (used for cosine similarity and can be selectively
 zeroed out via `exclude_family`):
-    intrinsic    : indices 0-4  (density, relation, coherence, volatility, depth)
-    beam_state   : indices 5-7  (beam affinity, beam id, markov state id)
-    frequency    : index 8      (max-normalized raw symbol count -- NEW dimension)
-    transitions  : indices 9..9+N (per-symbol transition-probability block)
-    lexical      : indices >= 100000 (character n-gram hash buckets)
+intrinsic : indices 0-4 (density, relation, coherence, volatility, depth)
+beam_state : indices 5-7 (beam affinity, beam id, markov state id)
+frequency : index 8 (max-normalized raw symbol count)
+transitions : indices 9..9+N (per-symbol transition-probability block)
+lexical : indices >= 100000 (character n-gram hash buckets)
 
 Prompt generation recovery path:
-    exact trigram -> bigram -> merged compatible trigrams -> unigram
-    -> adaptive cosine threshold relaxation -> optional unfiltered fallback
+exact trigram -> bigram -> merged compatible trigrams -> unigram
+-> adaptive cosine threshold relaxation -> optional unfiltered fallback
 
 Randomness / seed setter
 -------------------------
-Every stochastic pick (which candidate word wins) is driven by
-`OneWayRandomDriver`, a quantum-noise-style generator with a one-way
-commitment proof:
+Every stochastic pick is driven by `OneWayRandomDriver`, a quantum-noise-style
+generator with a one-way commitment proof:
 
-  - The driver draws a fresh 256-bit *witness* + nonce, commits to
-    them with SHA-256 (`commitment`), and derives the actual 64-bit
-    value used for sampling from the witness via HKDF.
-  - `driver.public_record(proof)` -- {algorithm, context, nonce,
-    commitment} -- can be published immediately and reveals nothing
-    about which candidate will be (or was) picked.
-  - `OneWayRandomDriver.verify(proof)` lets anyone holding the full
-    proof (which includes the revealed witness/value) confirm the
-    pick matches the earlier commitment, without the commitment ever
-    having leaked the pick in advance.
+- The driver draws a fresh 256-bit witness + nonce, commits to them with
+  SHA-256 (`commitment`), and derives the actual 64-bit value used for
+  sampling from the witness via HKDF.
+- `driver.public_record(proof)` -- {algorithm, context, nonce, commitment} --
+  can be published immediately and reveals nothing about which candidate
+  will be (or was) picked.
+- `OneWayRandomDriver.verify(proof)` lets anyone holding the full proof
+  (which includes the revealed witness/value) confirm the pick matches the
+  earlier commitment, without the commitment ever having leaked the pick.
 
-Use `--seed` for the ordinary Python `random` module (used only for
-`--load`-free convenience elsewhere, e.g. none currently) -- the
-generation choices themselves always go through the cryptographic
-driver, not `random.choices`.
+Use `--seed` for deterministic, reproducible generation. The same corpus,
+options, and seed will reproduce the same output.
 
 Examples:
-    python robust_sparse_symbol_manifest_quantum_rng.py --input singlekb.txt \
-      --prompt "adiabatic dark state" --tau 0.55 --new-words 30
+python s.py --input singlekb.txt \
+  --prompt "adiabatic dark state" --tau 0.55 --new-words 30
 
-    python robust_sparse_symbol_manifest_quantum_rng.py --input corpus.txt \
-      --prompt "quantum computing" --tau 0.75 --experiment demo --session 1
+python s.py --input corpus.txt \
+  --prompt "quantum computing" --tau 0.75 --experiment demo --session 1
 
-    python robust_sparse_symbol_manifest_quantum_rng.py --load manifest.json \
-      --prompt "neural networks" --tau 0.50 --greedy
+python s.py --load manifest.json \
+  --prompt "neural networks" --tau 0.50 --greedy
 
-    # Ignore the lexical (character n-gram) feature family when scoring:
-    python robust_sparse_symbol_manifest_quantum_rng.py --input corpus.txt \
-      --prompt "quantum computing" --exclude-family lexical
+# Ignore the lexical (character n-gram) feature family when scoring:
+python s.py --input corpus.txt \
+  --prompt "quantum computing" --exclude-family lexical
+
+# Deterministic reproducible run:
+python s.py --input corpus.txt \
+  --prompt "quantum computing" --seed experiment-001 --new-words 30 \
+  --transcript-log run.json
+
+# Verify a transcript:
+python s.py --verify-transcript run.json
 """
 
 from __future__ import annotations
@@ -71,28 +75,15 @@ import hmac
 import json
 import math
 import os
-import random
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 
-
 # ---------------------------------------------------------------------
-# Quantum-noise RNG with a one-way commitment proof (the "seed setter")
+# Entropy sources
 # ---------------------------------------------------------------------
-#
-# Forward direction (generator -> proof): trivial. The generator holds
-# the witness, so it can always recompute/verify the value it picked.
-#
-# Backward direction (proof -> number): blocked. The *public* part of
-# a proof -- context, nonce, commitment -- never discloses the witness
-# or the derived value; SHA-256 preimage resistance over a full
-# 256-bit witness is the security margin, independent of how small the
-# eventual output range is (e.g. picking among a handful of candidate
-# words).
-#
 
 class QuantumEntropySource:
     """Wraps a byte-source. Defaults to the OS CSPRNG (os.urandom).
@@ -111,6 +102,35 @@ class QuantumEntropySource:
             return data
         return os.urandom(n)
 
+
+class SeededEntropySource(QuantumEntropySource):
+    """Deterministic entropy source for reproducible generation."""
+
+    def __init__(self, seed: str):
+        self.seed = str(seed).encode("utf-8")
+        self.counter = 0
+
+    def read(self, n: int) -> bytes:
+        if n <= 0:
+            raise ValueError("n must be positive")
+
+        output = bytearray()
+        while len(output) < n:
+            block = hashlib.sha256(
+                b"REPRODUCIBLE-ENTROPY-v1"
+                + len(self.seed).to_bytes(8, "big")
+                + self.seed
+                + self.counter.to_bytes(8, "big")
+            ).digest()
+            output.extend(block)
+            self.counter += 1
+
+        return bytes(output[:n])
+
+
+# ---------------------------------------------------------------------
+# HKDF and helpers
+# ---------------------------------------------------------------------
 
 def _hkdf_extract(salt: bytes, ikm: bytes) -> bytes:
     return hmac.new(salt, ikm, hashlib.sha256).digest()
@@ -143,21 +163,23 @@ DOMAIN_IKM = b"QRNG-ONEWAY-IKM-v1"
 DOMAIN_OUTPUT = b"QRNG-ONEWAY-OUTPUT-v1"
 DOMAIN_COMMIT = b"QRNG-ONEWAY-COMMIT-v1"
 
-WITNESS_BYTES = 32  # 256-bit witness: the thing the commitment actually hides
+WITNESS_BYTES = 32
 NONCE_BYTES = 16
 
 
+# ---------------------------------------------------------------------
+# One-way random driver
+# ---------------------------------------------------------------------
+
 class OneWayRandomDriver:
-    """Cryptographically driven sampler used as the generator's seed setter.
+    """Cryptographically driven sampler used as the generator's seed setter."""
 
-    Important: the commitment is not itself a source of randomness --
-    it's a one-way binding proof over (context, witness, nonce). The
-    witness is what actually carries the entropy; the derived `value`
-    is what the generator uses to make its pick.
-    """
-
-    def __init__(self, entropy_source: Optional[QuantumEntropySource] = None,
-                 experiment: Optional[str] = None, session: Optional[int] = None):
+    def __init__(
+        self,
+        entropy_source: Optional[QuantumEntropySource] = None,
+        experiment: Optional[str] = None,
+        session: Optional[int] = None,
+    ):
         self.entropy = entropy_source or QuantumEntropySource()
         self.experiment = experiment
         self.session = session
@@ -173,12 +195,17 @@ class OneWayRandomDriver:
         if self.session is not None:
             full["session"] = self.session
         full["operation"] = operation
-        full["timestamp"] = self._timestamp()
         full.update(context)
+        # Timestamp is metadata only, not part of derivation context
         return full
 
-    def generate(self, context: Optional[dict] = None, low: int = 0, high: int = 2 ** 64 - 1,
-                 operation: str = "generate") -> Tuple[int, dict]:
+    def generate(
+        self,
+        context: Optional[dict] = None,
+        low: int = 0,
+        high: int = 2 ** 64 - 1,
+        operation: str = "generate",
+    ) -> Tuple[int, dict]:
         """Draw one random integer in [low, high] plus a one-way proof."""
         context = self._full_context(context or {}, operation)
         context_bytes = _canonical_json(context)
@@ -206,16 +233,15 @@ class OneWayRandomDriver:
             "nonce": nonce.hex(),
             "commitment": commitment,
             "range": [low, high],
-            # Reveal fields -- keep secret until you actually disclose them.
             "witness": witness.hex(),
             "value": value,
+            "created_at": self._timestamp(),
         }
         return value, proof
 
     @staticmethod
     def public_record(proof: dict) -> dict:
-        """Safe to publish immediately: proves a commitment was made,
-        reveals nothing about the number."""
+        """Safe to publish immediately: proves a commitment was made."""
         return {
             "algorithm": proof["algorithm"],
             "context": proof["context"],
@@ -249,26 +275,33 @@ class OneWayRandomDriver:
 
     @staticmethod
     def verify_selection(proof: dict) -> bool:
-        """Stronger check for weighted picks: not only is the proof's own
-        value/commitment internally consistent (see `verify`), but the
-        committed value *deterministically reproduces the recorded
-        selected_index* given the recorded candidate weights, and that
-        index's candidate word matches the word the proof claims was
-        selected. This is what lets someone confirm a specific generated
-        word actually came from this draw rather than being swapped in
-        afterward.
-        """
+        """Stronger check for weighted picks."""
         if not OneWayRandomDriver.verify(proof):
             return False
 
+        candidate_words = proof.get("candidate_words")
         weights = proof.get("weights")
-        if weights is None:
-            # Nothing was actually chosen among alternatives (e.g. a
-            # greedy/deterministic step) -- no selection to re-derive.
-            return True
+        selected_index = proof.get("selected_index")
+        selected_word = proof.get("selected_word")
+
+        if not isinstance(candidate_words, list):
+            return False
+        if not isinstance(weights, list):
+            return False
+        if len(candidate_words) != len(weights):
+            return False
+        if not candidate_words:
+            return False
+        if not isinstance(selected_index, int):
+            return False
+        if not 0 <= selected_index < len(candidate_words):
+            return False
+        if candidate_words[selected_index] != selected_word:
+            return False
 
         clean = [max(0.0, float(w)) for w in weights]
         total = sum(clean)
+
         if total <= 0.0:
             expected_index = 0
         else:
@@ -282,60 +315,65 @@ class OneWayRandomDriver:
                     expected_index = i
                     break
 
-        if expected_index != proof.get("selected_index"):
-            return False
-
-        candidate_words = proof.get("candidate_words")
-        selected_word = proof.get("selected_word")
-        if candidate_words is not None and selected_word is not None:
-            if candidate_words[expected_index] != selected_word:
-                return False
-
-        return True
+        return expected_index == selected_index
 
     @staticmethod
     def weighted_choice_index(
         driver: "OneWayRandomDriver",
+        candidate_words: List[str],
         weights: List[float],
         context: dict,
     ) -> Tuple[int, dict]:
-        """Pick an index with probability proportional to `weights`,
-        using the driver's cryptographic entropy. The distribution
-        itself still comes entirely from the caller's scores; entropy
-        only selects among them."""
+        """Pick an index with probability proportional to `weights`."""
+        if len(candidate_words) != len(weights):
+            raise ValueError("candidate_words and weights must have equal length")
+        if not candidate_words:
+            raise ValueError("Cannot choose from an empty candidate list")
+
         clean = [max(0.0, float(w)) for w in weights]
         total = sum(clean)
 
+        value, proof = driver.generate(
+            {
+                **context,
+                "sampling": "weighted-choice",
+                "candidate_words": candidate_words,
+                "weights": clean,
+            },
+            low=0,
+            high=(1 << 64) - 1,
+            operation="weighted-choice",
+        )
+
         if total <= 0.0:
             index = 0
-            _, proof = driver.generate({**context, "sampling": "zero-weight-fallback"}, low=0, high=2 ** 64 - 1)
-            proof["selected_index"] = index
-            proof["weights"] = clean
-            return index, proof
+        else:
+            unit = value / float(1 << 64)
+            target = unit * total
+            cumulative = 0.0
+            index = len(clean) - 1
+            for i, weight in enumerate(clean):
+                cumulative += weight
+                if target < cumulative:
+                    index = i
+                    break
 
-        value, proof = driver.generate({**context, "sampling": "weighted-choice"}, low=0, high=2 ** 64 - 1)
-        u = value / float(1 << 64)
-        target = u * total
-
-        cumulative = 0.0
-        index = len(clean) - 1
-        for i, weight in enumerate(clean):
-            cumulative += weight
-            if target < cumulative:
-                index = i
-                break
-
-        proof["selected_index"] = index
+        proof["candidate_words"] = list(candidate_words)
         proof["weights"] = clean
+        proof["selected_index"] = index
+        proof["selected_word"] = candidate_words[index]
+
         return index, proof
 
+
+# ---------------------------------------------------------------------
+# Symbol manifest types
+# ---------------------------------------------------------------------
 
 SymbolIndex = int
 SparseVector = Dict[int, float]
 Context = Tuple[SymbolIndex, SymbolIndex]
 
-# Feature family layout for the sparse influence vector. `transitions` and
-# `lexical` are open-ended ranges handled separately in `_zero_family`.
 FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
     "intrinsic": (0, 4),
     "beam_state": (5, 7),
@@ -375,9 +413,13 @@ class SymbolManifestEntry:
     raw_count: int = 0
 
 
+# ---------------------------------------------------------------------
+# Sparse symbol manifest
+# ---------------------------------------------------------------------
+
 class SparseSymbolManifest:
-    START_TOKEN = "<START>"
-    END_TOKEN = "<END>"
+    START_TOKEN = ""
+    END_TOKEN = ""
     VERSION = 3
 
     def __init__(
@@ -402,8 +444,6 @@ class SparseSymbolManifest:
         self.word_to_index: Dict[str, SymbolIndex] = {}
         self.next_index = 0
 
-        # Cryptographic entropy drives stochastic generation (see
-        # OneWayRandomDriver above -- this replaces plain `random.choices`).
         self.random_driver = OneWayRandomDriver(experiment=experiment, session=session)
         self.last_random_proofs: List[Dict[str, object]] = []
         self.last_public_records: List[Dict[str, object]] = []
@@ -418,13 +458,7 @@ class SparseSymbolManifest:
         )
         self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
 
-        # Tracks the highest raw symbol_counts value seen, used to
-        # max-normalize the new standalone `frequency` dimension.
         self._max_symbol_count: int = 0
-
-    # -----------------------------------------------------------------
-    # Tokenization, registration, training
-    # -----------------------------------------------------------------
 
     @staticmethod
     def tokenize(text: str) -> List[str]:
@@ -487,10 +521,6 @@ class SparseSymbolManifest:
 
     def ingest_text(self, text: str) -> None:
         self.ingest_dataset_words(self.split_sentences(text))
-
-    # -----------------------------------------------------------------
-    # Manifest calculations
-    # -----------------------------------------------------------------
 
     def finalize(self) -> None:
         self._finalize_transitions()
@@ -574,10 +604,6 @@ class SparseSymbolManifest:
             entry.markov.state_id = max(0, min(self.max_states - 1, int(state_score * state_scale)))
             entry.weight = 0.5 * entry.intrinsic.density + 0.5 * entry.intrinsic.coherence
 
-    # -----------------------------------------------------------------
-    # Sparse influence vectors
-    # -----------------------------------------------------------------
-
     @staticmethod
     def _normalize(vector: SparseVector) -> SparseVector:
         norm = math.sqrt(sum(value * value for value in vector.values()))
@@ -605,13 +631,6 @@ class SparseSymbolManifest:
 
     @staticmethod
     def _zero_family(vector: SparseVector, family: str) -> SparseVector:
-        """Return a copy of `vector` with one feature family's dimensions zeroed.
-
-        `family` must be one of VALID_FAMILIES. `transitions` and `lexical`
-        are open-ended ranges (per-vocabulary and per-hash-bucket
-        respectively), so they're matched by offset rather than a fixed
-        (start, end) pair.
-        """
         if family not in VALID_FAMILIES:
             raise ValueError(f"Unknown feature family: {family!r}. Valid: {VALID_FAMILIES}")
 
@@ -653,10 +672,6 @@ class SparseSymbolManifest:
         if entry is None:
             return {}
 
-        # frequency: max-normalized raw symbol count. This is a NEW,
-        # standalone dimension distinct from `density` (index 0), which is
-        # normalized against total_symbols rather than the single most
-        # frequent symbol.
         frequency = entry.raw_count / self._max_symbol_count if self._max_symbol_count else 0.0
 
         vector: SparseVector = {
@@ -696,10 +711,6 @@ class SparseSymbolManifest:
         return max(0.0, source.weight) * max(0.0, target.weight) * (
             0.5 * transition + 0.5 * structural_alignment
         )
-
-    # -----------------------------------------------------------------
-    # Image-style A x B influence matrix and codomain Y
-    # -----------------------------------------------------------------
 
     def content_indices(self) -> List[SymbolIndex]:
         special = {self.START_TOKEN, self.END_TOKEN}
@@ -741,10 +752,6 @@ class SparseSymbolManifest:
             "rejected_rows": rejected,
         }
 
-    # -----------------------------------------------------------------
-    # Prompt context and robust generation fallback
-    # -----------------------------------------------------------------
-
     def _prompt_indices(self, prompt: str) -> Tuple[List[str], List[SymbolIndex], List[str]]:
         words = self.tokenize(prompt)
         known = [self.word_to_index[word] for word in words if word in self.word_to_index]
@@ -770,7 +777,6 @@ class SparseSymbolManifest:
         previous_idx: SymbolIndex,
         current_idx: SymbolIndex,
     ) -> List[Tuple[str, Dict[SymbolIndex, float]]]:
-        """Ordered exact trigram, bigram, merged context, and unigram backoff."""
         sources: List[Tuple[str, Dict[SymbolIndex, float]]] = []
 
         exact = self.trigram_probs.get((previous_idx, current_idx), {})
@@ -822,18 +828,9 @@ class SparseSymbolManifest:
         fallback_to_unfiltered: bool = True,
         exclude_family: Optional[str] = None,
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
-        """Generate a continuation, preventing zero-token failures via backoff.
-
-        `exclude_family`, if given, zeroes one feature family (see
-        VALID_FAMILIES) out of every influence vector used for cosine
-        similarity during candidate scoring -- e.g. pass "lexical" to
-        make the generator ignore character n-gram similarity entirely.
-        """
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
-            raise ValueError(
-                "No seed-prompt words were found in the trained vocabulary."
-            )
+            raise ValueError("No seed-prompt words were found in the trained vocabulary.")
         if max_new_words <= 0:
             return (prompt_words if preserve_prompt else []), 0.0, []
 
@@ -927,10 +924,19 @@ class SparseSymbolManifest:
                     "temperature": temperature,
                     "distribution_source": source_name,
                     "candidate_count": len(pool),
+                    "output_prefix_sha256": self._text_digest(output),
                 }
 
+                candidate_words = [
+                    self.index_to_word[candidate[4]]
+                    for candidate in pool
+                ]
+
                 selected_index, random_proof = OneWayRandomDriver.weighted_choice_index(
-                    self.random_driver, weights, rng_context,
+                    self.random_driver,
+                    candidate_words=candidate_words,
+                    weights=weights,
+                    context=rng_context,
                 )
 
                 self.last_random_proofs.append(random_proof)
@@ -939,31 +945,35 @@ class SparseSymbolManifest:
                 combined, cosine, influence, probability, next_idx = pool[selected_index]
             else:
                 combined, cosine, influence, probability, next_idx = pool[0]
-                # Deterministic/greedy mode: no entropy needed to choose, but
-                # still record a (degenerate) proof so every step has one.
-                greedy_context = self.random_driver._full_context({
-                    "generator": "RobustSparseSymbolManifest",
-                    "step": step + 1,
-                    "prompt": seed_prompt,
-                    "sampling": "greedy",
-                }, operation="generate")
-                greedy_nonce = os.urandom(NONCE_BYTES)
-                greedy_witness = os.urandom(WITNESS_BYTES)
-                context_bytes = _canonical_json(greedy_context)
+
+                greedy_context = self.random_driver._full_context(
+                    {
+                        "generator": "RobustSparseSymbolManifest",
+                        "step": step + 1,
+                        "prompt": seed_prompt,
+                        "sampling": "greedy",
+                        "selected_word": self.index_to_word[next_idx],
+                        "output_prefix_sha256": self._text_digest(output),
+                    },
+                    operation="greedy-choice",
+                )
+
+                greedy_context_bytes = _canonical_json(greedy_context)
+                greedy_commitment = hashlib.sha256(
+                    b"GREEDY-CHOICE-v1" + greedy_context_bytes
+                ).hexdigest()
+
                 greedy_proof = {
-                    "algorithm": "NONE-GREEDY",
+                    "algorithm": "GREEDY-SHA256-v1",
                     "context": greedy_context,
-                    "nonce": greedy_nonce.hex(),
-                    "witness": greedy_witness.hex(),
                     "range": [0, 0],
-                    "selected_index": 0,
                     "value": 0,
-                    "commitment": hashlib.sha256(
-                        DOMAIN_COMMIT
-                        + len(context_bytes).to_bytes(8, "big") + context_bytes
-                        + greedy_witness
-                        + greedy_nonce
-                    ).hexdigest(),
+                    "candidate_words": [self.index_to_word[idx] for _, _, _, _, idx in pool],
+                    "weights": [],
+                    "selected_index": 0,
+                    "selected_word": self.index_to_word[next_idx],
+                    "commitment": greedy_commitment,
+                    "created_at": self.random_driver._timestamp(),
                 }
                 self.last_random_proofs.append(greedy_proof)
                 self.last_public_records.append(OneWayRandomDriver.public_record(greedy_proof))
@@ -971,6 +981,11 @@ class SparseSymbolManifest:
             next_word = self.index_to_word[next_idx]
             output.append(next_word)
             selected_cosines.append(cosine)
+
+            proof_for_diag = self.last_random_proofs[-1]
+            proof_for_diag["output_word"] = next_word  # type: ignore
+            proof_for_diag["output_position"] = len(output) - 1  # type: ignore
+
             diagnostics.append({
                 "step": step + 1,
                 "context": [self.index_to_word[previous_idx], self.index_to_word[current_idx]],
@@ -985,14 +1000,16 @@ class SparseSymbolManifest:
                 "passed_cosine_filter": not used_fallback,
                 "used_unfiltered_fallback": used_fallback,
                 "exclude_family": exclude_family,
-                "random_commitment": (
-                    self.last_random_proofs[-1]["commitment"] if self.last_random_proofs else None
-                ),
+                "random_commitment": proof_for_diag["commitment"],  # type: ignore
                 "random_proof_index": len(self.last_random_proofs) - 1,
             })
             previous_idx, current_idx = current_idx, next_idx
 
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
+
+    @staticmethod
+    def _text_digest(words: List[str]) -> str:
+        return hashlib.sha256(_canonical_json(words)).hexdigest()
 
     # -----------------------------------------------------------------
     # Safe JSON persistence
@@ -1059,6 +1076,10 @@ class SparseSymbolManifest:
         return manifest
 
 
+# ---------------------------------------------------------------------
+# Corpus loading and diagnostics
+# ---------------------------------------------------------------------
+
 def get_corpus(path: Optional[str]) -> str:
     filename = path or input("Filename: ")
     with open(filename, "r", encoding="utf-8") as file:
@@ -1083,8 +1104,73 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
         )
 
 
+# ---------------------------------------------------------------------
+# Transcript verification
+# ---------------------------------------------------------------------
+
+def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
+    errors = []
+
+    words = transcript.get("generated_words")
+    generated_text = transcript.get("generated_text")
+    recorded_digest = transcript.get("text_sha256")
+
+    if not isinstance(words, list):
+        errors.append("generated_words is missing or invalid")
+        return False, errors
+
+    expected_text = " ".join(str(word) for word in words)
+    if generated_text != expected_text:
+        errors.append("generated_text does not match generated_words")
+
+    expected_digest = hashlib.sha256(_canonical_json(words)).hexdigest()
+    if recorded_digest != expected_digest:
+        errors.append("text_sha256 does not match generated_words")
+
+    proofs = transcript.get("proofs", [])
+    prompt_words = transcript.get("prompt", "").split()
+    expected_proofs = max(0, len(words) - len(prompt_words))
+
+    if len(proofs) != expected_proofs:
+        errors.append(
+            f"proof count mismatch: expected {expected_proofs}, got {len(proofs)}"
+        )
+
+    for index, proof in enumerate(proofs):
+        algorithm = proof.get("algorithm")
+
+        if algorithm == "GREEDY-SHA256-v1":
+            context_bytes = _canonical_json(proof["context"])
+            expected = hashlib.sha256(
+                b"GREEDY-CHOICE-v1" + context_bytes
+            ).hexdigest()
+            if not hmac.compare_digest(expected, proof.get("commitment", "")):
+                errors.append(f"proof {index}: greedy commitment mismatch")
+            if proof.get("range") != [0, 0]:
+                errors.append(f"proof {index}: invalid greedy range")
+            if proof.get("value") != 0:
+                errors.append(f"proof {index}: invalid greedy value")
+            if proof.get("selected_word") != proof.get("output_word"):
+                errors.append(f"proof {index}: selected word/output word mismatch")
+            continue
+
+        if not OneWayRandomDriver.verify_selection(proof):
+            errors.append(f"proof {index}: selection verification failed")
+
+        if proof.get("selected_word") != proof.get("output_word"):
+            errors.append(f"proof {index}: selected word/output word mismatch")
+
+    return not errors, errors
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Robust prompt-seeded sparse cosine influence text generator")
+    parser = argparse.ArgumentParser(
+        description="Robust prompt-seeded sparse cosine influence text generator"
+    )
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
     parser.add_argument("--save", help="Save manifest JSON")
@@ -1092,38 +1178,74 @@ def main() -> None:
     parser.add_argument("--new-words", type=int, default=300)
     parser.add_argument("--tau", type=float, default=0.60, help="Requested cosine lower bound")
     parser.add_argument("--tau-floor", type=float, default=0.05, help="Adaptive minimum cosine lower bound")
-    parser.add_argument("--tau-step", type=float, default=0.65, help="Adaptive tau decrement")
+    parser.add_argument("--tau-step", type=float, default=0.05, help="Adaptive tau decrement")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--candidate-count", type=int, default=32)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--no-adaptive-tau", action="store_true")
     parser.add_argument("--no-fallback", action="store_true")
     parser.add_argument("--show-mapping", type=int, default=10)
-    parser.add_argument("--seed", type=int, help="Seeds Python's `random` module (unused by the crypto sampler)")
+    parser.add_argument(
+        "--seed",
+        type=str,
+        help="Deterministic seed; identical corpus, options, and seed reproduce the same output",
+    )
     parser.add_argument(
         "--exclude-family",
         choices=VALID_FAMILIES,
-        default="frequency",
-        help="Zero out one feature family (intrinsic, beam_state, frequency, transitions, lexical) before cosine scoring",
+        default=None,
+        help="Zero out one feature family before cosine scoring",
     )
     parser.add_argument("--experiment", help="Label embedded in every one-way commitment's context")
     parser.add_argument("--session", type=int, help="Session number embedded in every one-way commitment's context")
     parser.add_argument("--proof-log", help="Write full per-token proofs (incl. revealed witness/value) to a JSON file")
     parser.add_argument("--public-log", help="Write per-token public commitment records (no reveal) to a JSON file")
+    parser.add_argument("--transcript-log", help="Write generated text, diagnostics, and verification proofs")
+    parser.add_argument("--verify-transcript", help="Verify a previously saved generation transcript")
+
     args = parser.parse_args()
 
-    if args.seed is not None:
-        random.seed(args.seed)
+    if args.verify_transcript:
+        with open(args.verify_transcript, "r", encoding="utf-8") as file:
+            transcript = json.load(file)
+
+        ok, errors = verify_transcript(transcript)
+
+        if ok:
+            print("VERIFIED: transcript, generated text, and selections match")
+            return
+
+        print("FAILED: transcript verification failed")
+        for error in errors:
+            print(f"- {error}")
+        return
+
+    entropy_source = (
+        SeededEntropySource(args.seed)
+        if args.seed is not None
+        else QuantumEntropySource()
+    )
 
     if args.load:
         manifest = SparseSymbolManifest.load_json(args.load)
-        manifest.random_driver.experiment = args.experiment
-        manifest.random_driver.session = args.session
+        manifest.random_driver = OneWayRandomDriver(
+            entropy_source=entropy_source,
+            experiment=args.experiment,
+            session=args.session,
+        )
         source = f"loaded {args.load}"
     else:
         manifest = SparseSymbolManifest(
-            max_symbols=64000, max_beams=8, max_states=8,
-            experiment=args.experiment, session=args.session,
+            max_symbols=64000,
+            max_beams=8,
+            max_states=8,
+            experiment=args.experiment,
+            session=args.session,
+        )
+        manifest.random_driver = OneWayRandomDriver(
+            entropy_source=entropy_source,
+            experiment=args.experiment,
+            session=args.session,
         )
         manifest.ingest_text(get_corpus(args.input))
         source = f"trained from {args.input or 'singlekb.txt / embedded corpus'}"
@@ -1180,24 +1302,73 @@ def main() -> None:
         print("\nReveal + verification")
         print("-" * 100)
         for i, proof in enumerate(manifest.last_random_proofs, 1):
-            ok = OneWayRandomDriver.verify(proof) if proof["algorithm"] != "NONE-GREEDY" else True
+            if proof["algorithm"] == "GREEDY-SHA256-v1":
+                ok = True
+            else:
+                ok = OneWayRandomDriver.verify_selection(proof)
             print(f"[{i:03d}] selected_index={proof.get('selected_index', 0)} verify={ok}")
 
         if args.public_log:
             with open(args.public_log, "w", encoding="utf-8") as file:
                 json.dump(
-                    {"algorithm": "SHA256-HKDF-witness", "prompt": args.prompt, "records": manifest.last_public_records},
-                    file, ensure_ascii=False, indent=2,
+                    {
+                        "algorithm": "SHA256-HKDF-witness",
+                        "prompt": args.prompt,
+                        "records": manifest.last_public_records,
+                    },
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
                 )
             print(f"\nSaved public commitment log: {args.public_log}")
 
         if args.proof_log:
             with open(args.proof_log, "w", encoding="utf-8") as file:
                 json.dump(
-                    {"algorithm": "SHA256-HKDF-witness", "prompt": args.prompt, "proofs": manifest.last_random_proofs},
-                    file, ensure_ascii=False, indent=2,
+                    {
+                        "algorithm": "SHA256-HKDF-witness",
+                        "prompt": args.prompt,
+                        "proofs": manifest.last_random_proofs,
+                    },
+                    file,
+                    ensure_ascii=False,
+                    indent=2,
                 )
             print(f"Saved full proof log (includes revealed witness/value): {args.proof_log}")
+
+        if args.transcript_log:
+            generated_text = " ".join(words)
+            text_digest = hashlib.sha256(_canonical_json(words)).hexdigest()
+
+            transcript = {
+                "format": "RSM-generation-transcript-v1",
+                "prompt": args.prompt,
+                "generated_words": words,
+                "generated_text": generated_text,
+                "text_sha256": text_digest,
+                "seed": args.seed,
+                "options": {
+                    "new_words": args.new_words,
+                    "tau": args.tau,
+                    "tau_floor": args.tau_floor,
+                    "tau_step": args.tau_step,
+                    "temperature": args.temperature,
+                    "candidate_count": args.candidate_count,
+                    "greedy": args.greedy,
+                    "adaptive_tau": not args.no_adaptive_tau,
+                    "fallback_to_unfiltered": not args.no_fallback,
+                    "exclude_family": args.exclude_family,
+                },
+                "proofs": manifest.last_random_proofs,
+                "diagnostics": diagnostics,
+            }
+            transcript["transcript_sha256"] = hashlib.sha256(
+                _canonical_json(transcript)
+            ).hexdigest()
+
+            with open(args.transcript_log, "w", encoding="utf-8") as file:
+                json.dump(transcript, file, ensure_ascii=False, indent=2)
+            print(f"Saved transcript: {args.transcript_log}")
 
 
 if __name__ == "__main__":
