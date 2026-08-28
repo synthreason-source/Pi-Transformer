@@ -4,7 +4,7 @@
 Robust Sparse Symbol Manifest (Quantum-Noise, One-Way-Proof Sampling)
 ======================================================================
 
-Prompt-seeded trigram text generation with cosine lower-bound influence
+Prompt-seeded 4-gram text generation with cosine lower-bound influence
 mapping and robust backoff. No external packages are required.
 
 Influence workflow:
@@ -23,7 +23,7 @@ transitions : indices 9..9+N (per-symbol transition-probability block)
 lexical : indices >= 100000 (character n-gram hash buckets)
 
 Prompt generation recovery path:
-exact trigram -> bigram -> merged compatible trigrams -> unigram
+exact 4-gram -> 3-gram -> 2-gram -> unigram
 -> adaptive cosine threshold relaxation -> optional unfiltered fallback
 
 Randomness / seed setter
@@ -86,8 +86,7 @@ from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Set, T
 # ---------------------------------------------------------------------
 
 class QuantumEntropySource:
-    """Wraps a byte-source. Defaults to the OS CSPRNG (os.urandom).
-    Pass a `quantum_reader(n) -> bytes` callable to use real hardware."""
+    """Wraps a byte-source. Defaults to the OS CSPRNG (os.urandom)."""
 
     def __init__(self, quantum_reader: Optional[Callable[[int], bytes]] = None):
         self.quantum_reader = quantum_reader
@@ -196,7 +195,6 @@ class OneWayRandomDriver:
             full["session"] = self.session
         full["operation"] = operation
         full.update(context)
-        # Timestamp is metadata only, not part of derivation context
         return full
 
     def generate(
@@ -242,10 +240,8 @@ class OneWayRandomDriver:
     @staticmethod
     def public_record(proof: dict) -> dict:
         """Safe to publish immediately: proves a commitment was made."""
-        # Greedy proofs may not have a real nonce; synthesize one from context.
         nonce = proof.get("nonce")
         if nonce is None:
-            # Derive a stable pseudo-nonce from the commitment so it’s deterministic.
             nonce = hashlib.sha256(
                 b"GREEDY-PSEUDO-NONCE-v1"
                 + _canonical_json(proof.get("context", {}))
@@ -381,7 +377,7 @@ class OneWayRandomDriver:
 
 SymbolIndex = int
 SparseVector = Dict[int, float]
-Context = Tuple[SymbolIndex, SymbolIndex]
+Context = Tuple[SymbolIndex, SymbolIndex, SymbolIndex]  # 3-word context for 4-gram
 
 FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
     "intrinsic": (0, 4),
@@ -423,13 +419,13 @@ class SymbolManifestEntry:
 
 
 # ---------------------------------------------------------------------
-# Sparse symbol manifest
+# Sparse symbol manifest (4-gram)
 # ---------------------------------------------------------------------
 
 class SparseSymbolManifest:
     START_TOKEN = ""
     END_TOKEN = ""
-    VERSION = 3
+    VERSION = 4  # bumped for 4-gram + base-truths changes
 
     def __init__(
         self,
@@ -462,10 +458,17 @@ class SparseSymbolManifest:
         )
         self.transition_probs: Dict[SymbolIndex, Dict[SymbolIndex, float]] = {}
 
-        self.trigram_counts: DefaultDict[Context, DefaultDict[SymbolIndex, int]] = (
+        # 4-gram structures: context = (w_{t-3}, w_{t-2}, w_{t-1})
+        self.fourgram_counts: DefaultDict[Context, DefaultDict[SymbolIndex, int]] = (
             defaultdict(lambda: defaultdict(int))
         )
-        self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
+        self.fourgram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
+
+        # Legacy trigram probs used for 3-gram backoff (derived from 4-grams if desired)
+        self.trigram_counts: DefaultDict[Tuple[SymbolIndex, SymbolIndex], DefaultDict[SymbolIndex, int]] = (
+            defaultdict(lambda: defaultdict(int))
+        )
+        self.trigram_probs: Dict[Tuple[SymbolIndex, SymbolIndex], Dict[SymbolIndex, float]] = {}
 
         self._max_symbol_count: int = 0
 
@@ -503,7 +506,7 @@ class SparseSymbolManifest:
         if not words:
             return []
 
-        padded = [self.START_TOKEN, self.START_TOKEN, *words, self.END_TOKEN]
+        padded = [self.START_TOKEN, self.START_TOKEN, self.START_TOKEN, *words, self.END_TOKEN]
         sequence = [self._register_word(word) for word in padded]
         self.sequences.append(sequence)
 
@@ -517,10 +520,16 @@ class SparseSymbolManifest:
             self.transition_counts[current_idx][next_idx] += 1
             self.successors[current_idx].add(next_idx)
 
-        for position in range(len(sequence) - 2):
-            self.trigram_counts[(sequence[position], sequence[position + 1])][
-                sequence[position + 2]
-            ] += 1
+        # 4-gram counts: (w0, w1, w2) -> w3
+        for position in range(len(sequence) - 3):
+            ctx = (sequence[position], sequence[position + 1], sequence[position + 2])
+            next_idx = sequence[position + 3]
+            self.fourgram_counts[ctx][next_idx] += 1
+
+            # Also accumulate 3-gram counts for backoff: (w1, w2) -> w3
+            tri_ctx = (sequence[position + 1], sequence[position + 2])
+            self.trigram_counts[tri_ctx][next_idx] += 1
+
         return sequence
 
     def ingest_dataset_words(self, sequences: Iterable[List[str]]) -> None:
@@ -534,6 +543,7 @@ class SparseSymbolManifest:
     def finalize(self) -> None:
         self._finalize_transitions()
         self._finalize_trigrams()
+        self._finalize_fourgrams()
         self._update_intrinsics()
         self._assign_beams_and_states()
 
@@ -552,6 +562,15 @@ class SparseSymbolManifest:
             total = sum(counts.values())
             if total:
                 self.trigram_probs[context] = {
+                    nxt: count / total for nxt, count in counts.items()
+                }
+
+    def _finalize_fourgrams(self) -> None:
+        self.fourgram_probs = {}
+        for context, counts in self.fourgram_counts.items():
+            total = sum(counts.values())
+            if total:
+                self.fourgram_probs[context] = {
                     nxt: count / total for nxt, count in counts.items()
                 }
 
@@ -769,47 +788,50 @@ class SparseSymbolManifest:
 
     def _resolve_prompt_context(self, known: List[SymbolIndex]) -> Context:
         start = self.word_to_index[self.START_TOKEN]
-        if len(known) >= 2 and (known[-2], known[-1]) in self.trigram_probs:
-            return known[-2], known[-1]
+
+        if len(known) >= 3:
+            ctx = (known[-3], known[-2], known[-1])
+            if ctx in self.fourgram_probs:
+                return ctx
+
         if not known:
             raise ValueError("No prompt terms found in vocabulary.")
 
         current = known[-1]
-        matching = [context for context in self.trigram_probs if context[1] == current]
+
+        if len(known) >= 2:
+            suffix2 = (known[-2], known[-1])
+            matching = [ctx for ctx in self.fourgram_probs if ctx[1:] == suffix2]
+            if matching:
+                matching.sort(key=lambda ctx: sum(self.fourgram_counts[ctx].values()), reverse=True)
+                return matching[0]
+
+        matching = [ctx for ctx in self.fourgram_probs if ctx[2] == current]
         if matching:
-            matching.sort(key=lambda context: sum(self.trigram_counts[context].values()), reverse=True)
+            matching.sort(key=lambda ctx: sum(self.fourgram_counts[ctx].values()), reverse=True)
             return matching[0]
-        return start, current
+
+        return start, start, current
 
     def _backoff_distributions(
         self,
-        previous_idx: SymbolIndex,
-        current_idx: SymbolIndex,
+        context: Context,  # (w_{t-3}, w_{t-2}, w_{t-1})
     ) -> List[Tuple[str, Dict[SymbolIndex, float]]]:
+        """Ordered 4-gram, 3-gram, 2-gram, and unigram backoff."""
         sources: List[Tuple[str, Dict[SymbolIndex, float]]] = []
+        w3, w2, w1 = context
 
-        exact = self.trigram_probs.get((previous_idx, current_idx), {})
-        if exact:
-            sources.append(("trigram", exact))
+        exact4 = self.fourgram_probs.get(context, {})
+        if exact4:
+            sources.append(("4gram", exact4))
 
-        bigram = self.transition_probs.get(current_idx, {})
+        exact3 = self.trigram_probs.get((w2, w1), {})
+        if exact3:
+            sources.append(("3gram_backoff", exact3))
+
+        bigram = self.transition_probs.get(w1, {})
         if bigram:
-            sources.append(("bigram_backoff", bigram))
-
-        merged: DefaultDict[SymbolIndex, float] = defaultdict(float)
-        for (prev, current), successors in self.trigram_probs.items():
-            if current != current_idx:
-                continue
-            mass = sum(self.trigram_counts[(prev, current)].values())
-            for next_idx, probability in successors.items():
-                merged[next_idx] += probability * max(1, mass)
-
-        total = sum(merged.values())
-        if total:
-            sources.append((
-                "merged_context_backoff",
-                {idx: value / total for idx, value in merged.items()},
-            ))
+            sources.append(("2gram_backoff", bigram))
 
         special = {self.START_TOKEN, self.END_TOKEN}
         unigram = {
@@ -836,6 +858,7 @@ class SparseSymbolManifest:
         tau_step: float = 0.05,
         fallback_to_unfiltered: bool = True,
         exclude_family: Optional[str] = None,
+        run_root_hash: Optional[str] = None,
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
@@ -843,7 +866,7 @@ class SparseSymbolManifest:
         if max_new_words <= 0:
             return (prompt_words if preserve_prompt else []), 0.0, []
 
-        previous_idx, current_idx = self._resolve_prompt_context(known)
+        context = self._resolve_prompt_context(known)  # (w3, w2, w1)
         requested_tau = max(-1.0, min(1.0, float(tau)))
         tau_floor = max(-1.0, min(requested_tau, float(tau_floor)))
         tau_step = max(1e-4, float(tau_step))
@@ -859,7 +882,7 @@ class SparseSymbolManifest:
             source_name = ""
             distribution: Dict[SymbolIndex, float] = {}
 
-            for name, candidate_distribution in self._backoff_distributions(previous_idx, current_idx):
+            for name, candidate_distribution in self._backoff_distributions(context):
                 usable = {
                     idx: probability
                     for idx, probability in candidate_distribution.items()
@@ -877,7 +900,8 @@ class SparseSymbolManifest:
                 })
                 break
 
-            source_vector = self.influence_vector(current_idx, exclude_family=exclude_family)
+            w3, w2, w1 = context
+            source_vector = self.influence_vector(w1, exclude_family=exclude_family)
             candidates: List[Tuple[float, float, float, float, SymbolIndex]] = []
             ranked = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:max(1, candidate_count)]
 
@@ -886,7 +910,7 @@ class SparseSymbolManifest:
                     source_vector,
                     self.influence_vector(next_idx, exclude_family=exclude_family),
                 )
-                influence = self.influence_score(current_idx, next_idx)
+                influence = self.influence_score(w1, next_idx)
                 combined = 0.45 * cosine + 0.35 * influence + 0.20 * probability
                 candidates.append((combined, cosine, influence, probability, next_idx))
 
@@ -926,8 +950,11 @@ class SparseSymbolManifest:
                     "version": self.VERSION,
                     "step": step + 1,
                     "prompt": seed_prompt,
-                    "previous_word": self.index_to_word[previous_idx],
-                    "current_word": self.index_to_word[current_idx],
+                    "previous_words": [
+                        self.index_to_word[w3],
+                        self.index_to_word[w2],
+                        self.index_to_word[w1],
+                    ],
                     "tau": requested_tau,
                     "effective_tau": effective_tau,
                     "temperature": temperature,
@@ -935,6 +962,8 @@ class SparseSymbolManifest:
                     "candidate_count": len(pool),
                     "output_prefix_sha256": self._text_digest(output),
                 }
+                if run_root_hash is not None:
+                    rng_context["run_root_hash"] = run_root_hash
 
                 candidate_words = [
                     self.index_to_word[candidate[4]]
@@ -972,7 +1001,6 @@ class SparseSymbolManifest:
                     b"GREEDY-CHOICE-v1" + greedy_context_bytes
                 ).hexdigest()
 
-                # Deterministic pseudo-nonce for greedy proofs
                 greedy_nonce = hashlib.sha256(
                     b"GREEDY-NONCE-v1"
                     + greedy_context_bytes
@@ -1004,7 +1032,11 @@ class SparseSymbolManifest:
 
             diagnostics.append({
                 "step": step + 1,
-                "context": [self.index_to_word[previous_idx], self.index_to_word[current_idx]],
+                "context": [
+                    self.index_to_word[w3],
+                    self.index_to_word[w2],
+                    self.index_to_word[w1],
+                ],
                 "next_word": next_word,
                 "distribution_source": source_name,
                 "requested_tau": requested_tau,
@@ -1019,7 +1051,9 @@ class SparseSymbolManifest:
                 "random_commitment": proof_for_diag["commitment"],  # type: ignore
                 "random_proof_index": len(self.last_random_proofs) - 1,
             })
-            previous_idx, current_idx = current_idx, next_idx
+
+            # Slide context: (w2, w1, next)
+            context = (w2, w1, next_idx)
 
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
 
@@ -1047,8 +1081,12 @@ class SparseSymbolManifest:
                 for source, targets in self.transition_counts.items()
             },
             "trigram_counts": {
-                f"{previous},{current}": {str(target): count for target, count in targets.items()}
-                for (previous, current), targets in self.trigram_counts.items()
+                f"{a},{b}": {str(target): count for target, count in targets.items()}
+                for (a, b), targets in self.trigram_counts.items()
+            },
+            "fourgram_counts": {
+                f"{a},{b},{c}": {str(target): count for target, count in targets.items()}
+                for (a, b, c), targets in self.fourgram_counts.items()
             },
         }
 
@@ -1084,9 +1122,14 @@ class SparseSymbolManifest:
                 manifest.successors[source_idx].add(target_idx)
 
         for context, targets in state["trigram_counts"].items():
-            previous, current = (int(value) for value in context.split(",", 1))
+            a, b = (int(value) for value in context.split(",", 1))
             for target, count in targets.items():
-                manifest.trigram_counts[(previous, current)][int(target)] = int(count)
+                manifest.trigram_counts[(a, b)][int(target)] = int(count)
+
+        for context, targets in state["fourgram_counts"].items():
+            a, b, c = (int(value) for value in context.split(",", 2))
+            for target, count in targets.items():
+                manifest.fourgram_counts[(a, b, c)][int(target)] = int(count)
 
         manifest.finalize()
         return manifest
@@ -1095,6 +1138,14 @@ class SparseSymbolManifest:
 # ---------------------------------------------------------------------
 # Corpus loading and diagnostics
 # ---------------------------------------------------------------------
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 
 def get_corpus(path: Optional[str]) -> str:
     filename = path or input("Filename: ")
@@ -1123,9 +1174,11 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
 # ---------------------------------------------------------------------
 # Transcript verification
 # ---------------------------------------------------------------------
+
 def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
     errors = []
 
+    base = transcript.get("base_truths") or {}
     words = transcript.get("generated_words")
     generated_text = transcript.get("generated_text")
     recorded_digest = transcript.get("text_sha256")
@@ -1145,11 +1198,7 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
         errors.append("text_sha256 does not match generated_words")
 
     proofs = transcript.get("proofs", [])
-
-    # Use diagnostics length (one per generated token) as the ground truth.
     expected_proofs = len(diagnostics)
-
-    # Fallback: if diagnostics missing, use options.new_words if present.
     if expected_proofs == 0 and "new_words" in options:
         expected_proofs = int(options["new_words"])
 
@@ -1157,6 +1206,13 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
         errors.append(
             f"proof count mismatch: expected {expected_proofs}, got {len(proofs)}"
         )
+
+    if base and options:
+        base_opts = base.get("options", {})
+        for key in ["new_words", "tau", "temperature", "greedy"]:
+            if key in base_opts and key in options:
+                if base_opts[key] != options[key]:
+                    errors.append(f"options mismatch on {key}")
 
     for index, proof in enumerate(proofs):
         algorithm = proof.get("algorithm")
@@ -1191,7 +1247,7 @@ def verify_transcript(transcript: dict) -> Tuple[bool, List[str]]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Robust prompt-seeded sparse cosine influence text generator"
+        description="Robust 4-gram prompt-seeded sparse cosine influence text generator"
     )
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
@@ -1278,7 +1334,7 @@ def main() -> None:
 
     prompt_words, known, unknown = manifest._prompt_indices(args.prompt)
     print("=" * 100)
-    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
+    print("ROBUST 4-GRAM PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
     print("=" * 100)
     print(f"Source: {source}")
     print(f"Vocabulary: {len(manifest.content_indices())} words")
@@ -1289,6 +1345,39 @@ def main() -> None:
     print(f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; fallback={not args.no_fallback}")
     if args.exclude_family:
         print(f"Excluding feature family from cosine scoring: {args.exclude_family}")
+
+    # Build base truths
+    corpus_hash = None
+    if args.input:
+        corpus_hash = _file_sha256(args.input)
+
+    base_truths = {
+        "corpus_sha256": corpus_hash,
+        "manifest_config": {
+            "max_symbols": manifest.max_symbols,
+            "max_beams": manifest.max_beams,
+            "max_states": manifest.max_states,
+        },
+        "seed": args.seed,
+        "prompt": args.prompt,
+        "options": {
+            "new_words": args.new_words,
+            "tau": args.tau,
+            "tau_floor": args.tau_floor,
+            "tau_step": args.tau_step,
+            "temperature": args.temperature,
+            "candidate_count": args.candidate_count,
+            "greedy": args.greedy,
+            "adaptive_tau": not args.no_adaptive_tau,
+            "fallback_to_unfiltered": not args.no_fallback,
+            "exclude_family": args.exclude_family,
+        },
+    }
+
+    # Optional: derive a run root hash from base truths
+    run_root_hash = hashlib.sha256(
+        _canonical_json(base_truths)
+    ).hexdigest()
 
     while True:
         try:
@@ -1305,6 +1394,7 @@ def main() -> None:
                 tau_step=args.tau_step,
                 fallback_to_unfiltered=not args.no_fallback,
                 exclude_family=args.exclude_family,
+                run_root_hash=run_root_hash,
             )
         except ValueError as exc:
             print(f"Generation failed: {exc}")
@@ -1363,7 +1453,8 @@ def main() -> None:
             text_digest = hashlib.sha256(_canonical_json(words)).hexdigest()
 
             transcript = {
-                "format": "RSM-generation-transcript-v1",
+                "format": "RSM-4gram-generation-transcript-v1",
+                "base_truths": base_truths,
                 "prompt": args.prompt,
                 "generated_words": words,
                 "generated_text": generated_text,
@@ -1383,6 +1474,7 @@ def main() -> None:
                 },
                 "proofs": manifest.last_random_proofs,
                 "diagnostics": diagnostics,
+                "run_root_hash": run_root_hash,
             }
             transcript["transcript_sha256"] = hashlib.sha256(
                 _canonical_json(transcript)
