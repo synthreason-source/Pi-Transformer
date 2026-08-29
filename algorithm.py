@@ -134,7 +134,7 @@ class SparseSymbolManifest:
 
     def __init__(
         self,
-        max_symbols: int = 64000,
+        max_symbols: int = 6400000000,
         max_beams: int = 16,
         max_states: int = 32,
     ) -> None:
@@ -860,7 +860,7 @@ def main() -> None:
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
     parser.add_argument("--save", help="Save manifest JSON")
-    parser.add_argument("--prompt", default="adiabatic dark state", help="Seed prompt")
+    parser.add_argument("--prompt", default="Hello world", help="Seed prompt")
     parser.add_argument("--new-words", type=int, default=300)
     parser.add_argument("--tau", type=float, default=0.60, help="Requested cosine lower bound")
     parser.add_argument("--tau-floor", type=float, default=0.05, help="Adaptive minimum cosine lower bound")
@@ -890,7 +890,7 @@ def main() -> None:
         manifest = SparseSymbolManifest.load_json(args.load)
         source = f"loaded {args.load}"
     else:
-        manifest = SparseSymbolManifest(max_symbols=64000, max_beams=8, max_states=8)
+        manifest = SparseSymbolManifest(max_symbols=640000000, max_beams=8, max_states=8)
         manifest.ingest_text(get_corpus(args.input))
         source = f"trained from {args.input or 'singlekb.txt / embedded corpus'}"
 
@@ -900,21 +900,11 @@ def main() -> None:
 
     prompt_words, known, unknown = manifest._prompt_indices(args.prompt)
     print("=" * 110)
-    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION (v2: instrumented, componentized, honest-stop)")
+    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
     print("=" * 110)
     print(f"Source: {source}")
     print(f"Vocabulary: {len(manifest.content_indices())} words")
-    print(f"Prompt: {args.prompt!r}")
-    print(f"Known prompt words: {[manifest.index_to_word[idx] for idx in known]}")
-    if unknown:
-        print(f"Unknown prompt words: {unknown}")
-    print(
-        f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; "
-        f"require_meaningful_match={not args.allow_unfiltered_fallback}"
-    )
-    if args.exclude_family:
-        print(f"Excluding feature family from cosine scoring: {args.exclude_family}")
-
+ 
     while True:
         try:
             prompt = input("USER: ")
