@@ -1,44 +1,38 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robust Sparse Symbol Manifest
-=============================
+Robust Sparse Symbol Manifest (v2)
+===================================
 
-Prompt-seeded trigram text generation with cosine lower-bound influence
-mapping and robust backoff. No external packages are required.
+Same prompt-seeded trigram generator as v1, with three structural changes:
 
-Influence workflow:
-    A x B      : source/current-word x target/next-word pairs
-    s_ij       : weighted influence score
-    c_ij       : cosine similarity between sparse influence vectors
-    retain     : c_ij >= tau
-    Y          : retained influence space
+  1. INSTRUMENTATION
+     Every similarity comparison can report which feature family
+     (intrinsic / beam_state / frequency / transitions / lexical)
+     contributed how much to the result, instead of returning one
+     opaque combined number.
 
-Feature families (used for cosine similarity and can be selectively
-zeroed out via `exclude_family`):
-    intrinsic    : indices 0-4  (density, relation, coherence, volatility, depth)
-    beam_state   : indices 5-7  (beam affinity, beam id, markov state id)
-    frequency    : index 8      (max-normalized raw symbol count -- NEW dimension)
-    transitions  : indices 9..9+N (per-symbol transition-probability block)
-    lexical      : indices >= 100000 (character n-gram hash buckets)
+  2. NON-MERGED (COMPONENT) VECTORS
+     `influence_vector_components()` returns each feature family as its
+     own separate sub-vector (an `InfluenceComponents` object) rather
+     than flattening everything into one dict and normalizing it as a
+     single unit. The old flat `influence_vector()` still exists (built
+     by merging the components) for anything that needs a single vector,
+     but the seam between families is now preserved upstream and can be
+     inspected before it's collapsed.
 
-Prompt generation recovery path:
-    exact trigram -> bigram -> merged compatible trigrams -> unigram
-    -> adaptive cosine threshold relaxation -> optional unfiltered fallback
+  3. HONEST NO-MATCH EXIT
+     The generator no longer *always* produces a token. When
+     `require_meaningful_match=True` (the new default), if no candidate
+     clears `tau` even after adaptive relaxation to `tau_floor`, the
+     generator stops and reports `no_meaningful_match_found` with the
+     best candidate's per-family breakdown attached, instead of silently
+     falling back to an unfiltered top-probability pick. The old
+     always-succeed behavior is still available via
+     `require_meaningful_match=False` for anyone who wants it.
 
-Examples:
-    python robust_sparse_symbol_manifest.py --input singlekb.txt \
-      --prompt "adiabatic dark state" --tau 0.55 --new-words 30
-
-    python robust_sparse_symbol_manifest.py --input corpus.txt \
-      --prompt "quantum computing" --tau 0.75 --fallback
-
-    python robust_sparse_symbol_manifest.py --load manifest.json \
-      --prompt "neural networks" --tau 0.50 --greedy
-
-    # Ignore the lexical (character n-gram) feature family when scoring:
-    python robust_sparse_symbol_manifest.py --input corpus.txt \
-      --prompt "quantum computing" --exclude-family lexical
+Everything else (tokenization, counting, trigram backoff order, beam/
+state assignment, persistence format) is unchanged from v1.
 """
 
 from __future__ import annotations
@@ -58,8 +52,6 @@ SymbolIndex = int
 SparseVector = Dict[int, float]
 Context = Tuple[SymbolIndex, SymbolIndex]
 
-# Feature family layout for the sparse influence vector. `transitions` and
-# `lexical` are open-ended ranges handled separately in `_zero_family`.
 FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
     "intrinsic": (0, 4),
     "beam_state": (5, 7),
@@ -99,10 +91,46 @@ class SymbolManifestEntry:
     raw_count: int = 0
 
 
+@dataclass
+class InfluenceComponents:
+    """Per-family sub-vectors, kept separate rather than pre-merged.
+
+    Each family's sub-vector is normalized independently, so the seam
+    between "behaves like" (intrinsic/beam_state/frequency), "follows
+    like" (transitions), and "is spelled like" (lexical) survives long
+    enough to be inspected, weighted, or excluded per-family before any
+    combination happens.
+    """
+    intrinsic: SparseVector = field(default_factory=dict)
+    beam_state: SparseVector = field(default_factory=dict)
+    frequency: SparseVector = field(default_factory=dict)
+    transitions: SparseVector = field(default_factory=dict)
+    lexical: SparseVector = field(default_factory=dict)
+
+    def families(self) -> Dict[str, SparseVector]:
+        return {
+            "intrinsic": self.intrinsic,
+            "beam_state": self.beam_state,
+            "frequency": self.frequency,
+            "transitions": self.transitions,
+            "lexical": self.lexical,
+        }
+
+    def merged(self, exclude_family: Optional[str] = None) -> SparseVector:
+        """Flatten to one dict, for callers that need a single vector."""
+        merged: SparseVector = {}
+        for name, vector in self.families().items():
+            if exclude_family and name == exclude_family:
+                continue
+            for key, value in vector.items():
+                merged[key] = merged.get(key, 0.0) + value
+        return merged
+
+
 class SparseSymbolManifest:
     START_TOKEN = "<START>"
     END_TOKEN = "<END>"
-    VERSION = 3
+    VERSION = 4
 
     def __init__(
         self,
@@ -134,12 +162,10 @@ class SparseSymbolManifest:
         )
         self.trigram_probs: Dict[Context, Dict[SymbolIndex, float]] = {}
 
-        # Tracks the highest raw symbol_counts value seen, used to
-        # max-normalize the new standalone `frequency` dimension.
         self._max_symbol_count: int = 0
 
     # -----------------------------------------------------------------
-    # Tokenization, registration, training
+    # Tokenization, registration, training (unchanged from v1)
     # -----------------------------------------------------------------
 
     @staticmethod
@@ -205,7 +231,7 @@ class SparseSymbolManifest:
         self.ingest_dataset_words(self.split_sentences(text))
 
     # -----------------------------------------------------------------
-    # Manifest calculations
+    # Manifest calculations (unchanged from v1)
     # -----------------------------------------------------------------
 
     def finalize(self) -> None:
@@ -291,7 +317,7 @@ class SparseSymbolManifest:
             entry.weight = 0.5 * entry.intrinsic.density + 0.5 * entry.intrinsic.coherence
 
     # -----------------------------------------------------------------
-    # Sparse influence vectors
+    # Sparse vectors: (2) component form kept separate, flat form merged
     # -----------------------------------------------------------------
 
     @staticmethod
@@ -321,13 +347,6 @@ class SparseSymbolManifest:
 
     @staticmethod
     def _zero_family(vector: SparseVector, family: str) -> SparseVector:
-        """Return a copy of `vector` with one feature family's dimensions zeroed.
-
-        `family` must be one of VALID_FAMILIES. `transitions` and `lexical`
-        are open-ended ranges (per-vocabulary and per-hash-bucket
-        respectively), so they're matched by offset rather than a fixed
-        (start, end) pair.
-        """
         if family not in VALID_FAMILIES:
             raise ValueError(f"Unknown feature family: {family!r}. Valid: {VALID_FAMILIES}")
 
@@ -360,43 +379,57 @@ class SparseSymbolManifest:
                 vector[LEXICAL_OFFSET + bucket] += 1.0
         return self._normalize(dict(vector))
 
-    def influence_vector(
-        self,
-        idx: SymbolIndex,
-        exclude_family: Optional[str] = None,
-    ) -> SparseVector:
+    def influence_vector_components(self, idx: SymbolIndex) -> InfluenceComponents:
+        """(2) Return each feature family as its own separate, independently
+        normalized sub-vector, instead of pre-merging everything into one
+        dict. Nothing here decides how families should be weighted or
+        combined -- that decision is left to whoever consumes this, and
+        can be inspected before it happens.
+        """
         entry = self.entries.get(idx)
         if entry is None:
-            return {}
+            return InfluenceComponents()
 
-        # frequency: max-normalized raw symbol count. This is a NEW,
-        # standalone dimension distinct from `density` (index 0), which is
-        # normalized against total_symbols rather than the single most
-        # frequent symbol.
-        frequency = entry.raw_count / self._max_symbol_count if self._max_symbol_count else 0.0
-
-        vector: SparseVector = {
+        intrinsic = {
             0: entry.intrinsic.density,
             1: entry.intrinsic.relation,
             2: entry.intrinsic.coherence,
             3: entry.intrinsic.volatility,
             4: entry.intrinsic.depth,
+        }
+        beam_state = {
             5: entry.beam.affinity,
             6: entry.beam.beam_id / max(1, self.max_beams - 1),
             7: entry.markov.state_id / max(1, self.max_states - 1),
-            8: frequency,
         }
+        frequency = {
+            8: entry.raw_count / self._max_symbol_count if self._max_symbol_count else 0.0,
+        }
+        transitions = {
+            TRANSITIONS_OFFSET + next_idx: probability
+            for next_idx, probability in self.transition_probs.get(idx, {}).items()
+        }
+        lexical = self._lexical_vector(self.index_to_word[idx])
 
-        for next_idx, probability in self.transition_probs.get(idx, {}).items():
-            vector[TRANSITIONS_OFFSET + next_idx] = probability
+        return InfluenceComponents(
+            intrinsic=self._normalize(intrinsic),
+            beam_state=self._normalize(beam_state),
+            frequency=self._normalize(frequency),
+            transitions=self._normalize(transitions),
+            lexical=self._normalize(lexical),
+        )
 
-        for feature, value in self._lexical_vector(self.index_to_word[idx]).items():
-            vector[feature] = vector.get(feature, 0.0) + value
-
-        if exclude_family:
-            vector = self._zero_family(vector, exclude_family)
-
-        return self._normalize(vector)
+    def influence_vector(
+        self,
+        idx: SymbolIndex,
+        exclude_family: Optional[str] = None,
+    ) -> SparseVector:
+        """Flat vector, built by merging components. Kept for callers
+        (e.g. the whole-vocabulary influence_matrix) that legitimately
+        want one combined similarity number rather than a breakdown.
+        """
+        components = self.influence_vector_components(idx)
+        return self._normalize(components.merged(exclude_family=exclude_family))
 
     def influence_score(self, source_idx: SymbolIndex, target_idx: SymbolIndex) -> float:
         source = self.entries.get(source_idx)
@@ -414,6 +447,56 @@ class SparseSymbolManifest:
         )
 
     # -----------------------------------------------------------------
+    # (1) Instrumentation: per-family similarity breakdown
+    # -----------------------------------------------------------------
+
+    def similarity_breakdown(
+        self,
+        source_idx: SymbolIndex,
+        target_idx: SymbolIndex,
+        exclude_family: Optional[str] = None,
+    ) -> Dict[str, object]:
+        """Return which feature family contributed how much to the
+        similarity between two words, instead of one opaque number.
+
+        `per_family_cosine`: cosine similarity computed using ONLY that
+            family's sub-vectors (so a value near 1.0 in "lexical" and
+            near 0.0 in "transitions" tells you the words look alike by
+            spelling but have unrelated adjacency histories, etc).
+        `combined_cosine`: cosine similarity on the merged flat vector,
+            for comparison against the old single-number behavior.
+        `dominant_family`: whichever family had the highest per-family
+            cosine, i.e. which history the resemblance actually comes from.
+        """
+        source_components = self.influence_vector_components(source_idx)
+        target_components = self.influence_vector_components(target_idx)
+
+        per_family_cosine: Dict[str, float] = {}
+        for family in VALID_FAMILIES:
+            if exclude_family == family:
+                per_family_cosine[family] = 0.0
+                continue
+            vec_a = source_components.families()[family]
+            vec_b = target_components.families()[family]
+            per_family_cosine[family] = self.cosine_similarity(vec_a, vec_b)
+
+        combined_a = source_components.merged(exclude_family=exclude_family)
+        combined_b = target_components.merged(exclude_family=exclude_family)
+        combined_cosine = self.cosine_similarity(
+            self._normalize(combined_a), self._normalize(combined_b)
+        )
+
+        dominant_family = max(per_family_cosine, key=per_family_cosine.get) if per_family_cosine else None
+
+        return {
+            "source_word": self.index_to_word.get(source_idx),
+            "target_word": self.index_to_word.get(target_idx),
+            "per_family_cosine": per_family_cosine,
+            "combined_cosine": combined_cosine,
+            "dominant_family": dominant_family,
+        }
+
+    # -----------------------------------------------------------------
     # Image-style A x B influence matrix and codomain Y
     # -----------------------------------------------------------------
 
@@ -425,6 +508,7 @@ class SparseSymbolManifest:
         self,
         tau: float = 0.60,
         exclude_family: Optional[str] = None,
+        include_breakdown: bool = False,
     ) -> Dict[str, object]:
         tau = max(-1.0, min(1.0, float(tau)))
         indices = self.content_indices()
@@ -436,14 +520,19 @@ class SparseSymbolManifest:
                 if source == target:
                     continue
                 cosine = self.cosine_similarity(vectors[source], vectors[target])
-                rows.append({
+                row: Dict[str, object] = {
                     "source_word": self.index_to_word[source],
                     "target_word": self.index_to_word[target],
                     "influence_score": self.influence_score(source, target),
                     "cosine_similarity": cosine,
                     "transition_probability": self.transition_probs.get(source, {}).get(target, 0.0),
                     "kept": cosine >= tau,
-                })
+                }
+                if include_breakdown:
+                    row["family_breakdown"] = self.similarity_breakdown(
+                        source, target, exclude_family=exclude_family
+                    )["per_family_cosine"]
+                rows.append(row)
 
         kept = [row for row in rows if row["kept"]]
         rejected = [row for row in rows if not row["kept"]]
@@ -458,7 +547,7 @@ class SparseSymbolManifest:
         }
 
     # -----------------------------------------------------------------
-    # Prompt context and robust generation fallback
+    # Prompt context and backoff
     # -----------------------------------------------------------------
 
     def _prompt_indices(self, prompt: str) -> Tuple[List[str], List[SymbolIndex], List[str]]:
@@ -486,7 +575,6 @@ class SparseSymbolManifest:
         previous_idx: SymbolIndex,
         current_idx: SymbolIndex,
     ) -> List[Tuple[str, Dict[SymbolIndex, float]]]:
-        """Ordered exact trigram, bigram, merged context, and unigram backoff."""
         sources: List[Tuple[str, Dict[SymbolIndex, float]]] = []
 
         exact = self.trigram_probs.get((previous_idx, current_idx), {})
@@ -523,6 +611,10 @@ class SparseSymbolManifest:
 
         return sources
 
+    # -----------------------------------------------------------------
+    # (3) Generation with an honest no-meaningful-match exit
+    # -----------------------------------------------------------------
+
     def generate_from_seed_prompt(
         self,
         seed_prompt: str,
@@ -535,15 +627,16 @@ class SparseSymbolManifest:
         adaptive_tau: bool = True,
         tau_floor: float = 0.05,
         tau_step: float = 0.05,
-        fallback_to_unfiltered: bool = True,
+        require_meaningful_match: bool = True,
         exclude_family: Optional[str] = None,
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
-        """Generate a continuation, preventing zero-token failures via backoff.
+        """Generate a continuation.
 
-        `exclude_family`, if given, zeroes one feature family (see
-        VALID_FAMILIES) out of every influence vector used for cosine
-        similarity during candidate scoring -- e.g. pass "lexical" to
-        make the generator ignore character n-gram similarity entirely.
+        `require_meaningful_match` (new, default True): if no candidate
+        clears `tau` even after relaxing to `tau_floor`, generation stops
+        with an honest `no_meaningful_match_found` diagnostic instead of
+        silently accepting the best unfiltered candidate. Set this to
+        False to restore the old always-succeed fallback behavior.
         """
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
@@ -585,20 +678,20 @@ class SparseSymbolManifest:
                 })
                 break
 
-            source_vector = self.influence_vector(current_idx, exclude_family=exclude_family)
-            candidates: List[Tuple[float, float, float, float, SymbolIndex]] = []
+            source_components = self.influence_vector_components(current_idx)
+            source_vector = self._normalize(source_components.merged(exclude_family=exclude_family))
+
+            candidates: List[Tuple[float, float, float, float, SymbolIndex, Dict[str, float]]] = []
             ranked = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:max(1, candidate_count)]
 
             for next_idx, probability in ranked:
-                cosine = self.cosine_similarity(
-                    source_vector,
-                    self.influence_vector(next_idx, exclude_family=exclude_family),
-                )
+                breakdown = self.similarity_breakdown(current_idx, next_idx, exclude_family=exclude_family)
+                cosine = breakdown["combined_cosine"]
                 influence = self.influence_score(current_idx, next_idx)
                 combined = 0.45 * cosine + 0.35 * influence + 0.20 * probability
-                candidates.append((combined, cosine, influence, probability, next_idx))
+                candidates.append((combined, cosine, influence, probability, next_idx, breakdown["per_family_cosine"]))
 
-            candidates.sort(reverse=True)
+            candidates.sort(key=lambda c: c[0], reverse=True)
             effective_tau = requested_tau
             passing = [candidate for candidate in candidates if candidate[1] >= effective_tau]
 
@@ -609,28 +702,35 @@ class SparseSymbolManifest:
                     if passing:
                         break
 
-            used_fallback = False
-            if passing:
-                pool = passing
-            elif fallback_to_unfiltered:
-                pool = candidates
-                used_fallback = True
+            if not passing:
+                if require_meaningful_match:
+                    best = candidates[0] if candidates else None
+                    diagnostics.append({
+                        "step": step + 1,
+                        "stop_reason": "no_meaningful_match_found",
+                        "distribution_source": source_name,
+                        "requested_tau": requested_tau,
+                        "effective_tau": effective_tau,
+                        "best_candidate_word": self.index_to_word[best[4]] if best else None,
+                        "best_candidate_cosine": best[1] if best else 0.0,
+                        "best_candidate_family_breakdown": best[5] if best else {},
+                    })
+                    break
+                else:
+                    # Legacy always-succeed behavior, explicitly opted into.
+                    pool = candidates
+                    used_fallback = True
             else:
-                diagnostics.append({
-                    "step": step + 1,
-                    "stop_reason": "no_candidate_passed_cosine_threshold",
-                    "distribution_source": source_name,
-                    "requested_tau": requested_tau,
-                    "effective_tau": effective_tau,
-                    "best_available_cosine": candidates[0][1] if candidates else 0.0,
-                })
-                break
+                pool = passing
+                used_fallback = False
 
             if stochastic and len(pool) > 1:
                 weights = [max(1e-12, candidate[0]) ** (1.0 / temperature) for candidate in pool]
-                combined, cosine, influence, probability, next_idx = random.choices(pool, weights=weights, k=1)[0]
+                combined, cosine, influence, probability, next_idx, family_breakdown = random.choices(
+                    pool, weights=weights, k=1
+                )[0]
             else:
-                combined, cosine, influence, probability, next_idx = pool[0]
+                combined, cosine, influence, probability, next_idx, family_breakdown = pool[0]
 
             next_word = self.index_to_word[next_idx]
             output.append(next_word)
@@ -643,10 +743,11 @@ class SparseSymbolManifest:
                 "requested_tau": requested_tau,
                 "effective_tau": effective_tau,
                 "cosine": cosine,
+                "family_breakdown": family_breakdown,
+                "dominant_family": max(family_breakdown, key=family_breakdown.get) if family_breakdown else None,
                 "influence_score": influence,
                 "probability": probability,
                 "combined_score": combined,
-                "passed_cosine_filter": not used_fallback,
                 "used_unfiltered_fallback": used_fallback,
                 "exclude_family": exclude_family,
             })
@@ -655,7 +756,7 @@ class SparseSymbolManifest:
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
 
     # -----------------------------------------------------------------
-    # Safe JSON persistence
+    # Safe JSON persistence (unchanged from v1)
     # -----------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, object]:
@@ -720,15 +821,28 @@ class SparseSymbolManifest:
 
 
 def get_corpus(path: Optional[str]) -> str:
+    if path:
+        with open(path, "r", encoding="utf-8") as file:
+            return file.read()
     with open(input("Filename: "), "r", encoding="utf-8") as file:
         return file.read()
 
+
 def print_diagnostics(rows: List[Dict[str, object]]) -> None:
     print("\nStep diagnostics")
-    print("-" * 100)
+    print("-" * 110)
     for row in rows:
         if "stop_reason" in row:
-            print(f"STOP | {row['stop_reason']}")
+            if row["stop_reason"] == "no_meaningful_match_found":
+                print(
+                    f"STOP | no_meaningful_match_found | best candidate was "
+                    f"{row.get('best_candidate_word')!r} at cosine="
+                    f"{float(row.get('best_candidate_cosine', 0.0)):.4f} "
+                    f"(needed >= {float(row.get('effective_tau', 0.0)):.4f}) | "
+                    f"breakdown={row.get('best_candidate_family_breakdown')}"
+                )
+            else:
+                print(f"STOP | {row['stop_reason']}")
             continue
         context = " ".join(row["context"])  # type: ignore[arg-type]
         print(
@@ -736,13 +850,13 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
             f"src={str(row['distribution_source']):22s} | "
             f"cos={float(row['cosine']):.4f} | "
             f"tau={float(row['effective_tau']):.4f} | "
-            f"s={float(row['influence_score']):.5f} | "
+            f"dominant={str(row.get('dominant_family')):12s} | "
             f"fallback={row['used_unfiltered_fallback']}"
         )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Robust prompt-seeded sparse cosine influence text generator")
+    parser = argparse.ArgumentParser(description="Robust prompt-seeded sparse cosine influence text generator (v2)")
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
     parser.add_argument("--save", help="Save manifest JSON")
@@ -750,19 +864,22 @@ def main() -> None:
     parser.add_argument("--new-words", type=int, default=300)
     parser.add_argument("--tau", type=float, default=0.60, help="Requested cosine lower bound")
     parser.add_argument("--tau-floor", type=float, default=0.05, help="Adaptive minimum cosine lower bound")
-    parser.add_argument("--tau-step", type=float, default=0.65, help="Adaptive tau decrement")
+    parser.add_argument("--tau-step", type=float, default=0.05, help="Adaptive tau decrement")
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--candidate-count", type=int, default=32)
     parser.add_argument("--greedy", action="store_true")
     parser.add_argument("--no-adaptive-tau", action="store_true")
-    parser.add_argument("--no-fallback", action="store_true")
-    parser.add_argument("--show-mapping", type=int, default=10)
+    parser.add_argument(
+        "--allow-unfiltered-fallback",
+        action="store_true",
+        help="Restore the old always-succeed behavior instead of stopping honestly on no match.",
+    )
     parser.add_argument("--seed", type=int)
     parser.add_argument(
         "--exclude-family",
         choices=VALID_FAMILIES,
-        default="frequency",
-        help="Zero out one feature family (intrinsic, beam_state, frequency, transitions, lexical) before cosine scoring",
+        default=None,
+        help="Zero out one feature family before cosine scoring",
     )
     args = parser.parse_args()
 
@@ -782,22 +899,31 @@ def main() -> None:
         print(f"Saved manifest: {args.save}")
 
     prompt_words, known, unknown = manifest._prompt_indices(args.prompt)
-    print("=" * 100)
-    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
-    print("=" * 100)
+    print("=" * 110)
+    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION (v2: instrumented, componentized, honest-stop)")
+    print("=" * 110)
     print(f"Source: {source}")
     print(f"Vocabulary: {len(manifest.content_indices())} words")
     print(f"Prompt: {args.prompt!r}")
     print(f"Known prompt words: {[manifest.index_to_word[idx] for idx in known]}")
     if unknown:
         print(f"Unknown prompt words: {unknown}")
-    print(f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; fallback={not args.no_fallback}")
+    print(
+        f"Requested tau={args.tau:.3f}; adaptive floor={args.tau_floor:.3f}; "
+        f"require_meaningful_match={not args.allow_unfiltered_fallback}"
+    )
     if args.exclude_family:
         print(f"Excluding feature family from cosine scoring: {args.exclude_family}")
+
     while True:
         try:
+            prompt = input("USER: ")
+        except EOFError:
+            break
+
+        try:
             words, min_cosine, diagnostics = manifest.generate_from_seed_prompt(
-                seed_prompt=input("USER: "),
+                seed_prompt=prompt,
                 max_new_words=args.new_words,
                 temperature=args.temperature,
                 tau=args.tau,
@@ -807,16 +933,15 @@ def main() -> None:
                 adaptive_tau=not args.no_adaptive_tau,
                 tau_floor=args.tau_floor,
                 tau_step=args.tau_step,
-                fallback_to_unfiltered=not args.no_fallback,
+                require_meaningful_match=not args.allow_unfiltered_fallback,
                 exclude_family=args.exclude_family,
             )
         except ValueError as exc:
             print(f"Generation failed: {exc}")
-            return
+            continue
 
-        generated_count = sum(1 for row in diagnostics if "next_word" in row)
         print("\nGenerated text")
-        print("-" * 100)
+        print("-" * 110)
         print(" ".join(words))
 
 
