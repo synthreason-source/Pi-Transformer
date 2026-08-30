@@ -383,7 +383,7 @@ class NGramModel:
 def display_candidates(candidates: List[Candidate]) -> None:
     print()
     print("=" * 70)
-    print("CLOSEST CORPUS SENTENCES")
+    print("REASONING")
     print("=" * 70)
     if not candidates:
         print("No candidates found.")
