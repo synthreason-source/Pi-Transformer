@@ -59,7 +59,6 @@ from typing import Dict, Iterable, List, Tuple, Optional
 
 CORPUS_PATH = input("Filename: ")
 MODEL_PATH = "model.json"
-RECORD_PATH = "chinese_room_record.json"
 
 MAX_NEW_TOKENS = 500
 TEMPERATURE = 0.8
@@ -77,7 +76,7 @@ CURVE_MIDPOINT = 0.5
 # SYMBOLIC CANDIDATE ANALYSIS
 # ============================================================
 
-CANDIDATE_LIMIT = 5
+CANDIDATE_LIMIT = 15
 
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
@@ -1596,41 +1595,11 @@ def display_candidates(
             f"STEP {candidate.rank}"
         )
 
-        print(
-            "  Potential prompt:"
-        )
 
         print(
             f"    {candidate.potential_prompt}"
         )
 
-        print(
-            "  Candidate ground truth:"
-        )
-
-        print(
-            f"    {candidate.candidate_ground_truth}"
-        )
-
-        print(
-            "  Symbolic overlap:"
-            f" {candidate.symbolic_overlap:.4f}"
-        )
-
-        print(
-            "  Vector similarity:"
-            f" {candidate.vector_similarity:.4f}"
-        )
-
-        print(
-            "  Combined score:"
-            f" {candidate.score:.4f}"
-        )
-
-        print(
-            "  Corpus frequency:"
-            f" {candidate.frequency}"
-        )
 
 
 # ============================================================
@@ -1650,24 +1619,13 @@ def display_result(
     print(
         "SPARSE SYMBOL MANIFEST"
     )
-    print(
-        "SYMBOLIC CANDIDATE ANALYSIS"
-    )
-    print("=" * 70)
-
-    print()
-    print(
-        "ORIGINAL PROMPT"
-    )
-
-    print(prompt)
 
     # --------------------------------------------------------
     # FIRST PROCESSING STAGE
     # --------------------------------------------------------
 
     display_candidates(
-        "1. SYMBOLIC CANDIDATE ANALYSIS",
+        "1. ANALYSIS",
         pre_candidates,
     )
 
@@ -1678,96 +1636,14 @@ def display_result(
     print()
     print("=" * 70)
     print(
-        "2. FIRST SYMBOLIC GENERATION"
+        "2. SYMBOLIC GENERATION"
     )
     print("=" * 70)
 
     print()
     print(generated)
 
-    # --------------------------------------------------------
-    # POST-GENERATION REBINDING
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print(
-        "3. POST-GENERATION REBINDING"
-    )
-    print("=" * 70)
-
-    print()
-    print(
-        "Grounding score:"
-        f" {result.grounding_score:.4f}"
-    )
-
-    print(
-        "Symbolic overlap:"
-        f" {result.symbolic_overlap:.4f}"
-    )
-
-    print(
-        "Vector similarity:"
-        f" {result.semantic_overlap:.4f}"
-    )
-
-    print(
-        "Ambiguity:"
-        f" {result.ambiguity:.4f}"
-    )
-
-    print(
-        "Accepted:"
-        f" {result.accepted}"
-    )
-
-    print(
-        "Reason:"
-        f" {result.reason}"
-    )
-
-    if result.accepted:
-
-        print()
-        print(
-            "REBOUND PROMPT"
-        )
-
-        print(
-            result.rebound_prompt
-        )
-
-        print()
-        print(
-            "CANDIDATE GROUND TRUTH"
-        )
-
-        print(
-            result.rebound_ground_truth
-        )
-
-    # --------------------------------------------------------
-    # SECOND PASS
-    # --------------------------------------------------------
-
-    if second_generation is not None:
-
-        print()
-        print("=" * 70)
-        print(
-            "4. SECOND SYMBOLIC PASS"
-        )
-        print("=" * 70)
-
-        print()
-        print(
-            second_generation
-        )
-
-    print()
-    print("=" * 70)
-
+   
 
 # ============================================================
 # MAIN
@@ -1957,191 +1833,6 @@ def main() -> None:
             generated=generated,
             result=result,
             second_generation=second_generation,
-        )
-
-        # ========================================================
-        # COMPLETE MACHINE RECORD
-        # ========================================================
-
-        record = {
-
-            "experiment": {
-
-                "name":
-                    "Sparse Symbol Manifest "
-                    "Symbolic Candidate Analysis "
-                    "Chinese Room Rebinding",
-
-                "seed":
-                    RANDOM_SEED,
-
-                "prompt":
-                    prompt,
-            },
-
-            "processing_order": [
-
-                "symbolic_candidate_analysis",
-
-                "first_generation",
-
-                "post_generation_rebinding",
-
-                "second_symbolic_pass",
-            ],
-
-            "model": {
-
-                "model_path":
-                    MODEL_PATH,
-
-                "vocabulary_size":
-                    len(model.vocabulary),
-
-                "unigram_types":
-                    len(model.unigram),
-
-                "bigram_contexts":
-                    len(model.bigram),
-
-                "trigram_contexts":
-                    len(model.trigram),
-            },
-
-            # ----------------------------------------------------
-            # FIRST SYMBOLIC ANALYSIS
-            # ----------------------------------------------------
-
-            "symbolic_candidate_analysis": {
-
-                "description":
-                    "Observable symbolic candidate "
-                    "generation performed before "
-                    "language generation.",
-
-                "candidate_limit":
-                    CANDIDATE_LIMIT,
-
-                "lexical_weight":
-                    LEXICAL_WEIGHT,
-
-                "vector_weight":
-                    VECTOR_WEIGHT,
-
-                "candidates": [
-                    candidate.to_dict()
-                    for candidate
-                    in pre_candidates
-                ],
-            },
-
-            # ----------------------------------------------------
-            # GENERATION
-            # ----------------------------------------------------
-
-            "generation": {
-
-                "temperature":
-                    TEMPERATURE,
-
-                "top_k":
-                    TOP_K,
-
-                "max_new_tokens":
-                    MAX_NEW_TOKENS,
-
-                "generated":
-                    generated,
-            },
-
-            # ----------------------------------------------------
-            # CHINESE ROOM
-            # ----------------------------------------------------
-
-            "chinese_room": {
-
-                "candidate_limit":
-                    CANDIDATE_LIMIT,
-
-                "lexical_weight":
-                    LEXICAL_WEIGHT,
-
-                "vector_weight":
-                    VECTOR_WEIGHT,
-
-                "acceptance_threshold":
-                    ACCEPTANCE_THRESHOLD,
-
-                "ambiguity_margin":
-                    AMBIGUITY_MARGIN,
-
-                "rebinding":
-                    result.to_dict(),
-            },
-
-            # ----------------------------------------------------
-            # SECOND PASS
-            # ----------------------------------------------------
-
-            "second_pass": {
-
-                "enabled":
-                    SECOND_PASS_GENERATION,
-
-                "input":
-                    result.rebound_ground_truth,
-
-                "generated":
-                    second_generation,
-            },
-
-            # ----------------------------------------------------
-            # INTERPRETATION
-            # ----------------------------------------------------
-
-            "interpretation": {
-
-                "analysis_steps_are":
-                    "Explicit symbolic scoring operations, "
-                    "not hidden chain-of-thought.",
-
-                "generated_symbols_are_not":
-                    "Independently verified semantic understanding.",
-
-                "candidate_ground_truth_is":
-                    "A corpus-derived candidate reference.",
-
-                "potential_prompt_is":
-                    "A corpus sentence ranked as a possible "
-                    "symbolic reference for the prompt or output.",
-
-                "rebinding_measures":
-                    "Lexical overlap and vector similarity "
-                    "between symbolic text representations.",
-            },
-        }
-
-        # ========================================================
-        # SAVE RECORD
-        # ========================================================
-
-        Path(
-            RECORD_PATH
-        ).write_text(
-
-            json.dumps(
-                record,
-                indent=2,
-                ensure_ascii=False,
-            ),
-
-            encoding="utf-8",
-        )
-
-        print()
-        print(
-            f"Experiment record saved to "
-            f"{RECORD_PATH}"
         )
 
 
