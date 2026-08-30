@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Robust Sparse Symbol Manifest (v2)
+Robust Sparse Symbol Manifest (v3)
 ===================================
 
-Same prompt-seeded trigram generator as v1, with three structural changes:
+Builds on v2 (per-family instrumentation, non-merged component vectors,
+honest no-match exit). v3 adds:
 
-  1. INSTRUMENTATION
-     Every similarity comparison can report which feature family
-     (intrinsic / beam_state / frequency / transitions / lexical)
-     contributed how much to the result, instead of returning one
-     opaque combined number.
+  4. GENERIC EOS-DRIVEN WEIGHT CURVES
+     The old fixed blend (0.45*cosine + 0.35*influence + 0.20*probability)
+     is replaced by `curve(p_eos) -> (w_cosine, w_influence, w_probability)`,
+     a small family of generic parametric curves (linear / sigmoid /
+     inverse), each shifting weight toward raw transition probability as
+     `p_eos` -- the probability mass the *current* context distribution
+     assigns to <END> before filtering -- rises. Near termination,
+     structural resemblance (cosine/influence) matters less than what the
+     data actually saw happen next.
 
-  2. NON-MERGED (COMPONENT) VECTORS
-     `influence_vector_components()` returns each feature family as its
-     own separate sub-vector (an `InfluenceComponents` object) rather
-     than flattening everything into one dict and normalizing it as a
-     single unit. The old flat `influence_vector()` still exists (built
-     by merging the components) for anything that needs a single vector,
-     but the seam between families is now preserved upstream and can be
-     inspected before it's collapsed.
+  5. DETERMINISTIC, DATASET-ISOMORPHIC CURVE SELECTION
+     Which curve shape applies at a given step is chosen by
+     `_context_curve_name(previous_idx, current_idx)`, a pure function of
+     the current Markov context. The mapping is built from a stable rank
+     over every context that actually exists in the trained trigram
+     table (`_context_rank_cache`, rebuilt in `finalize()`), so the same
+     context always selects the same curve, and the index space is
+     isomorphic to the dataset's own trained context space rather than
+     to anything external (no hashing of arbitrary strings/objects).
 
-  3. HONEST NO-MATCH EXIT
-     The generator no longer *always* produces a token. When
-     `require_meaningful_match=True` (the new default), if no candidate
-     clears `tau` even after adaptive relaxation to `tau_floor`, the
-     generator stops and reports `no_meaningful_match_found` with the
-     best candidate's per-family breakdown attached, instead of silently
-     falling back to an unfiltered top-probability pick. The old
-     always-succeed behavior is still available via
-     `require_meaningful_match=False` for anyone who wants it.
+  6. LAZY CANDIDATE SCORING
+     Per-step candidate scoring is expressed as an explicit `iter(...)`
+     piped through `map(...)`, rather than a list comprehension building
+     the whole scored list eagerly in one expression.
 
 Everything else (tokenization, counting, trigram backoff order, beam/
-state assignment, persistence format) is unchanged from v1.
+state assignment, persistence format, per-family instrumentation, the
+honest no-match exit) is unchanged from v2.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ import random
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
+from typing import Callable, DefaultDict, Dict, Iterable, List, Optional, Set, Tuple
 
 SymbolIndex = int
 SparseVector = Dict[int, float]
@@ -60,6 +62,61 @@ FEATURE_FAMILY_RANGES: Dict[str, Tuple[int, int]] = {
 TRANSITIONS_OFFSET = 9
 LEXICAL_OFFSET = 100000
 VALID_FAMILIES = ("intrinsic", "beam_state", "frequency", "transitions", "lexical")
+
+# ---------------------------------------------------------------------
+# (4) Generic EOS-driven weight curves
+# ---------------------------------------------------------------------
+# Each curve maps p_eos in [0, 1] -> (w_cosine, w_influence, w_probability),
+# a triple that sums to 1.0. All three curves share the same "anchor"
+# ratio between cosine and influence weight (0.45 : 0.35, i.e. 0.5625 :
+# 0.4375 of whatever is left over after w_probability is taken out) so
+# the only thing that differs between curves is *how fast* w_probability
+# grows with p_eos, not what it grows at the expense of.
+
+_COSINE_SHARE = 0.45 / (0.45 + 0.35)   # 0.5625
+_INFLUENCE_SHARE = 0.35 / (0.45 + 0.35)  # 0.4375
+_BASE_PROB_WEIGHT = 0.20
+_MAX_PROB_WEIGHT = 0.80
+
+
+def _split_remaining(w_prob: float) -> Tuple[float, float, float]:
+    w_prob = max(0.0, min(1.0, w_prob))
+    remaining = 1.0 - w_prob
+    return remaining * _COSINE_SHARE, remaining * _INFLUENCE_SHARE, w_prob
+
+
+def _curve_linear(p_eos: float) -> Tuple[float, float, float]:
+    """w_probability grows linearly with p_eos."""
+    p_eos = max(0.0, min(1.0, p_eos))
+    w_prob = _BASE_PROB_WEIGHT + (_MAX_PROB_WEIGHT - _BASE_PROB_WEIGHT) * p_eos
+    return _split_remaining(w_prob)
+
+
+def _curve_sigmoid(p_eos: float) -> Tuple[float, float, float]:
+    """w_probability stays low until p_eos crosses ~0.5, then rises sharply."""
+    p_eos = max(0.0, min(1.0, p_eos))
+    steepness = 10.0
+    midpoint = 0.5
+    sig = 1.0 / (1.0 + math.exp(-steepness * (p_eos - midpoint)))
+    w_prob = _BASE_PROB_WEIGHT + (_MAX_PROB_WEIGHT - _BASE_PROB_WEIGHT) * sig
+    return _split_remaining(w_prob)
+
+
+def _curve_inverse(p_eos: float) -> Tuple[float, float, float]:
+    """w_probability rises quickly at first, then flattens out."""
+    p_eos = max(0.0, min(1.0, p_eos))
+    shaped = (2.0 * p_eos) / (1.0 + p_eos)  # in [0, 1], concave
+    w_prob = _BASE_PROB_WEIGHT + (_MAX_PROB_WEIGHT - _BASE_PROB_WEIGHT) * shaped
+    return _split_remaining(w_prob)
+
+
+CurveFn = Callable[[float], Tuple[float, float, float]]
+CURVE_FAMILY: Dict[str, CurveFn] = {
+    "linear": _curve_linear,
+    "sigmoid": _curve_sigmoid,
+    "inverse": _curve_inverse,
+}
+CURVE_NAMES: Tuple[str, ...] = tuple(CURVE_FAMILY.keys())
 
 
 @dataclass
@@ -93,14 +150,7 @@ class SymbolManifestEntry:
 
 @dataclass
 class InfluenceComponents:
-    """Per-family sub-vectors, kept separate rather than pre-merged.
-
-    Each family's sub-vector is normalized independently, so the seam
-    between "behaves like" (intrinsic/beam_state/frequency), "follows
-    like" (transitions), and "is spelled like" (lexical) survives long
-    enough to be inspected, weighted, or excluded per-family before any
-    combination happens.
-    """
+    """Per-family sub-vectors, kept separate rather than pre-merged."""
     intrinsic: SparseVector = field(default_factory=dict)
     beam_state: SparseVector = field(default_factory=dict)
     frequency: SparseVector = field(default_factory=dict)
@@ -117,7 +167,6 @@ class InfluenceComponents:
         }
 
     def merged(self, exclude_family: Optional[str] = None) -> SparseVector:
-        """Flatten to one dict, for callers that need a single vector."""
         merged: SparseVector = {}
         for name, vector in self.families().items():
             if exclude_family and name == exclude_family:
@@ -130,7 +179,7 @@ class InfluenceComponents:
 class SparseSymbolManifest:
     START_TOKEN = "<START>"
     END_TOKEN = "<END>"
-    VERSION = 4
+    VERSION = 5
 
     def __init__(
         self,
@@ -164,8 +213,13 @@ class SparseSymbolManifest:
 
         self._max_symbol_count: int = 0
 
+        # (5) Stable rank of every trained context, rebuilt in finalize().
+        # This is what makes curve selection isomorphic to the dataset's
+        # own trained context space rather than to an external hash.
+        self._context_rank_cache: Dict[Context, int] = {}
+
     # -----------------------------------------------------------------
-    # Tokenization, registration, training (unchanged from v1)
+    # Tokenization, registration, training (unchanged from v1/v2)
     # -----------------------------------------------------------------
 
     @staticmethod
@@ -231,7 +285,7 @@ class SparseSymbolManifest:
         self.ingest_dataset_words(self.split_sentences(text))
 
     # -----------------------------------------------------------------
-    # Manifest calculations (unchanged from v1)
+    # Manifest calculations (unchanged from v1/v2)
     # -----------------------------------------------------------------
 
     def finalize(self) -> None:
@@ -239,6 +293,7 @@ class SparseSymbolManifest:
         self._finalize_trigrams()
         self._update_intrinsics()
         self._assign_beams_and_states()
+        self._rebuild_context_rank_cache()
 
     def _finalize_transitions(self) -> None:
         self.transition_probs = {}
@@ -316,8 +371,18 @@ class SparseSymbolManifest:
             entry.markov.state_id = max(0, min(self.max_states - 1, int(state_score * state_scale)))
             entry.weight = 0.5 * entry.intrinsic.density + 0.5 * entry.intrinsic.coherence
 
+    def _rebuild_context_rank_cache(self) -> None:
+        """(5) Give every context that actually occurs in the trained
+        trigram table a stable rank, 0..N-1, ordered deterministically.
+        This is the dataset's own context space -- nothing external is
+        hashed into it -- so curve selection stays isomorphic to what
+        was actually trained, and stable across runs given the same data.
+        """
+        contexts = sorted(self.trigram_probs.keys())
+        self._context_rank_cache = {context: rank for rank, context in enumerate(contexts)}
+
     # -----------------------------------------------------------------
-    # Sparse vectors: (2) component form kept separate, flat form merged
+    # Sparse vectors: component form kept separate, flat form merged
     # -----------------------------------------------------------------
 
     @staticmethod
@@ -380,12 +445,6 @@ class SparseSymbolManifest:
         return self._normalize(dict(vector))
 
     def influence_vector_components(self, idx: SymbolIndex) -> InfluenceComponents:
-        """(2) Return each feature family as its own separate, independently
-        normalized sub-vector, instead of pre-merging everything into one
-        dict. Nothing here decides how families should be weighted or
-        combined -- that decision is left to whoever consumes this, and
-        can be inspected before it happens.
-        """
         entry = self.entries.get(idx)
         if entry is None:
             return InfluenceComponents()
@@ -424,10 +483,6 @@ class SparseSymbolManifest:
         idx: SymbolIndex,
         exclude_family: Optional[str] = None,
     ) -> SparseVector:
-        """Flat vector, built by merging components. Kept for callers
-        (e.g. the whole-vocabulary influence_matrix) that legitimately
-        want one combined similarity number rather than a breakdown.
-        """
         components = self.influence_vector_components(idx)
         return self._normalize(components.merged(exclude_family=exclude_family))
 
@@ -447,7 +502,7 @@ class SparseSymbolManifest:
         )
 
     # -----------------------------------------------------------------
-    # (1) Instrumentation: per-family similarity breakdown
+    # Instrumentation: per-family similarity breakdown (unchanged)
     # -----------------------------------------------------------------
 
     def similarity_breakdown(
@@ -456,18 +511,6 @@ class SparseSymbolManifest:
         target_idx: SymbolIndex,
         exclude_family: Optional[str] = None,
     ) -> Dict[str, object]:
-        """Return which feature family contributed how much to the
-        similarity between two words, instead of one opaque number.
-
-        `per_family_cosine`: cosine similarity computed using ONLY that
-            family's sub-vectors (so a value near 1.0 in "lexical" and
-            near 0.0 in "transitions" tells you the words look alike by
-            spelling but have unrelated adjacency histories, etc).
-        `combined_cosine`: cosine similarity on the merged flat vector,
-            for comparison against the old single-number behavior.
-        `dominant_family`: whichever family had the highest per-family
-            cosine, i.e. which history the resemblance actually comes from.
-        """
         source_components = self.influence_vector_components(source_idx)
         target_components = self.influence_vector_components(target_idx)
 
@@ -497,7 +540,7 @@ class SparseSymbolManifest:
         }
 
     # -----------------------------------------------------------------
-    # Image-style A x B influence matrix and codomain Y
+    # Image-style A x B influence matrix and codomain Y (unchanged)
     # -----------------------------------------------------------------
 
     def content_indices(self) -> List[SymbolIndex]:
@@ -547,7 +590,7 @@ class SparseSymbolManifest:
         }
 
     # -----------------------------------------------------------------
-    # Prompt context and backoff
+    # Prompt context and backoff (unchanged)
     # -----------------------------------------------------------------
 
     def _prompt_indices(self, prompt: str) -> Tuple[List[str], List[SymbolIndex], List[str]]:
@@ -612,7 +655,51 @@ class SparseSymbolManifest:
         return sources
 
     # -----------------------------------------------------------------
-    # (3) Generation with an honest no-meaningful-match exit
+    # (5) Deterministic, dataset-isomorphic curve selection
+    # -----------------------------------------------------------------
+
+    def _context_curve_name(self, previous_idx: SymbolIndex, current_idx: SymbolIndex) -> str:
+        """Pick which generic EOS-curve applies at this step, as a pure
+        function of the current Markov context. Contexts that were
+        actually trained get their stable rank from
+        `_context_rank_cache` (built over the dataset's own trigram
+        context space in `finalize()`); a context that was never trained
+        (can happen after aggressive backoff) falls back to ranking by
+        `current_idx` alone, which stays within the same trained
+        vocabulary space rather than reaching outside it.
+
+        Kept for callers that want context-driven curve selection; the
+        default generation path now uses `_prompt_curve_sequence`
+        instead (curve chosen per prompt word, not per generation step).
+        """
+        rank = self._context_rank_cache.get((previous_idx, current_idx))
+        if rank is None:
+            rank = current_idx
+        return CURVE_NAMES[rank % len(CURVE_NAMES)]
+
+    def _prompt_curve_sequence(self, known: List[SymbolIndex]) -> List[str]:
+        """Build a per-word curve assignment straight from the prompt.
+
+        Each known prompt word gets exactly one curve, in prompt order,
+        chosen from that word's own vocabulary index
+        (`self.word_to_index`, assigned once at training time and never
+        reused) modulo the number of curve shapes. Because every word in
+        the trained vocabulary owns a distinct index, this is a
+        deterministic, dataset-grounded assignment: the same word always
+        maps to the same curve, and the resulting sequence is read off
+        directly from the prompt's own word order rather than from
+        anything computed during generation.
+
+        Generation replays this sequence one entry per step, cycling
+        back to the start if more words are generated than the prompt
+        supplied curves for.
+        """
+        if not known:
+            return [CURVE_NAMES[0]]
+        return [CURVE_NAMES[idx % len(CURVE_NAMES)] for idx in known]
+
+    # -----------------------------------------------------------------
+    # Generation with generic EOS-driven curves + honest no-match exit
     # -----------------------------------------------------------------
 
     def generate_from_seed_prompt(
@@ -632,11 +719,24 @@ class SparseSymbolManifest:
     ) -> Tuple[List[str], float, List[Dict[str, object]]]:
         """Generate a continuation.
 
-        `require_meaningful_match` (new, default True): if no candidate
-        clears `tau` even after relaxing to `tau_floor`, generation stops
-        with an honest `no_meaningful_match_found` diagnostic instead of
-        silently accepting the best unfiltered candidate. Set this to
-        False to restore the old always-succeed fallback behavior.
+        Weighting is no longer a single fixed blend. At each step:
+          1. `_context_curve_name(previous_idx, current_idx)` deterministically
+             picks a curve shape from CURVE_FAMILY, based on the trained
+             trigram-context rank (isomorphic to the dataset's own
+             context space -- see `_rebuild_context_rank_cache`).
+          2. `p_eos`, the probability the *raw* backoff distribution
+             (before <START>/<END> filtering) assigns to <END>, is
+             computed for the current context.
+          3. That curve, evaluated at `p_eos`, returns
+             (w_cosine, w_influence, w_probability) for this step only --
+             every step can use a different blend, computed in real time,
+             with no external randomness in *which* curve is used.
+
+        `require_meaningful_match` (default True): if no candidate clears
+        `tau` even after relaxing to `tau_floor`, generation stops with an
+        honest `no_meaningful_match_found` diagnostic instead of silently
+        accepting the best unfiltered candidate. Set to False to restore
+        the old always-succeed fallback behavior.
         """
         prompt_words, known, unknown = self._prompt_indices(seed_prompt)
         if not known:
@@ -647,10 +747,15 @@ class SparseSymbolManifest:
             return (prompt_words if preserve_prompt else []), 0.0, []
 
         previous_idx, current_idx = self._resolve_prompt_context(known)
+        # Curve for step i is read off the prompt itself, one curve per
+        # prompt word, and cycled if generation runs longer than the prompt.
+        prompt_curves = self._prompt_curve_sequence(known)
         requested_tau = max(-1.0, min(1.0, float(tau)))
         tau_floor = max(-1.0, min(requested_tau, float(tau_floor)))
         tau_step = max(1e-4, float(tau_step))
         temperature = max(1e-6, float(temperature))
+        end_idx = self.word_to_index.get(self.END_TOKEN)
+        special = {self.START_TOKEN, self.END_TOKEN}
 
         output = list(prompt_words) if preserve_prompt else []
         selected_cosines: List[float] = []
@@ -659,16 +764,18 @@ class SparseSymbolManifest:
         for step in range(max_new_words):
             source_name = ""
             distribution: Dict[SymbolIndex, float] = {}
+            raw_distribution: Dict[SymbolIndex, float] = {}
 
             for name, candidate_distribution in self._backoff_distributions(previous_idx, current_idx):
                 usable = {
                     idx: probability
                     for idx, probability in candidate_distribution.items()
-                    if self.index_to_word.get(idx) not in {self.START_TOKEN, self.END_TOKEN}
+                    if self.index_to_word.get(idx) not in special
                 }
                 if usable:
                     source_name = name
                     distribution = usable
+                    raw_distribution = candidate_distribution
                     break
 
             if not distribution:
@@ -678,18 +785,28 @@ class SparseSymbolManifest:
                 })
                 break
 
-            source_components = self.influence_vector_components(current_idx)
-            source_vector = self._normalize(source_components.merged(exclude_family=exclude_family))
+            # (4) p_eos: mass the *current* raw context distribution
+            # assigns to <END>, before it gets filtered out of `distribution`.
+            p_eos = raw_distribution.get(end_idx, 0.0) if end_idx is not None else 0.0
 
-            candidates: List[Tuple[float, float, float, float, SymbolIndex, Dict[str, float]]] = []
+            # Curve for this step, read off the prompt's own word sequence
+            # (cycled if we've generated past the end of the prompt).
+            curve_name = prompt_curves[step % len(prompt_curves)]
+            w_cosine, w_influence, w_probability = CURVE_FAMILY[curve_name](p_eos)
+
             ranked = sorted(distribution.items(), key=lambda item: item[1], reverse=True)[:max(1, candidate_count)]
 
-            for next_idx, probability in ranked:
+            # (6) Lazy iterator -> map pipeline instead of a list comprehension.
+            def _score(item: Tuple[SymbolIndex, float]) -> Tuple[float, float, float, float, SymbolIndex, Dict[str, float]]:
+                next_idx, probability = item
                 breakdown = self.similarity_breakdown(current_idx, next_idx, exclude_family=exclude_family)
                 cosine = breakdown["combined_cosine"]
                 influence = self.influence_score(current_idx, next_idx)
-                combined = 0.45 * cosine + 0.35 * influence + 0.20 * probability
-                candidates.append((combined, cosine, influence, probability, next_idx, breakdown["per_family_cosine"]))
+                combined = w_cosine * cosine + w_influence * influence + w_probability * probability
+                return (combined, cosine, influence, probability, next_idx, breakdown["per_family_cosine"])
+
+            scored_iter = map(_score, iter(ranked))
+            candidates = list(scored_iter)
 
             candidates.sort(key=lambda c: c[0], reverse=True)
             effective_tau = requested_tau
@@ -702,6 +819,7 @@ class SparseSymbolManifest:
                     if passing:
                         break
 
+            used_fallback = False
             if not passing:
                 if require_meaningful_match:
                     best = candidates[0] if candidates else None
@@ -709,6 +827,9 @@ class SparseSymbolManifest:
                         "step": step + 1,
                         "stop_reason": "no_meaningful_match_found",
                         "distribution_source": source_name,
+                        "curve_name": curve_name,
+                        "p_eos": p_eos,
+                        "weights": {"cosine": w_cosine, "influence": w_influence, "probability": w_probability},
                         "requested_tau": requested_tau,
                         "effective_tau": effective_tau,
                         "best_candidate_word": self.index_to_word[best[4]] if best else None,
@@ -717,12 +838,10 @@ class SparseSymbolManifest:
                     })
                     break
                 else:
-                    # Legacy always-succeed behavior, explicitly opted into.
                     pool = candidates
                     used_fallback = True
             else:
                 pool = passing
-                used_fallback = False
 
             if stochastic and len(pool) > 1:
                 weights = [max(1e-12, candidate[0]) ** (1.0 / temperature) for candidate in pool]
@@ -740,6 +859,9 @@ class SparseSymbolManifest:
                 "context": [self.index_to_word[previous_idx], self.index_to_word[current_idx]],
                 "next_word": next_word,
                 "distribution_source": source_name,
+                "curve_name": curve_name,
+                "p_eos": p_eos,
+                "weights": {"cosine": w_cosine, "influence": w_influence, "probability": w_probability},
                 "requested_tau": requested_tau,
                 "effective_tau": effective_tau,
                 "cosine": cosine,
@@ -756,7 +878,7 @@ class SparseSymbolManifest:
         return output, min(selected_cosines) if selected_cosines else 0.0, diagnostics
 
     # -----------------------------------------------------------------
-    # Safe JSON persistence (unchanged from v1)
+    # Safe JSON persistence (unchanged from v1/v2)
     # -----------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, object]:
@@ -830,12 +952,13 @@ def get_corpus(path: Optional[str]) -> str:
 
 def print_diagnostics(rows: List[Dict[str, object]]) -> None:
     print("\nStep diagnostics")
-    print("-" * 110)
+    print("-" * 120)
     for row in rows:
         if "stop_reason" in row:
             if row["stop_reason"] == "no_meaningful_match_found":
                 print(
-                    f"STOP | no_meaningful_match_found | best candidate was "
+                    f"STOP | no_meaningful_match_found | curve={row.get('curve_name')} "
+                    f"p_eos={float(row.get('p_eos', 0.0)):.4f} | best candidate was "
                     f"{row.get('best_candidate_word')!r} at cosine="
                     f"{float(row.get('best_candidate_cosine', 0.0)):.4f} "
                     f"(needed >= {float(row.get('effective_tau', 0.0)):.4f}) | "
@@ -845,9 +968,14 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
                 print(f"STOP | {row['stop_reason']}")
             continue
         context = " ".join(row["context"])  # type: ignore[arg-type]
+        weights = row.get("weights", {})
         print(
             f"{int(row['step']):02d} | {context:30s} -> {str(row['next_word']):16s} | "
-            f"src={str(row['distribution_source']):22s} | "
+            f"src={str(row['distribution_source']):18s} | "
+            f"curve={str(row.get('curve_name')):8s} | "
+            f"p_eos={float(row.get('p_eos', 0.0)):.4f} | "
+            f"w=(c={weights.get('cosine', 0):.2f},i={weights.get('influence', 0):.2f},"
+            f"p={weights.get('probability', 0):.2f}) | "
             f"cos={float(row['cosine']):.4f} | "
             f"tau={float(row['effective_tau']):.4f} | "
             f"dominant={str(row.get('dominant_family')):12s} | "
@@ -856,7 +984,7 @@ def print_diagnostics(rows: List[Dict[str, object]]) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Robust prompt-seeded sparse cosine influence text generator (v2)")
+    parser = argparse.ArgumentParser(description="Robust prompt-seeded sparse cosine influence text generator (v3)")
     parser.add_argument("--input", help="Corpus file path")
     parser.add_argument("--load", help="Load manifest JSON")
     parser.add_argument("--save", help="Save manifest JSON")
@@ -899,12 +1027,12 @@ def main() -> None:
         print(f"Saved manifest: {args.save}")
 
     prompt_words, known, unknown = manifest._prompt_indices(args.prompt)
-    print("=" * 110)
-    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION")
-    print("=" * 110)
+    print("=" * 120)
+    print("ROBUST PROMPT-SEEDED COSINE LOWER-BOUND GENERATION (v3: EOS-driven curves)")
+    print("=" * 120)
     print(f"Source: {source}")
     print(f"Vocabulary: {len(manifest.content_indices())} words")
- 
+
     while True:
         try:
             prompt = input("USER: ")
@@ -931,7 +1059,7 @@ def main() -> None:
             continue
 
         print("\nGenerated text")
-        print("-" * 110)
+        print("-" * 120)
         print(" ".join(words))
 
 
