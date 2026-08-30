@@ -7,57 +7,20 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple, Optional
-
-
-# ============================================================
-# SPARSE SYMBOL MANIFEST
-# SYMBOLIC CANDIDATE ANALYSIS + CHINESE ROOM REBINDING
-#
-# Processing order:
-#
-#   singlekb.txt
-#        |
-#        v
-#   symbolic model
-#        |
-#        v
-#      USER PROMPT
-#        |
-#        v
-#   1. SYMBOLIC CANDIDATE ANALYSIS
-#        |
-#        +--> potential prompts
-#        +--> candidate references
-#        +--> overlap scores
-#        +--> vector scores
-#        +--> ranking
-#        |
-#        v
-#   2. FIRST GENERATION
-#        |
-#        v
-#   3. POST-GENERATION REBINDING
-#        |
-#        v
-#   4. SECOND SYMBOLIC PASS
-#
-# No command-line arguments.
-# No external ground_truth.jsonl.
-#
-# "Candidate ground truth" means a corpus-derived reference.
-# It is NOT independently verified ground truth.
-#
-# The "analysis steps" are explicit symbolic operations,
-# not hidden chain-of-thought.
-# ============================================================
-
+from typing import Dict, Iterable, List, Optional, Tuple
 
 # ============================================================
-# CONFIGURATION
+# Small n-gram language model + corpus similarity search.
+#
+# Pipeline per user turn:
+#   1. tokenize prompt, find closest corpus sentences (display only)
+#   2. sample a continuation from the trained n-gram model
+#
+# (The original script also computed a "post-generation rebinding"
+#  pass and a "second generation" pass, but neither was ever
+#  displayed or used — removed as dead code.)
 # ============================================================
 
-CORPUS_PATH = input("Filename: ")
 MODEL_PATH = "model.json"
 
 MAX_NEW_TOKENS = 500
@@ -67,1778 +30,425 @@ TOP_K = 20
 MIN_COUNT = 1
 INFLUENCE_TAU = 0.5
 
-CURVE_NAME = "sigmoid"
 CURVE_K = 8.0
 CURVE_MIDPOINT = 0.5
 
-
-# ============================================================
-# SYMBOLIC CANDIDATE ANALYSIS
-# ============================================================
-
 CANDIDATE_LIMIT = 15
-
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
 
-ACCEPTANCE_THRESHOLD = 0.35
-AMBIGUITY_MARGIN = 0.10
-
-
-# ============================================================
-# SECOND PASS
-# ============================================================
-
-SECOND_PASS_GENERATION = True
-
-SECOND_PASS_MAX_NEW_TOKENS = 50
-SECOND_PASS_TEMPERATURE = 0.8
-SECOND_PASS_TOP_K = 20
-
-
-# ============================================================
-# TRAINING
-# ============================================================
-
-TRAIN_MODEL = True
 RANDOM_SEED = 2026
-
 random.seed(RANDOM_SEED)
 
+TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
+IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
+
 
 # ============================================================
-# TOKENIZATION
+# Text utilities
 # ============================================================
-
-TOKEN_RE = re.compile(
-    r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]"
-)
-
 
 def tokenize(text: str) -> List[str]:
     return TOKEN_RE.findall(text.lower())
 
 
 def split_sentences(text: str) -> List[str]:
-    parts = re.split(
-        r"(?<=[.!?])\s+|\n+",
-        text.strip(),
-    )
-
-    return [
-        part.strip()
-        for part in parts
-        if part.strip()
-    ]
+    parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
+    return [p.strip() for p in parts if p.strip()]
 
 
-def safe_log(
-    value: float,
-    floor: float = 1e-12,
-) -> float:
+def safe_log(value: float, floor: float = 1e-12) -> float:
     return math.log(max(value, floor))
 
 
-# ============================================================
-# VECTOR FUNCTIONS
-# ============================================================
+def bag_of_words(tokens: Iterable[str]) -> Counter:
+    return Counter(t for t in tokens if t not in IGNORED_TOKENS)
 
-def cosine_similarity(
-    a: Dict[str, float],
-    b: Dict[str, float],
-) -> float:
 
+def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
     if not a or not b:
         return 0.0
-
-    common = set(a).intersection(b)
-
-    dot = sum(
-        a[k] * b[k]
-        for k in common
-    )
-
-    norm_a = math.sqrt(
-        sum(
-            v * v
-            for v in a.values()
-        )
-    )
-
-    norm_b = math.sqrt(
-        sum(
-            v * v
-            for v in b.values()
-        )
-    )
-
+    common = set(a) & set(b)
+    dot = sum(a[k] * b[k] for k in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-
     return dot / (norm_a * norm_b)
 
 
-def bag_of_words(
-    tokens: Iterable[str],
-) -> Counter:
-
-    ignored = {
-        "<bos>",
-        "<eos>",
-        "<unk>",
-    }
-
-    return Counter(
-        token
-        for token in tokens
-        if token not in ignored
-    )
-
-
-def lexical_overlap(
-    a: Iterable[str],
-    b: Iterable[str],
-) -> float:
-
-    ignored = {
-        "<bos>",
-        "<eos>",
-        "<unk>",
-    }
-
-    sa = set(a)
-    sb = set(b)
-
-    sa -= ignored
-    sb -= ignored
-
+def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
+    sa = set(a) - IGNORED_TOKENS
+    sb = set(b) - IGNORED_TOKENS
     if not sa or not sb:
         return 0.0
-
-    intersection = len(
-        sa.intersection(sb)
-    )
-
-    union = len(
-        sa.union(sb)
-    )
-
-    if union == 0:
-        return 0.0
-
-    return intersection / union
+    union = len(sa | sb)
+    return len(sa & sb) / union if union else 0.0
 
 
 # ============================================================
-# CORPUS REFERENCE
+# Corpus similarity search (used for the "candidates" display)
 # ============================================================
 
 @dataclass
 class CorpusReference:
-
     sentence: str
-
     tokens: List[str]
-
     vector: Dict[str, float]
-
     frequency: int = 1
 
-    def to_dict(self) -> dict:
-
-        return {
-            "sentence": self.sentence,
-            "tokens": self.tokens,
-            "vector": self.vector,
-            "frequency": self.frequency,
-        }
-
-
-# ============================================================
-# SYMBOLIC CANDIDATE
-# ============================================================
 
 @dataclass
-class RebindingCandidate:
-
-    potential_prompt: str
-
-    candidate_ground_truth: str
-
+class Candidate:
+    sentence: str
     symbolic_overlap: float
-
     vector_similarity: float
-
     frequency: int
-
     score: float
-
     rank: int = 0
 
-    def to_dict(self) -> dict:
 
-        return {
-            "rank": self.rank,
-            "potential_prompt": self.potential_prompt,
-            "candidate_ground_truth":
-                self.candidate_ground_truth,
-            "symbolic_overlap":
-                self.symbolic_overlap,
-            "vector_similarity":
-                self.vector_similarity,
-            "frequency":
-                self.frequency,
-            "score":
-                self.score,
-        }
+class CorpusSearch:
+    """Finds corpus sentences closest to a prompt (lexical + cosine)."""
 
-
-# ============================================================
-# REBINDING RESULT
-# ============================================================
-
-@dataclass
-class RebindingResult:
-
-    generated_text: str
-
-    potential_prompts: List[dict]
-
-    rebound_prompt: Optional[str]
-
-    rebound_ground_truth: Optional[str]
-
-    grounding_score: float
-
-    ambiguity: float
-
-    symbolic_overlap: float
-
-    semantic_overlap: float
-
-    accepted: bool
-
-    reason: str
-
-    def to_dict(self) -> dict:
-
-        return {
-            "generated_text":
-                self.generated_text,
-
-            "potential_prompts":
-                self.potential_prompts,
-
-            "rebound_prompt":
-                self.rebound_prompt,
-
-            "rebound_ground_truth":
-                self.rebound_ground_truth,
-
-            "grounding_score":
-                self.grounding_score,
-
-            "ambiguity":
-                self.ambiguity,
-
-            "symbolic_overlap":
-                self.symbolic_overlap,
-
-            "semantic_overlap":
-                self.semantic_overlap,
-
-            "accepted":
-                self.accepted,
-
-            "reason":
-                self.reason,
-        }
-
-
-# ============================================================
-# SYMBOLIC CANDIDATE ANALYSIS
-#
-# This is deliberately explicit and observable.
-# It does not expose hidden reasoning.
-# ============================================================
-
-@dataclass
-class SymbolicCandidateAnalyzer:
-
-    references: List[CorpusReference] = field(
-        default_factory=list
-    )
-
-    lexical_weight: float = LEXICAL_WEIGHT
-
-    vector_weight: float = VECTOR_WEIGHT
-
-    acceptance_threshold: float = (
-        ACCEPTANCE_THRESHOLD
-    )
-
-    ambiguity_margin: float = (
-        AMBIGUITY_MARGIN
-    )
-
-    # --------------------------------------------------------
-    # BUILD REFERENCE INDEX
-    # --------------------------------------------------------
-
-    def build_index(
+    def __init__(
         self,
-        corpus_text: str,
+        lexical_weight: float = LEXICAL_WEIGHT,
+        vector_weight: float = VECTOR_WEIGHT,
     ) -> None:
+        self.lexical_weight = lexical_weight
+        self.vector_weight = vector_weight
+        self.references: List[CorpusReference] = []
 
-        sentences = split_sentences(
-            corpus_text
-        )
-
-        frequency = Counter(
-            sentence.lower()
-            for sentence in sentences
-        )
+    def build_index(self, corpus_text: str) -> None:
+        sentences = split_sentences(corpus_text)
+        counts = Counter(s.lower() for s in sentences)
 
         self.references = []
-
         for sentence in sentences:
-
-            tokens = tokenize(
-                sentence
-            )
-
+            tokens = tokenize(sentence)
             if not tokens:
                 continue
-
-            bow = bag_of_words(
-                tokens
-            )
-
-            vector = {
-                token: float(count)
-                for token, count
-                in bow.items()
-            }
-
+            bow = bag_of_words(tokens)
             self.references.append(
                 CorpusReference(
                     sentence=sentence,
                     tokens=tokens,
-                    vector=vector,
-                    frequency=frequency[
-                        sentence.lower()
-                    ],
+                    vector={t: float(c) for t, c in bow.items()},
+                    frequency=counts[sentence.lower()],
                 )
             )
 
-    # --------------------------------------------------------
-    # ANALYZE PROMPT
-    #
-    # These are symbolic candidate-generation steps:
-    #
-    #   Step 1: tokenize
-    #   Step 2: construct bag of words
-    #   Step 3: compare against corpus
-    #   Step 4: calculate lexical overlap
-    #   Step 5: calculate vector similarity
-    #   Step 6: combine scores
-    #   Step 7: rank candidates
-    #
-    # --------------------------------------------------------
-
-    def analyze(
-        self,
-        prompt: str,
-        limit: int = 5,
-    ) -> List[RebindingCandidate]:
-
-        prompt_tokens = tokenize(
-            prompt
-        )
-
-        prompt_bow = bag_of_words(
-            prompt_tokens
-        )
-
-        prompt_vector = {
-            token: float(count)
-            for token, count
-            in prompt_bow.items()
-        }
+    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
+        prompt_tokens = tokenize(prompt)
+        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
 
         candidates = []
-
-        for reference in self.references:
-
-            symbolic = lexical_overlap(
-                prompt_tokens,
-                reference.tokens,
-            )
-
-            vector_similarity = (
-                cosine_similarity(
-                    prompt_vector,
-                    reference.vector,
-                )
-            )
-
-            score = (
-                self.lexical_weight
-                * symbolic
-                +
-                self.vector_weight
-                * vector_similarity
-            )
-
+        for ref in self.references:
+            symbolic = lexical_overlap(prompt_tokens, ref.tokens)
+            vector_sim = cosine_similarity(prompt_vector, ref.vector)
+            score = self.lexical_weight * symbolic + self.vector_weight * vector_sim
             candidates.append(
-                RebindingCandidate(
-                    potential_prompt=
-                        reference.sentence,
-
-                    candidate_ground_truth=
-                        reference.sentence,
-
-                    symbolic_overlap=
-                        symbolic,
-
-                    vector_similarity=
-                        vector_similarity,
-
-                    frequency=
-                        reference.frequency,
-
-                    score=
-                        score,
+                Candidate(
+                    sentence=ref.sentence,
+                    symbolic_overlap=symbolic,
+                    vector_similarity=vector_sim,
+                    frequency=ref.frequency,
+                    score=score,
                 )
             )
 
-        candidates.sort(
-            key=lambda candidate:
-                candidate.score,
-            reverse=True,
-        )
-
+        candidates.sort(key=lambda c: c.score, reverse=True)
         candidates = candidates[:limit]
-
-        for index, candidate in enumerate(
-            candidates,
-            start=1,
-        ):
-            candidate.rank = index
-
+        for i, c in enumerate(candidates, start=1):
+            c.rank = i
         return candidates
-
-    # --------------------------------------------------------
-    # REBIND GENERATED OUTPUT
-    # --------------------------------------------------------
-
-    def rebind(
-        self,
-        generated_text: str,
-        candidate_limit: int = 5,
-    ) -> RebindingResult:
-
-        candidates = self.analyze(
-            generated_text,
-            candidate_limit,
-        )
-
-        candidate_dicts = [
-            candidate.to_dict()
-            for candidate in candidates
-        ]
-
-        if not candidates:
-
-            return RebindingResult(
-                generated_text=generated_text,
-                potential_prompts=[],
-                rebound_prompt=None,
-                rebound_ground_truth=None,
-                grounding_score=0.0,
-                ambiguity=1.0,
-                symbolic_overlap=0.0,
-                semantic_overlap=0.0,
-                accepted=False,
-                reason=(
-                    "The corpus contained "
-                    "no candidate references."
-                ),
-            )
-
-        best = candidates[0]
-
-        best_score = best.score
-
-        if len(candidates) > 1:
-            second_score = candidates[1].score
-        else:
-            second_score = 0.0
-
-        margin = (
-            best_score
-            - second_score
-        )
-
-        if best_score > 0:
-
-            ambiguity = max(
-                0.0,
-                min(
-                    1.0,
-                    1.0
-                    - (
-                        margin
-                        / best_score
-                    ),
-                ),
-            )
-
-        else:
-            ambiguity = 1.0
-
-        accepted = (
-            best_score
-            >= self.acceptance_threshold
-            and (
-                len(candidates) == 1
-                or margin
-                >= self.ambiguity_margin
-            )
-        )
-
-        if accepted:
-
-            reason = (
-                "Highest-scoring corpus "
-                "reference accepted as a "
-                "candidate symbolic rebinding."
-            )
-
-            rebound_prompt = (
-                best.potential_prompt
-            )
-
-            rebound_ground_truth = (
-                best.candidate_ground_truth
-            )
-
-        elif (
-            best_score
-            < self.acceptance_threshold
-        ):
-
-            reason = (
-                "No candidate reached "
-                "the grounding threshold."
-            )
-
-            rebound_prompt = None
-            rebound_ground_truth = None
-
-        else:
-
-            reason = (
-                "Top candidates were too close "
-                "to establish an unambiguous "
-                "symbolic rebinding."
-            )
-
-            rebound_prompt = None
-            rebound_ground_truth = None
-
-        return RebindingResult(
-            generated_text=generated_text,
-
-            potential_prompts=candidate_dicts,
-
-            rebound_prompt=rebound_prompt,
-
-            rebound_ground_truth=
-                rebound_ground_truth,
-
-            grounding_score=best_score,
-
-            ambiguity=ambiguity,
-
-            symbolic_overlap=
-                best.symbolic_overlap,
-
-            semantic_overlap=
-                best.vector_similarity,
-
-            accepted=accepted,
-
-            reason=reason,
-        )
 
 
 # ============================================================
-# SPARSE SYMBOL MANIFEST
+# N-gram language model
 # ============================================================
 
 @dataclass
-class SparseSymbolManifest:
-
+class NGramModel:
     eos_token: str = "<eos>"
-
     unk_token: str = "<unk>"
+    min_count: int = MIN_COUNT
+    influence_tau: float = INFLUENCE_TAU
+    curve_k: float = CURVE_K
+    curve_midpoint: float = CURVE_MIDPOINT
 
-    min_count: int = 1
+    unigram: Counter = field(default_factory=Counter)
+    bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    trigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
 
-    influence_tau: float = 0.5
-
-    curve_name: str = "sigmoid"
-
-    curve_k: float = 8.0
-
-    curve_midpoint: float = 0.5
-
-    unigram: Counter = field(
-        default_factory=Counter
-    )
-
-    bigram: Dict[
-        str,
-        Counter
-    ] = field(
-        default_factory=lambda:
-            defaultdict(Counter)
-    )
-
-    trigram: Dict[
-        str,
-        Counter
-    ] = field(
-        default_factory=lambda:
-            defaultdict(Counter)
-    )
-
-    lexical_vectors: Dict[
-        str,
-        Dict[str, float]
-    ] = field(
-        default_factory=dict
-    )
-
-    influence_vectors: Dict[
-        str,
-        Dict[str, float]
-    ] = field(
-        default_factory=dict
-    )
-
-    vocabulary: List[str] = field(
-        default_factory=list
-    )
-
+    lexical_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    influence_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
 
-    # ========================================================
-    # INGESTION
-    # ========================================================
+    # ---------------- ingestion ----------------
 
-    def ingest_text(
-        self,
-        text: str,
-    ) -> None:
-
-        for sentence in split_sentences(
-            text
-        ):
-
-            words = tokenize(
-                sentence
-            )
-
+    def ingest_text(self, text: str) -> None:
+        for sentence in split_sentences(text):
+            words = tokenize(sentence)
             if not words:
                 continue
+            sequence = ["<bos>", "<bos>"] + words + [self.eos_token]
+            self._add_sequence(sequence)
 
-            sequence = (
-                ["<bos>", "<bos>"]
-                + words
-                + [self.eos_token]
-            )
-
-            self.add_sequence_words(
-                sequence
-            )
-
-    def add_sequence_words(
-        self,
-        sequence: List[str],
-    ) -> None:
-
+    def _add_sequence(self, sequence: List[str]) -> None:
         if len(sequence) < 3:
             return
-
         for token in sequence:
             self.unigram[token] += 1
-
-        for left, right in zip(
-            sequence,
-            sequence[1:],
-        ):
+        for left, right in zip(sequence, sequence[1:]):
             self.bigram[left][right] += 1
-
-        for a, b, c in zip(
-            sequence,
-            sequence[1:],
-            sequence[2:],
-        ):
-
-            self.trigram[
-                f"{a}\t{b}"
-            ][c] += 1
-
+        for a, b, c in zip(sequence, sequence[1:], sequence[2:]):
+            self.trigram[f"{a}\t{b}"][c] += 1
         self.finalized = False
 
-    # ========================================================
-    # VOCABULARY
-    # ========================================================
-
-    def register_vocabulary(
-        self,
-    ) -> None:
-
-        self.vocabulary = sorted(
-            token
-            for token, count
-            in self.unigram.items()
-            if count >= self.min_count
-        )
-
-        if self.unk_token not in self.vocabulary:
-
-            self.vocabulary.append(
-                self.unk_token
-            )
-
-    # ========================================================
-    # LEXICAL VECTORS
-    # ========================================================
-
-    def update_intrinsics(
-        self,
-    ) -> None:
-
-        self.register_vocabulary()
-
-        token_contexts = defaultdict(
-            Counter
-        )
-
-        for context, counts in (
-            self.bigram.items()
-        ):
-
-            for token, count in (
-                counts.items()
-            ):
-
-                token_contexts[token][
-                    context
-                ] += count
-
-        self.lexical_vectors = {}
-
-        for token in self.vocabulary:
-
-            counts = token_contexts.get(
-                token,
-                Counter(),
-            )
-
-            total = sum(
-                counts.values()
-            )
-
-            if total == 0:
-                total = 1
-
-            self.lexical_vectors[
-                token
-            ] = {
-                context:
-                    count / total
-                for context, count
-                in counts.items()
-            }
-
-    # ========================================================
-    # INFLUENCE VECTORS
-    # ========================================================
-
-    def build_influence_vectors(
-        self,
-    ) -> None:
-
-        self.influence_vectors = {}
-
-        for source in self.vocabulary:
-
-            source_vector = (
-                self.lexical_vectors.get(
-                    source,
-                    {},
-                )
-            )
-
-            scores = {}
-
-            for target in self.vocabulary:
-
-                if source == target:
-                    continue
-
-                target_vector = (
-                    self.lexical_vectors.get(
-                        target,
-                        {},
-                    )
-                )
-
-                similarity = (
-                    cosine_similarity(
-                        source_vector,
-                        target_vector,
-                    )
-                )
-
-                if (
-                    similarity
-                    >= self.influence_tau
-                ):
-
-                    scores[target] = (
-                        similarity
-                    )
-
-            self.influence_vectors[
-                source
-            ] = scores
-
-    # ========================================================
-    # FINALIZE
-    # ========================================================
+    # ---------------- training ----------------
 
     def finalize(self) -> None:
+        self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
+        if self.unk_token not in self.vocabulary:
+            self.vocabulary.append(self.unk_token)
 
-        self.update_intrinsics()
+        token_contexts = defaultdict(Counter)
+        for context, counts in self.bigram.items():
+            for token, count in counts.items():
+                token_contexts[token][context] += count
 
-        self.build_influence_vectors()
+        self.lexical_vectors = {}
+        for token in self.vocabulary:
+            counts = token_contexts.get(token, Counter())
+            total = sum(counts.values()) or 1
+            self.lexical_vectors[token] = {ctx: c / total for ctx, c in counts.items()}
+
+        self.influence_vectors = {}
+        for source in self.vocabulary:
+            source_vec = self.lexical_vectors.get(source, {})
+            scores = {}
+            for target in self.vocabulary:
+                if source == target:
+                    continue
+                sim = cosine_similarity(source_vec, self.lexical_vectors.get(target, {}))
+                if sim >= self.influence_tau:
+                    scores[target] = sim
+            self.influence_vectors[source] = scores
 
         self.finalized = True
 
-    # ========================================================
-    # BACKOFF
-    # ========================================================
+    # ---------------- generation ----------------
 
-    def backoff_distributions(
-        self,
-        previous_token: str,
-        previous_previous_token:
-            str | None = None,
-    ) -> Dict[str, float]:
-
-        if previous_previous_token is not None:
-
-            key = (
-                f"{previous_previous_token}"
-                f"\t{previous_token}"
-            )
-
-            counts = self.trigram.get(
-                key
-            )
-
+    def _backoff_distribution(self, prev: str, prev_prev: Optional[str]) -> Dict[str, float]:
+        if prev_prev is not None:
+            counts = self.trigram.get(f"{prev_prev}\t{prev}")
             if counts:
-
-                return self._normalize_counts(
-                    counts
-                )
-
-        counts = self.bigram.get(
-            previous_token
-        )
-
+                return self._normalize(counts)
+        counts = self.bigram.get(prev)
         if counts:
-
-            return self._normalize_counts(
-                counts
-            )
-
-        return self._normalize_counts(
-            self.unigram
-        )
+            return self._normalize(counts)
+        return self._normalize(self.unigram)
 
     @staticmethod
-    def _normalize_counts(
-        counts: Counter,
-    ) -> Dict[str, float]:
+    def _normalize(counts: Counter) -> Dict[str, float]:
+        total = sum(counts.values())
+        return {t: c / total for t, c in counts.items()} if total else {}
 
-        total = sum(
-            counts.values()
-        )
+    def _curve_weight(self, p_eos: float) -> float:
+        p_eos = min(1.0, max(0.0, p_eos))
+        z = self.curve_k * (p_eos - self.curve_midpoint)
+        return 1.0 / (1.0 + math.exp(z))
 
-        if total == 0:
-            return {}
-
-        return {
-            token:
-                count / total
-            for token, count
-            in counts.items()
-        }
-
-    # ========================================================
-    # PROMPT CONTEXT
-    # ========================================================
-
-    def resolve_prompt_context(
-        self,
-        prompt: str,
-    ) -> Tuple[
-        str,
-        str | None,
-    ]:
-
-        tokens = tokenize(
-            prompt
-        )
-
+    def _resolve_context(self, prompt: str) -> Tuple[str, Optional[str]]:
+        tokens = tokenize(prompt)
         if not tokens:
+            return "<bos>", None
+        prev = tokens[-1]
+        prev_prev = tokens[-2] if len(tokens) >= 2 else None
+        return prev, prev_prev
 
-            return (
-                "<bos>",
-                None,
-            )
-
-        previous = tokens[-1]
-
-        previous_previous = (
-            tokens[-2]
-            if len(tokens) >= 2
-            else None
-        )
-
-        return (
-            previous,
-            previous_previous,
-        )
-
-    # ========================================================
-    # EOS CURVE
-    # ========================================================
-
-    def curve_weight(
-        self,
-        p_eos: float,
-    ) -> float:
-
-        p_eos = min(
-            1.0,
-            max(
-                0.0,
-                p_eos,
-            ),
-        )
-
-        if self.curve_name == "linear":
-
-            return 1.0 - p_eos
-
-        if self.curve_name == "inverse":
-
-            return 1.0 / (
-                1.0 + p_eos
-            )
-
-        if self.curve_name == "sigmoid":
-
-            z = (
-                self.curve_k
-                * (
-                    p_eos
-                    - self.curve_midpoint
-                )
-            )
-
-            return 1.0 / (
-                1.0
-                + math.exp(z)
-            )
-
-        raise ValueError(
-            f"Unknown curve: "
-            f"{self.curve_name}"
-        )
-
-    # ========================================================
-    # NEXT TOKEN
-    # ========================================================
-
-    def score_next_token(
-        self,
-        prompt: str,
-        candidate_limit: int = 64,
-    ) -> Dict[str, float]:
-
+    def _score_next_token(self, prompt: str, candidate_limit: int = 64) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
 
-        previous, previous_previous = (
-            self.resolve_prompt_context(
-                prompt
-            )
-        )
-
-        base = self.backoff_distributions(
-            previous,
-            previous_previous,
-        )
-
+        prev, prev_prev = self._resolve_context(prompt)
+        base = self._backoff_distribution(prev, prev_prev)
         if not base:
             return {}
 
-        candidates = sorted(
-            base,
-            key=base.get,
-            reverse=True,
-        )[:candidate_limit]
-
-        source = (
-            self.lexical_vectors.get(
-                previous,
-                {},
-            )
-        )
-
-        influences = (
-            self.influence_vectors.get(
-                previous,
-                {},
-            )
-        )
-
-        p_eos = base.get(
-            self.eos_token,
-            0.0,
-        )
-
-        curve = self.curve_weight(
-            p_eos
-        )
+        candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
+        source_vec = self.lexical_vectors.get(prev, {})
+        influences = self.influence_vectors.get(prev, {})
+        curve = self._curve_weight(base.get(self.eos_token, 0.0))
 
         scores = {}
-
         for token in candidates:
-
-            similarity = (
-                cosine_similarity(
-                    source,
-                    self.lexical_vectors.get(
-                        token,
-                        {},
-                    ),
-                )
+            similarity = cosine_similarity(source_vec, self.lexical_vectors.get(token, {}))
+            influence = influences.get(token, 0.0)
+            scores[token] = (
+                safe_log(base[token])
+                + curve * 0.35 * similarity
+                + curve * 0.65 * influence
             )
-
-            influence = influences.get(
-                token,
-                0.0,
-            )
-
-            score = (
-                safe_log(
-                    base[token]
-                )
-                +
-                curve
-                * 0.35
-                * similarity
-                +
-                curve
-                * 0.65
-                * influence
-            )
-
-            scores[token] = score
-
         return scores
 
-    # ========================================================
-    # PROBABILITIES
-    # ========================================================
-
-    def probabilities(
-        self,
-        prompt: str,
-        temperature: float = 1.0,
-        candidate_limit: int = 64,
-    ) -> Dict[str, float]:
-
-        scores = self.score_next_token(
-            prompt,
-            candidate_limit,
-        )
-
+    def _probabilities(self, prompt: str, temperature: float, candidate_limit: int) -> Dict[str, float]:
+        scores = self._score_next_token(prompt, candidate_limit)
         if not scores:
             return {}
+        temperature = max(temperature, 1e-5)
+        scaled = {t: s / temperature for t, s in scores.items()}
+        maximum = max(scaled.values())
+        exps = {t: math.exp(s - maximum) for t, s in scaled.items()}
+        total = sum(exps.values())
+        return {t: v / total for t, v in exps.items()} if total else {}
 
-        temperature = max(
-            temperature,
-            1e-5,
-        )
-
-        scaled = {
-            token:
-                score / temperature
-            for token, score
-            in scores.items()
-        }
-
-        maximum = max(
-            scaled.values()
-        )
-
-        exponentials = {
-            token:
-                math.exp(
-                    score - maximum
-                )
-            for token, score
-            in scaled.items()
-        }
-
-        total = sum(
-            exponentials.values()
-        )
-
-        if total == 0:
-            return {}
-
-        return {
-            token:
-                value / total
-            for token, value
-            in exponentials.items()
-        }
-
-    # ========================================================
-    # SAMPLE
-    # ========================================================
-
-    def sample_next(
-        self,
-        prompt: str,
-        temperature: float = 0.8,
-        top_k: int = 20,
-    ) -> str:
-
-        probabilities = self.probabilities(
-            prompt,
-            temperature,
-            max(
-                top_k,
-                1,
-            ),
-        )
-
-        if not probabilities:
+    def sample_next(self, prompt: str, temperature: float = 0.8, top_k: int = 20) -> str:
+        probs = self._probabilities(prompt, temperature, max(top_k, 1))
+        if not probs:
             return self.eos_token
+        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        tokens, weights = zip(*items)
+        return random.choices(tokens, weights=weights, k=1)[0]
 
-        items = sorted(
-            probabilities.items(),
-            key=lambda item:
-                item[1],
-            reverse=True,
-        )[:top_k]
-
-        tokens = [
-            token
-            for token, _
-            in items
-        ]
-
-        weights = [
-            weight
-            for _, weight
-            in items
-        ]
-
-        return random.choices(
-            tokens,
-            weights=weights,
-            k=1,
-        )[0]
-
-    # ========================================================
-    # GENERATE
-    # ========================================================
-
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 50,
-        temperature: float = 0.8,
-        top_k: int = 20,
-    ) -> str:
-
-        generated = tokenize(
-            prompt
-        )
-
-        for _ in range(
-            max_new_tokens
-        ):
-
-            current_prompt = " ".join(
-                generated
-            )
-
-            token = self.sample_next(
-                current_prompt,
-                temperature,
-                top_k,
-            )
-
+    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 20) -> str:
+        generated = tokenize(prompt)
+        for _ in range(max_new_tokens):
+            token = self.sample_next(" ".join(generated), temperature, top_k)
             if token == self.eos_token:
                 break
-
-            generated.append(
-                token
-            )
-
-        return self.detokenize(
-            generated
-        )
-
-    # ========================================================
-    # DETOKENIZE
-    # ========================================================
+            generated.append(token)
+        return self.detokenize(generated)
 
     @staticmethod
-    def detokenize(
-        tokens: List[str],
-    ) -> str:
-
-        text = " ".join(
-            tokens
-        )
-
-        text = re.sub(
-            r"\s+([.,!?;:)\]}])",
-            r"\1",
-            text,
-        )
-
-        text = re.sub(
-            r"([(\[{])\s+",
-            r"\1",
-            text,
-        )
-
+    def detokenize(tokens: List[str]) -> str:
+        text = " ".join(tokens)
+        text = re.sub(r"\s+([.,!?;:)\]}])", r"\1", text)
+        text = re.sub(r"([(\[{])\s+", r"\1", text)
         return text
 
-    # ========================================================
-    # SERIALIZATION
-    # ========================================================
+    # ---------------- persistence ----------------
 
     def to_dict(self) -> dict:
-
         return {
-            "eos_token":
-                self.eos_token,
-
-            "unk_token":
-                self.unk_token,
-
-            "min_count":
-                self.min_count,
-
-            "influence_tau":
-                self.influence_tau,
-
-            "curve_name":
-                self.curve_name,
-
-            "curve_k":
-                self.curve_k,
-
-            "curve_midpoint":
-                self.curve_midpoint,
-
-            "unigram":
-                dict(self.unigram),
-
-            "bigram": {
-                key: dict(value)
-                for key, value
-                in self.bigram.items()
-            },
-
-            "trigram": {
-                key: dict(value)
-                for key, value
-                in self.trigram.items()
-            },
-
-            "lexical_vectors":
-                self.lexical_vectors,
-
-            "influence_vectors":
-                self.influence_vectors,
-
-            "vocabulary":
-                self.vocabulary,
-
-            "finalized":
-                self.finalized,
+            "eos_token": self.eos_token,
+            "unk_token": self.unk_token,
+            "min_count": self.min_count,
+            "influence_tau": self.influence_tau,
+            "curve_k": self.curve_k,
+            "curve_midpoint": self.curve_midpoint,
+            "unigram": dict(self.unigram),
+            "bigram": {k: dict(v) for k, v in self.bigram.items()},
+            "trigram": {k: dict(v) for k, v in self.trigram.items()},
+            "lexical_vectors": self.lexical_vectors,
+            "influence_vectors": self.influence_vectors,
+            "vocabulary": self.vocabulary,
+            "finalized": self.finalized,
         }
 
     @classmethod
-    def from_dict(
-        cls,
-        data: dict,
-    ) -> "SparseSymbolManifest":
-
+    def from_dict(cls, data: dict) -> "NGramModel":
         model = cls(
-            eos_token=data[
-                "eos_token"
-            ],
-
-            unk_token=data[
-                "unk_token"
-            ],
-
-            min_count=data[
-                "min_count"
-            ],
-
-            influence_tau=data[
-                "influence_tau"
-            ],
-
-            curve_name=data[
-                "curve_name"
-            ],
-
-            curve_k=data[
-                "curve_k"
-            ],
-
-            curve_midpoint=data[
-                "curve_midpoint"
-            ],
+            eos_token=data["eos_token"],
+            unk_token=data["unk_token"],
+            min_count=data["min_count"],
+            influence_tau=data["influence_tau"],
+            curve_k=data["curve_k"],
+            curve_midpoint=data["curve_midpoint"],
         )
-
-        model.unigram = Counter(
-            data["unigram"]
-        )
-
-        model.bigram = defaultdict(
-            Counter,
-            {
-                key: Counter(value)
-                for key, value
-                in data["bigram"].items()
-            },
-        )
-
-        model.trigram = defaultdict(
-            Counter,
-            {
-                key: Counter(value)
-                for key, value
-                in data["trigram"].items()
-            },
-        )
-
-        model.lexical_vectors = (
-            data["lexical_vectors"]
-        )
-
-        model.influence_vectors = (
-            data["influence_vectors"]
-        )
-
-        model.vocabulary = (
-            data["vocabulary"]
-        )
-
-        model.finalized = (
-            data["finalized"]
-        )
-
+        model.unigram = Counter(data["unigram"])
+        model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data["bigram"].items()})
+        model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data["trigram"].items()})
+        model.lexical_vectors = data["lexical_vectors"]
+        model.influence_vectors = data["influence_vectors"]
+        model.vocabulary = data["vocabulary"]
+        model.finalized = data["finalized"]
         return model
 
-    def save_json(
-        self,
-        path: str | Path,
-    ) -> None:
-
-        Path(path).write_text(
-            json.dumps(
-                self.to_dict(),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+    def save_json(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
-    def load_json(
-        cls,
-        path: str | Path,
-    ) -> "SparseSymbolManifest":
-
-        data = json.loads(
-            Path(path).read_text(
-                encoding="utf-8",
-            )
-        )
-
-        return cls.from_dict(
-            data
-        )
+    def load_json(cls, path: str | Path) -> "NGramModel":
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
 # ============================================================
-# TRAIN MODEL
+# Display
 # ============================================================
 
-def train_model(
-    corpus_text: str,
-) -> SparseSymbolManifest:
-
-    model = SparseSymbolManifest(
-        curve_name=CURVE_NAME,
-        curve_k=CURVE_K,
-        curve_midpoint=CURVE_MIDPOINT,
-        min_count=MIN_COUNT,
-        influence_tau=INFLUENCE_TAU,
-    )
-
-    model.ingest_text(
-        corpus_text
-    )
-
-    model.finalize()
-
-    model.save_json(
-        MODEL_PATH
-    )
-
-    return model
-
-
-# ============================================================
-# SECOND SYMBOLIC PASS
-# ============================================================
-
-def second_pass(
-    model: SparseSymbolManifest,
-    result: RebindingResult,
-) -> Optional[str]:
-
-    if not result.accepted:
-        return None
-
-    if not result.rebound_ground_truth:
-        return None
-
-    reference = (
-        result.rebound_ground_truth
-    )
-
-    return model.generate(
-        reference,
-        max_new_tokens=(
-            SECOND_PASS_MAX_NEW_TOKENS
-        ),
-        temperature=(
-            SECOND_PASS_TEMPERATURE
-        ),
-        top_k=(
-            SECOND_PASS_TOP_K
-        ),
-    )
-
-
-# ============================================================
-# DISPLAY CANDIDATE ANALYSIS
-# ============================================================
-
-def display_candidates(
-    title: str,
-    candidates: List[RebindingCandidate],
-) -> None:
-
+def display_candidates(candidates: List[Candidate]) -> None:
     print()
     print("=" * 70)
-    print(title)
+    print("CLOSEST CORPUS SENTENCES")
     print("=" * 70)
-
     if not candidates:
-
-        print(
-            "No symbolic candidates found."
-        )
-
+        print("No candidates found.")
         return
-
-    for candidate in candidates:
-
-        print()
-        print(
-            f"STEP {candidate.rank}"
-        )
+    for c in candidates:
+        print(f"\n[{c.rank}] score={c.score:.3f}  {c.sentence}")
 
 
-        print(
-            f"    {candidate.potential_prompt}"
-        )
-
-
-
-# ============================================================
-# DISPLAY FINAL RESULT
-# ============================================================
-
-def display_result(
-    prompt: str,
-    pre_candidates: List[RebindingCandidate],
-    generated: str,
-    result: RebindingResult,
-    second_generation: Optional[str],
-) -> None:
-
+def display_generation(generated: str) -> None:
     print()
     print("=" * 70)
-    print(
-        "SPARSE SYMBOL MANIFEST"
-    )
-
-    # --------------------------------------------------------
-    # FIRST PROCESSING STAGE
-    # --------------------------------------------------------
-
-    display_candidates(
-        "1. ANALYSIS",
-        pre_candidates,
-    )
-
-    # --------------------------------------------------------
-    # GENERATION
-    # --------------------------------------------------------
-
-    print()
+    print("GENERATED")
     print("=" * 70)
-    print(
-        "2. SYMBOLIC GENERATION"
-    )
-    print("=" * 70)
-
     print()
     print(generated)
 
-   
 
 # ============================================================
-# MAIN
+# Main
 # ============================================================
 
 def main() -> None:
-
-    corpus_path = Path(
-        CORPUS_PATH
-    )
-
+    corpus_path = Path(input("Filename: "))
     if not corpus_path.exists():
-
-        print()
-        print(
-            f"ERROR: {CORPUS_PATH} "
-            "does not exist."
-        )
-
-        print()
-        print(
-            "Create singlekb.txt in "
-            "the same directory as this script."
-        )
-
+        print(f"\nERROR: {corpus_path} does not exist.")
         return
 
-  
-    # --------------------------------------------------------
-    # LOAD CORPUS
-    # --------------------------------------------------------
+    corpus_text = corpus_path.read_text(encoding="utf-8")
 
-    corpus_text = (
-        corpus_path.read_text(
-            encoding="utf-8"
-        )
-    )
-
-    # --------------------------------------------------------
-    # TRAIN / LOAD MODEL
-    # --------------------------------------------------------
-
-    if (
-        TRAIN_MODEL
-        or not Path(
-            MODEL_PATH
-        ).exists()
-    ):
-
-        print()
-        print(
-            "Training sparse symbolic model..."
-        )
-
-        model = train_model(
-            corpus_text
-        )
-
+    if Path(MODEL_PATH).exists():
+        print("\nLoading existing model...")
+        model = NGramModel.load_json(MODEL_PATH)
     else:
+        print("\nTraining n-gram model...")
+        model = NGramModel(min_count=MIN_COUNT, influence_tau=INFLUENCE_TAU)
+        model.ingest_text(corpus_text)
+        model.finalize()
+        model.save_json(MODEL_PATH)
 
-        print()
-        print(
-            "Loading existing model..."
-        )
+    print(f"\nVocabulary: {len(model.vocabulary)}")
+    print(f"Unigrams: {len(model.unigram)}")
+    print(f"Bigram contexts: {len(model.bigram)}")
+    print(f"Trigram contexts: {len(model.trigram)}")
 
-        model = (
-            SparseSymbolManifest.load_json(
-                MODEL_PATH
-            )
-        )
+    search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
+    search.build_index(corpus_text)  # built once, not on every turn
 
-    # --------------------------------------------------------
-    # MODEL STATISTICS
-    # --------------------------------------------------------
-
-    print()
-    print(
-        f"Vocabulary: "
-        f"{len(model.vocabulary)}"
-    )
-
-    print(
-        f"Unigrams: "
-        f"{len(model.unigram)}"
-    )
-
-    print(
-        f"Bigram contexts: "
-        f"{len(model.bigram)}"
-    )
-
-    print(
-        f"Trigram contexts: "
-        f"{len(model.trigram)}"
-    )
     while True:
-        # --------------------------------------------------------
-        # USER INPUT
-        # --------------------------------------------------------
-
-        prompt = input(
-            "USER: "
-        ).strip()
-
+        prompt = input("\nUSER: ").strip()
         if not prompt:
+            print("Empty prompt.")
+            continue
 
-            print(
-                "Empty prompt."
-            )
+        candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
+        display_candidates(candidates)
 
-
-        # ========================================================
-        # CREATE SYMBOLIC REFERENCE INDEX
-        # ========================================================
-
-        analyzer = SymbolicCandidateAnalyzer(
-            lexical_weight=LEXICAL_WEIGHT,
-            vector_weight=VECTOR_WEIGHT,
-            acceptance_threshold=(
-                ACCEPTANCE_THRESHOLD
-            ),
-            ambiguity_margin=(
-                AMBIGUITY_MARGIN
-            ),
-        )
-
-        analyzer.build_index(
-            corpus_text
-        )
-
-        # ========================================================
-        # FIRST PROCESSING STAGE
-        #
-        # Potential prompts are identified BEFORE generation.
-        # ========================================================
-
-        pre_candidates = analyzer.analyze(
-            prompt,
-            limit=CANDIDATE_LIMIT,
-        )
-
-        # ========================================================
-        # GENERATION
-        # ========================================================
-
-        print()
-        print(
-            "Generating..."
-        )
-
+        print("\nGenerating...")
         generated = model.generate(
             prompt,
             max_new_tokens=MAX_NEW_TOKENS,
             temperature=TEMPERATURE,
             top_k=TOP_K,
         )
+        display_generation(generated)
 
-        # ========================================================
-        # POST-GENERATION REBINDING
-        # ========================================================
-
-        result = analyzer.rebind(
-            generated,
-            candidate_limit=CANDIDATE_LIMIT,
-        )
-
-        # ========================================================
-        # SECOND PASS
-        # ========================================================
-
-        second_generation = None
-
-        if SECOND_PASS_GENERATION:
-
-            second_generation = second_pass(
-                model,
-                result,
-            )
-
-        # ========================================================
-        # DISPLAY
-        # ========================================================
-
-        display_result(
-            prompt=prompt,
-            pre_candidates=pre_candidates,
-            generated=generated,
-            result=result,
-            second_generation=second_generation,
-        )
-
-
-    # ============================================================
-    # ENTRY POINT
-    # ============================================================
 
 if __name__ == "__main__":
     main()
