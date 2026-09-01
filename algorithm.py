@@ -447,7 +447,7 @@ def display_candidates(candidates: List[Candidate]) -> None:
             
             if len(parts) >= 2:
                 print(f'"""{parts[0]}.' + '"""')
-                print(f"\n{parts[1]}.]\n\n")
+                print(f"\n[{parts[1]}.]\n\n")
             elif len(parts) == 1:
                 print(f'"""{parts[0]}.' + '"""\n')
             else:
