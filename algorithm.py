@@ -441,7 +441,7 @@ def display_candidates(candidates: List[Candidate]) -> None:
         )       
     
 
-        print(f"\n{generated.split('.')[1]} '.'")
+        print(f"\n{generated.split('.')[1]}.")
 
 
 
