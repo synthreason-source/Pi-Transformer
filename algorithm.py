@@ -434,14 +434,14 @@ def display_candidates(candidates: List[Candidate]) -> None:
     for c in candidates:
 
         generated = model_gpt.generate(
-            c.sentence + "this is",
+            c.sentence.strip() + ". This is",
             max_new_tokens=440,
             temperature=TEMPERATURE,
             top_k=TOP_K,
         )       
     
         try:
-            print(f"\"\"\"{''.join(generated.split('.')[0]).split('?')[0]}.\"\"\"")
+            print(f"\"\"\"{generated.split('.')[0]}.\"\"\"")
 
             print(f"\n{generated.split('.')[1]}.]\n\n")
 
