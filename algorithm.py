@@ -443,7 +443,7 @@ def display_candidates(candidates: List[Candidate]) -> None:
         try:
             print(f"\"\"\"{generated.split('.')[0]}.\"\"\"")
 
-            print(f"\n{generated.split('.')[1]}.\n\n")
+            print(f"\n{generated.split('.')[1]}.$\n\n")
 
         except:
             False
