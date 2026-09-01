@@ -467,7 +467,7 @@ def display_candidates(candidates: List[Candidate], prompt: str) -> None:
         
         generated = model_gpt.generate(
             prompt_text,
-            max_new_tokens=440,
+            max_new_tokens=600,
             temperature=TEMPERATURE,
             top_k=TOP_K,
         )       
@@ -477,7 +477,7 @@ def display_candidates(candidates: List[Candidate], prompt: str) -> None:
             
             if len(parts) >= 2:
                 print(f'"""{parts[0]}.' + '"""')
-                print(f"\n[{parts[1]}.]\n\n")
+                print(f"\n[{parts[1]}.]\n[{parts[2]}.]\n\n")
             elif len(parts) == 1:
                 print(f'"""{parts[0]}.' + '"""\n')
             else:
