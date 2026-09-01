@@ -432,22 +432,30 @@ def display_candidates(candidates: List[Candidate]) -> None:
     model_gpt = GPT2Generator(GPT2_MODEL_NAME)
     generated_string = []
     for c in candidates:
-
-        generated = model_gpt.generate(
-            c.sentence.strip() + ". This is",
+        # Added a leading space so words don't collide ("sentence this is" instead of "sentencethis is")
+        prompt_text = c.sentence.strip() + " this is"
+        
+        generated = model_gpt.generate(  # Change to model_gpt if that's your variable name
+            prompt_text,
             max_new_tokens=440,
             temperature=TEMPERATURE,
             top_k=TOP_K,
         )       
-    
+        
         try:
-            print(f"\"\"\"{generated.split('.')[0]}.\"\"\"")
-
-            print(f"\n{generated.split('.')[1]}.$\n\n")
-
-        except:
-            False
-
+            parts = [p.strip() for p in generated.split('.') if p.strip()]
+            
+            if len(parts) >= 2:
+                print(f'"""{parts[0]}.' + '"""')
+                print(f"\n{parts[1]}.]\n\n")
+            elif len(parts) == 1:
+                print(f'"""{parts[0]}.' + '"""\n')
+            else:
+                print(f'"""{generated}"""\n')
+                
+        except (IndexError, ValueError):
+            # Fallback if splitting fails unexpectedly
+            print(f'"""{generated}"""\n')
 
 def display_generation(generated: str) -> None:
     print()
