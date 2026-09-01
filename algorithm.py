@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# Optional imports for GPT-2 integration
+# Optional imports for GPT-2 & spaCy integration
 try:
     import torch
     from transformers import GPT2LMHeadModel, GPT2Tokenizer
@@ -17,12 +17,19 @@ try:
 except ImportError:
     HAS_GPT2 = False
 
+try:
+    import spacy
+    # Load lightweight English NLP model
+    nlp = spacy.load("en_core_web_sm")
+    HAS_SPACY = True
+except (ImportError, OSError):
+    HAS_SPACY = False
+
 # ============================================================
 # Small n-gram language model + corpus similarity search.
 # ============================================================
 
 MODEL_PATH = "model.json"
-USE_GPT2 = False  # Set to True to use pretrained GPT-2 instead of n-gram
 GPT2_MODEL_NAME = "gpt2" # Can be "gpt2", "gpt2-medium", etc.
 
 MAX_NEW_TOKENS = 500
@@ -47,7 +54,7 @@ IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
 
 # ============================================================
-# Text utilities
+# Text utilities & Verb Extraction
 # ============================================================
 
 def tokenize(text: str) -> List[str]:
@@ -57,6 +64,29 @@ def tokenize(text: str) -> List[str]:
 def split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
     return [p.strip() for p in parts if p.strip()]
+
+
+def extract_primary_verb(prompt: str) -> str:
+    """Isolates the primary action verb from the prompt using spaCy.
+    Falls back to a basic heuristic if spaCy is unavailable.
+    """
+    if HAS_SPACY:
+        doc = nlp(prompt)
+        # Look for a root verb or any verb (POS tag 'VERB')
+        for token in doc:
+            if token.pos_ == "VERB":
+                # Return lemma form (e.g., 'running' -> 'run', 'made' -> 'make') or token.text
+                return token.lemma_
+        # Fallback: check dependencies for root
+        for token in doc:
+            if token.dep_ == "ROOT" and token.pos_ in ("VERB", "AUX"):
+                return token.lemma_
+
+    # Fallback heuristic if spaCy is missing: grab the first alphanumeric word matching common patterns
+    words = tokenize(prompt)
+    if words:
+        return words[0]
+    return "explore"
 
 
 def safe_log(value: float, floor: float = 1e-12) -> float:
@@ -385,14 +415,12 @@ class GPT2Generator:
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
         
-        # Ensure padding token is set
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = GPT2LMHeadModel.from_pretrained(model_name)
         self.model.to(self.device)
         
-        # Dummy attributes to mimic stats printouts safely
         self.vocabulary = list(self.tokenizer.get_vocab().keys())
         self.unigram = Counter()
         self.bigram = {}
@@ -400,8 +428,6 @@ class GPT2Generator:
 
     def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 20) -> str:
         input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        
-        # Handle generation settings safely
         do_sample = temperature > 0.0
         
         output_ids = self.model.generate(
@@ -421,7 +447,7 @@ class GPT2Generator:
 # Display
 # ============================================================
 
-def display_candidates(candidates: List[Candidate]) -> None:
+def display_candidates(candidates: List[Candidate], prompt: str) -> None:
     print()
     print("=" * 70)
     print("REASONING (Corpus Context Match)")
@@ -429,13 +455,17 @@ def display_candidates(candidates: List[Candidate]) -> None:
     if not candidates:
         print("No candidates found.")
         return
-    model_gpt = GPT2Generator(GPT2_MODEL_NAME)
-    generated_string = []
-    for c in candidates:
-        # Added a leading space so words don't collide ("sentence this is" instead of "sentencethis is")
-        prompt_text = c.sentence.strip() + " this is"
         
-        generated = model_gpt.generate(  # Change to model_gpt if that's your variable name
+    model_gpt = GPT2Generator(GPT2_MODEL_NAME)
+    
+    # Isolate the verb from the original user prompt
+    primary_verb = extract_primary_verb(prompt)
+    
+    for c in candidates:
+        # Replaced " this is" with " to [verb]"
+        prompt_text = f"{c.sentence.strip()} to {primary_verb}"
+        
+        generated = model_gpt.generate(
             prompt_text,
             max_new_tokens=440,
             temperature=TEMPERATURE,
@@ -454,8 +484,8 @@ def display_candidates(candidates: List[Candidate]) -> None:
                 print(f'"""{generated}"""\n')
                 
         except (IndexError, ValueError):
-            # Fallback if splitting fails unexpectedly
             print(f'"""{generated}"""\n')
+
 
 def display_generation(generated: str) -> None:
     print()
@@ -478,8 +508,6 @@ def main() -> None:
 
     corpus_text = corpus_path.read_text(encoding="utf-8")
 
-    # Initialize model depending on flag
-
     if Path(MODEL_PATH).exists():
         print("\nLoading existing n-gram model...")
         model = NGramModel.load_json(MODEL_PATH)
@@ -496,7 +524,7 @@ def main() -> None:
     print(f"Trigram contexts: {len(model.trigram)}")
 
     search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
-    search.build_index(corpus_text)  # built once, not on every turn
+    search.build_index(corpus_text)
 
     while True:
         prompt = input("\nUSER: ").strip()
@@ -505,7 +533,7 @@ def main() -> None:
             continue
 
         candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
-        display_candidates(candidates)
+        display_candidates(candidates, prompt)
 
 
 if __name__ == "__main__":
