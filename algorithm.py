@@ -475,9 +475,9 @@ def display_candidates(candidates: List[Candidate], prompt: str) -> None:
         try:
             parts = [p.strip() for p in generated.split('.') if p.strip()]
             
-            if len(parts) >= 2:
+            if len(parts) >= 4:
                 print(f'"""{parts[0]}.' + '"""')
-                print(f"\n[{parts[1]}.]\n[{parts[2]}.]\n\n")
+                print(f"\n[{parts[1]}.]\n[{parts[2]}.]\n[{parts[3]}.]\n[{parts[4]}.]\n[{parts[5]}.]\n")
             elif len(parts) == 1:
                 print(f'"""{parts[0]}.' + '"""\n')
             else:
