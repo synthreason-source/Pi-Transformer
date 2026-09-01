@@ -9,19 +9,21 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+# Optional imports for GPT-2 integration
+try:
+    import torch
+    from transformers import GPT2LMHeadModel, GPT2Tokenizer
+    HAS_GPT2 = True
+except ImportError:
+    HAS_GPT2 = False
+
 # ============================================================
 # Small n-gram language model + corpus similarity search.
-#
-# Pipeline per user turn:
-#   1. tokenize prompt, find closest corpus sentences (display only)
-#   2. sample a continuation from the trained n-gram model
-#
-# (The original script also computed a "post-generation rebinding"
-#  pass and a "second generation" pass, but neither was ever
-#  displayed or used — removed as dead code.)
 # ============================================================
 
 MODEL_PATH = "model.json"
+USE_GPT2 = False  # Set to True to use pretrained GPT-2 instead of n-gram
+GPT2_MODEL_NAME = "gpt2" # Can be "gpt2", "gpt2-medium", etc.
 
 MAX_NEW_TOKENS = 500
 TEMPERATURE = 0.8
@@ -187,8 +189,6 @@ class NGramModel:
     vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
 
-    # ---------------- ingestion ----------------
-
     def ingest_text(self, text: str) -> None:
         for sentence in split_sentences(text):
             words = tokenize(sentence)
@@ -207,8 +207,6 @@ class NGramModel:
         for a, b, c in zip(sequence, sequence[1:], sequence[2:]):
             self.trigram[f"{a}\t{b}"][c] += 1
         self.finalized = False
-
-    # ---------------- training ----------------
 
     def finalize(self) -> None:
         self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
@@ -239,8 +237,6 @@ class NGramModel:
             self.influence_vectors[source] = scores
 
         self.finalized = True
-
-    # ---------------- generation ----------------
 
     def _backoff_distribution(self, prev: str, prev_prev: Optional[str]) -> Dict[str, float]:
         if prev_prev is not None:
@@ -330,8 +326,6 @@ class NGramModel:
         text = re.sub(r"([(\[{])\s+", r"\1", text)
         return text
 
-    # ---------------- persistence ----------------
-
     def to_dict(self) -> dict:
         return {
             "eos_token": self.eos_token,
@@ -377,19 +371,78 @@ class NGramModel:
 
 
 # ============================================================
+# GPT-2 Language Model Wrapper
+# ============================================================
+
+class GPT2Generator:
+    """Hugging Face GPT-2 wrapper matching the generation interface."""
+
+    def __init__(self, model_name: str = GPT2_MODEL_NAME) -> None:
+        if not HAS_GPT2:
+            raise ImportError("Please install PyTorch and Transformers to use GPT-2: pip install torch transformers")
+        
+        print(f"\nLoading Hugging Face GPT-2 model ({model_name})...")
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        
+        # Ensure padding token is set
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = GPT2LMHeadModel.from_pretrained(model_name)
+        self.model.to(self.device)
+        
+        # Dummy attributes to mimic stats printouts safely
+        self.vocabulary = list(self.tokenizer.get_vocab().keys())
+        self.unigram = Counter()
+        self.bigram = {}
+        self.trigram = {}
+
+    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 20) -> str:
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        
+        # Handle generation settings safely
+        do_sample = temperature > 0.0
+        
+        output_ids = self.model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=max(temperature, 1e-5),
+            top_k=top_k,
+            do_sample=do_sample,
+            pad_token_id=self.tokenizer.eos_token_id
+        )
+        
+        generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
+        return generated_text
+
+
+# ============================================================
 # Display
 # ============================================================
 
 def display_candidates(candidates: List[Candidate]) -> None:
     print()
     print("=" * 70)
-    print("REASONING")
+    print("REASONING (Corpus Context Match)")
     print("=" * 70)
     if not candidates:
         print("No candidates found.")
         return
+    model_gpt = GPT2Generator(GPT2_MODEL_NAME)
+    generated_string = []
     for c in candidates:
-        print(f"\n[{c.rank}] score={c.score:.3f}  {c.sentence}")
+
+        generated = model_gpt.generate(
+            c.sentence,
+            max_new_tokens=440,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+        )       
+    
+
+        print(f"\n{generated.split('.')[1]} '.'")
+
 
 
 def display_generation(generated: str) -> None:
@@ -413,8 +466,10 @@ def main() -> None:
 
     corpus_text = corpus_path.read_text(encoding="utf-8")
 
+    # Initialize model depending on flag
+
     if Path(MODEL_PATH).exists():
-        print("\nLoading existing model...")
+        print("\nLoading existing n-gram model...")
         model = NGramModel.load_json(MODEL_PATH)
     else:
         print("\nTraining n-gram model...")
@@ -439,15 +494,6 @@ def main() -> None:
 
         candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
         display_candidates(candidates)
-
-        print("\nGenerating...")
-        generated = model.generate(
-            prompt,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-        )
-        display_generation(generated)
 
 
 if __name__ == "__main__":
