@@ -463,7 +463,7 @@ def display_candidates(candidates: List[Candidate], prompt: str) -> None:
     
     for c in candidates:
         # Replaced " this is" with " to [verb]"
-        prompt_text = f"{c.sentence.strip()} to {primary_verb}"
+        prompt_text = f"{c.sentence.strip()} to {primary_verb} this"
         
         generated = model_gpt.generate(
             prompt_text,
