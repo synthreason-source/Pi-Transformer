@@ -300,8 +300,6 @@ model.ingest_text(CORPUS)               # actually engages on this small corpus
 model.finalize()
     
 while True:
-    print(f"curve_k before generation: {model.curve_k:.3f}")
-    text = model.generate_automodifying(prompt=input("USER: "), max_new_tokens=25)
-    print(f"curve_k after generation:  {model.curve_k:.3f}")
+    text = model.generate_automodifying(prompt=input("USER: "), max_new_tokens=650)
     print()
     print("GENERATED (automodifying):", text)
