@@ -213,7 +213,7 @@ class SemanticEvaluator:
                 "wasn't", "didn't", "hasn't", "haven't")
 
     def __init__(self, model_name: str = "all-MiniLM-L6-v2",
-                 support_threshold: float = 0.40, model=None):
+                 support_threshold: float = 0.10, model=None):
         from sentence_transformers import SentenceTransformer  # local import: optional dep
         self.model = model or SentenceTransformer(model_name)
         self.support_threshold = support_threshold
