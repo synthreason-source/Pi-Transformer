@@ -8,25 +8,55 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-from tqdm import tqdm
+
+# ============================================================
+# Small n-gram language model + corpus similarity search.
+#
+# Pipeline per user turn:
+#   1. tokenize prompt, find closest corpus sentences (display only)
+#   2. run several independent "scratch" generations from the model
+#   3. combine those runs into a single candidate modifier: tokens
+#      that show up consistently across runs reinforce each other,
+#      tokens that only appear in a minority of runs cancel out
+#   4. sample the final continuation, using that modifier to bias
+#      the per-token scores
+#
+# (The original script also computed a "post-generation rebinding"
+#  pass and a "second generation" pass, but neither was ever
+#  displayed or used — removed as dead code.)
+# ============================================================
 
 MODEL_PATH = "model.json"
+
 MAX_NEW_TOKENS = 500
 TEMPERATURE = 0.8
 TOP_K = 20
+
 MIN_COUNT = 1
 INFLUENCE_TAU = 0.5
+
 CURVE_K = 8.0
 CURVE_MIDPOINT = 0.5
+
 CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
+
+# --- consensus / "cancel out" ensemble settings ---
+NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
+CANCEL_STRENGTH = 1.0      # how hard disagreement between runs is penalized
+MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
+
 RANDOM_SEED = 2026
 random.seed(RANDOM_SEED)
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
+
+# ============================================================
+# Text utilities
+# ============================================================
 
 def tokenize(text: str) -> List[str]:
     return TOKEN_RE.findall(text.lower())
@@ -57,6 +87,98 @@ def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
     return dot / (norm_a * norm_b)
 
 
+def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
+    sa = set(a) - IGNORED_TOKENS
+    sb = set(b) - IGNORED_TOKENS
+    if not sa or not sb:
+        return 0.0
+    union = len(sa | sb)
+    return len(sa & sb) / union if union else 0.0
+
+
+# ============================================================
+# Corpus similarity search (used for the "candidates" display)
+# ============================================================
+
+@dataclass
+class CorpusReference:
+    sentence: str
+    tokens: List[str]
+    vector: Dict[str, float]
+    frequency: int = 1
+
+
+@dataclass
+class Candidate:
+    sentence: str
+    symbolic_overlap: float
+    vector_similarity: float
+    frequency: int
+    score: float
+    rank: int = 0
+
+
+class CorpusSearch:
+    """Finds corpus sentences closest to a prompt (lexical + cosine)."""
+
+    def __init__(
+        self,
+        lexical_weight: float = LEXICAL_WEIGHT,
+        vector_weight: float = VECTOR_WEIGHT,
+    ) -> None:
+        self.lexical_weight = lexical_weight
+        self.vector_weight = vector_weight
+        self.references: List[CorpusReference] = []
+
+    def build_index(self, corpus_text: str) -> None:
+        sentences = split_sentences(corpus_text)
+        counts = Counter(s.lower() for s in sentences)
+
+        self.references = []
+        for sentence in sentences:
+            tokens = tokenize(sentence)
+            if not tokens:
+                continue
+            bow = bag_of_words(tokens)
+            self.references.append(
+                CorpusReference(
+                    sentence=sentence,
+                    tokens=tokens,
+                    vector={t: float(c) for t, c in bow.items()},
+                    frequency=counts[sentence.lower()],
+                )
+            )
+
+    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
+        prompt_tokens = tokenize(prompt)
+        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
+
+        candidates = []
+        for ref in self.references:
+            symbolic = lexical_overlap(prompt_tokens, ref.tokens)
+            vector_sim = cosine_similarity(prompt_vector, ref.vector)
+            score = self.lexical_weight * symbolic + self.vector_weight * vector_sim
+            candidates.append(
+                Candidate(
+                    sentence=ref.sentence,
+                    symbolic_overlap=symbolic,
+                    vector_similarity=vector_sim,
+                    frequency=ref.frequency,
+                    score=score,
+                )
+            )
+
+        candidates.sort(key=lambda c: c.score, reverse=True)
+        candidates = candidates[:limit]
+        for i, c in enumerate(candidates, start=1):
+            c.rank = i
+        return candidates
+
+
+# ============================================================
+# N-gram language model
+# ============================================================
+
 @dataclass
 class NGramModel:
     eos_token: str = "<eos>"
@@ -75,9 +197,10 @@ class NGramModel:
     vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
 
+    # ---------------- ingestion ----------------
+
     def ingest_text(self, text: str) -> None:
-        sentences = split_sentences(text)
-        for sentence in tqdm(sentences, desc="Ingesting sentences"):
+        for sentence in split_sentences(text):
             words = tokenize(sentence)
             if not words:
                 continue
@@ -95,6 +218,8 @@ class NGramModel:
             self.trigram[f"{a}\t{b}"][c] += 1
         self.finalized = False
 
+    # ---------------- training ----------------
+
     def finalize(self) -> None:
         self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
         if self.unk_token not in self.vocabulary:
@@ -106,13 +231,13 @@ class NGramModel:
                 token_contexts[token][context] += count
 
         self.lexical_vectors = {}
-        for token in tqdm(self.vocabulary, desc="Building lexical vectors"):
+        for token in self.vocabulary:
             counts = token_contexts.get(token, Counter())
             total = sum(counts.values()) or 1
             self.lexical_vectors[token] = {ctx: c / total for ctx, c in counts.items()}
 
         self.influence_vectors = {}
-        for source in tqdm(self.vocabulary, desc="Computing influence vectors"):
+        for source in self.vocabulary:
             source_vec = self.lexical_vectors.get(source, {})
             scores = {}
             for target in self.vocabulary:
@@ -124,6 +249,8 @@ class NGramModel:
             self.influence_vectors[source] = scores
 
         self.finalized = True
+
+    # ---------------- generation ----------------
 
     def _backoff_distribution(self, prev: str, prev_prev: Optional[str]) -> Dict[str, float]:
         if prev_prev is not None:
@@ -153,43 +280,50 @@ class NGramModel:
         prev_prev = tokens[-2] if len(tokens) >= 2 else None
         return prev, prev_prev
 
-    def score_next_token_decomposed(self, prompt: str, candidate_limit: int = 64):
-        """Same math as _score_next_token, but returns the base (explained)
-        and boost (unexplained) contributions separately per candidate."""
+    def _score_next_token(
+        self,
+        prompt: str,
+        candidate_limit: int = 64,
+        candidate_modifier: Optional[Dict[str, float]] = None,
+        modifier_weight: float = 0.0,
+    ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
+
         prev, prev_prev = self._resolve_context(prompt)
         base = self._backoff_distribution(prev, prev_prev)
         if not base:
-            return {}, 0.0
+            return {}
+
         candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
         source_vec = self.lexical_vectors.get(prev, {})
         influences = self.influence_vectors.get(prev, {})
-        p_eos = base.get(self.eos_token, 0.0)
-        curve = self._curve_weight(p_eos)
+        curve = self._curve_weight(base.get(self.eos_token, 0.0))
 
-        decomposed = {}
+        scores = {}
         for token in candidates:
-            explained = safe_log(base[token])
             similarity = cosine_similarity(source_vec, self.lexical_vectors.get(token, {}))
             influence = influences.get(token, 0.0)
-            boost = curve * 0.35 * similarity + curve * 0.65 * influence
-            decomposed[token] = {
-                "base_prob": base[token],
-                "explained_score": explained,
-                "boost_score": boost,
-                "total_score": explained + boost,
-                "similarity": similarity,
-                "influence": influence,
-            }
-        return decomposed, curve
+            score = (
+                safe_log(base[token])
+                + curve * 0.35 * similarity
+                + curve * 0.65 * influence
+            )
+            if candidate_modifier and modifier_weight:
+                # bias toward tokens that survived the ensemble "cancel out" pass
+                score += modifier_weight * candidate_modifier.get(token, 0.0)
+            scores[token] = score
+        return scores
 
-    def _score_next_token(self, prompt: str, candidate_limit: int = 64) -> Dict[str, float]:
-        decomposed, _ = self.score_next_token_decomposed(prompt, candidate_limit)
-        return {t: d["total_score"] for t, d in decomposed.items()}
-
-    def _probabilities(self, prompt: str, temperature: float, candidate_limit: int) -> Dict[str, float]:
-        scores = self._score_next_token(prompt, candidate_limit)
+    def _probabilities(
+        self,
+        prompt: str,
+        temperature: float,
+        candidate_limit: int,
+        candidate_modifier: Optional[Dict[str, float]] = None,
+        modifier_weight: float = 0.0,
+    ) -> Dict[str, float]:
+        scores = self._score_next_token(prompt, candidate_limit, candidate_modifier, modifier_weight)
         if not scores:
             return {}
         temperature = max(temperature, 1e-5)
@@ -199,92 +333,141 @@ class NGramModel:
         total = sum(exps.values())
         return {t: v / total for t, v in exps.items()} if total else {}
 
-    def sample_next(self, prompt: str, temperature: float = 0.8, top_k: int = 20) -> str:
-        probs = self._probabilities(prompt, temperature, max(top_k, 1))
+    def sample_next(
+        self,
+        prompt: str,
+        temperature: float = 0.8,
+        top_k: int = 20,
+        candidate_modifier: Optional[Dict[str, float]] = None,
+        modifier_weight: float = 0.0,
+    ) -> str:
+        probs = self._probabilities(prompt, temperature, max(top_k, 1), candidate_modifier, modifier_weight)
         if not probs:
             return self.eos_token
         items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
         tokens, weights = zip(*items)
         return random.choices(tokens, weights=weights, k=1)[0]
 
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 20) -> str:
-        generated = tokenize(prompt)
-        for _ in range(max_new_tokens):
-            token = self.sample_next(" ".join(generated), temperature, top_k)
-            if token == self.eos_token:
-                break
-            generated.append(token)
-        return self.detokenize(generated)
-
-    def _sample_with_prob(self, prompt: str, temperature: float, top_k: int) -> Tuple[str, float]:
-        """Like sample_next, but also returns the probability mass the
-        model itself assigned to the token it picked -- this is the
-        confidence signal used to drive automodification."""
-        probs = self._probabilities(prompt, temperature, max(top_k, 1))
-        if not probs:
-            return self.eos_token, 0.0
-        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
-        tokens, weights = zip(*items)
-        token = random.choices(tokens, weights=weights, k=1)[0]
-        return token, probs[token]
-
-    def generate_automodifying(
+    def generate(
         self,
         prompt: str,
         max_new_tokens: int = 50,
         temperature: float = 0.8,
         top_k: int = 20,
-        min_temp: float = 0.2,
-        max_temp: float = 2.0,
-        adapt_rate: float = 0.4,
-        trace: bool = False,
-    ):
-        """
-        Sec. 4: S_{t+1} = F(S_t, I_t); pi_{t+1} = G(pi_t, S_t, I_t) -- run
-        as an actual loop inside generation, using a feedback signal that
-        is guaranteed to be informative every step: the model's own
-        confidence (probability mass) in the token it just emitted.
-
-          confidence high  -> temperature tightens  (commit further)
-          confidence low   -> temperature loosens   (explore more)
-
-        This changes `temp`, which is then used to sample the NEXT token,
-        so the effect is not cosmetic -- it changes what actually gets
-        generated. `trace=True` returns the per-step (token, confidence,
-        temp) log so the effect can be inspected directly.
-        """
+        candidate_modifier: Optional[Dict[str, float]] = None,
+        modifier_weight: float = 0.0,
+    ) -> str:
         generated = tokenize(prompt)
-        temp = temperature
-        log = []
+        for _ in range(max_new_tokens):
+            token = self.sample_next(
+                " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight
+            )
+            if token == self.eos_token:
+                break
+            generated.append(token)
+        return self.detokenize(generated)
 
-        for step in range(max_new_tokens):
-            context = " ".join(generated)
-            token, confidence = self._sample_with_prob(context, temp, top_k)
-            #if token == self.eos_token:
-                #break
+    def generate_with_trace(
+        self, prompt: str, max_new_tokens: int, temperature: float, top_k: int
+    ) -> Tuple[str, List[str]]:
+        """Generate once and also return just the newly generated tokens."""
+        generated = tokenize(prompt)
+        start = len(generated)
+        for _ in range(max_new_tokens):
+            token = self.sample_next(" ".join(generated), temperature, top_k)
+            if token == self.eos_token:
+                break
+            generated.append(token)
+        return self.detokenize(generated), generated[start:]
 
-            temp_before = temp
-            # pi_{t+1} = G(pi_t, S_t, I_t): temperature IS part of the
-            # generation policy here, and it is being rewritten based on
-            # what the system just observed about its own output.
-            temp = temp * (1 + adapt_rate * (0.5 - confidence))
-            temp = max(min_temp, min(max_temp, temp))
-            if token not in IGNORED_TOKENS and token not in generated:
-                generated.append(token)
-            if trace:
-                log.append((step, token, confidence, temp_before, temp))
+    def multi_generate(
+        self,
+        prompt: str,
+        num_generations: int = NUM_GENERATIONS,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 20,
+    ) -> List[List[str]]:
+        """Run several independent scratch generations from the same prompt."""
+        runs: List[List[str]] = []
+        for _ in range(num_generations):
+            _, new_tokens = self.generate_with_trace(prompt, max_new_tokens, temperature, top_k)
+            runs.append(new_tokens)
+        return runs
 
-            # S_{t+1} = F(S_t, I_t): feed the emitted token back into the
-            # model's own counts before the next step is scored.
-            window = generated[-3:] if len(generated) >= 3 else ["<bos>"] * (3 - len(generated)) + generated
-            self.unigram[token] += 1
-            if len(window) >= 2:
-                self.bigram[window[-2]][window[-1]] += 1
-            if len(window) >= 3:
-                self.trigram[f"{window[-3]}\t{window[-2]}"][window[-1]] += 1
+    @staticmethod
+    def build_candidate_modifier(
+        runs: List[List[str]], cancel_strength: float = CANCEL_STRENGTH
+    ) -> Dict[str, float]:
+        """
+        Combine multiple generation runs ("arrays") into one candidate modifier.
 
-        text = self.detokenize(generated)
-        return (text, log) if trace else text
+        Each run is turned into a token-count vector. The vectors are
+        combined by taking their mean and then subtracting the
+        disagreement between them (population std-dev), scaled by
+        cancel_strength:
+
+            modifier[token] = mean_count(token) - cancel_strength * std(token)
+
+        Tokens that appear consistently across runs (low variance) survive
+        and reinforce each other. Tokens that only show up in a minority of
+        runs (high variance relative to their mean) get cancelled out to
+        zero or below and are dropped. The surviving values are normalized
+        to 0..1 so they can be blended into the scoring function.
+        """
+        if not runs:
+            return {}
+
+        counters = [Counter(run) for run in runs]
+        vocab = set()
+        for c in counters:
+            vocab.update(c.keys())
+
+        n = len(counters)
+        modifier: Dict[str, float] = {}
+        for token in vocab:
+            values = [c.get(token, 0) for c in counters]
+            mean = sum(values) / n
+            variance = sum((v - mean) ** 2 for v in values) / n
+            std = math.sqrt(variance)
+            net = mean - cancel_strength * std
+            if net > 0:
+                modifier[token] = net
+
+        if not modifier:
+            return {}
+        max_val = max(modifier.values())
+        return {t: v / max_val for t, v in modifier.items()}
+
+    def generate_consensus(
+        self,
+        prompt: str,
+        num_generations: int = NUM_GENERATIONS,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 20,
+        cancel_strength: float = CANCEL_STRENGTH,
+        modifier_weight: float = MODIFIER_WEIGHT,
+    ) -> Tuple[str, List[List[str]], Dict[str, float]]:
+        """
+        Full pipeline: run several scratch generations, cancel them out
+        against each other into a candidate modifier, then do one more
+        final generation using that modifier to bias token scores.
+
+        Returns (final_text, scratch_runs, modifier) so callers can inspect
+        what survived the cancel-out pass.
+        """
+        runs = self.multi_generate(prompt, num_generations, max_new_tokens, temperature, top_k)
+        modifier = self.build_candidate_modifier(runs, cancel_strength)
+        final_text = self.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            candidate_modifier=modifier,
+            modifier_weight=modifier_weight,
+        )
+        return final_text, runs, modifier
 
     @staticmethod
     def detokenize(tokens: List[str]) -> str:
@@ -293,15 +476,146 @@ class NGramModel:
         text = re.sub(r"([(\[{])\s+", r"\1", text)
         return text
 
-with open(input("Filename: "), "r", encoding="utf-8") as file:
-    CORPUS = file.read()
+    # ---------------- persistence ----------------
+
+    def to_dict(self) -> dict:
+        return {
+            "eos_token": self.eos_token,
+            "unk_token": self.unk_token,
+            "min_count": self.min_count,
+            "influence_tau": self.influence_tau,
+            "curve_k": self.curve_k,
+            "curve_midpoint": self.curve_midpoint,
+            "unigram": dict(self.unigram),
+            "bigram": {k: dict(v) for k, v in self.bigram.items()},
+            "trigram": {k: dict(v) for k, v in self.trigram.items()},
+            "lexical_vectors": self.lexical_vectors,
+            "influence_vectors": self.influence_vectors,
+            "vocabulary": self.vocabulary,
+            "finalized": self.finalized,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "NGramModel":
+        model = cls(
+            eos_token=data["eos_token"],
+            unk_token=data["unk_token"],
+            min_count=data["min_count"],
+            influence_tau=data["influence_tau"],
+            curve_k=data["curve_k"],
+            curve_midpoint=data["curve_midpoint"],
+        )
+        model.unigram = Counter(data["unigram"])
+        model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data["bigram"].items()})
+        model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data["trigram"].items()})
+        model.lexical_vectors = data["lexical_vectors"]
+        model.influence_vectors = data["influence_vectors"]
+        model.vocabulary = data["vocabulary"]
+        model.finalized = data["finalized"]
+        return model
+
+    def save_json(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+
+    @classmethod
+    def load_json(cls, path: str | Path) -> "NGramModel":
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-model = NGramModel(influence_tau=0.15)  # lower threshold so the boost term
-model.ingest_text(CORPUS)               # actually engages on this small corpus
-model.finalize()
-    
-while True:
-    text = model.generate_automodifying(prompt=input("USER: "), max_new_tokens=650)
+# ============================================================
+# Display
+# ============================================================
+
+def display_candidates(candidates: List[Candidate]) -> None:
     print()
-    print("GENERATED (automodifying):", text)
+    print("=" * 70)
+    print("REASONING")
+    print("=" * 70)
+    if not candidates:
+        print("No candidates found.")
+        return
+    for c in candidates:
+        print(f"\n[{c.rank}] score={c.score:.3f}  {c.sentence}")
+
+
+def display_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> None:
+    print()
+    print("=" * 70)
+    print(f"ENSEMBLE ({len(runs)} scratch generations, cancelled against each other)")
+    print("=" * 70)
+    for i, run in enumerate(runs, start=1):
+        preview = NGramModel.detokenize(run[:20])
+        print(f"\n[run {i}] {preview}{' ...' if len(run) > 20 else ''}")
+    top_survivors = sorted(modifier.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    print("\nSurviving tokens after cancel-out (top 15):")
+    if not top_survivors:
+        print("  (none survived — runs disagreed on everything)")
+    for token, weight in top_survivors:
+        print(f"  {token!r:<15} weight={weight:.3f}")
+
+
+def display_generation(generated: str) -> None:
+    print()
+    print("=" * 70)
+    print("GENERATED")
+    print("=" * 70)
+    print()
+    print(generated)
+
+
+# ============================================================
+# Main
+# ============================================================
+
+def main() -> None:
+    corpus_path = Path(input("Filename: "))
+    if not corpus_path.exists():
+        print(f"\nERROR: {corpus_path} does not exist.")
+        return
+
+    corpus_text = corpus_path.read_text(encoding="utf-8")
+
+    if Path(MODEL_PATH).exists():
+        print("\nLoading existing model...")
+        model = NGramModel.load_json(MODEL_PATH)
+    else:
+        print("\nTraining n-gram model...")
+        model = NGramModel(min_count=MIN_COUNT, influence_tau=INFLUENCE_TAU)
+        model.ingest_text(corpus_text)
+        model.finalize()
+        model.save_json(MODEL_PATH)
+
+    print(f"\nVocabulary: {len(model.vocabulary)}")
+    print(f"Unigrams: {len(model.unigram)}")
+    print(f"Bigram contexts: {len(model.bigram)}")
+    print(f"Trigram contexts: {len(model.trigram)}")
+
+    search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
+    search.build_index(corpus_text)  # built once, not on every turn
+
+    while True:
+        prompt = input("\nUSER: ").strip()
+        if not prompt:
+            print("Empty prompt.")
+            continue
+
+        candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
+        display_candidates(candidates)
+
+        print(f"\nRunning {NUM_GENERATIONS} scratch generations to build a consensus modifier...")
+        final_text, runs, modifier = model.generate_consensus(
+            prompt,
+            num_generations=NUM_GENERATIONS,
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            cancel_strength=CANCEL_STRENGTH,
+            modifier_weight=MODIFIER_WEIGHT,
+        )
+
+        print("\nGenerating final (modifier-biased)...")
+        display_generation(final_text)
+
+
+if __name__ == "__main__":
+    main()
