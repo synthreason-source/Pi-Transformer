@@ -271,10 +271,7 @@ if __name__ == "__main__":
             observations = [s.strip() for s in f.read().split(".") if s.strip()]
     else:
         observations = [
-            "I dreamed of falling last night",
-            "I did not fly today",
-            "I lost several teeth in the dream",
-            "something was chasing me through a hallway",
+
         ]
 
     hyps = [
