@@ -269,7 +269,7 @@ class NGramModel:
             # what the system just observed about its own output.
             temp = temp * (1 + adapt_rate * (0.5 - confidence))
             temp = max(min_temp, min(max_temp, temp))
-            if token not in IGNORED_TOKENS:
+            if token not in IGNORED_TOKENS and token not in generated:
                 generated.append(token)
             if trace:
                 log.append((step, token, confidence, temp_before, temp))
