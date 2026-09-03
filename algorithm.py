@@ -9,53 +9,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# Optional imports for GPT-2 & spaCy integration
-try:
-    import torch
-    from transformers import GPT2LMHeadModel, GPT2Tokenizer
-    HAS_GPT2 = True
-except ImportError:
-    HAS_GPT2 = False
-
-try:
-    import spacy
-    # Load lightweight English NLP model
-    nlp = spacy.load("en_core_web_sm")
-    HAS_SPACY = True
-except (ImportError, OSError):
-    HAS_SPACY = False
-
-# ============================================================
-# Small n-gram language model + corpus similarity search.
-# ============================================================
-
 MODEL_PATH = "model.json"
-GPT2_MODEL_NAME = "gpt2" # Can be "gpt2", "gpt2-medium", etc.
-
 MAX_NEW_TOKENS = 500
 TEMPERATURE = 0.8
 TOP_K = 20
-
 MIN_COUNT = 1
 INFLUENCE_TAU = 0.5
-
 CURVE_K = 8.0
 CURVE_MIDPOINT = 0.5
-
 CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
-
 RANDOM_SEED = 2026
 random.seed(RANDOM_SEED)
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
-
-# ============================================================
-# Text utilities & Verb Extraction
-# ============================================================
 
 def tokenize(text: str) -> List[str]:
     return TOKEN_RE.findall(text.lower())
@@ -64,29 +34,6 @@ def tokenize(text: str) -> List[str]:
 def split_sentences(text: str) -> List[str]:
     parts = re.split(r"(?<=[.!?])\s+|\n+", text.strip())
     return [p.strip() for p in parts if p.strip()]
-
-
-def extract_primary_verb(prompt: str) -> str:
-    """Isolates the primary action verb from the prompt using spaCy.
-    Falls back to a basic heuristic if spaCy is unavailable.
-    """
-    if HAS_SPACY:
-        doc = nlp(prompt)
-        # Look for a root verb or any verb (POS tag 'VERB')
-        for token in doc:
-            if token.pos_ == "VERB":
-                # Return lemma form (e.g., 'running' -> 'run', 'made' -> 'make') or token.text
-                return token.lemma_
-        # Fallback: check dependencies for root
-        for token in doc:
-            if token.dep_ == "ROOT" and token.pos_ in ("VERB", "AUX"):
-                return token.lemma_
-
-    # Fallback heuristic if spaCy is missing: grab the first alphanumeric word matching common patterns
-    words = tokenize(prompt)
-    if words:
-        return words[0]
-    return "explore"
 
 
 def safe_log(value: float, floor: float = 1e-12) -> float:
@@ -108,98 +55,6 @@ def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
         return 0.0
     return dot / (norm_a * norm_b)
 
-
-def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
-    sa = set(a) - IGNORED_TOKENS
-    sb = set(b) - IGNORED_TOKENS
-    if not sa or not sb:
-        return 0.0
-    union = len(sa | sb)
-    return len(sa & sb) / union if union else 0.0
-
-
-# ============================================================
-# Corpus similarity search (used for the "candidates" display)
-# ============================================================
-
-@dataclass
-class CorpusReference:
-    sentence: str
-    tokens: List[str]
-    vector: Dict[str, float]
-    frequency: int = 1
-
-
-@dataclass
-class Candidate:
-    sentence: str
-    symbolic_overlap: float
-    vector_similarity: float
-    frequency: int
-    score: float
-    rank: int = 0
-
-
-class CorpusSearch:
-    """Finds corpus sentences closest to a prompt (lexical + cosine)."""
-
-    def __init__(
-        self,
-        lexical_weight: float = LEXICAL_WEIGHT,
-        vector_weight: float = VECTOR_WEIGHT,
-    ) -> None:
-        self.lexical_weight = lexical_weight
-        self.vector_weight = vector_weight
-        self.references: List[CorpusReference] = []
-
-    def build_index(self, corpus_text: str) -> None:
-        sentences = split_sentences(corpus_text)
-        counts = Counter(s.lower() for s in sentences)
-
-        self.references = []
-        for sentence in sentences:
-            tokens = tokenize(sentence)
-            if not tokens:
-                continue
-            bow = bag_of_words(tokens)
-            self.references.append(
-                CorpusReference(
-                    sentence=sentence,
-                    tokens=tokens,
-                    vector={t: float(c) for t, c in bow.items()},
-                    frequency=counts[sentence.lower()],
-                )
-            )
-
-    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
-        prompt_tokens = tokenize(prompt)
-        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
-
-        candidates = []
-        for ref in self.references:
-            symbolic = lexical_overlap(prompt_tokens, ref.tokens)
-            vector_sim = cosine_similarity(prompt_vector, ref.vector)
-            score = self.lexical_weight * symbolic + self.vector_weight * vector_sim
-            candidates.append(
-                Candidate(
-                    sentence=ref.sentence,
-                    symbolic_overlap=symbolic,
-                    vector_similarity=vector_sim,
-                    frequency=ref.frequency,
-                    score=score,
-                )
-            )
-
-        candidates.sort(key=lambda c: c.score, reverse=True)
-        candidates = candidates[:limit]
-        for i, c in enumerate(candidates, start=1):
-            c.rank = i
-        return candidates
-
-
-# ============================================================
-# N-gram language model
-# ============================================================
 
 @dataclass
 class NGramModel:
@@ -296,30 +151,40 @@ class NGramModel:
         prev_prev = tokens[-2] if len(tokens) >= 2 else None
         return prev, prev_prev
 
-    def _score_next_token(self, prompt: str, candidate_limit: int = 64) -> Dict[str, float]:
+    def score_next_token_decomposed(self, prompt: str, candidate_limit: int = 64):
+        """Same math as _score_next_token, but returns the base (explained)
+        and boost (unexplained) contributions separately per candidate."""
         if not self.finalized:
             self.finalize()
-
         prev, prev_prev = self._resolve_context(prompt)
         base = self._backoff_distribution(prev, prev_prev)
         if not base:
-            return {}
-
+            return {}, 0.0
         candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
         source_vec = self.lexical_vectors.get(prev, {})
         influences = self.influence_vectors.get(prev, {})
-        curve = self._curve_weight(base.get(self.eos_token, 0.0))
+        p_eos = base.get(self.eos_token, 0.0)
+        curve = self._curve_weight(p_eos)
 
-        scores = {}
+        decomposed = {}
         for token in candidates:
+            explained = safe_log(base[token])
             similarity = cosine_similarity(source_vec, self.lexical_vectors.get(token, {}))
             influence = influences.get(token, 0.0)
-            scores[token] = (
-                safe_log(base[token])
-                + curve * 0.35 * similarity
-                + curve * 0.65 * influence
-            )
-        return scores
+            boost = curve * 0.35 * similarity + curve * 0.65 * influence
+            decomposed[token] = {
+                "base_prob": base[token],
+                "explained_score": explained,
+                "boost_score": boost,
+                "total_score": explained + boost,
+                "similarity": similarity,
+                "influence": influence,
+            }
+        return decomposed, curve
+
+    def _score_next_token(self, prompt: str, candidate_limit: int = 64) -> Dict[str, float]:
+        decomposed, _ = self.score_next_token_decomposed(prompt, candidate_limit)
+        return {t: d["total_score"] for t, d in decomposed.items()}
 
     def _probabilities(self, prompt: str, temperature: float, candidate_limit: int) -> Dict[str, float]:
         scores = self._score_next_token(prompt, candidate_limit)
@@ -349,6 +214,76 @@ class NGramModel:
             generated.append(token)
         return self.detokenize(generated)
 
+    def _sample_with_prob(self, prompt: str, temperature: float, top_k: int) -> Tuple[str, float]:
+        """Like sample_next, but also returns the probability mass the
+        model itself assigned to the token it picked -- this is the
+        confidence signal used to drive automodification."""
+        probs = self._probabilities(prompt, temperature, max(top_k, 1))
+        if not probs:
+            return self.eos_token, 0.0
+        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
+        tokens, weights = zip(*items)
+        token = random.choices(tokens, weights=weights, k=1)[0]
+        return token, probs[token]
+
+    def generate_automodifying(
+        self,
+        prompt: str,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 20,
+        min_temp: float = 0.2,
+        max_temp: float = 2.0,
+        adapt_rate: float = 0.4,
+        trace: bool = False,
+    ):
+        """
+        Sec. 4: S_{t+1} = F(S_t, I_t); pi_{t+1} = G(pi_t, S_t, I_t) -- run
+        as an actual loop inside generation, using a feedback signal that
+        is guaranteed to be informative every step: the model's own
+        confidence (probability mass) in the token it just emitted.
+
+          confidence high  -> temperature tightens  (commit further)
+          confidence low   -> temperature loosens   (explore more)
+
+        This changes `temp`, which is then used to sample the NEXT token,
+        so the effect is not cosmetic -- it changes what actually gets
+        generated. `trace=True` returns the per-step (token, confidence,
+        temp) log so the effect can be inspected directly.
+        """
+        generated = tokenize(prompt)
+        temp = temperature
+        log = []
+
+        for step in range(max_new_tokens):
+            context = " ".join(generated)
+            token, confidence = self._sample_with_prob(context, temp, top_k)
+            if token == self.eos_token:
+                break
+
+            temp_before = temp
+            # pi_{t+1} = G(pi_t, S_t, I_t): temperature IS part of the
+            # generation policy here, and it is being rewritten based on
+            # what the system just observed about its own output.
+            temp = temp * (1 + adapt_rate * (0.5 - confidence))
+            temp = max(min_temp, min(max_temp, temp))
+
+            generated.append(token)
+            if trace:
+                log.append((step, token, confidence, temp_before, temp))
+
+            # S_{t+1} = F(S_t, I_t): feed the emitted token back into the
+            # model's own counts before the next step is scored.
+            window = generated[-3:] if len(generated) >= 3 else ["<bos>"] * (3 - len(generated)) + generated
+            self.unigram[token] += 1
+            if len(window) >= 2:
+                self.bigram[window[-2]][window[-1]] += 1
+            if len(window) >= 3:
+                self.trigram[f"{window[-3]}\t{window[-2]}"][window[-1]] += 1
+
+        text = self.detokenize(generated)
+        return (text, log) if trace else text
+
     @staticmethod
     def detokenize(tokens: List[str]) -> str:
         text = " ".join(tokens)
@@ -356,185 +291,17 @@ class NGramModel:
         text = re.sub(r"([(\[{])\s+", r"\1", text)
         return text
 
-    def to_dict(self) -> dict:
-        return {
-            "eos_token": self.eos_token,
-            "unk_token": self.unk_token,
-            "min_count": self.min_count,
-            "influence_tau": self.influence_tau,
-            "curve_k": self.curve_k,
-            "curve_midpoint": self.curve_midpoint,
-            "unigram": dict(self.unigram),
-            "bigram": {k: dict(v) for k, v in self.bigram.items()},
-            "trigram": {k: dict(v) for k, v in self.trigram.items()},
-            "lexical_vectors": self.lexical_vectors,
-            "influence_vectors": self.influence_vectors,
-            "vocabulary": self.vocabulary,
-            "finalized": self.finalized,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "NGramModel":
-        model = cls(
-            eos_token=data["eos_token"],
-            unk_token=data["unk_token"],
-            min_count=data["min_count"],
-            influence_tau=data["influence_tau"],
-            curve_k=data["curve_k"],
-            curve_midpoint=data["curve_midpoint"],
-        )
-        model.unigram = Counter(data["unigram"])
-        model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data["bigram"].items()})
-        model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data["trigram"].items()})
-        model.lexical_vectors = data["lexical_vectors"]
-        model.influence_vectors = data["influence_vectors"]
-        model.vocabulary = data["vocabulary"]
-        model.finalized = data["finalized"]
-        return model
-
-    def save_json(self, path: str | Path) -> None:
-        Path(path).write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
-
-    @classmethod
-    def load_json(cls, path: str | Path) -> "NGramModel":
-        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+with open(input("Filename: "), "r", encoding="utf-8") as file:
+    CORPUS = file.read()
 
 
-# ============================================================
-# GPT-2 Language Model Wrapper
-# ============================================================
-
-class GPT2Generator:
-    """Hugging Face GPT-2 wrapper matching the generation interface."""
-
-    def __init__(self, model_name: str = GPT2_MODEL_NAME) -> None:
-        if not HAS_GPT2:
-            raise ImportError("Please install PyTorch and Transformers to use GPT-2: pip install torch transformers")
-        
-        print(f"\nLoading Hugging Face GPT-2 model ({model_name})...")
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
-        
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-
-        self.model = GPT2LMHeadModel.from_pretrained(model_name)
-        self.model.to(self.device)
-        
-        self.vocabulary = list(self.tokenizer.get_vocab().keys())
-        self.unigram = Counter()
-        self.bigram = {}
-        self.trigram = {}
-
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 0.8, top_k: int = 20) -> str:
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        do_sample = temperature > 0.0
-        
-        output_ids = self.model.generate(
-            input_ids,
-            max_new_tokens=max_new_tokens,
-            temperature=max(temperature, 1e-5),
-            top_k=top_k,
-            do_sample=do_sample,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        
-        generated_text = self.tokenizer.decode(output_ids[0], skip_special_tokens=True)
-        return generated_text
-
-
-# ============================================================
-# Display
-# ============================================================
-
-def display_candidates(candidates: List[Candidate], prompt: str) -> None:
-    print()
-    print("=" * 70)
-    print("REASONING (Corpus Context Match)")
-    print("=" * 70)
-    if not candidates:
-        print("No candidates found.")
-        return
-        
-    model_gpt = GPT2Generator(GPT2_MODEL_NAME)
+model = NGramModel(influence_tau=0.15)  # lower threshold so the boost term
+model.ingest_text(CORPUS)               # actually engages on this small corpus
+model.finalize()
     
-    # Isolate the verb from the original user prompt
-    primary_verb = extract_primary_verb(prompt)
-    
-    for c in candidates:
-        # Replaced " this is" with " to [verb]"
-        prompt_text = f"{c.sentence.strip()} to {primary_verb} this"
-        
-        generated = model_gpt.generate(
-            prompt_text,
-            max_new_tokens=600,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-        )       
-        
-        try:
-            parts = [p.strip() for p in generated.split('.') if p.strip()]
-            
-            if len(parts) >= 4:
-                print(f'"""{parts[0]}.' + '"""')
-                print(f"\n[{parts[1]}.]\n[{parts[2]}.]\n[{parts[3]}.]\n[{parts[4]}.]\n[{parts[5]}.]\n")
-            elif len(parts) == 1:
-                print(f'"""{parts[0]}.' + '"""\n')
-            else:
-                print(f'"""{generated}"""\n')
-                
-        except (IndexError, ValueError):
-            print(f'"""{generated}"""\n')
-
-
-def display_generation(generated: str) -> None:
+while True:
+    print(f"curve_k before generation: {model.curve_k:.3f}")
+    text = model.generate_automodifying(prompt=input("USER: "), max_new_tokens=25)
+    print(f"curve_k after generation:  {model.curve_k:.3f}")
     print()
-    print("=" * 70)
-    print("GENERATED")
-    print("=" * 70)
-    print()
-    print(generated)
-
-
-# ============================================================
-# Main
-# ============================================================
-
-def main() -> None:
-    corpus_path = Path(input("Filename: "))
-    if not corpus_path.exists():
-        print(f"\nERROR: {corpus_path} does not exist.")
-        return
-
-    corpus_text = corpus_path.read_text(encoding="utf-8")
-
-    if Path(MODEL_PATH).exists():
-        print("\nLoading existing n-gram model...")
-        model = NGramModel.load_json(MODEL_PATH)
-    else:
-        print("\nTraining n-gram model...")
-        model = NGramModel(min_count=MIN_COUNT, influence_tau=INFLUENCE_TAU)
-        model.ingest_text(corpus_text)
-        model.finalize()
-        model.save_json(MODEL_PATH)
-
-    print(f"\nVocabulary: {len(model.vocabulary)}")
-    print(f"Unigrams: {len(model.unigram)}")
-    print(f"Bigram contexts: {len(model.bigram)}")
-    print(f"Trigram contexts: {len(model.trigram)}")
-
-    search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
-    search.build_index(corpus_text)
-
-    while True:
-        prompt = input("\nUSER: ").strip()
-        if not prompt:
-            print("Empty prompt.")
-            continue
-
-        candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
-        display_candidates(candidates, prompt)
-
-
-if __name__ == "__main__":
-    main()
+    print("GENERATED (automodifying):", text)
