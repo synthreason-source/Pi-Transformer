@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+from tqdm import tqdm
 
 MODEL_PATH = "model.json"
 MAX_NEW_TOKENS = 500
@@ -75,7 +76,8 @@ class NGramModel:
     finalized: bool = False
 
     def ingest_text(self, text: str) -> None:
-        for sentence in split_sentences(text):
+        sentences = split_sentences(text)
+        for sentence in tqdm(sentences, desc="Ingesting sentences"):
             words = tokenize(sentence)
             if not words:
                 continue
@@ -104,13 +106,13 @@ class NGramModel:
                 token_contexts[token][context] += count
 
         self.lexical_vectors = {}
-        for token in self.vocabulary:
+        for token in tqdm(self.vocabulary, desc="Building lexical vectors"):
             counts = token_contexts.get(token, Counter())
             total = sum(counts.values()) or 1
             self.lexical_vectors[token] = {ctx: c / total for ctx, c in counts.items()}
 
         self.influence_vectors = {}
-        for source in self.vocabulary:
+        for source in tqdm(self.vocabulary, desc="Computing influence vectors"):
             source_vec = self.lexical_vectors.get(source, {})
             scores = {}
             for target in self.vocabulary:
@@ -267,8 +269,8 @@ class NGramModel:
             # what the system just observed about its own output.
             temp = temp * (1 + adapt_rate * (0.5 - confidence))
             temp = max(min_temp, min(max_temp, temp))
-
-            generated.append(token)
+            if token not in IGNORED_TOKENS:
+                generated.append(token)
             if trace:
                 log.append((step, token, confidence, temp_before, temp))
 
