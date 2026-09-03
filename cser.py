@@ -278,10 +278,7 @@ if __name__ == "__main__":
         ]
 
     hyps = [
-        Hypothesis("falling"),
-        Hypothesis("flying"),
-        Hypothesis("teeth loss"),
-        Hypothesis("being chased"),
+
     ]
     while True:
         custom = input("Custom hypothesis (leave blank to skip): ").strip()
