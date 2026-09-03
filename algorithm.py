@@ -258,8 +258,8 @@ class NGramModel:
         for step in range(max_new_tokens):
             context = " ".join(generated)
             token, confidence = self._sample_with_prob(context, temp, top_k)
-            if token == self.eos_token:
-                break
+            #if token == self.eos_token:
+                #break
 
             temp_before = temp
             # pi_{t+1} = G(pi_t, S_t, I_t): temperature IS part of the
