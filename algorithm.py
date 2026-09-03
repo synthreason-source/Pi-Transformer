@@ -362,8 +362,8 @@ class NGramModel:
             token = self.sample_next(
                 " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight
             )
-            if token == self.eos_token:
-                break
+            #if token == self.eos_token:
+                #break
             generated.append(token)
         return self.detokenize(generated)
 
@@ -375,8 +375,8 @@ class NGramModel:
         start = len(generated)
         for _ in range(max_new_tokens):
             token = self.sample_next(" ".join(generated), temperature, top_k)
-            if token == self.eos_token:
-                break
+            #if token == self.eos_token:
+                #break
             generated.append(token)
         return self.detokenize(generated), generated[start:]
 
