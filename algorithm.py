@@ -18,8 +18,9 @@ from typing import Dict, Iterable, List, Optional, Tuple
 #   3. combine those runs into a single candidate modifier: tokens
 #      that show up consistently across runs reinforce each other,
 #      tokens that only appear in a minority of runs cancel out
-#   4. sample the final continuation, using that modifier to bias
-#      the per-token scores
+#   4. sample the final continuation, using that modifier (blended
+#      50/50 with the raw baseline token probability) to bias the
+#      per-token scores
 #
 # (The original script also computed a "post-generation rebinding"
 #  pass and a "second generation" pass, but neither was ever
@@ -46,6 +47,7 @@ VECTOR_WEIGHT = 0.55
 NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
 CANCEL_STRENGTH = 1.0      # how hard disagreement between runs is penalized
 MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
+CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
 
 RANDOM_SEED = 2026
 random.seed(RANDOM_SEED)
@@ -310,8 +312,16 @@ class NGramModel:
                 + curve * 0.65 * influence
             )
             if candidate_modifier and modifier_weight:
-                # bias toward tokens that survived the ensemble "cancel out" pass
-                score += modifier_weight * candidate_modifier.get(token, 0.0)
+                # Split the difference between the ensemble consensus
+                # ("census") weight and the raw baseline probability for
+                # this token, instead of using the consensus weight alone.
+                consensus_weight = candidate_modifier.get(token, 0.0)
+                baseline_prob = base.get(token, 0.0)
+                blended_bias = (
+                    CONSENSUS_BASELINE_SPLIT * consensus_weight
+                    + (1.0 - CONSENSUS_BASELINE_SPLIT) * baseline_prob
+                )
+                score += modifier_weight * blended_bias
             scores[token] = score
         return scores
 
@@ -452,7 +462,9 @@ class NGramModel:
         """
         Full pipeline: run several scratch generations, cancel them out
         against each other into a candidate modifier, then do one more
-        final generation using that modifier to bias token scores.
+        final generation. The final generation's per-token bias splits
+        the difference between that consensus modifier and each token's
+        raw baseline probability (see CONSENSUS_BASELINE_SPLIT).
 
         Returns (final_text, scratch_runs, modifier) so callers can inspect
         what survived the cancel-out pass.
