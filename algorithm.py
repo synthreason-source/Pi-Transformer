@@ -6,8 +6,14 @@ import random
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.decomposition import TruncatedSVD
+from sklearn.preprocessing import normalize
 
 # ============================================================
 # Small n-gram language model + corpus similarity search.
@@ -42,6 +48,10 @@ CURVE_MIDPOINT = 0.5
 CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
+
+# how hard the corpus evidence modifier (SUPPORTED/REFUTED sentences)
+# pushes the final generation's per-token scores
+EVIDENCE_WEIGHT = 0.4
 
 # --- consensus / "cancel out" ensemble settings ---
 NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
@@ -99,6 +109,108 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
 
 
 # ============================================================
+# Evidence
+#
+# Each corpus sentence is treated as a standing hypothesis about
+# the world. Every user prompt is an observation that either
+# supports it, contradicts it, or says nothing about it. Evidence
+# accumulates across turns instead of being recomputed from
+# scratch each time, so a sentence's status can evolve (or become
+# CONFLICTED) as the conversation goes on.
+# ============================================================
+
+class Evidence(Enum):
+    TRUE = "⊤"
+    FALSE = "⊥"
+    UNKNOWN = "?"
+    CONFLICT = "!"
+
+
+NEGATORS = ("not ", "never ", "did not ", "didn't ", "no ", "without ")
+
+
+@dataclass
+class EvidenceRecord:
+    state: Evidence = Evidence.UNKNOWN
+    true_count: int = 0
+    false_count: int = 0
+    similarities: List[float] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.true_count + self.false_count
+
+    @property
+    def consistency(self) -> float:
+        if self.total == 0:
+            return 0.0
+        return max(self.true_count, self.false_count) / self.total
+
+    def add(self, result: Evidence, similarity: float) -> None:
+        if result is Evidence.UNKNOWN:
+            return
+        self.similarities.append(similarity)
+        if result is Evidence.TRUE:
+            self.true_count += 1
+        elif result is Evidence.FALSE:
+            self.false_count += 1
+        if self.true_count and self.false_count:
+            self.state = Evidence.CONFLICT
+        elif self.true_count:
+            self.state = Evidence.TRUE
+        elif self.false_count:
+            self.state = Evidence.FALSE
+
+    @property
+    def verdict(self) -> str:
+        return {
+            Evidence.TRUE: "SUPPORTED",
+            Evidence.FALSE: "REFUTED",
+            Evidence.UNKNOWN: "UNRESOLVED",
+            Evidence.CONFLICT: "CONFLICTED",
+        }[self.state]
+
+
+# ============================================================
+# Geometric text space (TF-IDF -> SVD -> normalized vectors)
+#
+# Replaces the old raw bag-of-words cosine similarity. Sparse
+# term-count cosine tends to reward any shared word equally; TF-IDF
+# downweights corpus-wide filler and SVD lets sentences that share
+# no exact words still land close together if they share context.
+# The similarity SCALE this pipeline produces is much smaller than
+# a hand-picked constant like 0.35 would assume, so thresholds are
+# calibrated per turn from what's actually achievable (see analyze).
+# ============================================================
+
+class GeometricDataset:
+    def __init__(self, texts: List[str], dimensions: int = 16) -> None:
+        self.texts = texts
+        self.vectorizer = TfidfVectorizer(lowercase=True, ngram_range=(1, 2), min_df=1)
+        X = self.vectorizer.fit_transform(texts)
+
+        max_dim = min(dimensions, max(1, X.shape[0] - 1), max(1, X.shape[1] - 1))
+
+        if X.shape[1] <= 1:
+            self.X = X.toarray().astype(float)
+            self.svd = None
+        else:
+            self.svd = TruncatedSVD(n_components=max_dim, random_state=42)
+            self.X = self.svd.fit_transform(X)
+
+        self.X = normalize(self.X)
+
+    def transform(self, texts: List[str]) -> np.ndarray:
+        X = self.vectorizer.transform(texts)
+        if self.svd is not None:
+            X = self.svd.transform(X)
+        return normalize(X)
+
+    def vector(self, text: str) -> np.ndarray:
+        return self.transform([text])[0]
+
+
+# ============================================================
 # Corpus similarity search (used for the "candidates" display)
 # ============================================================
 
@@ -106,8 +218,9 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
 class CorpusReference:
     sentence: str
     tokens: List[str]
-    vector: Dict[str, float]
+    vector: np.ndarray
     frequency: int = 1
+    evidence: EvidenceRecord = field(default_factory=EvidenceRecord)
 
 
 @dataclass
@@ -117,11 +230,21 @@ class Candidate:
     vector_similarity: float
     frequency: int
     score: float
+    state: Evidence
+    verdict: str
+    true_count: int
+    false_count: int
+    consistency: float
+    samples: int
     rank: int = 0
 
 
 class CorpusSearch:
-    """Finds corpus sentences closest to a prompt (lexical + cosine)."""
+    """
+    Finds corpus sentences closest to a prompt, and classifies each
+    one as supported, refuted, unresolved, or conflicted evidence
+    given everything said so far this session.
+    """
 
     def __init__(
         self,
@@ -131,35 +254,71 @@ class CorpusSearch:
         self.lexical_weight = lexical_weight
         self.vector_weight = vector_weight
         self.references: List[CorpusReference] = []
+        self.dataset: Optional[GeometricDataset] = None
 
     def build_index(self, corpus_text: str) -> None:
         sentences = split_sentences(corpus_text)
         counts = Counter(s.lower() for s in sentences)
 
-        self.references = []
-        for sentence in sentences:
-            tokens = tokenize(sentence)
-            if not tokens:
-                continue
-            bow = bag_of_words(tokens)
-            self.references.append(
-                CorpusReference(
-                    sentence=sentence,
-                    tokens=tokens,
-                    vector={t: float(c) for t, c in bow.items()},
-                    frequency=counts[sentence.lower()],
-                )
-            )
+        kept = [(s, tokenize(s)) for s in sentences]
+        kept = [(s, t) for s, t in kept if t]
+        if not kept:
+            self.references = []
+            self.dataset = None
+            return
 
-    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
+        self.dataset = GeometricDataset([s for s, _ in kept], dimensions=16)
+
+        self.references = [
+            CorpusReference(
+                sentence=sentence,
+                tokens=tokens,
+                vector=self.dataset.X[i],
+                frequency=counts[sentence.lower()],
+            )
+            for i, (sentence, tokens) in enumerate(kept)
+        ]
+
+    def analyze(self, prompt: str, limit: int = 5) -> Tuple[List[Candidate], Dict[str, float]]:
+        if not self.references or self.dataset is None:
+            return [], {}
+
         prompt_tokens = tokenize(prompt)
-        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
+        prompt_vector = self.dataset.vector(prompt)
+
+        similarities = [float(np.dot(prompt_vector, ref.vector)) for ref in self.references]
+
+        # Calibrate this turn's support/contradiction bar against what
+        # this prompt actually achieved, instead of a fixed constant
+        # tuned for a different similarity scale (dense embeddings).
+        # contradiction_threshold is kept <= support_threshold so a
+        # negated-but-on-topic prompt is caught as a contradiction
+        # before it can be mistaken for support.
+        ceiling = max(similarities) if similarities else 0.0
+        support_threshold = 0.55 * ceiling
+        contradiction_threshold = 0.45 * ceiling
+
+        text = " " + prompt.lower() + " "
+        explicitly_negative = any(neg in text for neg in NEGATORS)
 
         candidates = []
-        for ref in self.references:
+        raw_modifier: Dict[str, float] = defaultdict(float)
+
+        for ref, vector_sim in zip(self.references, similarities):
+            if ceiling <= 1e-9:
+                result = Evidence.UNKNOWN
+            elif explicitly_negative and vector_sim >= contradiction_threshold:
+                result = Evidence.FALSE
+            elif vector_sim >= support_threshold:
+                result = Evidence.TRUE
+            else:
+                result = Evidence.UNKNOWN
+
+            ref.evidence.add(result, vector_sim)
+
             symbolic = lexical_overlap(prompt_tokens, ref.tokens)
-            vector_sim = cosine_similarity(prompt_vector, ref.vector)
             score = self.lexical_weight * symbolic + self.vector_weight * vector_sim
+
             candidates.append(
                 Candidate(
                     sentence=ref.sentence,
@@ -167,14 +326,54 @@ class CorpusSearch:
                     vector_similarity=vector_sim,
                     frequency=ref.frequency,
                     score=score,
+                    state=ref.evidence.state,
+                    verdict=ref.evidence.verdict,
+                    true_count=ref.evidence.true_count,
+                    false_count=ref.evidence.false_count,
+                    consistency=ref.evidence.consistency,
+                    samples=ref.evidence.total,
                 )
             )
+
+            # --- compartmental evidence modifier ---
+            # Each reference is its own compartment: its (sim, symbolic)
+            # -> score is computed independently, then spread onto only
+            # that reference's own tokens, signed by its evidence state.
+            # SUPPORTED sentences push their tokens up, REFUTED sentences
+            # push theirs down, CONFLICTED sentences push proportionally
+            # to which side currently outweighs the other, and UNRESOLVED
+            # sentences contribute nothing. Compartments are then summed
+            # additively per token, so a token repeated across several
+            # supported sentences accumulates more bias than one that
+            # only shows up once.
+            state = ref.evidence.state
+            if state is Evidence.TRUE:
+                sign = 1.0
+            elif state is Evidence.FALSE:
+                sign = -1.0
+            elif state is Evidence.CONFLICT:
+                total = ref.evidence.total
+                sign = (ref.evidence.true_count - ref.evidence.false_count) / total if total else 0.0
+            else:  # UNKNOWN
+                sign = 0.0
+
+            if sign != 0.0:
+                weight = sign * score
+                for token in ref.tokens:
+                    if token not in IGNORED_TOKENS:
+                        raw_modifier[token] += weight
+
+        evidence_modifier: Dict[str, float] = {}
+        if raw_modifier:
+            largest = max(abs(v) for v in raw_modifier.values())
+            if largest > 0:
+                evidence_modifier = {t: v / largest for t, v in raw_modifier.items()}
 
         candidates.sort(key=lambda c: c.score, reverse=True)
         candidates = candidates[:limit]
         for i, c in enumerate(candidates, start=1):
             c.rank = i
-        return candidates
+        return candidates, evidence_modifier
 
 
 # ============================================================
@@ -288,6 +487,8 @@ class NGramModel:
         candidate_limit: int = 64,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        evidence_modifier: Optional[Dict[str, float]] = None,
+        evidence_weight: float = 0.0,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
@@ -322,6 +523,14 @@ class NGramModel:
                     + (1.0 - CONSENSUS_BASELINE_SPLIT) * baseline_prob
                 )
                 score += modifier_weight * blended_bias
+            if evidence_modifier and evidence_weight:
+                # Signed compartmental bias from CorpusSearch: positive
+                # for tokens belonging to SUPPORTED corpus sentences,
+                # negative for REFUTED ones, applied directly (unlike
+                # the consensus modifier this one is meaningfully
+                # negative, so it isn't blended toward a nonnegative
+                # baseline probability).
+                score += evidence_weight * evidence_modifier.get(token, 0.0)
             scores[token] = score
         return scores
 
@@ -332,8 +541,13 @@ class NGramModel:
         candidate_limit: int,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        evidence_modifier: Optional[Dict[str, float]] = None,
+        evidence_weight: float = 0.0,
     ) -> Dict[str, float]:
-        scores = self._score_next_token(prompt, candidate_limit, candidate_modifier, modifier_weight)
+        scores = self._score_next_token(
+            prompt, candidate_limit, candidate_modifier, modifier_weight,
+            evidence_modifier, evidence_weight,
+        )
         if not scores:
             return {}
         temperature = max(temperature, 1e-5)
@@ -350,8 +564,13 @@ class NGramModel:
         top_k: int = 20,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        evidence_modifier: Optional[Dict[str, float]] = None,
+        evidence_weight: float = 0.0,
     ) -> str:
-        probs = self._probabilities(prompt, temperature, max(top_k, 1), candidate_modifier, modifier_weight)
+        probs = self._probabilities(
+            prompt, temperature, max(top_k, 1), candidate_modifier, modifier_weight,
+            evidence_modifier, evidence_weight,
+        )
         if not probs:
             return self.eos_token
         items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
@@ -366,11 +585,14 @@ class NGramModel:
         top_k: int = 20,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        evidence_modifier: Optional[Dict[str, float]] = None,
+        evidence_weight: float = 0.0,
     ) -> str:
         generated = tokenize(prompt)
         for _ in range(max_new_tokens):
             token = self.sample_next(
-                " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight
+                " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight,
+                evidence_modifier, evidence_weight,
             )
             #if token == self.eos_token:
                 #break
@@ -458,13 +680,19 @@ class NGramModel:
         top_k: int = 20,
         cancel_strength: float = CANCEL_STRENGTH,
         modifier_weight: float = MODIFIER_WEIGHT,
+        evidence_modifier: Optional[Dict[str, float]] = None,
+        evidence_weight: float = 0.0,
     ) -> Tuple[str, List[List[str]], Dict[str, float]]:
         """
         Full pipeline: run several scratch generations, cancel them out
         against each other into a candidate modifier, then do one more
         final generation. The final generation's per-token bias splits
         the difference between that consensus modifier and each token's
-        raw baseline probability (see CONSENSUS_BASELINE_SPLIT).
+        raw baseline probability (see CONSENSUS_BASELINE_SPLIT), and is
+        additionally pushed by the corpus evidence_modifier (from
+        CorpusSearch.analyze) toward tokens belonging to currently
+        SUPPORTED sentences and away from REFUTED ones. Scratch runs are
+        left unbiased so they stay independent of each other.
 
         Returns (final_text, scratch_runs, modifier) so callers can inspect
         what survived the cancel-out pass.
@@ -478,6 +706,8 @@ class NGramModel:
             top_k=top_k,
             candidate_modifier=modifier,
             modifier_weight=modifier_weight,
+            evidence_modifier=evidence_modifier,
+            evidence_weight=evidence_weight,
         )
         return final_text, runs, modifier
 
@@ -547,7 +777,12 @@ def display_candidates(candidates: List[Candidate]) -> None:
         print("No candidates found.")
         return
     for c in candidates:
-        print(f"\n[{c.rank}] score={c.score:.3f}  {c.sentence}")
+        print(f"\n[{c.rank}] score={c.score:.3f}  state={c.state.value} ({c.verdict})  {c.sentence}")
+        print(
+            f"      sim={c.vector_similarity:.3f}  symbolic={c.symbolic_overlap:.3f}  "
+            f"true={c.true_count}  false={c.false_count}  "
+            f"consistency={c.consistency:.2f}  samples={c.samples}"
+        )
 
 
 def display_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> None:
@@ -611,7 +846,7 @@ def main() -> None:
             print("Empty prompt.")
             continue
 
-        candidates = search.analyze(prompt, limit=CANDIDATE_LIMIT)
+        candidates, evidence_modifier = search.analyze(prompt, limit=CANDIDATE_LIMIT)
         display_candidates(candidates)
 
         print(f"\nRunning {NUM_GENERATIONS} scratch generations to build a consensus modifier...")
@@ -623,9 +858,11 @@ def main() -> None:
             top_k=TOP_K,
             cancel_strength=CANCEL_STRENGTH,
             modifier_weight=MODIFIER_WEIGHT,
+            evidence_modifier=evidence_modifier,
+            evidence_weight=EVIDENCE_WEIGHT,
         )
 
-        print("\nGenerating final (modifier-biased)...")
+        print("\nGenerating final (modifier- and evidence-biased)...")
         display_generation(final_text)
 
 
