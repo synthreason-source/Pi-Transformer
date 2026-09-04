@@ -297,7 +297,7 @@ class NGramModel:
         if not base:
             return {}
 
-        candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
+        candidates = [t for t in sorted(base, key=base.get, reverse=True) if t not in IGNORED_TOKENS][:candidate_limit]
         source_vec = self.lexical_vectors.get(prev, {})
         influences = self.influence_vectors.get(prev, {})
         curve = self._curve_weight(base.get(self.eos_token, 0.0))
