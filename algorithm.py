@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float32
+
 # ============================================================
 # Small n-gram language model + corpus similarity search.
 #
@@ -177,7 +182,14 @@ def bag_of_words(tokens: Iterable[str]) -> Counter:
     return Counter(t for t in tokens if t not in IGNORED_TOKENS)
 
 
-def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
+
+def cosine_similarity(a, b, eps=1e-12):
+    """GPU-compatible cosine similarity for dict or tensor inputs."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        a = a / torch.clamp(torch.linalg.vector_norm(a, dim=-1, keepdim=True), min=eps)
+        b = b / torch.clamp(torch.linalg.vector_norm(b, dim=-1, keepdim=True), min=eps)
+        return (a * b).sum(dim=-1)
+    # Fallback to dict version
     if not a or not b:
         return 0.0
     common = set(a) & set(b)
@@ -364,27 +376,13 @@ class NGramModel:
 
         self.finalized = True
 
+
     def _reduce_context_dimensions(
         self,
         fraction: Optional[float] = None,
         max_dims: Optional[int] = None,
     ) -> None:
-        """
-        Reduce the dimensionality of lexical_vectors by agglomeratively
-        merging the context dimensions (bigram left-contexts) that behave
-        most alike across tokens -- clustering the *columns* of the token
-        x context matrix, not the tokens themselves. Two context dims
-        merge when the tokens that follow them, weighted by frequency,
-        look similar; merging sums their weight into one new
-        pseudo-dimension.
-
-        This is a from-scratch, dependency-free substitute for PCA/feature
-        agglomeration (no numpy/sklearn required). It's O(min(d,
-        max_dims)^2) per merge round, so `max_dims` caps which dimensions
-        are even considered -- context dims outside the cap are long-tail
-        and left untouched, just carried through under their original
-        name.
-        """
+        """GPU-accelerated context-dimension reduction."""
         fraction = self.context_reduction_fraction if fraction is None else fraction
         max_dims = self.context_reduction_max_dims if max_dims is None else max_dims
 
@@ -411,18 +409,31 @@ class NGramModel:
 
         groups: Dict[str, List[str]] = {c: [c] for c in active}
         group_vecs: Dict[str, Dict[str, float]] = dict(columns)
+        vocab_list = list(self.vocabulary)
+        V = len(vocab_list)
+        tok_idx = {t:idx for idx,t in enumerate(vocab_list)}
 
         while len(groups) > target_count:
             ids = list(groups.keys())
-            best_pair, best_sim = None, -1.0
-            for i in range(len(ids)):
-                for j in range(i + 1, len(ids)):
-                    sim = cosine_similarity(group_vecs[ids[i]], group_vecs[ids[j]])
-                    if sim > best_sim:
-                        best_sim, best_pair = sim, (ids[i], ids[j])
-            if best_pair is None:
+            G = len(ids)
+            mat = torch.zeros((G, V), dtype=DTYPE, device=DEVICE)
+            for gi, gid in enumerate(ids):
+                gv = group_vecs[gid]
+                for tok, w in gv.items():
+                    vi = tok_idx.get(tok)
+                    if vi is not None:
+                        mat[gi, vi] = w
+            norms = mat.norm(dim=1, keepdim=True).clamp_min(1e-12)
+            mat_norm = mat / norms
+            sims = mat_norm @ mat_norm.T
+            sims.fill_diagonal_(-1.0)
+            best_flat = torch.argmax(sims).item()
+            i_best = best_flat // G
+            j_best = best_flat % G
+            best_sim = sims[i_best, j_best].item()
+            if best_sim < 0:
                 break
-            a, b = best_pair
+            a, b = ids[i_best], ids[j_best]
             merged_name = f"{a}+{b}"
             merged_vec: Dict[str, float] = defaultdict(float)
             for tok, w in group_vecs[a].items():
@@ -447,40 +458,43 @@ class NGramModel:
         self.lexical_vectors = new_vectors
 
     def _build_isomorphism_classes(self) -> None:
-        """
-        Group tokens whose (dimension-reduced) bigram-context distributions
-        are (near) identical. Two tokens are treated as isomorphic in the
-        vocabulary if their lexical vectors' cosine similarity, raised to
-        `isomorphism_sharpness`, is >= isomorphism_tau -- i.e. they play
-        the same structural role in the grammar even if they're literally
-        different words. Each class collapses to a single canonical token
-        (its first member, in sorted vocabulary order) so that a vote cast
-        for any member reinforces the whole class.
-        """
+        """GPU-accelerated isomorphism classing."""
+        vocab = self.vocabulary
+        V = len(vocab)
+        contexts = sorted(set().union(*(set(v) for v in self.lexical_vectors.values())))
+        C = len(contexts)
+        ctx_index = {c: i for i, c in enumerate(contexts)}
+
+        lexical = torch.zeros((V, C), dtype=DTYPE, device=DEVICE)
+        for i, token in enumerate(vocab):
+            vec = self.lexical_vectors.get(token, {})
+            for ctx, val in vec.items():
+                j = ctx_index.get(ctx)
+                if j is not None:
+                    lexical[i, j] = val
+
+        norms = lexical.norm(dim=1, keepdim=True).clamp_min(1e-12)
+        lexical_norm = lexical / norms
+        sims = lexical_norm @ lexical_norm.T
+
         canonical: Dict[str, str] = {}
         assigned = set()
-        vocab = self.vocabulary
         for i, tok_a in enumerate(vocab):
             if tok_a in assigned:
                 continue
             canonical[tok_a] = tok_a
             assigned.add(tok_a)
-            vec_a = self.lexical_vectors.get(tok_a, {})
-            if not vec_a:
-                continue
-            for tok_b in vocab[i + 1:]:
-                if tok_b in assigned:
+            row = sims[i]
+            sharpened = row ** self.isomorphism_sharpness
+            mask = sharpened >= self.isomorphism_tau
+            candidates = torch.nonzero(mask, as_tuple=False).flatten().tolist()
+            for j in candidates:
+                tok_b = vocab[j]
+                if tok_b in assigned or tok_b == tok_a:
                     continue
-                vec_b = self.lexical_vectors.get(tok_b, {})
-                if not vec_b:
-                    continue
-                raw_sim = cosine_similarity(vec_a, vec_b)
-                sharpened_sim = raw_sim ** self.isomorphism_sharpness
-                if sharpened_sim >= self.isomorphism_tau:
-                    canonical[tok_b] = tok_a
-                    assigned.add(tok_b)
+                canonical[tok_b] = tok_a
+                assigned.add(tok_b)
         self.isomorphism_map = canonical
-
     def _canonical(self, token: str) -> str:
         return self.isomorphism_map.get(token, token)
 
