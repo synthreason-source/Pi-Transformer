@@ -21,16 +21,19 @@ from typing import Dict, Iterable, List, Optional, Tuple
 #      the old mean/std cancel-out
 #   4. sample the final continuation, using that modifier (blended
 #      50/50 with the raw baseline token probability) to bias the
-#      per-token scores
+#      per-token scores, PLUS a compounding instruction-likeness curve
+#      (see below) that pulls the final text back toward the original
+#      instruction as it gets longer
 #
 # --- Kernelized adversarial consensus ---
 # Each scratch run is first canonicalized through the vocabulary's
 # "isomorphism classes": tokens whose bigram-context distributions are
-# near-identical (cosine similarity above ISOMORPHISM_TAU) play the same
-# structural role in the grammar, so they're collapsed to one canonical
-# representative before anything is counted. This means a vote for any
-# member of a class reinforces the whole class, both when the modifier
-# is built and when it's looked up during final scoring.
+# near-identical (cosine similarity above ISOMORPHISM_TAU, after
+# sharpening -- see below) play the same structural role in the grammar,
+# so they're collapsed to one canonical representative before anything
+# is counted. This means a vote for any member of a class reinforces the
+# whole class, both when the modifier is built and when it's looked up
+# during final scoring.
 #
 # Each (canonicalized) run is then treated as a point in token-count
 # space. An RBF kernel measures how close every run sits to the others.
@@ -40,6 +43,51 @@ from typing import Dict, Iterable, List, Optional, Tuple
 # kernel-agreement score is raised to a sharpening power before being
 # used as a weight, which pushes outlier runs toward zero rather than
 # just discounting them linearly (as the old std-based penalty did).
+#
+# --- Context-dimension reduction (feature agglomeration) ---
+# Before isomorphism classes are built, the *context* dimensions of each
+# token's lexical vector (i.e. which bigram-left-context it followed, and
+# how often) are themselves clustered and merged: the most frequent
+# CONTEXT_REDUCTION_MAX_DIMS context columns are agglomeratively paired
+# up by cosine similarity of the tokens that follow them, until only
+# CONTEXT_REDUCTION_FRACTION of them remain, and every token's vector is
+# re-expressed in that smaller basis. This is a from-scratch,
+# dependency-free stand-in for PCA / feature agglomeration -- it does not
+# require numpy/sklearn. Long-tail context dims outside the cap are left
+# untouched. Isomorphism classing and influence scoring both then run on
+# this reduced space.
+#
+# Because dimensionality reduction is lossy and tends to make cosine
+# similarities cluster upward, the isomorphism threshold is sharpened
+# by raising raw cosine similarity to ISOMORPHISM_SHARPNESS before
+# comparing to ISOMORPHISM_TAU. Cosine similarities here are always in
+# [0, 1] (context vectors are non-negative frequencies): an exponent > 1
+# shrinks weak similarities faster than strong ones (more selective),
+# while an exponent < 1 pulls similarities upward toward 1, i.e. makes
+# the threshold *more permissive* / less selective. Which direction you
+# want depends on whether dimension reduction is being used aggressively
+# (favor > 1, more selective) or you deliberately want more classes to
+# merge (favor < 1).
+#
+# --- Compounding instruction-likeness curve (final generation only) ---
+# A single instruction vector is built once from the original prompt's
+# tokens (summing their lexical vectors). During the *final* biased
+# generation pass -- never the independent scratch runs, which must stay
+# diverse and unbiased for the consensus step to mean anything -- every
+# candidate token's cosine similarity to that instruction vector is
+# pushed through an increasing sigmoid curve and added to its score,
+# scaled by a running `compound_factor`. That factor is multiplied up a
+# little further after every token actually chosen (proportional to how
+# instruction-like it was), so the pull toward the instruction gets
+# stronger as the continuation gets longer -- it compounds -- but is
+# clamped at INSTRUCTION_COMPOUND_CAP so it cannot spiral into simply
+# echoing the instruction back verbatim. This bias stacks additively on
+# top of whatever candidate_modifier is already active (the kernel
+# consensus modifier, or the ontology's concept-vocabulary modifier in
+# list generation), rather than replacing it. The factor resets to 1.0
+# at the start of every independent continuation (each generate() call,
+# each list item), so it never carries over and saturates across an
+# entire multi-item list.
 #
 # (The original script also computed a "post-generation rebinding"
 #  pass and a "second generation" pass, but neither was ever
@@ -59,24 +107,47 @@ CURVE_K = 18.0
 CURVE_MIDPOINT = 0.5
 
 CANDIDATE_LIMIT = 15
-LEXICAL_WEIGHT = 0.45
+LEXICAL_WEIGHT = 0.85
 VECTOR_WEIGHT = 0.55
 
 # --- consensus / kernelized adversarial ensemble settings ---
 NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
-KERNEL_SHARPNESS = 4.0     # adversarial sharpening exponent on kernel agreement
+KERNEL_SHARPNESS = 0.1     # adversarial sharpening exponent on kernel agreement
 MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
 CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
 
 # --- vocab isomorphism settings ---
-ISOMORPHISM_TAU = 0.97     # cosine similarity threshold for treating two tokens
-                           # as structurally interchangeable in the vocabulary
+ISOMORPHISM_TAU = 0.07     # cosine similarity threshold (post-sharpening) for treating
+                           # two tokens as structurally interchangeable in the vocabulary
+ISOMORPHISM_SHARPNESS = 0.5  # exponent applied to raw cosine similarity before comparing
+                             # to ISOMORPHISM_TAU. Cosine values live in [0,1]; an exponent
+                             # < 1 (as set here) pulls similarities upward, making the
+                             # threshold more permissive -- more tokens merge into classes.
+
+# --- context-dimension reduction settings (feature agglomeration) ---
+CONTEXT_REDUCTION_FRACTION = 0.9   # keep this fraction of context dimensions after merging
+CONTEXT_REDUCTION_MAX_DIMS = 2000  # only cluster the N most frequent context dims;
+                                    # merging is O(n^2) per round, so this caps cost.
+                                    # rarer context dims pass through untouched.
 
 # --- Markovian transitivity masking settings ---
-TRANSITIVITY_DECAY = 0.5   # decay applied per hop when composing A->B->C into A->C
-TRANSITIVITY_WEIGHT = 0.5  # how strongly the prompt-pattern mask biases scoring
+TRANSITIVITY_DECAY = 0.1   # decay applied per hop when composing A->B->C into A->C
+TRANSITIVITY_WEIGHT = 0.1  # how strongly the prompt-pattern mask biases scoring
 TRANSITIVITY_MASK_PENALTY = 1.0   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
 TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
+
+# --- compounding instruction-likeness curve settings (final generation only) ---
+INSTRUCTION_COMPOUND_CURVE_K = 12.0        # steepness of the increasing sigmoid applied
+                                            # to a candidate token's cosine similarity
+                                            # to the instruction vector
+INSTRUCTION_COMPOUND_MIDPOINT = 0.3        # similarity value at which the curve crosses 0.5
+INSTRUCTION_COMPOUND_GROWTH = 0.15         # how much each chosen token's instruction-likeness
+                                            # grows the running compound_factor
+INSTRUCTION_COMPOUND_CAP = 4.0             # hard ceiling on compound_factor, so the pull
+                                            # toward the instruction cannot run away into
+                                            # degenerate echoing of the prompt
+INSTRUCTION_COMPOUND_WEIGHT = 0.4          # base strength of the instruction-likeness bias
+                                            # in the score, before compounding is applied
 
 RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
 random.seed(RANDOM_SEED)
@@ -219,6 +290,9 @@ class NGramModel:
     curve_k: float = CURVE_K
     curve_midpoint: float = CURVE_MIDPOINT
     isomorphism_tau: float = ISOMORPHISM_TAU
+    isomorphism_sharpness: float = ISOMORPHISM_SHARPNESS
+    context_reduction_fraction: float = CONTEXT_REDUCTION_FRACTION
+    context_reduction_max_dims: int = CONTEXT_REDUCTION_MAX_DIMS
 
     unigram: Counter = field(default_factory=Counter)
     bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
@@ -269,6 +343,11 @@ class NGramModel:
             total = sum(counts.values()) or 1
             self.lexical_vectors[token] = {ctx: c / total for ctx, c in counts.items()}
 
+        # Reduce the dimensionality of the context space (feature
+        # agglomeration) before anything downstream -- influence scoring
+        # and isomorphism classing -- runs on these vectors.
+        self._reduce_context_dimensions()
+
         self.influence_vectors = {}
         for source in self.vocabulary:
             source_vec = self.lexical_vectors.get(source, {})
@@ -285,15 +364,98 @@ class NGramModel:
 
         self.finalized = True
 
+    def _reduce_context_dimensions(
+        self,
+        fraction: Optional[float] = None,
+        max_dims: Optional[int] = None,
+    ) -> None:
+        """
+        Reduce the dimensionality of lexical_vectors by agglomeratively
+        merging the context dimensions (bigram left-contexts) that behave
+        most alike across tokens -- clustering the *columns* of the token
+        x context matrix, not the tokens themselves. Two context dims
+        merge when the tokens that follow them, weighted by frequency,
+        look similar; merging sums their weight into one new
+        pseudo-dimension.
+
+        This is a from-scratch, dependency-free substitute for PCA/feature
+        agglomeration (no numpy/sklearn required). It's O(min(d,
+        max_dims)^2) per merge round, so `max_dims` caps which dimensions
+        are even considered -- context dims outside the cap are long-tail
+        and left untouched, just carried through under their original
+        name.
+        """
+        fraction = self.context_reduction_fraction if fraction is None else fraction
+        max_dims = self.context_reduction_max_dims if max_dims is None else max_dims
+
+        context_totals: Counter = Counter()
+        for vec in self.lexical_vectors.values():
+            for ctx, w in vec.items():
+                context_totals[ctx] += w
+
+        if len(context_totals) <= 1:
+            return
+
+        ranked = [c for c, _ in context_totals.most_common()]
+        active = ranked[:max_dims]
+
+        target_count = max(1, math.ceil(len(active) * fraction))
+        if target_count >= len(active):
+            return
+
+        columns: Dict[str, Dict[str, float]] = {c: {} for c in active}
+        for token, vec in self.lexical_vectors.items():
+            for ctx, w in vec.items():
+                if ctx in columns:
+                    columns[ctx][token] = w
+
+        groups: Dict[str, List[str]] = {c: [c] for c in active}
+        group_vecs: Dict[str, Dict[str, float]] = dict(columns)
+
+        while len(groups) > target_count:
+            ids = list(groups.keys())
+            best_pair, best_sim = None, -1.0
+            for i in range(len(ids)):
+                for j in range(i + 1, len(ids)):
+                    sim = cosine_similarity(group_vecs[ids[i]], group_vecs[ids[j]])
+                    if sim > best_sim:
+                        best_sim, best_pair = sim, (ids[i], ids[j])
+            if best_pair is None:
+                break
+            a, b = best_pair
+            merged_name = f"{a}+{b}"
+            merged_vec: Dict[str, float] = defaultdict(float)
+            for tok, w in group_vecs[a].items():
+                merged_vec[tok] += w
+            for tok, w in group_vecs[b].items():
+                merged_vec[tok] += w
+            groups[merged_name] = groups.pop(a) + groups.pop(b)
+            group_vecs.pop(a)
+            group_vecs.pop(b)
+            group_vecs[merged_name] = dict(merged_vec)
+
+        remap: Dict[str, str] = {
+            member: gid for gid, members in groups.items() for member in members
+        }
+
+        new_vectors: Dict[str, Dict[str, float]] = {}
+        for token, vec in self.lexical_vectors.items():
+            new_vec: Dict[str, float] = defaultdict(float)
+            for ctx, w in vec.items():
+                new_vec[remap.get(ctx, ctx)] += w
+            new_vectors[token] = dict(new_vec)
+        self.lexical_vectors = new_vectors
+
     def _build_isomorphism_classes(self) -> None:
         """
-        Group tokens whose bigram-context distributions are (near) identical.
-        Two tokens are treated as isomorphic in the vocabulary if their
-        lexical vectors are nearly parallel (cosine >= isomorphism_tau) --
-        i.e. they play the same structural role in the grammar even if
-        they're literally different words. Each class collapses to a single
-        canonical token (its first member, in sorted vocabulary order) so
-        that a vote cast for any member reinforces the whole class.
+        Group tokens whose (dimension-reduced) bigram-context distributions
+        are (near) identical. Two tokens are treated as isomorphic in the
+        vocabulary if their lexical vectors' cosine similarity, raised to
+        `isomorphism_sharpness`, is >= isomorphism_tau -- i.e. they play
+        the same structural role in the grammar even if they're literally
+        different words. Each class collapses to a single canonical token
+        (its first member, in sorted vocabulary order) so that a vote cast
+        for any member reinforces the whole class.
         """
         canonical: Dict[str, str] = {}
         assigned = set()
@@ -312,7 +474,9 @@ class NGramModel:
                 vec_b = self.lexical_vectors.get(tok_b, {})
                 if not vec_b:
                     continue
-                if cosine_similarity(vec_a, vec_b) >= self.isomorphism_tau:
+                raw_sim = cosine_similarity(vec_a, vec_b)
+                sharpened_sim = raw_sim ** self.isomorphism_sharpness
+                if sharpened_sim >= self.isomorphism_tau:
                     canonical[tok_b] = tok_a
                     assigned.add(tok_b)
         self.isomorphism_map = canonical
@@ -322,6 +486,35 @@ class NGramModel:
 
     def _canonicalize_run(self, run: List[str]) -> Counter:
         return Counter(self._canonical(t) for t in run)
+
+    # ---------------- compounding instruction-likeness curve ----------------
+
+    @staticmethod
+    def _sigmoid_curve(x: float, k: float, midpoint: float) -> float:
+        """
+        Increasing logistic curve: 0 as x -> -inf, 1 as x -> +inf, 0.5 at
+        x == midpoint. Used to turn a raw cosine similarity (instruction
+        likeness) into a smooth 0..1 bias term. This is the mirror image
+        of `_curve_weight`, which is a *decreasing* curve used for EOS
+        suppression -- this one increases with similarity instead.
+        """
+        return 1.0 / (1.0 + math.exp(-k * (x - midpoint)))
+
+    def _instruction_vector(self, prompt: str) -> Dict[str, float]:
+        """
+        Build a single fixed context-vector for the whole instruction by
+        summing the (dimension-reduced) lexical vectors of its tokens.
+        This is the target that the compounding curve pulls the final
+        generation toward -- it is computed once from the original prompt
+        and never updated as generation proceeds.
+        """
+        tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
+        agg: Dict[str, float] = defaultdict(float)
+        for t in tokens:
+            vec = self.lexical_vectors.get(t, {})
+            for ctx, w in vec.items():
+                agg[ctx] += w
+        return dict(agg)
 
     # ---------------- generation ----------------
 
@@ -363,6 +556,9 @@ class NGramModel:
         transitivity_weight: float = 0.0,
         mask_penalty: float = TRANSITIVITY_MASK_PENALTY,
         superpoly_k: float = TRANSITIVITY_SUPERPOLY_K,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+        compound_factor: float = 1.0,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
@@ -400,6 +596,21 @@ class NGramModel:
                     score += transitivity_weight * (math.exp(superpoly_k * mask_weight) - 1.0)
                 else:
                     score -= transitivity_weight * (math.exp(superpoly_k * mask_penalty) - 1.0)
+            if instruction_vector and instruction_weight:
+                # This term stacks additively on top of candidate_modifier
+                # above (the kernel-consensus or ontology-vocab bias) --
+                # it does not replace it. compound_factor grows across the
+                # generation loop (see generate()/generate_list()), so
+                # this term's influence increases as the continuation gets
+                # longer, "compounding" toward likeness with the
+                # instruction.
+                likeness = cosine_similarity(
+                    instruction_vector, self.lexical_vectors.get(token, {})
+                )
+                curved_likeness = self._sigmoid_curve(
+                    likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
+                )
+                score += instruction_weight * compound_factor * curved_likeness
             scores[token] = score
         return scores
 
@@ -412,6 +623,9 @@ class NGramModel:
         modifier_weight: float = 0.0,
         transitivity_mask: Optional[Dict[str, float]] = None,
         transitivity_weight: float = 0.0,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+        compound_factor: float = 1.0,
     ) -> Dict[str, float]:
         scores = self._score_next_token(
             prompt,
@@ -420,6 +634,9 @@ class NGramModel:
             modifier_weight,
             transitivity_mask,
             transitivity_weight,
+            instruction_vector=instruction_vector,
+            instruction_weight=instruction_weight,
+            compound_factor=compound_factor,
         )
         if not scores:
             return {}
@@ -439,6 +656,9 @@ class NGramModel:
         modifier_weight: float = 0.0,
         transitivity_mask: Optional[Dict[str, float]] = None,
         transitivity_weight: float = 0.0,
+        instruction_vector: Optional[Dict[str, float]] = None,
+        instruction_weight: float = 0.0,
+        compound_factor: float = 1.0,
     ) -> str:
         probs = self._probabilities(
             prompt,
@@ -448,6 +668,9 @@ class NGramModel:
             modifier_weight,
             transitivity_mask,
             transitivity_weight,
+            instruction_vector=instruction_vector,
+            instruction_weight=instruction_weight,
+            compound_factor=compound_factor,
         )
         if not probs:
             return self.eos_token
@@ -465,8 +688,20 @@ class NGramModel:
         modifier_weight: float = 0.0,
         transitivity_mask: Optional[Dict[str, float]] = None,
         transitivity_weight: float = 0.0,
+        instruction_weight: float = 0.0,
+        compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
+        compound_cap: float = INSTRUCTION_COMPOUND_CAP,
     ) -> str:
         generated = tokenize(prompt)
+
+        # Fixed instruction target, built once from the original prompt
+        # (never recomputed from the growing `generated` list). Off by
+        # default (instruction_weight=0.0) -- callers that want the
+        # compounding pull toward the instruction (generate_consensus's
+        # final pass, generate_list's per-item loop) opt in explicitly.
+        instruction_vector = self._instruction_vector(prompt) if instruction_weight else None
+        compound_factor = 1.0
+
         for _ in range(max_new_tokens):
             token = self.sample_next(
                 " ".join(generated),
@@ -476,8 +711,21 @@ class NGramModel:
                 modifier_weight,
                 transitivity_mask,
                 transitivity_weight,
+                instruction_vector=instruction_vector,
+                instruction_weight=instruction_weight,
+                compound_factor=compound_factor,
             )
             generated.append(token)
+            if instruction_vector and instruction_weight:
+                likeness = cosine_similarity(
+                    instruction_vector, self.lexical_vectors.get(token, {})
+                )
+                curved_likeness = self._sigmoid_curve(
+                    likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
+                )
+                compound_factor = min(
+                    compound_cap, compound_factor * (1.0 + compound_growth * curved_likeness)
+                )
         # <bos>/<eos>/<unk> stay in `generated` for scoring purposes
         # (backoff distributions and the curve weight depend on seeing
         # them) but are stripped before the text is ever shown to the user.
@@ -486,6 +734,12 @@ class NGramModel:
     def generate_with_trace(
         self, prompt: str, max_new_tokens: int, temperature: float, top_k: int
     ) -> Tuple[str, List[str]]:
+        # Deliberately unbiased: no candidate_modifier, no transitivity
+        # mask, no instruction-compounding curve. These scratch runs need
+        # to stay independent and diverse -- the kernel-consensus step
+        # downstream is only meaningful if they disagree where the model
+        # is genuinely uncertain, rather than all being pulled toward the
+        # same instruction target ahead of time.
         generated = tokenize(prompt)
         start = len(generated)
         for _ in range(max_new_tokens):
@@ -577,11 +831,17 @@ class NGramModel:
         top_k: int = 20,
         kernel_sharpness: float = KERNEL_SHARPNESS,
         modifier_weight: float = MODIFIER_WEIGHT,
+        instruction_weight: float = INSTRUCTION_COMPOUND_WEIGHT,
+        compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
+        compound_cap: float = INSTRUCTION_COMPOUND_CAP,
     ) -> Tuple[str, List[List[str]], Dict[str, float]]:
         if not self.finalized:
             self.finalize()
+        # Scratch runs stay unbiased (see generate_with_trace's docstring).
         runs = self.multi_generate(prompt, num_generations, max_new_tokens, temperature, top_k)
         modifier = self.build_kernel_consensus_modifier(runs, kernel_sharpness)
+        # Only the final generation gets both the consensus modifier AND
+        # the compounding instruction-likeness curve, stacked together.
         final_text = self.generate(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -589,6 +849,9 @@ class NGramModel:
             top_k=top_k,
             candidate_modifier=modifier,
             modifier_weight=modifier_weight,
+            instruction_weight=instruction_weight,
+            compound_growth=compound_growth,
+            compound_cap=compound_cap,
         )
         return final_text, runs, modifier
 
@@ -710,6 +973,9 @@ class NGramModel:
             "curve_k": self.curve_k,
             "curve_midpoint": self.curve_midpoint,
             "isomorphism_tau": self.isomorphism_tau,
+            "isomorphism_sharpness": self.isomorphism_sharpness,
+            "context_reduction_fraction": self.context_reduction_fraction,
+            "context_reduction_max_dims": self.context_reduction_max_dims,
             "unigram": dict(self.unigram),
             "bigram": {k: dict(v) for k, v in self.bigram.items()},
             "trigram": {k: dict(v) for k, v in self.trigram.items()},
@@ -730,6 +996,13 @@ class NGramModel:
             curve_k=data["curve_k"],
             curve_midpoint=data["curve_midpoint"],
             isomorphism_tau=data.get("isomorphism_tau", ISOMORPHISM_TAU),
+            isomorphism_sharpness=data.get("isomorphism_sharpness", ISOMORPHISM_SHARPNESS),
+            context_reduction_fraction=data.get(
+                "context_reduction_fraction", CONTEXT_REDUCTION_FRACTION
+            ),
+            context_reduction_max_dims=data.get(
+                "context_reduction_max_dims", CONTEXT_REDUCTION_MAX_DIMS
+            ),
         )
         model.unigram = Counter(data["unigram"])
         model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data["bigram"].items()})
@@ -762,7 +1035,10 @@ class NGramModel:
 # each with typicality-scored terms and G2-scored properties) and uses it
 # to bias this script's own generation toward a controlled vocabulary,
 # then emits the result as a list -- one item per top-typicality term in
-# the matched concept -- instead of one continuous block of text.
+# the matched concept -- instead of one continuous block of text. Each
+# item's generation also carries the compounding instruction-likeness
+# curve (see NGramModel docstring), stacked on top of the ontology's
+# vocabulary bias, and reset fresh for every item.
 # ============================================================
 
 def load_ontology(path: str | Path) -> dict:
@@ -839,12 +1115,25 @@ def generate_list(
     max_new_tokens_per_item: int,
     temperature: float,
     top_k: int,
+    prompt: str = "",
+    instruction_weight: float = INSTRUCTION_COMPOUND_WEIGHT,
+    compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
+    compound_cap: float = INSTRUCTION_COMPOUND_CAP,
 ) -> List[Tuple[str, str]]:
     """
     One list item per top-typicality term in the concept: use that term as
     the generation seed, bias every token choice with the concept's vocab
     modifier, and take the first sentence (up to the first <eos>) as the
     item's text. Returns (seed_term, item_text) pairs.
+
+    If `prompt` (the original user instruction) is given and
+    instruction_weight > 0, each item's generation also carries the
+    compounding instruction-likeness curve, stacked additively on top of
+    the ontology vocab bias. The instruction vector is built once from
+    `prompt` and shared across all items, but each item's compound_factor
+    starts fresh at 1.0 -- otherwise the pull would ratchet up across the
+    whole list and saturate the cap well before the last item, making
+    every later item converge on echoing the instruction.
     """
     ranked_terms = sorted(concept["terms"], key=lambda t: t["typicality"], reverse=True)
     seeds = [t["term"] for t in ranked_terms[:num_items]]
@@ -852,9 +1141,14 @@ def generate_list(
         # not enough distinct terms -- cycle back through the ranked list
         seeds.append(ranked_terms[len(seeds) % len(ranked_terms)]["term"])
 
+    instruction_vector = (
+        model._instruction_vector(prompt) if (prompt and instruction_weight) else None
+    )
+
     items = []
     for seed in seeds:
         generated_tokens = tokenize(seed)
+        compound_factor = 1.0  # reset per item -- see docstring above
         for _ in range(max_new_tokens_per_item):
             next_tok = model.sample_next(
                 " ".join(generated_tokens),
@@ -862,10 +1156,23 @@ def generate_list(
                 top_k=top_k,
                 candidate_modifier=modifier,
                 modifier_weight=modifier_weight,
+                instruction_vector=instruction_vector,
+                instruction_weight=instruction_weight,
+                compound_factor=compound_factor,
             )
             if next_tok == model.eos_token:
                 break
             generated_tokens.append(next_tok)
+            if instruction_vector and instruction_weight:
+                likeness = cosine_similarity(
+                    instruction_vector, model.lexical_vectors.get(next_tok, {})
+                )
+                curved_likeness = NGramModel._sigmoid_curve(
+                    likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
+                )
+                compound_factor = min(
+                    compound_cap, compound_factor * (1.0 + compound_growth * curved_likeness)
+                )
         item_text = NGramModel.detokenize(_strip_structural_tokens(generated_tokens))
         items.append((seed, item_text))
     return items
@@ -1022,7 +1329,7 @@ def main() -> None:
         )
         display_ensemble(runs, modifier)
 
-        print("\nGenerating final (modifier-biased)...")
+        print("\nGenerating final (modifier-biased, compounding toward instruction)...")
         display_generation(final_text)
 
         if ontology is not None:
@@ -1035,6 +1342,7 @@ def main() -> None:
                 max_new_tokens_per_item=args.list_tokens,
                 temperature=TEMPERATURE,
                 top_k=TOP_K,
+                prompt=prompt,
             )
             display_list(concept, items)
 
