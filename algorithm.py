@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import math
 import random
@@ -386,11 +387,6 @@ class NGramModel:
                 + curve * 0.65 * influence
             )
             if candidate_modifier and modifier_weight:
-                # Split the difference between the ensemble consensus
-                # weight and the raw baseline probability for this token,
-                # instead of using the consensus weight alone. The lookup
-                # goes through the isomorphism map so a token benefits from
-                # votes cast for any structurally-equivalent partner.
                 consensus_weight = candidate_modifier.get(self._canonical(token), 0.0)
                 baseline_prob = base.get(token, 0.0)
                 blended_bias = (
@@ -399,13 +395,6 @@ class NGramModel:
                 )
                 score += modifier_weight * blended_bias
             if transitivity_mask is not None and transitivity_weight:
-                # Superpolynomial masking: rather than adding the promise
-                # weight linearly, run it through an exponential so the
-                # gap between a weakly-promised and a strongly-promised
-                # token blows up rather than scaling proportionally.
-                # Masked-out tokens get the mirror-image exponential
-                # penalty (using the fixed deficit strength) instead of a
-                # flat linear subtraction.
                 mask_weight = transitivity_mask.get(token)
                 if mask_weight is not None:
                     score += transitivity_weight * (math.exp(superpoly_k * mask_weight) - 1.0)
@@ -488,23 +477,24 @@ class NGramModel:
                 transitivity_mask,
                 transitivity_weight,
             )
-            #if token == self.eos_token:
-                #break
             generated.append(token)
-        return self.detokenize(generated)
+        # <bos>/<eos>/<unk> stay in `generated` for scoring purposes
+        # (backoff distributions and the curve weight depend on seeing
+        # them) but are stripped before the text is ever shown to the user.
+        return self.detokenize(_strip_structural_tokens(generated))
 
     def generate_with_trace(
         self, prompt: str, max_new_tokens: int, temperature: float, top_k: int
     ) -> Tuple[str, List[str]]:
-        """Generate once and also return just the newly generated tokens."""
         generated = tokenize(prompt)
         start = len(generated)
         for _ in range(max_new_tokens):
             token = self.sample_next(" ".join(generated), temperature, top_k)
-            #if token == self.eos_token:
-                #break
             generated.append(token)
-        return self.detokenize(generated), generated[start:]
+        # Return the cleaned text for display, but the raw (unstripped)
+        # new-token slice for the consensus/canonicalization machinery,
+        # which needs <eos>/<bos> to correctly detect run boundaries.
+        return self.detokenize(_strip_structural_tokens(generated)), generated[start:]
 
     def multi_generate(
         self,
@@ -514,7 +504,6 @@ class NGramModel:
         temperature: float = 0.8,
         top_k: int = 20,
     ) -> List[List[str]]:
-        """Run several independent scratch generations from the same prompt."""
         runs: List[List[str]] = []
         for _ in range(num_generations):
             _, new_tokens = self.generate_with_trace(prompt, max_new_tokens, temperature, top_k)
@@ -531,29 +520,6 @@ class NGramModel:
         runs: List[List[str]],
         sharpness: float = KERNEL_SHARPNESS,
     ) -> Dict[str, float]:
-        """
-        Kernelized adversarial replacement for the old mean/std cancel-out.
-
-        Each scratch run is canonicalized through the vocabulary's
-        isomorphism classes (structurally-equivalent tokens collapsed to
-        one representative), then treated as a point in token-count space.
-
-        An RBF kernel (bandwidth set by the median-distance heuristic)
-        measures how close each run sits to the others. A run's
-        "agreement" score is its average kernel similarity to every other
-        run -- high if it resembles the shared cluster (a "promise" the
-        ensemble is making), low if it sits apart in the interstitial
-        space between clusters (an outlier).
-
-        Those agreement scores are then raised to `sharpness` before being
-        renormalized into weights. This is the adversarial step: it
-        doesn't just discount outliers linearly, it pushes them toward
-        zero influence while pushes consensus runs' tokens up, so the
-        final modifier is dominated by tokens the ensemble actually
-        agrees on.
-
-        Returns a 0..1 normalized dict suitable for blending into scoring.
-        """
         if not runs:
             return {}
 
@@ -577,7 +543,7 @@ class NGramModel:
             median_d2 = sorted(nonzero)[len(nonzero) // 2]
             gamma = 1.0 / (2.0 * median_d2)
         else:
-            gamma = 1.0  # every run produced an identical token multiset
+            gamma = 1.0
 
         agreement = []
         for i in range(n):
@@ -612,17 +578,6 @@ class NGramModel:
         kernel_sharpness: float = KERNEL_SHARPNESS,
         modifier_weight: float = MODIFIER_WEIGHT,
     ) -> Tuple[str, List[List[str]], Dict[str, float]]:
-        """
-        Full pipeline: run several scratch generations, combine them with
-        the kernelized adversarial consensus pass into a candidate
-        modifier, then do one more final generation. The final
-        generation's per-token bias splits the difference between that
-        consensus modifier and each token's raw baseline probability
-        (see CONSENSUS_BASELINE_SPLIT).
-
-        Returns (final_text, scratch_runs, modifier) so callers can
-        inspect what survived the kernel/isomorphism pass.
-        """
         if not self.finalized:
             self.finalize()
         runs = self.multi_generate(prompt, num_generations, max_new_tokens, temperature, top_k)
@@ -640,14 +595,6 @@ class NGramModel:
     # ---------------- non-conjoint context matrix / rhombus selection ----------------
 
     def build_disjointness_matrix(self, top_n: int = 30) -> Tuple[List[str], List[List[float]]]:
-        """
-        Build a square matrix over the `top_n` most frequent bigram contexts
-        (rows/cols = contexts, i.e. this is a slice of the Markov transition
-        table). Entry (i, j) is a disjointness score in [0, 1]: 1.0 means
-        contexts i and j are "non-conjoint" -- their successor-token sets
-        share nothing in common (Jaccard distance of the two rows) -- and
-        0.0 means they always transition to the same tokens.
-        """
         contexts = sorted(
             self.bigram.keys(),
             key=lambda c: sum(self.bigram[c].values()),
@@ -669,16 +616,6 @@ class NGramModel:
     def rhombus_select_lateral(
         matrix: List[List[float]], radius: int = 2
     ) -> Dict[Tuple[int, int], float]:
-        """
-        Select the "lateral" part of a square matrix using a rhombus
-        (diamond) band mask centered on the main diagonal: every cell
-        (i, j) with |i - j| <= radius, EXCLUDING the diagonal itself
-        (i == j). Plotted on a grid this is a diamond-shaped strip
-        running along the diagonal; "lateral" means we keep only the
-        wings of that strip (the off-diagonal transitions between
-        distinct contexts/tokens) and drop the diagonal (self-transitions,
-        i == j) which carry no lateral information.
-        """
         n = len(matrix)
         selected: Dict[Tuple[int, int], float] = {}
         for i in range(n):
@@ -695,18 +632,14 @@ class NGramModel:
         radius: int = 2,
         threshold: float = 0.999,
     ) -> List[Tuple[str, str, float]]:
-        """
-        Full pipeline: build the context disjointness matrix, rhombus-select
-        its lateral (off-diagonal, diamond-banded) region, then keep only
-        the pairs that are (near-)perfectly non-conjoint (score >= threshold),
-        sorted strongest-first.
-        """
         contexts, matrix = self.build_disjointness_matrix(top_n)
         lateral = self.rhombus_select_lateral(matrix, radius)
         pairs = [
             (contexts[i], contexts[j], score)
             for (i, j), score in lateral.items()
             if score >= threshold
+            and contexts[i] not in IGNORED_TOKENS
+            and contexts[j] not in IGNORED_TOKENS
         ]
         pairs.sort(key=lambda t: -t[2])
         return pairs
@@ -714,13 +647,6 @@ class NGramModel:
     # ---------------- Markovian transitivity / prompt-pattern masking ----------------
 
     def transitive_successors(self, token: str, decay: float = 0.5) -> Dict[str, float]:
-        """
-        One hop of Markovian transitive closure. If A has a direct bigram
-        successor B (prob p_ab), and B itself has a direct successor C
-        (prob p_bc), then A relates to C transitively even if "A C" never
-        literally occurs in the corpus. The transitive weight is
-        p_ab * p_bc * decay, summed over all intermediate B's.
-        """
         direct = self._normalize(self.bigram.get(token, Counter()))
         transitive: Dict[str, float] = defaultdict(float)
         for mid, p_ab in direct.items():
@@ -732,15 +658,6 @@ class NGramModel:
         return dict(transitive)
 
     def prompt_transitivity_mask(self, prompt: str, decay: float = 0.5) -> Dict[str, float]:
-        """
-        Masking via prompt patterns: build a vocabulary mask from the
-        tokens that actually appear in the prompt. For each distinct
-        prompt token, compute its transitive (2-hop) Markov successors;
-        the mask value for a candidate token is the max transitive weight
-        reaching it from any prompt token. Tokens with no transitive path
-        from anything in the prompt get no entry at all -- they're
-        implicitly masked out when this is applied during scoring.
-        """
         tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
         mask: Dict[str, float] = defaultdict(float)
         seen = set()
@@ -762,12 +679,6 @@ class NGramModel:
         decay: float = TRANSITIVITY_DECAY,
         transitivity_weight: float = TRANSITIVITY_WEIGHT,
     ) -> Tuple[str, Dict[str, float]]:
-        """
-        Convenience wrapper: build the prompt-pattern transitivity mask
-        from the current prompt, then generate with it applied. Returns
-        (generated_text, mask) so callers can inspect what was allowed
-        through vs. masked out.
-        """
         if not self.finalized:
             self.finalize()
         mask = self.prompt_transitivity_mask(prompt, decay)
@@ -831,10 +742,6 @@ class NGramModel:
         if "isomorphism_map" in data:
             model.isomorphism_map = data["isomorphism_map"]
         elif model.vocabulary and model.lexical_vectors:
-            # Migrating an older model.json saved before isomorphism
-            # classes existed: everything needed (vocabulary, lexical
-            # vectors) is already loaded, so build the map now rather
-            # than silently leaving it empty.
             model._build_isomorphism_classes()
         else:
             model.isomorphism_map = {}
@@ -846,6 +753,132 @@ class NGramModel:
     @classmethod
     def load_json(cls, path: str | Path) -> "NGramModel":
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+# ============================================================
+# Ontology-driven list generation
+#
+# Loads the JSON produced by terminology_ontology_pipeline.py (concepts,
+# each with typicality-scored terms and G2-scored properties) and uses it
+# to bias this script's own generation toward a controlled vocabulary,
+# then emits the result as a list -- one item per top-typicality term in
+# the matched concept -- instead of one continuous block of text.
+# ============================================================
+
+def load_ontology(path: str | Path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "concepts" not in data:
+        raise ValueError(f"{path} does not look like a terminology_ontology_pipeline.py result")
+    return data
+
+
+def select_concept(ontology: dict, prompt: str) -> dict:
+    """
+    Pick the concept whose terms/properties overlap most with the prompt's
+    tokens (same lexical_overlap metric already used for corpus search).
+    Falls back to the largest concept if nothing overlaps at all, so list
+    generation always has something to work with.
+    """
+    prompt_tokens = tokenize(prompt)
+    best, best_score = None, -1.0
+    for concept in ontology["concepts"]:
+        vocab_tokens = []
+        for t in concept["terms"]:
+            vocab_tokens.extend(t["term"].split())
+        for p in concept["properties"]:
+            vocab_tokens.append(p["word"])
+        score = lexical_overlap(prompt_tokens, vocab_tokens)
+        if score > best_score:
+            best, best_score = concept, score
+
+    if best is None or best_score <= 0.0:
+        best = max(ontology["concepts"], key=lambda c: len(c["terms"]))
+    return best
+
+
+def concept_vocab_modifier(concept: dict) -> Dict[str, float]:
+    """
+    Build a 0..1 normalized token-weight dict from a concept's terms
+    (weighted by typicality) and properties (weighted by normalized G2
+    significance), suitable for passing straight into NGramModel.generate
+    as candidate_modifier -- the same interface the kernel-consensus
+    modifier already uses, so no changes were needed to the scoring code.
+    """
+    weights: Dict[str, float] = defaultdict(float)
+
+    for t in concept["terms"]:
+        typ = t.get("typicality", 0.5)
+        for word in t["term"].split():
+            weights[word] = max(weights[word], typ)
+
+    props = concept.get("properties", [])
+    max_g2 = max((p["g2"] for p in props), default=1.0) or 1.0
+    for p in props:
+        norm_g2 = p["g2"] / max_g2
+        weights[p["word"]] = max(weights[p["word"]], norm_g2)
+
+    if not weights:
+        return {}
+    max_val = max(weights.values())
+    return {w: v / max_val for w, v in weights.items()} if max_val > 0 else dict(weights)
+
+
+def _strip_structural_tokens(tokens: List[str]) -> List[str]:
+    """Drop <bos>/<eos>/<unk> before display -- the underlying generate()
+    treats them as ordinary vocabulary (see module docstring), so list
+    items need this cleanup to read as text rather than leaking markup."""
+    return [t for t in tokens if t not in IGNORED_TOKENS]
+
+
+def generate_list(
+    model: "NGramModel",
+    concept: dict,
+    modifier: Dict[str, float],
+    modifier_weight: float,
+    num_items: int,
+    max_new_tokens_per_item: int,
+    temperature: float,
+    top_k: int,
+) -> List[Tuple[str, str]]:
+    """
+    One list item per top-typicality term in the concept: use that term as
+    the generation seed, bias every token choice with the concept's vocab
+    modifier, and take the first sentence (up to the first <eos>) as the
+    item's text. Returns (seed_term, item_text) pairs.
+    """
+    ranked_terms = sorted(concept["terms"], key=lambda t: t["typicality"], reverse=True)
+    seeds = [t["term"] for t in ranked_terms[:num_items]]
+    while len(seeds) < num_items and ranked_terms:
+        # not enough distinct terms -- cycle back through the ranked list
+        seeds.append(ranked_terms[len(seeds) % len(ranked_terms)]["term"])
+
+    items = []
+    for seed in seeds:
+        generated_tokens = tokenize(seed)
+        for _ in range(max_new_tokens_per_item):
+            next_tok = model.sample_next(
+                " ".join(generated_tokens),
+                temperature=temperature,
+                top_k=top_k,
+                candidate_modifier=modifier,
+                modifier_weight=modifier_weight,
+            )
+            if next_tok == model.eos_token:
+                break
+            generated_tokens.append(next_tok)
+        item_text = NGramModel.detokenize(_strip_structural_tokens(generated_tokens))
+        items.append((seed, item_text))
+    return items
+
+
+def display_list(concept: dict, items: List[Tuple[str, str]]) -> None:
+    print()
+    print("=" * 70)
+    print(f"GENERATED LIST -- concept {concept['concept_id']} "
+          f"(parent {concept['parent_concept_id']})")
+    print("=" * 70)
+    for i, (seed, text) in enumerate(items, start=1):
+        print(f"  {i}. [{seed}] {text}")
 
 
 # ============================================================
@@ -870,9 +903,10 @@ def display_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> None:
     print(f"ENSEMBLE ({len(runs)} scratch generations, kernel-weighted consensus)")
     print("=" * 70)
     for i, run in enumerate(runs, start=1):
-        preview = NGramModel.detokenize(run[:20])
+        preview = NGramModel.detokenize(_strip_structural_tokens(run[:20]))
         print(f"\n[run {i}] {preview}{' ...' if len(run) > 20 else ''}")
-    top_survivors = sorted(modifier.items(), key=lambda kv: kv[1], reverse=True)[:15]
+    visible_modifier = {t: w for t, w in modifier.items() if t not in IGNORED_TOKENS}
+    top_survivors = sorted(visible_modifier.items(), key=lambda kv: kv[1], reverse=True)[:15]
     print("\nSurviving tokens after kernel/isomorphism consensus (top 15):")
     if not top_survivors:
         print("  (none survived — runs disagreed on everything)")
@@ -905,11 +939,42 @@ def display_generation(generated: str) -> None:
 # Main
 # ============================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="N-gram consensus generator, optionally biased by a "
+                     "terminology_ontology_pipeline.py result for list generation.")
+    parser.add_argument("--corpus", type=str, default=None,
+                         help="Corpus filename (skips the interactive prompt if given).")
+    parser.add_argument("--ontology", type=str, default=None,
+                         help="Path to a terminology_ontology_pipeline.py JSON result. "
+                              "When set, each prompt also produces a generated list "
+                              "from the best-matching concept's controlled vocabulary.")
+    parser.add_argument("--list-items", type=int, default=50,
+                         help="Number of list items to generate per prompt.")
+    parser.add_argument("--list-tokens", type=int, default=120,
+                         help="Max tokens generated per list item.")
+    parser.add_argument("--list-modifier-weight", type=float, default=MODIFIER_WEIGHT,
+                         help="How strongly the concept vocabulary biases list generation.")
+    return parser.parse_args()
+
+
 def main() -> None:
-    corpus_path = Path(input("Filename: "))
+    args = parse_args()
+
+    corpus_path = Path(args.corpus) if args.corpus else Path(input("Filename: "))
     if not corpus_path.exists():
         print(f"\nERROR: {corpus_path} does not exist.")
         return
+
+    ontology = None
+    if args.ontology:
+        try:
+            ontology = load_ontology(args.ontology)
+            print(f"\nLoaded ontology: {len(ontology['concepts'])} concepts "
+                  f"from {args.ontology}")
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"\nERROR loading ontology: {e}")
+            return
 
     corpus_text = corpus_path.read_text(encoding="utf-8")
 
@@ -934,7 +999,7 @@ def main() -> None:
     display_non_conjoint(non_conjoint_pairs)
 
     search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
-    search.build_index(corpus_text)  # built once, not on every turn
+    search.build_index(corpus_text)
 
     while True:
         prompt = input("\nUSER: ").strip()
@@ -959,6 +1024,19 @@ def main() -> None:
 
         print("\nGenerating final (modifier-biased)...")
         display_generation(final_text)
+
+        if ontology is not None:
+            concept = select_concept(ontology, prompt)
+            list_modifier = concept_vocab_modifier(concept)
+            items = generate_list(
+                model, concept, list_modifier,
+                modifier_weight=args.list_modifier_weight,
+                num_items=args.list_items,
+                max_new_tokens_per_item=args.list_tokens,
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+            )
+            display_list(concept, items)
 
 
 if __name__ == "__main__":
