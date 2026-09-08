@@ -49,11 +49,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 MODEL_PATH = "model.json"
 
 MAX_NEW_TOKENS = 500
-TEMPERATURE = 0.9
+TEMPERATURE = 0.8
 TOP_K = 20
 
 MIN_COUNT = 1
-INFLUENCE_TAU = 0.8
+INFLUENCE_TAU = 0.5
 
 CURVE_K = 8.0
 CURVE_MIDPOINT = 0.5
@@ -949,9 +949,9 @@ def parse_args():
                          help="Path to a terminology_ontology_pipeline.py JSON result. "
                               "When set, each prompt also produces a generated list "
                               "from the best-matching concept's controlled vocabulary.")
-    parser.add_argument("--list-items", type=int, default=500,
+    parser.add_argument("--list-items", type=int, default=50,
                          help="Number of list items to generate per prompt.")
-    parser.add_argument("--list-tokens", type=int, default=1200,
+    parser.add_argument("--list-tokens", type=int, default=120,
                          help="Max tokens generated per list item.")
     parser.add_argument("--list-modifier-weight", type=float, default=MODIFIER_WEIGHT,
                          help="How strongly the concept vocabulary biases list generation.")
