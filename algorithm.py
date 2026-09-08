@@ -71,7 +71,13 @@ CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus
 ISOMORPHISM_TAU = 0.97     # cosine similarity threshold for treating two tokens
                            # as structurally interchangeable in the vocabulary
 
-RANDOM_SEED = 2026
+# --- Markovian transitivity masking settings ---
+TRANSITIVITY_DECAY = 0.5   # decay applied per hop when composing A->B->C into A->C
+TRANSITIVITY_WEIGHT = 0.5  # how strongly the prompt-pattern mask biases scoring
+TRANSITIVITY_MASK_PENALTY = 1.0   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
+TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
+
+RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
 random.seed(RANDOM_SEED)
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
@@ -352,6 +358,10 @@ class NGramModel:
         candidate_limit: int = 64,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        transitivity_mask: Optional[Dict[str, float]] = None,
+        transitivity_weight: float = 0.0,
+        mask_penalty: float = TRANSITIVITY_MASK_PENALTY,
+        superpoly_k: float = TRANSITIVITY_SUPERPOLY_K,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
@@ -388,6 +398,19 @@ class NGramModel:
                     + (1.0 - CONSENSUS_BASELINE_SPLIT) * baseline_prob
                 )
                 score += modifier_weight * blended_bias
+            if transitivity_mask is not None and transitivity_weight:
+                # Superpolynomial masking: rather than adding the promise
+                # weight linearly, run it through an exponential so the
+                # gap between a weakly-promised and a strongly-promised
+                # token blows up rather than scaling proportionally.
+                # Masked-out tokens get the mirror-image exponential
+                # penalty (using the fixed deficit strength) instead of a
+                # flat linear subtraction.
+                mask_weight = transitivity_mask.get(token)
+                if mask_weight is not None:
+                    score += transitivity_weight * (math.exp(superpoly_k * mask_weight) - 1.0)
+                else:
+                    score -= transitivity_weight * (math.exp(superpoly_k * mask_penalty) - 1.0)
             scores[token] = score
         return scores
 
@@ -398,8 +421,17 @@ class NGramModel:
         candidate_limit: int,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        transitivity_mask: Optional[Dict[str, float]] = None,
+        transitivity_weight: float = 0.0,
     ) -> Dict[str, float]:
-        scores = self._score_next_token(prompt, candidate_limit, candidate_modifier, modifier_weight)
+        scores = self._score_next_token(
+            prompt,
+            candidate_limit,
+            candidate_modifier,
+            modifier_weight,
+            transitivity_mask,
+            transitivity_weight,
+        )
         if not scores:
             return {}
         temperature = max(temperature, 1e-5)
@@ -416,8 +448,18 @@ class NGramModel:
         top_k: int = 20,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        transitivity_mask: Optional[Dict[str, float]] = None,
+        transitivity_weight: float = 0.0,
     ) -> str:
-        probs = self._probabilities(prompt, temperature, max(top_k, 1), candidate_modifier, modifier_weight)
+        probs = self._probabilities(
+            prompt,
+            temperature,
+            max(top_k, 1),
+            candidate_modifier,
+            modifier_weight,
+            transitivity_mask,
+            transitivity_weight,
+        )
         if not probs:
             return self.eos_token
         items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
@@ -432,11 +474,19 @@ class NGramModel:
         top_k: int = 20,
         candidate_modifier: Optional[Dict[str, float]] = None,
         modifier_weight: float = 0.0,
+        transitivity_mask: Optional[Dict[str, float]] = None,
+        transitivity_weight: float = 0.0,
     ) -> str:
         generated = tokenize(prompt)
         for _ in range(max_new_tokens):
             token = self.sample_next(
-                " ".join(generated), temperature, top_k, candidate_modifier, modifier_weight
+                " ".join(generated),
+                temperature,
+                top_k,
+                candidate_modifier,
+                modifier_weight,
+                transitivity_mask,
+                transitivity_weight,
             )
             #if token == self.eos_token:
                 #break
@@ -587,6 +637,150 @@ class NGramModel:
         )
         return final_text, runs, modifier
 
+    # ---------------- non-conjoint context matrix / rhombus selection ----------------
+
+    def build_disjointness_matrix(self, top_n: int = 30) -> Tuple[List[str], List[List[float]]]:
+        """
+        Build a square matrix over the `top_n` most frequent bigram contexts
+        (rows/cols = contexts, i.e. this is a slice of the Markov transition
+        table). Entry (i, j) is a disjointness score in [0, 1]: 1.0 means
+        contexts i and j are "non-conjoint" -- their successor-token sets
+        share nothing in common (Jaccard distance of the two rows) -- and
+        0.0 means they always transition to the same tokens.
+        """
+        contexts = sorted(
+            self.bigram.keys(),
+            key=lambda c: sum(self.bigram[c].values()),
+            reverse=True,
+        )[:top_n]
+        succ_sets = {c: set(self.bigram[c]) for c in contexts}
+
+        n = len(contexts)
+        matrix = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            a = succ_sets[contexts[i]]
+            for j in range(n):
+                b = succ_sets[contexts[j]]
+                union = a | b
+                matrix[i][j] = 1.0 if not union else 1.0 - len(a & b) / len(union)
+        return contexts, matrix
+
+    @staticmethod
+    def rhombus_select_lateral(
+        matrix: List[List[float]], radius: int = 2
+    ) -> Dict[Tuple[int, int], float]:
+        """
+        Select the "lateral" part of a square matrix using a rhombus
+        (diamond) band mask centered on the main diagonal: every cell
+        (i, j) with |i - j| <= radius, EXCLUDING the diagonal itself
+        (i == j). Plotted on a grid this is a diamond-shaped strip
+        running along the diagonal; "lateral" means we keep only the
+        wings of that strip (the off-diagonal transitions between
+        distinct contexts/tokens) and drop the diagonal (self-transitions,
+        i == j) which carry no lateral information.
+        """
+        n = len(matrix)
+        selected: Dict[Tuple[int, int], float] = {}
+        for i in range(n):
+            for j in range(n):
+                if i == j:
+                    continue
+                if abs(i - j) <= radius:
+                    selected[(i, j)] = matrix[i][j]
+        return selected
+
+    def non_conjoint_lateral_report(
+        self,
+        top_n: int = 30,
+        radius: int = 2,
+        threshold: float = 0.999,
+    ) -> List[Tuple[str, str, float]]:
+        """
+        Full pipeline: build the context disjointness matrix, rhombus-select
+        its lateral (off-diagonal, diamond-banded) region, then keep only
+        the pairs that are (near-)perfectly non-conjoint (score >= threshold),
+        sorted strongest-first.
+        """
+        contexts, matrix = self.build_disjointness_matrix(top_n)
+        lateral = self.rhombus_select_lateral(matrix, radius)
+        pairs = [
+            (contexts[i], contexts[j], score)
+            for (i, j), score in lateral.items()
+            if score >= threshold
+        ]
+        pairs.sort(key=lambda t: -t[2])
+        return pairs
+
+    # ---------------- Markovian transitivity / prompt-pattern masking ----------------
+
+    def transitive_successors(self, token: str, decay: float = 0.5) -> Dict[str, float]:
+        """
+        One hop of Markovian transitive closure. If A has a direct bigram
+        successor B (prob p_ab), and B itself has a direct successor C
+        (prob p_bc), then A relates to C transitively even if "A C" never
+        literally occurs in the corpus. The transitive weight is
+        p_ab * p_bc * decay, summed over all intermediate B's.
+        """
+        direct = self._normalize(self.bigram.get(token, Counter()))
+        transitive: Dict[str, float] = defaultdict(float)
+        for mid, p_ab in direct.items():
+            if mid in IGNORED_TOKENS:
+                continue
+            mid_direct = self._normalize(self.bigram.get(mid, Counter()))
+            for c, p_bc in mid_direct.items():
+                transitive[c] += p_ab * p_bc * decay
+        return dict(transitive)
+
+    def prompt_transitivity_mask(self, prompt: str, decay: float = 0.5) -> Dict[str, float]:
+        """
+        Masking via prompt patterns: build a vocabulary mask from the
+        tokens that actually appear in the prompt. For each distinct
+        prompt token, compute its transitive (2-hop) Markov successors;
+        the mask value for a candidate token is the max transitive weight
+        reaching it from any prompt token. Tokens with no transitive path
+        from anything in the prompt get no entry at all -- they're
+        implicitly masked out when this is applied during scoring.
+        """
+        tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
+        mask: Dict[str, float] = defaultdict(float)
+        seen = set()
+        for t in tokens:
+            if t in seen:
+                continue
+            seen.add(t)
+            for c, w in self.transitive_successors(t, decay).items():
+                if w > mask[c]:
+                    mask[c] = w
+        return dict(mask)
+
+    def generate_with_transitivity_mask(
+        self,
+        prompt: str,
+        max_new_tokens: int = 50,
+        temperature: float = 0.8,
+        top_k: int = 20,
+        decay: float = TRANSITIVITY_DECAY,
+        transitivity_weight: float = TRANSITIVITY_WEIGHT,
+    ) -> Tuple[str, Dict[str, float]]:
+        """
+        Convenience wrapper: build the prompt-pattern transitivity mask
+        from the current prompt, then generate with it applied. Returns
+        (generated_text, mask) so callers can inspect what was allowed
+        through vs. masked out.
+        """
+        if not self.finalized:
+            self.finalize()
+        mask = self.prompt_transitivity_mask(prompt, decay)
+        text = self.generate(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            transitivity_mask=mask,
+            transitivity_weight=transitivity_weight,
+        )
+        return text, mask
+
     @staticmethod
     def detokenize(tokens: List[str]) -> str:
         text = " ".join(tokens)
@@ -631,9 +825,19 @@ class NGramModel:
         model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data["trigram"].items()})
         model.lexical_vectors = data["lexical_vectors"]
         model.influence_vectors = data["influence_vectors"]
-        model.isomorphism_map = data.get("isomorphism_map", {})
         model.vocabulary = data["vocabulary"]
         model.finalized = data["finalized"]
+
+        if "isomorphism_map" in data:
+            model.isomorphism_map = data["isomorphism_map"]
+        elif model.vocabulary and model.lexical_vectors:
+            # Migrating an older model.json saved before isomorphism
+            # classes existed: everything needed (vocabulary, lexical
+            # vectors) is already loaded, so build the map now rather
+            # than silently leaving it empty.
+            model._build_isomorphism_classes()
+        else:
+            model.isomorphism_map = {}
         return model
 
     def save_json(self, path: str | Path) -> None:
@@ -676,6 +880,18 @@ def display_ensemble(runs: List[List[str]], modifier: Dict[str, float]) -> None:
         print(f"  {token!r:<15} weight={weight:.3f}")
 
 
+def display_non_conjoint(pairs: List[Tuple[str, str, float]]) -> None:
+    print()
+    print("=" * 70)
+    print("NON-CONJOINT CONTEXTS (rhombus-selected lateral band)")
+    print("=" * 70)
+    if not pairs:
+        print("No fully non-conjoint context pairs found in this band.")
+        return
+    for a, b, score in pairs[:15]:
+        print(f"  {a!r:<25} <-/-> {b!r:<25} disjointness={score:.3f}")
+
+
 def display_generation(generated: str) -> None:
     print()
     print("=" * 70)
@@ -713,6 +929,9 @@ def main() -> None:
     print(f"Trigram contexts: {len(model.trigram)}")
     iso_classes = len(set(model.isomorphism_map.values())) if model.isomorphism_map else 0
     print(f"Isomorphism classes: {iso_classes} (from {len(model.isomorphism_map)} vocab tokens)")
+
+    non_conjoint_pairs = model.non_conjoint_lateral_report(top_n=30, radius=2, threshold=0.999)
+    display_non_conjoint(non_conjoint_pairs)
 
     search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
     search.build_index(corpus_text)  # built once, not on every turn
