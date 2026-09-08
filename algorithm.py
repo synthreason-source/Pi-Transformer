@@ -50,12 +50,12 @@ MODEL_PATH = "model.json"
 
 MAX_NEW_TOKENS = 500
 TEMPERATURE = 0.8
-TOP_K = 20
+TOP_K = 120
 
 MIN_COUNT = 1
-INFLUENCE_TAU = 0.5
+INFLUENCE_TAU = 0.7
 
-CURVE_K = 8.0
+CURVE_K = 18.0
 CURVE_MIDPOINT = 0.5
 
 CANDIDATE_LIMIT = 15
@@ -949,7 +949,7 @@ def parse_args():
                          help="Path to a terminology_ontology_pipeline.py JSON result. "
                               "When set, each prompt also produces a generated list "
                               "from the best-matching concept's controlled vocabulary.")
-    parser.add_argument("--list-items", type=int, default=50,
+    parser.add_argument("--list-items", type=int, default=500,
                          help="Number of list items to generate per prompt.")
     parser.add_argument("--list-tokens", type=int, default=120,
                          help="Max tokens generated per list item.")
