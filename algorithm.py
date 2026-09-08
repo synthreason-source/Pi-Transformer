@@ -53,7 +53,7 @@ TEMPERATURE = 0.9
 TOP_K = 20
 
 MIN_COUNT = 1
-INFLUENCE_TAU = 0.6
+INFLUENCE_TAU = 0.8
 
 CURVE_K = 8.0
 CURVE_MIDPOINT = 0.5
@@ -63,19 +63,19 @@ LEXICAL_WEIGHT = 0.45
 VECTOR_WEIGHT = 0.55
 
 # --- consensus / kernelized adversarial ensemble settings ---
-NUM_GENERATIONS = 15        # how many scratch runs to generate per turn
-KERNEL_SHARPNESS = 14.0     # adversarial sharpening exponent on kernel agreement
-MODIFIER_WEIGHT = 0.9      # how much the consensus modifier biases the final generation
-CONSENSUS_BASELINE_SPLIT = 0.3  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
+NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
+KERNEL_SHARPNESS = 4.0     # adversarial sharpening exponent on kernel agreement
+MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
+CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
 
 # --- vocab isomorphism settings ---
-ISOMORPHISM_TAU = 0.47     # cosine similarity threshold for treating two tokens
+ISOMORPHISM_TAU = 0.97     # cosine similarity threshold for treating two tokens
                            # as structurally interchangeable in the vocabulary
 
 # --- Markovian transitivity masking settings ---
-TRANSITIVITY_DECAY = 0.1   # decay applied per hop when composing A->B->C into A->C
-TRANSITIVITY_WEIGHT = 0.45  # how strongly the prompt-pattern mask biases scoring
-TRANSITIVITY_MASK_PENALTY = 1.4   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
+TRANSITIVITY_DECAY = 0.5   # decay applied per hop when composing A->B->C into A->C
+TRANSITIVITY_WEIGHT = 0.5  # how strongly the prompt-pattern mask biases scoring
+TRANSITIVITY_MASK_PENALTY = 1.0   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
 TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
 
 RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
