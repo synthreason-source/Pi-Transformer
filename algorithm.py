@@ -155,10 +155,10 @@ def main():
 
     text = Path(args.corpus).read_text(encoding="utf-8")
     model = FreqMarkovModel.from_corpus(text)
-
-    output = model.generate(prompt=args.prompt, max_new_tokens=args.max_tokens, temperature=args.temp, decay=args.decay)
-    print("\n--- Output ---")
-    print(output)
+    while True:
+        output = model.generate(prompt=input("USER: "), max_new_tokens=args.max_tokens, temperature=args.temp, decay=args.decay)
+        print("\n--- Output ---")
+        print(output)
 
 
 if __name__ == "__main__":
