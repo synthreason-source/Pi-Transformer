@@ -2,7 +2,7 @@
 markov_freq_logic.py
 ====================
 Markov model using vocabulary frequencies for p_t and transition probabilities for self.P,
-incorporating your exact custom logic step.
+incorporating your exact custom logic step and an incremental approximation for generation.
 """
 
 from __future__ import annotations
@@ -102,25 +102,25 @@ class FreqMarkovModel:
         p_next = exps / exps.sum()
         return p_next
 
-    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 1.0) -> str:
+    def generate(self, prompt: str, max_new_tokens: int = 50, temperature: float = 1.0, decay: float = 0.9) -> str:
         prompt_tokens = tokenize(prompt) if prompt.strip() else []
         generated = list(prompt_tokens)
 
         if not generated:
             generated = [BOS]
 
-        for _ in range(max_new_tokens):
-            # Build vocabulary frequency vector p_t from the generated sequence so far
-            p_t = np.zeros(len(self.vocab), dtype=np.float64)
-            for token in generated:
-                if token in self.token_to_idx:
-                    p_t[self.token_to_idx[token]] += 1.0
-            
-            # Normalize to frequencies/proportions
-            total_count = p_t.sum()
-            if total_count > 0:
-                p_t /= total_count
+        # Initialize p_t using an incremental exponential decay approximation
+        p_t = np.zeros(len(self.vocab), dtype=np.float64)
+        for token in generated:
+            if token in self.token_to_idx:
+                p_t *= decay
+                p_t[self.token_to_idx[token]] += (1.0 - decay)
 
+        total_count = p_t.sum()
+        if total_count > 0:
+            p_t /= total_count
+
+        for _ in range(max_new_tokens):
             p_next = self.step(p_t, temperature=temperature)
             
             # Sample from distribution
@@ -132,21 +132,31 @@ class FreqMarkovModel:
 
             generated.append(next_token)
 
+            # Incrementally update p_t using exponential decay approximation (O(1) update)
+            p_t *= decay
+            if next_token in self.token_to_idx:
+                p_t[self.token_to_idx[next_token]] += (1.0 - decay)
+            
+            total_count = p_t.sum()
+            if total_count > 0:
+                p_t /= total_count
+
         return detokenize(generated)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Frequency-based Custom Logic Markov Model")
+    parser = argparse.ArgumentParser(description="Frequency-based Custom Logic Markov Model with Approximation")
     parser.add_argument("--corpus", required=True, help="Path to text file.")
     parser.add_argument("--prompt", default="", help="Generation prompt.")
     parser.add_argument("--max-tokens", type=int, default=50)
     parser.add_argument("--temp", type=float, default=1.0)
+    parser.add_argument("--decay", type=float, default=0.9, help="Exponential decay factor for history approximation.")
     args = parser.parse_args()
 
     text = Path(args.corpus).read_text(encoding="utf-8")
     model = FreqMarkovModel.from_corpus(text)
 
-    output = model.generate(prompt=args.prompt, max_new_tokens=args.max_tokens, temperature=args.temp)
+    output = model.generate(prompt=args.prompt, max_new_tokens=args.max_tokens, temperature=args.temp, decay=args.decay)
     print("\n--- Output ---")
     print(output)
 
