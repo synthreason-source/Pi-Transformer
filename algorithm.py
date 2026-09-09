@@ -18,6 +18,7 @@ CHANGES vs. original
 
 Usage
 -----
+python neural_text_generator_cuda_features.py --corpus mytext.txt --prompt "once upon a time"
 python neural_text_generator_cuda_features.py --corpus mytext.txt --train-steps 0
 python neural_text_generator_cuda_features.py --corpus mytext.txt --max-tokens 120 --temperature 0.9 --device cuda
 """
@@ -619,8 +620,7 @@ def unbiased_generate(
             model, " ".join(generated), temperature, top_k
         )
         generated.append(tok)
-        if tok == EOS:
-            break
+
     return generated[start:]
 
 
@@ -934,8 +934,7 @@ def generate(
             k=1,
         )[0]
 
-        if next_tok == EOS:
-            break
+
         generated.append(next_tok)
         prev = next_tok
 
@@ -1165,7 +1164,7 @@ def main():
             extractor,
             feature_layer,
             prompt=input("USER: "),
-            max_new_tokens=args.max_tokens,
+            max_new_tokens=660,
             temperature=args.temperature,
             top_k=args.top_k,
             candidate_limit=args.candidate_limit,
