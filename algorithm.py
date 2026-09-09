@@ -18,7 +18,6 @@ CHANGES vs. original
 
 Usage
 -----
-python neural_text_generator_cuda_features.py --corpus mytext.txt --prompt "once upon a time"
 python neural_text_generator_cuda_features.py --corpus mytext.txt --train-steps 0
 python neural_text_generator_cuda_features.py --corpus mytext.txt --max-tokens 120 --temperature 0.9 --device cuda
 """
