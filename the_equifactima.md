@@ -1,5 +1,3 @@
-Absolutely. I’d frame **“equifactima” as a proposed philosophical/phenomenological concept**, rather than presenting it as an established scientific term. Here is a paper-style treatment.
-
 # Recognition of the Equifactima Through the Qualitative Dimensions of Consciousness
 
 ## Abstract
