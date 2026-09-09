@@ -37,6 +37,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+from tqdm import tqdm
 
 TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
 BOS, EOS = "<BOS>", "<EOS>"
@@ -71,7 +72,7 @@ def split_sentences(text: str) -> List[str]:
 def detokenize(tokens: List[str]) -> str:
     text = " ".join(t for t in tokens if t not in (BOS, EOS))
     text = re.sub(r"\s+([.,!?;:)\]}])", r"\1", text)
-    text = re.sub(r"([(\[{])\s+", r"\1", text)
+    text = re.sub(r"([({\[<])\s+", r"\1", text)
     return text
 
 
@@ -803,7 +804,11 @@ def train_feature_layer(
     verbose: bool = True,
 ) -> None:
     rng = random.Random(seed)
-    for step in range(steps):
+    for step in tqdm(
+        range(steps),
+        desc="Training",
+        disable=not verbose,
+    ):
         X, y = make_training_batch(
             model,
             extractor,
@@ -813,10 +818,8 @@ def train_feature_layer(
             output_dim=feature_layer.output_dim,
         )
         loss = feature_layer.train_step(X, y, lr=lr)
-        if verbose and (
-            step % max(1, steps // 10) == 0 or step == steps - 1
-        ):
-            print(
+        if verbose:
+            tqdm.write(
                 f" train step {step:4d}/{steps} loss={loss:.4f}"
             )
 
