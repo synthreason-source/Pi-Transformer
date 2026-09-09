@@ -149,7 +149,7 @@ def main():
     parser.add_argument("--corpus", required=True, help="Path to text file.")
     parser.add_argument("--prompt", default="", help="Generation prompt.")
     parser.add_argument("--max-tokens", type=int, default=50)
-    parser.add_argument("--temp", type=float, default=1.0)
+    parser.add_argument("--temp", type=float, default=0.6)
     parser.add_argument("--decay", type=float, default=0.9, help="Exponential decay factor for history approximation.")
     args = parser.parse_args()
 
