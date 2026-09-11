@@ -10,99 +10,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-# ============================================================
-# Small n-gram language model + corpus similarity search.
-#
-# Pipeline per user turn:
-#   1. tokenize prompt, find closest corpus sentences (display only)
-#   2. run several independent "scratch" generations from the model
-#   3. combine those runs into a single candidate modifier using a
-#      kernelized adversarial consensus pass (see below), instead of
-#      the old mean/std cancel-out
-#   4. sample the final continuation, using that modifier (blended
-#      50/50 with the raw baseline token probability) to bias the
-#      per-token scores, PLUS a compounding instruction-likeness curve
-#      (see below) that pulls the final text back toward the original
-#      instruction as it gets longer, PLUS a length-gated inversion
-#      (see below) that flips that instruction-likeness bias once the
-#      continuation passes a configured length
-#
-# --- Kernelized adversarial consensus ---
-# Each scratch run is first canonicalized through the vocabulary's
-# "isomorphism classes": tokens whose bigram-context distributions are
-# near-identical (cosine similarity above ISOMORPHISM_TAU, after
-# sharpening -- see below) play the same structural role in the grammar,
-# so they're collapsed to one canonical representative before anything
-# is counted. This means a vote for any member of a class reinforces the
-# whole class, both when the modifier is built and when it's looked up
-# during final scoring.
-#
-# Each (canonicalized) run is then treated as a point in token-count
-# space. An RBF kernel measures how close every run sits to the others.
-# Runs near the shared cluster are the ensemble's "promises" -- tokens
-# they contain get amplified. Runs sitting apart, in the interstitial
-# space between clusters, are adversarially suppressed: their
-# kernel-agreement score is raised to a sharpening power before being
-# used as a weight, which pushes outlier runs toward zero rather than
-# just discounting them linearly (as the old std-based penalty did).
-#
-# --- Context-dimension reduction (feature agglomeration) ---
-# Before isomorphism classes are built, the *context* dimensions of each
-# token's lexical vector (i.e. which bigram-left-context it followed, and
-# how often) are themselves clustered and merged: the most frequent
-# CONTEXT_REDUCTION_MAX_DIMS context columns are agglomeratively paired
-# up by cosine similarity of the tokens that follow them, until only
-# CONTEXT_REDUCTION_FRACTION of them remain, and every token's vector is
-# re-expressed in that smaller basis. This is a from-scratch,
-# dependency-free stand-in for PCA / feature agglomeration -- it does not
-# require numpy/sklearn. Long-tail context dims outside the cap are left
-# untouched. Isomorphism classing and influence scoring both then run on
-# this reduced space.
-#
-# Because dimensionality reduction is lossy and tends to make cosine
-# similarities cluster upward, the isomorphism threshold is sharpened
-# by raising raw cosine similarity to ISOMORPHISM_SHARPNESS before
-# comparing to ISOMORPHISM_TAU. Cosine similarities here are always in
-# [0, 1] (context vectors are non-negative frequencies): an exponent > 1
-# shrinks weak similarities faster than strong ones (more selective),
-# while an exponent < 1 pulls similarities upward toward 1, i.e. makes
-# the threshold *more permissive* / less selective. Which direction you
-# want depends on whether dimension reduction is being used aggressively
-# (favor > 1, more selective) or you deliberately want more classes to
-# merge (favor < 1).
-#
-# --- Compounding instruction-likeness curve (final generation only) ---
-# A single instruction vector is built once from the original prompt's
-# tokens (summing their lexical vectors). During the *final* biased
-# generation pass -- never the independent scratch runs, which must stay
-# diverse and unbiased for the consensus step to mean anything -- every
-# candidate token's cosine similarity to that instruction vector is
-# pushed through an increasing sigmoid curve and added to its score,
-# scaled by a running `compound_factor`. That factor is multiplied up a
-# little further after every token actually chosen (proportional to how
-# instruction-like it was), so the pull toward the instruction gets
-# stronger as the continuation gets longer -- it compounds -- but is
-# clamped at INSTRUCTION_COMPOUND_CAP so it cannot spiral into simply
-# echoing the instruction back verbatim. This bias stacks additively on
-# top of whatever candidate_modifier is already active (the kernel
-# consensus modifier), rather than replacing it. The factor resets to
-# 1.0 at the start of every independent continuation (each generate()
-# call), so it never carries over across calls.
-#
-# --- Length-gated inversion (final generation only) ---
-# Once the generated continuation reaches INVERSION_GATE_TOKENS new
-# tokens, the instruction-likeness term above is inverted: instead of
-# adding `instruction_weight * compound_factor * curved_likeness` to a
-# candidate's score, the sign is flipped, so from that point on the
-# generation is pushed *away* from the instruction vector instead of
-# toward it. This only affects the sign of that one additive term --
-# the kernel-consensus modifier and the raw n-gram score are untouched.
-# Before the gate, generation behaves exactly as described above.
-#
-# (The original script also computed a "post-generation rebinding"
-#  pass and a "second generation" pass, but neither was ever
-#  displayed or used -- removed as dead code.)
-# ============================================================
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float32
 
 MODEL_PATH = "model.json"
 
@@ -120,60 +31,35 @@ CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.85
 VECTOR_WEIGHT = 0.55
 
-# --- consensus / kernelized adversarial ensemble settings ---
-NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
-KERNEL_SHARPNESS = 0.1     # adversarial sharpening exponent on kernel agreement
-MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
-CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
+NUM_GENERATIONS = 5
+KERNEL_SHARPNESS = 0.1
+MODIFIER_WEIGHT = 0.6
+CONSENSUS_BASELINE_SPLIT = 0.5
 
-# --- vocab isomorphism settings ---
-ISOMORPHISM_TAU = 0.07     # cosine similarity threshold (post-sharpening) for treating
-                           # two tokens as structurally interchangeable in the vocabulary
-ISOMORPHISM_SHARPNESS = 0.5  # exponent applied to raw cosine similarity before comparing
-                             # to ISOMORPHISM_TAU. Cosine values live in [0,1]; an exponent
-                             # < 1 (as set here) pulls similarities upward, making the
-                             # threshold more permissive -- more tokens merge into classes.
+ISOMORPHISM_TAU = 0.07
+ISOMORPHISM_SHARPNESS = 0.5
 
-# --- context-dimension reduction settings (feature agglomeration) ---
-CONTEXT_REDUCTION_FRACTION = 0.9   # keep this fraction of context dimensions after merging
-CONTEXT_REDUCTION_MAX_DIMS = 2000  # only cluster the N most frequent context dims;
-                                    # merging is O(n^2) per round, so this caps cost.
-                                    # rarer context dims pass through untouched.
+CONTEXT_REDUCTION_FRACTION = 0.9
+CONTEXT_REDUCTION_MAX_DIMS = 2000
 
-# --- Markovian transitivity masking settings ---
-TRANSITIVITY_DECAY = 0.1   # decay applied per hop when composing A->B->C into A->C
-TRANSITIVITY_WEIGHT = 0.1  # how strongly the prompt-pattern mask biases scoring
-TRANSITIVITY_MASK_PENALTY = 1.0   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
-TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
+TRANSITIVITY_DECAY = 0.1
+TRANSITIVITY_WEIGHT = 0.1
+TRANSITIVITY_MASK_PENALTY = 1.0
+TRANSITIVITY_SUPERPOLY_K = 3.0
 
-# --- compounding instruction-likeness curve settings (final generation only) ---
-INSTRUCTION_COMPOUND_CURVE_K = 12.0        # steepness of the increasing sigmoid applied
-                                            # to a candidate token's cosine similarity
-                                            # to the instruction vector
-INSTRUCTION_COMPOUND_MIDPOINT = 0.3        # similarity value at which the curve crosses 0.5
-INSTRUCTION_COMPOUND_GROWTH = 0.15         # how much each chosen token's instruction-likeness
-                                            # grows the running compound_factor
-INSTRUCTION_COMPOUND_CAP = 4.0             # hard ceiling on compound_factor, so the pull
-                                            # toward the instruction cannot run away into
-                                            # degenerate echoing of the prompt
-INSTRUCTION_COMPOUND_WEIGHT = 0.4          # base strength of the instruction-likeness bias
-                                            # in the score, before compounding is applied
+INSTRUCTION_COMPOUND_CURVE_K = 12.0
+INSTRUCTION_COMPOUND_MIDPOINT = 0.3
+INSTRUCTION_COMPOUND_GROWTH = 0.15
+INSTRUCTION_COMPOUND_CAP = 4.0
+INSTRUCTION_COMPOUND_WEIGHT = 0.4
 
-INVERSION_GATE_TOKENS = 60                 # once the final generation has produced this many
-                                            # new tokens, the instruction-likeness bias term
-                                            # flips sign (pulls away from the instruction
-                                            # instead of toward it) for the rest of the run
+RANDOM_SEED = None
+if RANDOM_SEED is not None:
+    random.seed(RANDOM_SEED)
 
-RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
-random.seed(RANDOM_SEED)
-
-TOKEN_RE = re.compile(r"[A-Za-z0-9_']+|[.,!?;:()\[\]{}\-]")
+TOKEN_RE = re.compile(r"[A-Za-z0-9_\']+|[.,!?;:()\[\]{}\-]")
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
-
-# ============================================================
-# Text utilities
-# ============================================================
 
 def tokenize(text: str) -> List[str]:
     return TOKEN_RE.findall(text.lower())
@@ -213,10 +99,6 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
     return len(sa & sb) / union if union else 0.0
 
 
-# ============================================================
-# Corpus similarity search (used for the "candidates" display)
-# ============================================================
-
 @dataclass
 class CorpusReference:
     sentence: str
@@ -236,8 +118,6 @@ class Candidate:
 
 
 class CorpusSearch:
-    """Finds corpus sentences closest to a prompt (lexical + cosine)."""
-
     def __init__(
         self,
         lexical_weight: float = LEXICAL_WEIGHT,
@@ -250,7 +130,6 @@ class CorpusSearch:
     def build_index(self, corpus_text: str) -> None:
         sentences = split_sentences(corpus_text)
         counts = Counter(s.lower() for s in sentences)
-
         self.references = []
         for sentence in sentences:
             tokens = tokenize(sentence)
@@ -269,7 +148,6 @@ class CorpusSearch:
     def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
         prompt_tokens = tokenize(prompt)
         prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
-
         candidates = []
         for ref in self.references:
             symbolic = lexical_overlap(prompt_tokens, ref.tokens)
@@ -284,7 +162,6 @@ class CorpusSearch:
                     score=score,
                 )
             )
-
         candidates.sort(key=lambda c: c.score, reverse=True)
         candidates = candidates[:limit]
         for i, c in enumerate(candidates, start=1):
@@ -292,9 +169,129 @@ class CorpusSearch:
         return candidates
 
 
-# ============================================================
-# N-gram language model
-# ============================================================
+class CUDANGramBackend:
+    """Dense tensor backend for the original NGramModel equations."""
+
+    def finalize_cuda(self, model):
+        self.model = model
+        self.vocab = list(model.vocabulary)
+        self.index = {t: i for i, t in enumerate(self.vocab)}
+        self.V = len(self.vocab)
+        contexts = sorted(model.bigram.keys())
+        self.contexts = contexts
+        self.context_index = {c: i for i, c in enumerate(contexts)}
+        C = len(contexts)
+
+        lexical = torch.zeros((self.V, C), dtype=DTYPE, device=DEVICE)
+        for token, vec in model.lexical_vectors.items():
+            i = self.index.get(token)
+            if i is None:
+                continue
+            for ctx, value in vec.items():
+                j = self.context_index.get(ctx)
+                if j is not None:
+                    lexical[i, j] = float(value)
+        self.lexical = lexical
+        self.lexical_norm = torch.linalg.vector_norm(lexical, dim=1).clamp_min(1e-12)
+
+        sims = (lexical @ lexical.T) / (self.lexical_norm[:, None] * self.lexical_norm[None, :])
+        sims.fill_diagonal_(0.0)
+        self.influence = torch.where(sims >= model.influence_tau, sims, torch.zeros_like(sims))
+
+        self.bigram_probs = torch.zeros((self.V, self.V), dtype=DTYPE, device=DEVICE)
+        self.trigram_probs = {}
+        for left, counts in model.bigram.items():
+            i = self.index.get(left)
+            if i is not None:
+                ids = [self.index[t] for t in counts if t in self.index]
+                vals = torch.tensor([counts[t] for t in counts if t in self.index], dtype=DTYPE, device=DEVICE)
+                if ids:
+                    self.bigram_probs[i, torch.tensor(ids, device=DEVICE)] = vals / vals.sum()
+        for key, counts in model.trigram.items():
+            ids = [self.index[t] for t in counts if t in self.index]
+            if ids:
+                vals = torch.tensor([counts[t] for t in counts if t in self.index], dtype=DTYPE, device=DEVICE)
+                self.trigram_probs[key] = (torch.tensor(ids, device=DEVICE), vals / vals.sum())
+
+        unigram_ids = [self.index[t] for t in model.unigram if t in self.index]
+        unigram_vals = torch.tensor([model.unigram[t] for t in model.unigram if t in self.index], dtype=DTYPE, device=DEVICE)
+        self.unigram_probs = torch.zeros(self.V, dtype=DTYPE, device=DEVICE)
+        self.unigram_probs[torch.tensor(unigram_ids, device=DEVICE)] = unigram_vals / unigram_vals.sum()
+        self.eos_id = self.index.get(model.eos_token, -1)
+        return self
+
+    def _distribution(self, prev: str, prev_prev: Optional[str]):
+        key = f"{prev_prev}\t{prev}" if prev_prev is not None else None
+        if key in self.trigram_probs:
+            ids, probs = self.trigram_probs[key]
+            return ids, probs
+        i = self.index.get(prev)
+        if i is not None:
+            ids = torch.nonzero(self.bigram_probs[i] > 0, as_tuple=False).flatten()
+            if ids.numel():
+                return ids, self.bigram_probs[i, ids]
+        ids = torch.nonzero(self.unigram_probs > 0, as_tuple=False).flatten()
+        return ids, self.unigram_probs[ids]
+
+    def score_next(self, prev: str, prev_prev: Optional[str], temperature=0.8,
+                   candidate_modifier=None, modifier_weight=0.0,
+                   instruction_vector=None, instruction_weight=0.0,
+                   compound_factor=1.0):
+        ids, base = self._distribution(prev, prev_prev)
+        if ids.numel() == 0:
+            return ids, ids.to(DTYPE)
+        p_eos = base[ids == self.eos_id].sum() if self.eos_id >= 0 else torch.zeros((), device=DEVICE)
+        curve = torch.sigmoid(-self.model.curve_k * (p_eos - self.model.curve_midpoint))
+        prev_i = self.index.get(prev, -1)
+        source = self.lexical[prev_i] if prev_i >= 0 else torch.zeros(self.lexical.shape[1], device=DEVICE)
+        target = self.lexical[ids]
+        sim = (target @ source) / (torch.linalg.vector_norm(target, dim=1).clamp_min(1e-12) * torch.linalg.vector_norm(source).clamp_min(1e-12))
+        influence = self.influence[prev_i, ids] if prev_i >= 0 else torch.zeros_like(sim)
+        scores = torch.log(torch.clamp(base, min=1e-12)) + curve * (0.35 * sim + 0.65 * influence)
+
+        if candidate_modifier and modifier_weight:
+            bias = torch.tensor([candidate_modifier.get(self.model._canonical(self.vocab[i]), 0.0) for i in ids.tolist()], dtype=DTYPE, device=DEVICE)
+            scores = scores + modifier_weight * (0.5 * bias + 0.5 * base)
+        if instruction_vector is not None and instruction_weight:
+            iv = instruction_vector
+            likeness = (target @ iv) / (torch.linalg.vector_norm(target, dim=1).clamp_min(1e-12) * torch.linalg.vector_norm(iv).clamp_min(1e-12))
+            curved = torch.sigmoid(INSTRUCTION_COMPOUND_CURVE_K * (likeness - INSTRUCTION_COMPOUND_MIDPOINT))
+            scores = scores + instruction_weight * compound_factor * curved
+        return ids, torch.softmax(scores / max(float(temperature), 1e-5), dim=-1)
+
+    @torch.inference_mode()
+    def sample_next(self, prompt_tokens: List[str], temperature=0.8, top_k=20, **kwargs):
+        prev = prompt_tokens[-1] if prompt_tokens else "<bos>"
+        prev_prev = prompt_tokens[-2] if len(prompt_tokens) > 1 else None
+        ids, probs = self.score_next(prev, prev_prev, temperature, **kwargs)
+        if ids.numel() == 0:
+            return self.model.eos_token
+        k = min(int(top_k), ids.numel())
+        vals, pos = torch.topk(probs, k)
+        chosen = pos[torch.multinomial(vals / vals.sum(), 1)]
+        return self.vocab[int(ids[chosen].item())]
+
+    @torch.inference_mode()
+    def consensus_modifier(self, runs: List[List[str]], sharpness=0.1):
+        if not runs:
+            return {}
+        counters = [Counter(self.model._canonical(t) for t in run) for run in runs]
+        keys = sorted(set().union(*(c.keys() for c in counters)))
+        mat = torch.zeros((len(counters), len(keys)), dtype=DTYPE, device=DEVICE)
+        ki = {k: i for i, k in enumerate(keys)}
+        for r, c in enumerate(counters):
+            for token, count in c.items():
+                mat[r, ki[token]] = count
+        d2 = torch.cdist(mat, mat, p=2).square()
+        nonzero = d2[d2 > 0]
+        gamma = 1.0 / (2.0 * torch.median(nonzero)) if nonzero.numel() else torch.ones((), device=DEVICE)
+        agreement = (torch.exp(-gamma * d2).sum(1) - 1.0) / max(len(counters) - 1, 1)
+        weights = agreement.clamp_min(0).pow(sharpness)
+        weights = weights / weights.sum().clamp_min(1e-12)
+        modifier = (weights[:, None] * mat).sum(0)
+        modifier = modifier / modifier.max().clamp_min(1e-12)
+        return {k: float(v) for k, v in zip(keys, modifier.detach().cpu())}
+
 
 @dataclass
 class NGramModel:
@@ -319,8 +316,6 @@ class NGramModel:
     vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
 
-    # ---------------- ingestion ----------------
-
     def ingest_text(self, text: str) -> None:
         for sentence in split_sentences(text):
             words = tokenize(sentence)
@@ -340,8 +335,6 @@ class NGramModel:
             self.trigram[f"{a}\t{b}"][c] += 1
         self.finalized = False
 
-    # ---------------- training ----------------
-
     def finalize(self) -> None:
         self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
         if self.unk_token not in self.vocabulary:
@@ -358,9 +351,6 @@ class NGramModel:
             total = sum(counts.values()) or 1
             self.lexical_vectors[token] = {ctx: c / total for ctx, c in counts.items()}
 
-        # Reduce the dimensionality of the context space (feature
-        # agglomeration) before anything downstream -- influence scoring
-        # and isomorphism classing -- runs on these vectors.
         self._reduce_context_dimensions()
 
         self.influence_vectors = {}
@@ -376,7 +366,6 @@ class NGramModel:
             self.influence_vectors[source] = scores
 
         self._build_isomorphism_classes()
-
         self.finalized = True
 
     def _reduce_context_dimensions(
@@ -384,22 +373,6 @@ class NGramModel:
         fraction: Optional[float] = None,
         max_dims: Optional[int] = None,
     ) -> None:
-        """
-        Reduce the dimensionality of lexical_vectors by agglomeratively
-        merging the context dimensions (bigram left-contexts) that behave
-        most alike across tokens -- clustering the *columns* of the token
-        x context matrix, not the tokens themselves. Two context dims
-        merge when the tokens that follow them, weighted by frequency,
-        look similar; merging sums their weight into one new
-        pseudo-dimension.
-
-        This is a from-scratch, dependency-free substitute for PCA/feature
-        agglomeration (no numpy/sklearn required). It's O(min(d,
-        max_dims)^2) per merge round, so `max_dims` caps which dimensions
-        are even considered -- context dims outside the cap are long-tail
-        and left untouched, just carried through under their original
-        name.
-        """
         fraction = self.context_reduction_fraction if fraction is None else fraction
         max_dims = self.context_reduction_max_dims if max_dims is None else max_dims
 
@@ -462,16 +435,6 @@ class NGramModel:
         self.lexical_vectors = new_vectors
 
     def _build_isomorphism_classes(self) -> None:
-        """
-        Group tokens whose (dimension-reduced) bigram-context distributions
-        are (near) identical. Two tokens are treated as isomorphic in the
-        vocabulary if their lexical vectors' cosine similarity, raised to
-        `isomorphism_sharpness`, is >= isomorphism_tau -- i.e. they play
-        the same structural role in the grammar even if they're literally
-        different words. Each class collapses to a single canonical token
-        (its first member, in sorted vocabulary order) so that a vote cast
-        for any member reinforces the whole class.
-        """
         canonical: Dict[str, str] = {}
         assigned = set()
         vocab = self.vocabulary
@@ -502,27 +465,11 @@ class NGramModel:
     def _canonicalize_run(self, run: List[str]) -> Counter:
         return Counter(self._canonical(t) for t in run)
 
-    # ---------------- compounding instruction-likeness curve ----------------
-
     @staticmethod
     def _sigmoid_curve(x: float, k: float, midpoint: float) -> float:
-        """
-        Increasing logistic curve: 0 as x -> -inf, 1 as x -> +inf, 0.5 at
-        x == midpoint. Used to turn a raw cosine similarity (instruction
-        likeness) into a smooth 0..1 bias term. This is the mirror image
-        of `_curve_weight`, which is a *decreasing* curve used for EOS
-        suppression -- this one increases with similarity instead.
-        """
         return 1.0 / (1.0 + math.exp(-k * (x - midpoint)))
 
     def _instruction_vector(self, prompt: str) -> Dict[str, float]:
-        """
-        Build a single fixed context-vector for the whole instruction by
-        summing the (dimension-reduced) lexical vectors of its tokens.
-        This is the target that the compounding curve pulls the final
-        generation toward -- it is computed once from the original prompt
-        and never updated as generation proceeds.
-        """
         tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
         agg: Dict[str, float] = defaultdict(float)
         for t in tokens:
@@ -530,8 +477,6 @@ class NGramModel:
             for ctx, w in vec.items():
                 agg[ctx] += w
         return dict(agg)
-
-    # ---------------- generation ----------------
 
     def _backoff_distribution(self, prev: str, prev_prev: Optional[str]) -> Dict[str, float]:
         if prev_prev is not None:
@@ -574,7 +519,6 @@ class NGramModel:
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
         compound_factor: float = 1.0,
-        invert_instruction: bool = False,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
@@ -613,23 +557,13 @@ class NGramModel:
                 else:
                     score -= transitivity_weight * (math.exp(superpoly_k * mask_penalty) - 1.0)
             if instruction_vector and instruction_weight:
-                # This term stacks additively on top of candidate_modifier
-                # above (the kernel-consensus bias) -- it does not replace
-                # it. compound_factor grows across the generation loop
-                # (see generate()), so this term's influence increases as
-                # the continuation gets longer, "compounding" toward
-                # likeness with the instruction -- unless the length gate
-                # has fired (invert_instruction=True), in which case the
-                # sign is flipped and it pushes away from the instruction
-                # instead, with the same growing magnitude.
                 likeness = cosine_similarity(
                     instruction_vector, self.lexical_vectors.get(token, {})
                 )
                 curved_likeness = self._sigmoid_curve(
                     likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
                 )
-                sign = -1.0 if invert_instruction else 1.0
-                score += sign * instruction_weight * compound_factor * curved_likeness
+                score += instruction_weight * compound_factor * curved_likeness
             scores[token] = score
         return scores
 
@@ -645,7 +579,6 @@ class NGramModel:
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
         compound_factor: float = 1.0,
-        invert_instruction: bool = False,
     ) -> Dict[str, float]:
         scores = self._score_next_token(
             prompt,
@@ -657,7 +590,6 @@ class NGramModel:
             instruction_vector=instruction_vector,
             instruction_weight=instruction_weight,
             compound_factor=compound_factor,
-            invert_instruction=invert_instruction,
         )
         if not scores:
             return {}
@@ -680,7 +612,6 @@ class NGramModel:
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
         compound_factor: float = 1.0,
-        invert_instruction: bool = False,
     ) -> str:
         probs = self._probabilities(
             prompt,
@@ -693,7 +624,6 @@ class NGramModel:
             instruction_vector=instruction_vector,
             instruction_weight=instruction_weight,
             compound_factor=compound_factor,
-            invert_instruction=invert_instruction,
         )
         if not probs:
             return self.eos_token
@@ -780,7 +710,6 @@ class NGramModel:
         # new-token slice for the consensus/canonicalization machinery,
         # which needs <eos>/<bos> to correctly detect run boundaries.
         return self.detokenize(_strip_structural_tokens(generated)), generated[start:]
-
     def multi_generate(
         self,
         prompt: str,
@@ -889,7 +818,6 @@ class NGramModel:
         )
         return final_text, runs, modifier
 
-    # ---------------- non-conjoint context matrix / rhombus selection ----------------
 
     def build_disjointness_matrix(self, top_n: int = 30) -> Tuple[List[str], List[List[float]]]:
         contexts = sorted(
@@ -898,7 +826,6 @@ class NGramModel:
             reverse=True,
         )[:top_n]
         succ_sets = {c: set(self.bigram[c]) for c in contexts}
-
         n = len(contexts)
         matrix = [[0.0] * n for _ in range(n)]
         for i in range(n):
@@ -940,8 +867,6 @@ class NGramModel:
         ]
         pairs.sort(key=lambda t: -t[2])
         return pairs
-
-    # ---------------- Markovian transitivity / prompt-pattern masking ----------------
 
     def transitive_successors(self, token: str, decay: float = 0.5) -> Dict[str, float]:
         direct = self._normalize(self.bigram.get(token, Counter()))
@@ -995,8 +920,6 @@ class NGramModel:
         text = re.sub(r"\s+([.,!?;:)\]}])", r"\1", text)
         text = re.sub(r"([(\[{])\s+", r"\1", text)
         return text
-
-    # ---------------- persistence ----------------
 
     def to_dict(self) -> dict:
         return {
@@ -1062,17 +985,114 @@ class NGramModel:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
+def load_ontology(path: str | Path) -> dict:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if "concepts" not in data:
+        raise ValueError(f"{path} does not look like a terminology_ontology_pipeline.py result")
+    return data
+
+
+def select_concept(ontology: dict, prompt: str) -> dict:
+    prompt_tokens = tokenize(prompt)
+    best, best_score = None, -1.0
+    for concept in ontology["concepts"]:
+        vocab_tokens = []
+        for t in concept["terms"]:
+            vocab_tokens.extend(t["term"].split())
+        for p in concept["properties"]:
+            vocab_tokens.append(p["word"])
+        score = lexical_overlap(prompt_tokens, vocab_tokens)
+        if score > best_score:
+            best, best_score = concept, score
+    if best is None or best_score <= 0.0:
+        best = max(ontology["concepts"], key=lambda c: len(c["terms"]))
+    return best
+
+
+def concept_vocab_modifier(concept: dict) -> Dict[str, float]:
+    weights: Dict[str, float] = defaultdict(float)
+    for t in concept["terms"]:
+        typ = t.get("typicality", 0.5)
+        for word in t["term"].split():
+            weights[word] = max(weights[word], typ)
+    props = concept.get("properties", [])
+    max_g2 = max((p["g2"] for p in props), default=1.0) or 1.0
+    for p in props:
+        norm_g2 = p["g2"] / max_g2
+        weights[p["word"]] = max(weights[p["word"]], norm_g2)
+    if not weights:
+        return {}
+    max_val = max(weights.values())
+    return {w: v / max_val for w, v in weights.items()} if max_val > 0 else dict(weights)
+
+
 def _strip_structural_tokens(tokens: List[str]) -> List[str]:
-    """Drop <bos>/<eos>/<unk> before display -- the underlying generate()
-    treats them as ordinary vocabulary (see module docstring), so
-    generated text needs this cleanup to read as plain text rather than
-    leaking markup."""
     return [t for t in tokens if t not in IGNORED_TOKENS]
 
 
-# ============================================================
-# Display
-# ============================================================
+def generate_list(
+    model: "NGramModel",
+    concept: dict,
+    modifier: Dict[str, float],
+    modifier_weight: float,
+    num_items: int,
+    max_new_tokens_per_item: int,
+    temperature: float,
+    top_k: int,
+    prompt: str = "",
+    instruction_weight: float = INSTRUCTION_COMPOUND_WEIGHT,
+    compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
+    compound_cap: float = INSTRUCTION_COMPOUND_CAP,
+) -> List[Tuple[str, str]]:
+    ranked_terms = sorted(concept["terms"], key=lambda t: t["typicality"], reverse=True)
+    seeds = [t["term"] for t in ranked_terms[:num_items]]
+    while len(seeds) < num_items and ranked_terms:
+        seeds.append(ranked_terms[len(seeds) % len(ranked_terms)]["term"])
+    instruction_vector = (
+        model._instruction_vector(prompt) if (prompt and instruction_weight) else None
+    )
+    items = []
+    for seed in seeds:
+        generated_tokens = tokenize(seed)
+        compound_factor = 1.0
+        for _ in range(max_new_tokens_per_item):
+            next_tok = model.sample_next(
+                " ".join(generated_tokens),
+                temperature=temperature,
+                top_k=top_k,
+                candidate_modifier=modifier,
+                modifier_weight=modifier_weight,
+                instruction_vector=instruction_vector,
+                instruction_weight=instruction_weight,
+                compound_factor=compound_factor,
+            )
+            if next_tok == model.eos_token:
+                break
+            generated_tokens.append(next_tok)
+            if instruction_vector and instruction_weight:
+                likeness = cosine_similarity(
+                    instruction_vector, model.lexical_vectors.get(next_tok, {})
+                )
+                curved_likeness = NGramModel._sigmoid_curve(
+                    likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
+                )
+                compound_factor = min(
+                    compound_cap, compound_factor * (1.0 + compound_growth * curved_likeness)
+                )
+        item_text = NGramModel.detokenize(_strip_structural_tokens(generated_tokens))
+        items.append((seed, item_text))
+    return items
+
+
+def display_list(concept: dict, items: List[Tuple[str, str]]) -> None:
+    print()
+    print("=" * 70)
+    print(f"GENERATED LIST -- concept {concept['concept_id']} "
+          f"(parent {concept['parent_concept_id']})")
+    print("=" * 70)
+    for i, (seed, text) in enumerate(items, start=1):
+        print(f"  {i}. [{seed}] {text}")
+
 
 def display_candidates(candidates: List[Candidate]) -> None:
     print()
@@ -1124,22 +1144,22 @@ def display_generation(generated: str) -> None:
     print(generated)
 
 
-# ============================================================
-# Main
-# ============================================================
-
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="N-gram consensus generator with kernel-weighted "
-                     "ensemble consensus and a length-gated instruction "
-                     "bias inversion on the final pass.")
+        description="N-gram consensus generator, optionally biased by a "
+                     "terminology_ontology_pipeline.py result for list generation.")
     parser.add_argument("--corpus", type=str, default=None,
                          help="Corpus filename (skips the interactive prompt if given).")
-    parser.add_argument("--inversion-gate-tokens", type=int, default=INVERSION_GATE_TOKENS,
-                         help="Number of new tokens generated in the final pass before the "
-                              "instruction-likeness bias flips sign. Use a negative number "
-                              "or omit to keep the default; pass a value >= max-new-tokens "
-                              "to effectively disable the inversion.")
+    parser.add_argument("--ontology", type=str, default=None,
+                         help="Path to a terminology_ontology_pipeline.py JSON result. "
+                              "When set, each prompt also produces a generated list "
+                              "from the best-matching concept's controlled vocabulary.")
+    parser.add_argument("--list-items", type=int, default=500,
+                         help="Number of list items to generate per prompt.")
+    parser.add_argument("--list-tokens", type=int, default=120,
+                         help="Max tokens generated per list item.")
+    parser.add_argument("--list-modifier-weight", type=float, default=MODIFIER_WEIGHT,
+                         help="How strongly the concept vocabulary biases list generation.")
     return parser.parse_args()
 
 
@@ -1150,6 +1170,16 @@ def main() -> None:
     if not corpus_path.exists():
         print(f"\nERROR: {corpus_path} does not exist.")
         return
+
+    ontology = None
+    if args.ontology:
+        try:
+            ontology = load_ontology(args.ontology)
+            print(f"\nLoaded ontology: {len(ontology['concepts'])} concepts "
+                  f"from {args.ontology}")
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"\nERROR loading ontology: {e}")
+            return
 
     corpus_text = corpus_path.read_text(encoding="utf-8")
 
@@ -1176,6 +1206,12 @@ def main() -> None:
     search = CorpusSearch(lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT)
     search.build_index(corpus_text)
 
+    # Initialize CUDA backend after model is finalized
+    print("\nInitializing CUDA backend...")
+    cuda_model = CUDANGramBackend()
+    cuda_model.finalize_cuda(model)
+    print(f"Running on device: {DEVICE}")
+
     while True:
         prompt = input("\nUSER: ").strip()
         if not prompt:
@@ -1186,21 +1222,53 @@ def main() -> None:
         display_candidates(candidates)
 
         print(f"\nRunning {NUM_GENERATIONS} scratch generations for kernelized consensus...")
-        final_text, runs, modifier = model.generate_consensus(
-            prompt,
-            num_generations=NUM_GENERATIONS,
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-            kernel_sharpness=KERNEL_SHARPNESS,
-            modifier_weight=MODIFIER_WEIGHT,
-            inversion_gate_tokens=args.inversion_gate_tokens,
-        )
+        # Use CUDA consensus modifier
+        runs = model.multi_generate(prompt, NUM_GENERATIONS, MAX_NEW_TOKENS, TEMPERATURE, TOP_K)
+        modifier = cuda_model.consensus_modifier(runs, KERNEL_SHARPNESS)
         display_ensemble(runs, modifier)
 
-        print("\nGenerating final (modifier-biased, compounding toward "
-              f"instruction, inverting after {args.inversion_gate_tokens} tokens)...")
+        print("\nGenerating final (modifier-biased, compounding toward instruction)...")
+        # Use CUDA sampling for final generation
+        generated = tokenize(prompt)
+        instruction_vector = model._instruction_vector(prompt)
+        compound_factor = 1.0
+        for _ in range(MAX_NEW_TOKENS):
+            token = cuda_model.sample_next(
+                generated,
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+                candidate_modifier=modifier,
+                modifier_weight=MODIFIER_WEIGHT,
+                instruction_vector=torch.tensor(list(instruction_vector.values()), dtype=DTYPE, device=DEVICE) if instruction_vector else None,
+                instruction_weight=INSTRUCTION_COMPOUND_WEIGHT,
+                compound_factor=compound_factor,
+            )
+            generated.append(token)
+            if instruction_vector:
+                tok_vec = model.lexical_vectors.get(token, {})
+                likeness = cosine_similarity(instruction_vector, tok_vec)
+                curved_likeness = NGramModel._sigmoid_curve(
+                    likeness, INSTRUCTION_COMPOUND_CURVE_K, INSTRUCTION_COMPOUND_MIDPOINT
+                )
+                compound_factor = min(
+                    INSTRUCTION_COMPOUND_CAP, compound_factor * (1.0 + INSTRUCTION_COMPOUND_GROWTH * curved_likeness)
+                )
+        final_text = model.detokenize(_strip_structural_tokens(generated))
         display_generation(final_text)
+
+        if ontology is not None:
+            concept = select_concept(ontology, prompt)
+            list_modifier = concept_vocab_modifier(concept)
+            items = generate_list(
+                model, concept, list_modifier,
+                modifier_weight=args.list_modifier_weight,
+                num_items=args.list_items,
+                max_new_tokens_per_item=args.list_tokens,
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+                prompt=prompt,
+            )
+            display_list(concept, items)
 
 
 if __name__ == "__main__":
