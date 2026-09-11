@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import torch
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DTYPE = torch.float32
+
 # ============================================================
 # Small n-gram language model + corpus similarity search.
 #
@@ -23,9 +28,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 #      50/50 with the raw baseline token probability) to bias the
 #      per-token scores, PLUS a compounding instruction-likeness curve
 #      (see below) that pulls the final text back toward the original
-#      instruction as it gets longer, PLUS a length-gated inversion
-#      (see below) that flips that instruction-likeness bias once the
-#      continuation passes a configured length
+#      instruction as it gets longer
 #
 # --- Kernelized adversarial consensus ---
 # Each scratch run is first canonicalized through the vocabulary's
@@ -85,19 +88,11 @@ from typing import Dict, Iterable, List, Optional, Tuple
 # clamped at INSTRUCTION_COMPOUND_CAP so it cannot spiral into simply
 # echoing the instruction back verbatim. This bias stacks additively on
 # top of whatever candidate_modifier is already active (the kernel
-# consensus modifier), rather than replacing it. The factor resets to
-# 1.0 at the start of every independent continuation (each generate()
-# call), so it never carries over across calls.
-#
-# --- Length-gated inversion (final generation only) ---
-# Once the generated continuation reaches INVERSION_GATE_TOKENS new
-# tokens, the instruction-likeness term above is inverted: instead of
-# adding `instruction_weight * compound_factor * curved_likeness` to a
-# candidate's score, the sign is flipped, so from that point on the
-# generation is pushed *away* from the instruction vector instead of
-# toward it. This only affects the sign of that one additive term --
-# the kernel-consensus modifier and the raw n-gram score are untouched.
-# Before the gate, generation behaves exactly as described above.
+# consensus modifier, or the ontology's concept-vocabulary modifier in
+# list generation), rather than replacing it. The factor resets to 1.0
+# at the start of every independent continuation (each generate() call,
+# each list item), so it never carries over and saturates across an
+# entire multi-item list.
 #
 # (The original script also computed a "post-generation rebinding"
 #  pass and a "second generation" pass, but neither was ever
@@ -150,19 +145,17 @@ TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise s
 INSTRUCTION_COMPOUND_CURVE_K = 12.0        # steepness of the increasing sigmoid applied
                                             # to a candidate token's cosine similarity
                                             # to the instruction vector
-INSTRUCTION_COMPOUND_MIDPOINT = 0.3        # similarity value at which the curve crosses 0.5
-INSTRUCTION_COMPOUND_GROWTH = 0.15         # how much each chosen token's instruction-likeness
+INSTRUCTION_COMPOUND_MIDPOINT = 0.9        # similarity value at which the curve crosses 0.5
+INSTRUCTION_COMPOUND_GROWTH = 0.85         # how much each chosen token's instruction-likeness
                                             # grows the running compound_factor
-INSTRUCTION_COMPOUND_CAP = 4.0             # hard ceiling on compound_factor, so the pull
+INSTRUCTION_COMPOUND_CAP = 14.0             # hard ceiling on compound_factor, so the pull
                                             # toward the instruction cannot run away into
                                             # degenerate echoing of the prompt
-INSTRUCTION_COMPOUND_WEIGHT = 0.4          # base strength of the instruction-likeness bias
+INSTRUCTION_COMPOUND_WEIGHT = 10.4          # base strength of the instruction-likeness bias
                                             # in the score, before compounding is applied
 
-INVERSION_GATE_TOKENS = 60                 # once the final generation has produced this many
-                                            # new tokens, the instruction-likeness bias term
-                                            # flips sign (pulls away from the instruction
-                                            # instead of toward it) for the rest of the run
+
+INVERSION_GATE_TOKENS = 60       
 
 RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
 random.seed(RANDOM_SEED)
@@ -192,7 +185,14 @@ def bag_of_words(tokens: Iterable[str]) -> Counter:
     return Counter(t for t in tokens if t not in IGNORED_TOKENS)
 
 
-def cosine_similarity(a: Dict[str, float], b: Dict[str, float]) -> float:
+
+def cosine_similarity(a, b, eps=1e-12):
+    """GPU-compatible cosine similarity for dict or tensor inputs."""
+    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
+        a = a / torch.clamp(torch.linalg.vector_norm(a, dim=-1, keepdim=True), min=eps)
+        b = b / torch.clamp(torch.linalg.vector_norm(b, dim=-1, keepdim=True), min=eps)
+        return (a * b).sum(dim=-1)
+    # Fallback to dict version
     if not a or not b:
         return 0.0
     common = set(a) & set(b)
@@ -290,6 +290,11 @@ class CorpusSearch:
         for i, c in enumerate(candidates, start=1):
             c.rank = i
         return candidates
+
+
+# ============================================================
+# N-gram language model
+# ============================================================
 
 
 # ============================================================
@@ -1070,6 +1075,7 @@ def _strip_structural_tokens(tokens: List[str]) -> List[str]:
     return [t for t in tokens if t not in IGNORED_TOKENS]
 
 
+
 # ============================================================
 # Display
 # ============================================================
@@ -1130,16 +1136,20 @@ def display_generation(generated: str) -> None:
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="N-gram consensus generator with kernel-weighted "
-                     "ensemble consensus and a length-gated instruction "
-                     "bias inversion on the final pass.")
+        description="N-gram consensus generator, optionally biased by a "
+                     "terminology_ontology_pipeline.py result for list generation.")
     parser.add_argument("--corpus", type=str, default=None,
                          help="Corpus filename (skips the interactive prompt if given).")
-    parser.add_argument("--inversion-gate-tokens", type=int, default=INVERSION_GATE_TOKENS,
-                         help="Number of new tokens generated in the final pass before the "
-                              "instruction-likeness bias flips sign. Use a negative number "
-                              "or omit to keep the default; pass a value >= max-new-tokens "
-                              "to effectively disable the inversion.")
+    parser.add_argument("--ontology", type=str, default=None,
+                         help="Path to a terminology_ontology_pipeline.py JSON result. "
+                              "When set, each prompt also produces a generated list "
+                              "from the best-matching concept's controlled vocabulary.")
+    parser.add_argument("--list-items", type=int, default=500,
+                         help="Number of list items to generate per prompt.")
+    parser.add_argument("--list-tokens", type=int, default=120,
+                         help="Max tokens generated per list item.")
+    parser.add_argument("--list-modifier-weight", type=float, default=MODIFIER_WEIGHT,
+                         help="How strongly the concept vocabulary biases list generation.")
     return parser.parse_args()
 
 
@@ -1150,6 +1160,16 @@ def main() -> None:
     if not corpus_path.exists():
         print(f"\nERROR: {corpus_path} does not exist.")
         return
+
+    ontology = None
+    if args.ontology:
+        try:
+            ontology = load_ontology(args.ontology)
+            print(f"\nLoaded ontology: {len(ontology['concepts'])} concepts "
+                  f"from {args.ontology}")
+        except (OSError, ValueError, json.JSONDecodeError) as e:
+            print(f"\nERROR loading ontology: {e}")
+            return
 
     corpus_text = corpus_path.read_text(encoding="utf-8")
 
@@ -1194,13 +1214,25 @@ def main() -> None:
             top_k=TOP_K,
             kernel_sharpness=KERNEL_SHARPNESS,
             modifier_weight=MODIFIER_WEIGHT,
-            inversion_gate_tokens=args.inversion_gate_tokens,
         )
         display_ensemble(runs, modifier)
 
-        print("\nGenerating final (modifier-biased, compounding toward "
-              f"instruction, inverting after {args.inversion_gate_tokens} tokens)...")
+        print("\nGenerating final (modifier-biased, compounding toward instruction)...")
         display_generation(final_text)
+
+        if ontology is not None:
+            concept = select_concept(ontology, prompt)
+            list_modifier = concept_vocab_modifier(concept)
+            items = generate_list(
+                model, concept, list_modifier,
+                modifier_weight=args.list_modifier_weight,
+                num_items=args.list_items,
+                max_new_tokens_per_item=args.list_tokens,
+                temperature=TEMPERATURE,
+                top_k=TOP_K,
+                prompt=prompt,
+            )
+            display_list(concept, items)
 
 
 if __name__ == "__main__":
