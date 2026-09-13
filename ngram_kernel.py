@@ -720,8 +720,25 @@ class NGramModel:
         compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
         compound_cap: float = INSTRUCTION_COMPOUND_CAP,
         inversion_gate_tokens: Optional[int] = INVERSION_GATE_TOKENS,
+        reform_window: int = 0,
+        reform_passes: int = 1,
     ) -> str:
+        """
+        reform_window/reform_passes ("reform previous tokens in sync"):
+        Off by default (reform_window=0), matching prior behavior exactly.
+        When reform_window > 0, after each new token is appended we walk
+        back over the last `reform_window` *generated* tokens (never the
+        fixed prompt) and re-sample each one, in place, using whatever
+        `compound_factor` / instruction pull / modifiers apply *right now*
+        -- not the (earlier, less-informed) state that picked it originally.
+        This is done `reform_passes` times per step, left-to-right, so a
+        reformed token can itself be re-reformed later in the same pass
+        using its now-updated left neighbor. It keeps earlier tokens "in
+        sync" with the trajectory the sequence has since taken, rather
+        than freezing them at generation time.
+        """
         generated = tokenize(prompt)
+        prompt_len = len(generated)
 
         # Fixed instruction target, built once from the original prompt
         # (never recomputed from the growing `generated` list). Off by
@@ -730,6 +747,27 @@ class NGramModel:
         # final pass) opt in explicitly.
         instruction_vector = self._instruction_vector(prompt) if instruction_weight else None
         compound_factor = 1.0
+
+        def _resample_at(pos: int, invert: bool) -> str:
+            # Re-sample generated[pos] using only the tokens *before* it
+            # (the model is left-context only) but with the *current*
+            # compound_factor/instruction state, so the choice reflects
+            # how far the generation has progressed since pos was first
+            # picked.
+            left_context = " ".join(generated[:pos])
+            return self.sample_next(
+                left_context,
+                temperature,
+                top_k,
+                candidate_modifier,
+                modifier_weight,
+                transitivity_mask,
+                transitivity_weight,
+                instruction_vector=instruction_vector,
+                instruction_weight=instruction_weight,
+                compound_factor=compound_factor,
+                invert_instruction=invert,
+            )
 
         for step in range(max_new_tokens):
             # Length-gated inversion: once `step` reaches the gate, the
@@ -762,6 +800,17 @@ class NGramModel:
                 compound_factor = min(
                     compound_cap, compound_factor * (1.0 + compound_growth * curved_likeness)
                 )
+
+            if reform_window > 0:
+                # Only reform tokens we generated ourselves, never the
+                # user's original prompt, and never the token we just
+                # picked this step (it's already maximally "in sync").
+                window_start = max(prompt_len, len(generated) - 1 - reform_window)
+                window_end = len(generated) - 1
+                for _ in range(max(reform_passes, 1)):
+                    for pos in range(window_start, window_end):
+                        generated[pos] = _resample_at(pos, invert)
+
         # <bos>/<eos>/<unk> stay in `generated` for scoring purposes
         # (backoff distributions and the curve weight depend on seeing
         # them) but are stripped before the text is ever shown to the user.
