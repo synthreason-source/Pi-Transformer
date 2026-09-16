@@ -1660,16 +1660,25 @@ def load_or_train_model(
     return model
 
 
-
 import argparse
+import math
 from pathlib import Path
+from typing import Any
 
 import gradio as gr
+import numpy as np
 
-
+# --------------------------- Config ---------------------------------
 
 MODEL_JSON = "model.json"
 DEFAULT_CORPUS_FILE = "corpus.txt"
+
+TEXT_MAX_NEW_TOKENS = 80
+TEXT_TEMPERATURE = 0.8
+TEXT_TOP_K = 20
+
+
+# --------------------------- Globals --------------------------------
 
 TEXT_MODEL: NGramModel | None = None
 CORPUS_SEARCH: CorpusSearch | None = None
@@ -1715,8 +1724,133 @@ def reload_globals():
     CORPUS_SEARCH = load_corpus_search(corpus_text)
 
 
-# ----------------- Callbacks (fill with your logic) -----------------
+# ------------------- Image feature extraction -----------------------
 
+def flip_image_horizontal(image: Any) -> np.ndarray | None:
+    if image is None:
+        return None
+
+    if hasattr(image, "convert"):
+        image = np.array(image.convert("RGB"))
+
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        return np.fliplr(image)
+    if image.ndim == 3:
+        return np.fliplr(image)
+    return image
+
+
+def safe_float(x: float) -> float:
+    if math.isnan(x) or math.isinf(x):
+        return 0.0
+    return x
+
+
+def image_to_feature_tokens(
+    image: Any,
+    n_bins: int = 8,
+) -> list[str]:
+    if image is None:
+        return ["no_image"]
+
+    if hasattr(image, "convert"):
+        image = np.array(image.convert("RGB"))
+
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        image = np.stack([image, image, image], axis=-1)
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+
+    img = image.astype(np.float32)
+
+    # Per-channel stats
+    means = [safe_float(img[:, :, c].mean()) for c in range(3)]
+    stds = [safe_float(img[:, :, c].std()) for c in range(3)]
+
+    # Global brightness & contrast
+    gray = img.mean(axis=-1)
+    brightness = safe_float(float(gray.mean()))
+    contrast = safe_float(float(gray.std()))
+
+    # Histogram features
+    hist_features = []
+    for c in range(3):
+        channel = img[:, :, c].ravel()
+        hist, _ = np.histogram(channel, bins=n_bins, range=(0.0, 255.0))
+        hist = hist.astype(np.float32)
+        total = hist.sum()
+        probs = hist / total if total else np.zeros_like(hist)
+        probs_str = "_".join(f"{p:.2f}" for p in probs)
+        ch_label = ["r", "g", "b"][c]
+        hist_features.append(f"{ch_label}_hist_{probs_str}")
+
+    def quantize_0_255(x: float, steps: int = 5) -> str:
+        x = max(0.0, min(255.0, x))
+        bucket = int(x / 255.0 * steps)
+        bucket = max(0, min(steps - 1, bucket))
+        return f"b{bucket}"
+
+    mean_tokens = [f"mean_{quantize_0_255(m)}" for m in means]
+    std_tokens = [f"std_{quantize_0_255(s)}" for s in stds]
+    bright_token = f"bright_{quantize_0_255(brightness)}"
+    contrast_token = f"contrast_{quantize_0_255(contrast)}"
+
+    tokens = (
+        ["image"]
+        + mean_tokens
+        + std_tokens
+        + [bright_token, contrast_token]
+        + hist_features
+    )
+    return tokens
+
+
+def tokens_to_prompt_text(tokens: list[str]) -> str:
+    if not tokens:
+        return "no_image"
+    return " ".join(tokens)
+
+
+# ------------------- Text model helpers -----------------------------
+
+def format_matches(prompt: str, limit: int = 5) -> str:
+    if CORPUS_SEARCH is None or not CORPUS_SEARCH.references:
+        return "No corpus file loaded."
+
+    candidates = CORPUS_SEARCH.analyze(prompt, limit=limit)
+    if not candidates:
+        return "No corpus matches found."
+
+    lines = []
+    for candidate in candidates:
+        lines.append(
+            f"{candidate.rank}. "
+            f"{candidate.sentence} "
+            f"(score={candidate.score:.3f}, "
+            f"overlap={candidate.symbolic_overlap:.3f}, "
+            f"vector={candidate.vector_similarity:.3f})"
+        )
+    return "\n".join(lines)
+
+
+def generate_text(prompt: str) -> str:
+    if TEXT_MODEL is None:
+        return "Model not loaded. Train first."
+    if not prompt.strip():
+        return ""
+    return TEXT_MODEL.generate(
+        prompt=prompt,
+        max_new_tokens=TEXT_MAX_NEW_TOKENS,
+        temperature=TEXT_TEMPERATURE,
+        top_k=TEXT_TOP_K,
+    )
+
+
+# ------------------- Training callback ------------------------------
 
 def train_model_from_file(corpus_file):
     global CORPUS_TEXT_CACHE
@@ -1750,32 +1884,45 @@ def train_model_from_file(corpus_file):
         f"Vocabulary: {len(model.vocabulary)}\n"
         f"Unigrams: {len(model.unigram)}\n"
         f"Bigram contexts: {len(model.bigram)}\n"
-        f"Trigram contexts: {len(model.trigram)}"
+        f"Trigram contexts: {len(model.trigram)}\n"
+        f"Isomorphism classes: "
+        f"{len(set(model.isomorphism_map.values()))} "
+        f"from {len(model.isomorphism_map)} tokens"
     )
 
     return f"Model trained and saved to {MODEL_JSON}.", sample_lines, summary
 
 
+# ------------------- Inference callback -----------------------------
+
 def process_camera_image(image, user_prompt: str):
-    # Replace with your actual image→tokens→generation logic
     if TEXT_MODEL is None or CORPUS_SEARCH is None:
         return (
             image,
-            "Model not loaded. Train first.",
+            "Model not loaded. Upload a corpus and click 'Train model' first.",
             "",
             "",
         )
 
-    # TODO: plug in your image feature + generation code here
-    tokens_text = "image features not implemented yet"
-    corpus_matches = "No matches."
-    generated = "No generation."
+    # Flip is already done by browser mirror; but we can still apply if desired
+    flipped = flip_image_horizontal(image)
 
-    return image, tokens_text, corpus_matches, generated
+    feature_tokens = image_to_feature_tokens(flipped)
+    image_prompt = tokens_to_prompt_text(feature_tokens)
+
+    if user_prompt and user_prompt.strip():
+        full_prompt = f"{image_prompt} . {user_prompt.strip()}"
+    else:
+        full_prompt = image_prompt
+
+    corpus_matches = format_matches(full_prompt, limit=5)
+    generated = generate_text(full_prompt)
+    tokens_text = " ".join(feature_tokens)
+
+    return flipped, tokens_text, corpus_matches, generated
 
 
 # --------------------------- UI -------------------------------------
-
 
 with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
     gr.Markdown(
@@ -1784,7 +1931,7 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
 
 1. Upload any file as corpus.
 2. Click **Train model**.
-3. Use the webcam to run inference.
+3. Use the mirrored webcam to generate text from image features.
 """
     )
 
@@ -1827,8 +1974,8 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
             camera = gr.Image(
                 sources=["webcam", "upload"],
                 type="numpy",
-                label="Camera image",
-                webcam_options=gr.WebcamOptions(mirror=False),
+                label="Camera image (mirrored)",
+                webcam_options=gr.WebcamOptions(mirror=True),
             )
             user_prompt = gr.Textbox(
                 label="Optional question",
