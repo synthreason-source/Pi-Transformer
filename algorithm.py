@@ -8,19 +8,22 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple, Any
 
 import torch
+import numpy as np
+import gradio as gr
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
 
 MODEL_PATH = "model.json"
+DEFAULT_CORPUS_FILE = "corpus.txt"
 
-MAX_NEW_TOKENS = 500
+MAX_NEW_TOKENS = 80
 TEMPERATURE = 0.8
-TOP_K = 120
+TOP_K = 20
 
 MIN_COUNT = 1
 INFLUENCE_TAU = 0.7
@@ -56,8 +59,6 @@ INSTRUCTION_COMPOUND_WEIGHT = 1.4
 
 RANDOM_SEED = None
 random.seed(RANDOM_SEED)
-
-
 
 
 IGNORED_TOKENS = {
@@ -1045,6 +1046,7 @@ class NGramModel:
         top_k: int = 20,
         transitivity_mask: Optional[Dict[str, float]] = None,
         transitivity_weight: float = 0.0,
+        instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
         compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
         compound_cap: float = INSTRUCTION_COMPOUND_CAP,
@@ -1054,11 +1056,7 @@ class NGramModel:
         generated = tokenize(prompt)
         prompt_length = len(generated)
 
-        instruction_target = (
-            self.instruction_vector(prompt)
-            if instruction_weight
-            else None
-        )
+        instruction_target = instruction_vector
 
         compound_factor = 1.0
 
@@ -1134,197 +1132,9 @@ class NGramModel:
 
         return self.detokenize(visible_tokens)
 
-    def build_disjointness_matrix(
-        self,
-        top_n: int = 30,
-    ) -> Tuple[List[str], List[List[float]]]:
-        contexts = sorted(
-            self.bigram.keys(),
-            key=lambda context: sum(
-                self.bigram[context].values()
-            ),
-            reverse=True,
-        )[:top_n]
-
-        successor_sets = {
-            context: set(self.bigram[context])
-            for context in contexts
-        }
-
-        count = len(contexts)
-
-        matrix = [
-            [0.0] * count
-            for _ in range(count)
-        ]
-
-        for first_index in range(count):
-            first_set = successor_sets[
-                contexts[first_index]
-            ]
-
-            for second_index in range(count):
-                second_set = successor_sets[
-                    contexts[second_index]
-                ]
-
-                union = first_set | second_set
-
-                if not union:
-                    score = 1.0
-                else:
-                    score = 1.0 - (
-                        len(first_set & second_set)
-                        / len(union)
-                    )
-
-                matrix[first_index][second_index] = score
-
-        return contexts, matrix
-
-    @staticmethod
-    def rhombus_select_lateral(
-        matrix: List[List[float]],
-        radius: int = 2,
-    ) -> Dict[Tuple[int, int], float]:
-        count = len(matrix)
-        selected: Dict[Tuple[int, int], float] = {}
-
-        for first_index in range(count):
-            for second_index in range(count):
-                if first_index == second_index:
-                    continue
-
-                if abs(first_index - second_index) <= radius:
-                    selected[
-                        (first_index, second_index)
-                    ] = matrix[first_index][second_index]
-
-        return selected
-
-    def non_conjoint_lateral_report(
-        self,
-        top_n: int = 30,
-        radius: int = 2,
-        threshold: float = 0.999,
-    ) -> List[Tuple[str, str, float]]:
-        contexts, matrix = self.build_disjointness_matrix(top_n)
-
-        lateral = self.rhombus_select_lateral(
-            matrix,
-            radius,
-        )
-
-        pairs = [
-            (
-                contexts[first_index],
-                contexts[second_index],
-                score,
-            )
-            for (
-                first_index,
-                second_index,
-            ), score in lateral.items()
-            if score >= threshold
-            and contexts[first_index] not in IGNORED_TOKENS
-            and contexts[second_index] not in IGNORED_TOKENS
-        ]
-
-        pairs.sort(key=lambda item: -item[2])
-
-        return pairs
-
-    def transitive_successors(
-        self,
-        token: str,
-        decay: float = 0.5,
-    ) -> Dict[str, float]:
-        direct = self.normalize(
-            self.bigram.get(token, Counter())
-        )
-
-        transitive: Dict[str, float] = defaultdict(float)
-
-        for middle, first_probability in direct.items():
-            if middle in IGNORED_TOKENS:
-                continue
-
-            middle_direct = self.normalize(
-                self.bigram.get(middle, Counter())
-            )
-
-            for successor, second_probability in middle_direct.items():
-                transitive[successor] += (
-                    first_probability
-                    * second_probability
-                    * decay
-                )
-
-        return dict(transitive)
-
-    def prompt_transitivity_mask(
-        self,
-        prompt: str,
-        decay: float = 0.5,
-    ) -> Dict[str, float]:
-        tokens = [
-            token
-            for token in tokenize(prompt)
-            if token not in IGNORED_TOKENS
-        ]
-
-        mask: Dict[str, float] = defaultdict(float)
-        seen = set()
-
-        for token in tokens:
-            if token in seen:
-                continue
-
-            seen.add(token)
-
-            successors = self.transitive_successors(
-                token,
-                decay,
-            )
-
-            for successor, weight in successors.items():
-                if weight > mask[successor]:
-                    mask[successor] = weight
-
-        return dict(mask)
-
-    def generate_with_transitivity_mask(
-        self,
-        prompt: str,
-        max_new_tokens: int = 50,
-        temperature: float = 0.8,
-        top_k: int = 20,
-        decay: float = TRANSITIVITY_DECAY,
-        transitivity_weight: float = TRANSITIVITY_WEIGHT,
-    ) -> Tuple[str, Dict[str, float]]:
-        if not self.finalized:
-            self.finalize()
-
-        mask = self.prompt_transitivity_mask(
-            prompt,
-            decay,
-        )
-
-        text = self.generate(
-            prompt=prompt,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            top_k=top_k,
-            transitivity_mask=mask,
-            transitivity_weight=transitivity_weight,
-        )
-
-        return text, mask
-
     @staticmethod
     def detokenize(tokens: List[str]) -> str:
-        text =tokens
-        return text
+        return " ".join(tokens)
 
     def to_dict(self) -> dict:
         return {
@@ -1502,183 +1312,106 @@ def strip_structural_tokens(
     ]
 
 
-def display_candidates(
-    candidates: List[Candidate],
-) -> None:
-    print()
-    print("=" * 70)
-    print("CORPUS MATCHES")
-    print("=" * 70)
+# ------------------- Direct Tensor Image Projection -----------------
 
-    if not candidates:
-        print("No candidates found.")
-        return
+def flip_image_horizontal(image: Any) -> np.ndarray | None:
+    if image is None:
+        return None
 
-    for candidate in candidates:
-        print(
-            f"\n[{candidate.rank}] "
-            f"score={candidate.score:.3f} "
-            f"overlap={candidate.symbolic_overlap:.3f} "
-            f"vector={candidate.vector_similarity:.3f}\n"
-            f"{candidate.sentence}"
-        )
+    if hasattr(image, "convert"):
+        image = np.array(image.convert("RGB"))
+
+    image = np.asarray(image)
+
+    if image.ndim == 2:
+        return np.fliplr(image)
+    if image.ndim == 3:
+        return np.fliplr(image)
+    return image
 
 
-def display_non_conjoint(
-    pairs: List[Tuple[str, str, float]],
-) -> None:
-    print()
-    print("=" * 70)
-    print("NON-CONJOINT CONTEXTS")
-    print("=" * 70)
+def extract_raw_image_tensor(image: Any, n_bins: int = 8) -> torch.Tensor:
+    if image is None:
+        return torch.zeros(3 + 3 + 2 + (3 * n_bins), dtype=DTYPE, device=DEVICE)
 
-    if not pairs:
-        print("No fully non-conjoint context pairs found.")
-        return
+    if hasattr(image, "convert"):
+        image = np.array(image.convert("RGB"))
+    image = np.asarray(image)
 
-    for first, second, score in pairs[:15]:
-        print(
-            f"  {first!r:<25} "
-            f"<-/-> {second!r:<25} "
-            f"disjointness={score:.3f}"
-        )
+    if image.ndim == 2:
+        image = np.stack([image, image, image], axis=-1)
+    if image.shape[-1] == 1:
+        image = np.repeat(image, 3, axis=-1)
+
+    img = image.astype(np.float32)
+
+    means = [float(img[:, :, c].mean()) / 255.0 for c in range(3)]
+    stds = [float(img[:, :, c].std()) / 255.0 for c in range(3)]
+    
+    gray = img.mean(axis=-1)
+    brightness = float(gray.mean()) / 255.0
+    contrast = float(gray.std()) / 255.0
+
+    hist_features = []
+    for c in range(3):
+        channel = img[:, :, c].ravel()
+        hist, _ = np.histogram(channel, bins=n_bins, range=(0.0, 255.0))
+        hist = hist.astype(np.float32)
+        total = hist.sum()
+        probs = hist / total if total else np.zeros_like(hist)
+        hist_features.extend(probs.tolist())
+
+    feature_vector = means + stds + [brightness, contrast] + hist_features
+    return torch.tensor(feature_vector, dtype=DTYPE, device=DEVICE)
 
 
-def display_generation(generated: str) -> None:
-    print()
-    print("=" * 70)
-    print("GENERATED")
-    print("=" * 70)
-    print()
-    print(' '.join(generated))
+def project_image_to_lexical_vector(
+    model: NGramModel,
+    image: Any,
+) -> Dict[str, float]:
+    if not model.finalized:
+        model.finalize()
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "GPU-assisted n-gram corpus generator "
-            "without ensemble or inverse generation."
-        )
+    context_keys = sorted(
+        {
+            key
+            for vector in model.lexical_vectors.values()
+            for key in vector
+        }
     )
 
-    parser.add_argument(
-        "--corpus",
-        type=str,
-        default=None,
-        help=(
-            "Corpus filename. If omitted, the program asks "
-            "interactively."
-        ),
+    if not context_keys:
+        return {}
+
+    img_tensor = extract_raw_image_tensor(image)
+    img_dim = img_tensor.shape[0]
+    ctx_dim = len(context_keys)
+
+    generator = torch.Generator(device=DEVICE)
+    generator.manual_seed(42)
+
+    projection_matrix = torch.randn(
+        (img_dim, ctx_dim),
+        generator=generator,
+        dtype=DTYPE,
+        device=DEVICE,
     )
+    projection_matrix = torch.nn.functional.normalize(projection_matrix, dim=0)
 
-    parser.add_argument(
-        "--model",
-        type=str,
-        default=MODEL_PATH,
-        help="JSON model filename.",
-    )
+    projected = img_tensor @ projection_matrix
+    projected = torch.tanh(projected)
 
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=MAX_NEW_TOKENS,
-        help="Maximum number of generated tokens.",
-    )
+    result = {}
+    projected_cpu = projected.detach().cpu()
+    for i, key in enumerate(context_keys):
+        val = float(projected_cpu[i].item())
+        if abs(val) > 1e-6:
+            result[key] = val
 
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=TEMPERATURE,
-        help="Sampling temperature.",
-    )
-
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=TOP_K,
-        help="Number of candidate tokens sampled from.",
-    )
-
-    parser.add_argument(
-        "--no-bilinear",
-        action="store_true",
-        help="Disable the deep bilinear activation.",
-    )
-
-    parser.add_argument(
-        "--instruction-weight",
-        type=float,
-        default=0.0,
-        help=(
-            "Optional instruction-likeness bias. "
-            "Default: 0, disabled."
-        ),
-    )
-
-    parser.add_argument(
-        "--reform-window",
-        type=int,
-        default=0,
-        help=(
-            "Number of recently generated tokens to resample "
-            "after each step. Default: 0."
-        ),
-    )
-
-    parser.add_argument(
-        "--reform-passes",
-        type=int,
-        default=1,
-        help="Number of reform passes.",
-    )
-
-    return parser.parse_args()
+    return result
 
 
-def load_or_train_model(
-    corpus_text: str,
-    model_path: Path,
-    disable_bilinear: bool,
-) -> NGramModel:
-    if model_path.exists():
-        print("\nLoading existing model...")
-        return NGramModel.load_json(model_path)
-
-    print("\nTraining n-gram model...")
-
-    model = NGramModel(
-        min_count=MIN_COUNT,
-        influence_tau=INFLUENCE_TAU,
-        enable_deep_bilinear_activation=(
-            not disable_bilinear
-        ),
-    )
-
-    model.ingest_text(corpus_text)
-    model.finalize()
-    model.save_json(model_path)
-
-    return model
-
-
-import argparse
-import math
-from pathlib import Path
-from typing import Any
-
-import gradio as gr
-import numpy as np
-
-# --------------------------- Config ---------------------------------
-
-MODEL_JSON = "model.json"
-DEFAULT_CORPUS_FILE = "corpus.txt"
-
-TEXT_MAX_NEW_TOKENS = 80
-TEXT_TEMPERATURE = 0.8
-TEXT_TOP_K = 20
-
-
-# --------------------------- Globals --------------------------------
+# ------------------- Globals & Inference Helpers --------------------
 
 TEXT_MODEL: NGramModel | None = None
 CORPUS_SEARCH: CorpusSearch | None = None
@@ -1686,10 +1419,10 @@ CORPUS_TEXT_CACHE: str | None = None
 
 
 def load_text_model() -> NGramModel:
-    model_path = Path(MODEL_JSON)
+    model_path = Path(MODEL_PATH)
     if not model_path.exists():
         raise FileNotFoundError(
-            f"{MODEL_JSON} not found. Upload a corpus and click 'Train model' first."
+            f"{MODEL_PATH} not found. Upload a corpus and click 'Train model' first."
         )
     model = NGramModel.load_json(model_path)
     if not model.finalized:
@@ -1724,99 +1457,6 @@ def reload_globals():
     CORPUS_SEARCH = load_corpus_search(corpus_text)
 
 
-# ------------------- Image feature extraction -----------------------
-
-def flip_image_horizontal(image: Any) -> np.ndarray | None:
-    if image is None:
-        return None
-
-    if hasattr(image, "convert"):
-        image = np.array(image.convert("RGB"))
-
-    image = np.asarray(image)
-
-    if image.ndim == 2:
-        return np.fliplr(image)
-    if image.ndim == 3:
-        return np.fliplr(image)
-    return image
-
-
-def safe_float(x: float) -> float:
-    if math.isnan(x) or math.isinf(x):
-        return 0.0
-    return x
-
-
-def image_to_feature_tokens(
-    image: Any,
-    n_bins: int = 8,
-) -> list[str]:
-    if image is None:
-        return ["no_image"]
-
-    if hasattr(image, "convert"):
-        image = np.array(image.convert("RGB"))
-
-    image = np.asarray(image)
-
-    if image.ndim == 2:
-        image = np.stack([image, image, image], axis=-1)
-    if image.shape[-1] == 1:
-        image = np.repeat(image, 3, axis=-1)
-
-    img = image.astype(np.float32)
-
-    # Per-channel stats
-    means = [safe_float(img[:, :, c].mean()) for c in range(3)]
-    stds = [safe_float(img[:, :, c].std()) for c in range(3)]
-
-    # Global brightness & contrast
-    gray = img.mean(axis=-1)
-    brightness = safe_float(float(gray.mean()))
-    contrast = safe_float(float(gray.std()))
-
-    # Histogram features
-    hist_features = []
-    for c in range(3):
-        channel = img[:, :, c].ravel()
-        hist, _ = np.histogram(channel, bins=n_bins, range=(0.0, 255.0))
-        hist = hist.astype(np.float32)
-        total = hist.sum()
-        probs = hist / total if total else np.zeros_like(hist)
-        probs_str = "_".join(f"{p:.2f}" for p in probs)
-        ch_label = ["r", "g", "b"][c]
-        hist_features.append(f"{ch_label}_hist_{probs_str}")
-
-    def quantize_0_255(x: float, steps: int = 5) -> str:
-        x = max(0.0, min(255.0, x))
-        bucket = int(x / 255.0 * steps)
-        bucket = max(0, min(steps - 1, bucket))
-        return f"b{bucket}"
-
-    mean_tokens = [f"mean_{quantize_0_255(m)}" for m in means]
-    std_tokens = [f"std_{quantize_0_255(s)}" for s in stds]
-    bright_token = f"bright_{quantize_0_255(brightness)}"
-    contrast_token = f"contrast_{quantize_0_255(contrast)}"
-
-    tokens = (
-        ["image"]
-        + mean_tokens
-        + std_tokens
-        + [bright_token, contrast_token]
-        + hist_features
-    )
-    return tokens
-
-
-def tokens_to_prompt_text(tokens: list[str]) -> str:
-    if not tokens:
-        return "no_image"
-    return " ".join(tokens)
-
-
-# ------------------- Text model helpers -----------------------------
-
 def format_matches(prompt: str, limit: int = 5) -> str:
     if CORPUS_SEARCH is None or not CORPUS_SEARCH.references:
         return "No corpus file loaded."
@@ -1836,21 +1476,6 @@ def format_matches(prompt: str, limit: int = 5) -> str:
         )
     return "\n".join(lines)
 
-
-def generate_text(prompt: str) -> str:
-    if TEXT_MODEL is None:
-        return "Model not loaded. Train first."
-    if not prompt.strip():
-        return ""
-    return TEXT_MODEL.generate(
-        prompt=prompt,
-        max_new_tokens=TEXT_MAX_NEW_TOKENS,
-        temperature=TEXT_TEMPERATURE,
-        top_k=TEXT_TOP_K,
-    )
-
-
-# ------------------- Training callback ------------------------------
 
 def train_model_from_file(corpus_file):
     global CORPUS_TEXT_CACHE
@@ -1873,7 +1498,7 @@ def train_model_from_file(corpus_file):
     model.ingest_text(corpus_text)
     model.finalize()
 
-    model_path = Path(MODEL_JSON)
+    model_path = Path(MODEL_PATH)
     model.save_json(model_path)
 
     reload_globals()
@@ -1890,10 +1515,8 @@ def train_model_from_file(corpus_file):
         f"from {len(model.isomorphism_map)} tokens"
     )
 
-    return f"Model trained and saved to {MODEL_JSON}.", sample_lines, summary
+    return f"Model trained and saved to {MODEL_PATH}.", sample_lines, summary
 
-
-# ------------------- Inference callback -----------------------------
 
 def process_camera_image(image, user_prompt: str):
     if TEXT_MODEL is None or CORPUS_SEARCH is None:
@@ -1904,38 +1527,48 @@ def process_camera_image(image, user_prompt: str):
             "",
         )
 
-    # Flip is already done by browser mirror; but we can still apply if desired
     flipped = flip_image_horizontal(image)
-
-    feature_tokens = image_to_feature_tokens(flipped)
-    image_prompt = tokens_to_prompt_text(feature_tokens)
+    image_vector = project_image_to_lexical_vector(TEXT_MODEL, flipped)
 
     if user_prompt and user_prompt.strip():
-        full_prompt = f"{image_prompt} . {user_prompt.strip()}"
+        generated = TEXT_MODEL.generate(
+            prompt=user_prompt.strip(),
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            instruction_vector=image_vector,
+            instruction_weight=1.5,
+        )
+        corpus_matches = format_matches(user_prompt.strip(), limit=5)
     else:
-        full_prompt = image_prompt
+        generated = TEXT_MODEL.generate(
+            prompt="<bos>",
+            max_new_tokens=MAX_NEW_TOKENS,
+            temperature=TEMPERATURE,
+            top_k=TOP_K,
+            instruction_vector=image_vector,
+            instruction_weight=1.5,
+        )
+        corpus_matches = "No prompt provided for corpus search."
 
-    corpus_matches = format_matches(full_prompt, limit=5)
-    generated = generate_text(full_prompt)
-    tokens_text = " ".join(feature_tokens)
+    vector_summary = f"Projected {len(image_vector)} active dimensions into model lexical space."
 
-    return flipped, tokens_text, corpus_matches, generated
+    return flipped, vector_summary, corpus_matches, generated
 
 
 # --------------------------- UI -------------------------------------
 
-with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
+with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
     gr.Markdown(
         """
-# Camera + Math-Faceted Tau Model
+# Camera Tensor-Faceted Tau Model
 
 1. Upload any file as corpus.
 2. Click **Train model**.
-3. Use the mirrored webcam to generate text from image features.
+3. Use the webcam/upload to project image tensors directly into model inference.
 """
     )
 
-    # ---- Training section ----
     gr.Markdown("## 1. Corpus & Training")
 
     with gr.Row():
@@ -1966,23 +1599,22 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
         outputs=[train_status, corpus_sample, model_summary],
     )
 
-    # ---- Camera & inference section ----
-    gr.Markdown("## 2. Camera + Inference")
+    gr.Markdown("## 2. Camera + Tensor Inference")
 
     with gr.Row():
         with gr.Column(scale=1):
             camera = gr.Image(
                 sources=["webcam", "upload"],
                 type="numpy",
-                label="Camera image (mirrored)",
-                webcam_options=gr.WebcamOptions(mirror=True),
+                label="Camera image",
+                webcam_options=gr.WebcamOptions(mirror=False),
             )
             user_prompt = gr.Textbox(
-                label="Optional question",
+                label="Optional text prompt",
                 lines=3,
             )
             recognize_button = gr.Button(
-                "Process image",
+                "Process image tensor",
                 variant="primary",
             )
 
@@ -1992,8 +1624,8 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
                 type="numpy",
             )
             feature_tokens_output = gr.Textbox(
-                label="Image-derived feature tokens",
-                lines=4,
+                label="Image Tensor Mapping Status",
+                lines=2,
             )
             corpus_output = gr.Textbox(
                 label="Corpus matches",
