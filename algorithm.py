@@ -1784,7 +1784,7 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
 
 1. Upload any file as corpus.
 2. Click **Train model**.
-3. Use the mirrored webcam to run inference.
+3. Use the webcam to run inference.
 """
     )
 
@@ -1827,8 +1827,8 @@ with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
             camera = gr.Image(
                 sources=["webcam", "upload"],
                 type="numpy",
-                label="Camera image (mirrored)",
-                webcam_options=gr.WebcamOptions(mirror=True),
+                label="Camera image",
+                webcam_options=gr.WebcamOptions(mirror=False),
             )
             user_prompt = gr.Textbox(
                 label="Optional question",
