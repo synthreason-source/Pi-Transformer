@@ -1,7 +1,9 @@
 #include <Arduino.h>
 #include <cmath>
 
-// Static Configuration Limits (No Heap Allocation)
+// Static Configuration Limits (Zero Heap Allocation)
+#define MAX_WORDS 64
+#define VECTOR_DIM 8
 #define MAX_TRANSITIONS 256
 #define MAX_TOKEN_LEN 24
 
@@ -10,12 +12,20 @@ const float CURVE_K = 18.0f;
 const float CURVE_MIDPOINT = 0.5f;
 
 // Static Data Structures
+struct WordEmbedding {
+    char word[MAX_TOKEN_LEN];
+    float vector[VECTOR_DIM];
+};
+
 struct Transition {
     char prev[MAX_TOKEN_LEN];
     char next[MAX_TOKEN_LEN];
     int count;
     float base_prob;
 };
+
+WordEmbedding vocab[MAX_WORDS];
+int vocab_count = 0;
 
 Transition transitions[MAX_TRANSITIONS];
 int transition_count = 0;
@@ -49,13 +59,73 @@ int tokenizeLine(const char* line, char tokens[][MAX_TOKEN_LEN], int max_tokens)
     return token_idx;
 }
 
-// Ingest text line safely into static memory
+// Generate or retrieve a deterministic embedding vector for a word (Zero Heap)
+void getOrCreateEmbedding(const char* word, float* out_vec) {
+    for (int i = 0; i < vocab_count; i++) {
+        if (strcmp(vocab[i].word, word) == 0) {
+            for (int d = 0; d < VECTOR_DIM; d++) out_vec[d] = vocab[i].vector[d];
+            return;
+        }
+    }
+
+    if (vocab_count < MAX_WORDS) {
+        strncpy(vocab[vocab_count].word, word, MAX_TOKEN_LEN - 1);
+        vocab[vocab_count].word[MAX_TOKEN_LEN - 1] = '\0';
+        
+        // Generate pseudo-embedding feature vector via character hashing/trigonometry
+        for (int d = 0; d < VECTOR_DIM; d++) {
+            float val = 0.0f;
+            for (int c = 0; word[c] != '\0'; c++) {
+                val += sinf((float)(c + 1) * (d + 1) * word[c]);
+            }
+            vocab[vocab_count].vector[d] = val / (float)(strlen(word) + 1);
+        }
+
+        for (int d = 0; d < VECTOR_DIM; d++) out_vec[d] = vocab[vocab_count].vector[d];
+        vocab_count++;
+    } else {
+        for (int d = 0; d < VECTOR_DIM; d++) out_vec[d] = 0.1f;
+    }
+}
+
+// Math 1: True Vector Cosine Similarity
+float computeCosineSimilarity(const char* wordA, const char* wordB) {
+    float vecA[VECTOR_DIM];
+    float vecB[VECTOR_DIM];
+    getOrCreateEmbedding(wordA, vecA);
+    getOrCreateEmbedding(wordB, vecB);
+
+    float dot = 0.0f;
+    float normA = 0.0f;
+    float normB = 0.0f;
+
+    for (int d = 0; d < VECTOR_DIM; d++) {
+        dot += vecA[d] * vecB[d];
+        normA += vecA[d] * vecA[d];
+        normB += vecB[d] * vecB[d];
+    }
+
+    if (normA <= 0.0f || normB <= 0.0f) return 0.0f;
+    return dot / (sqrtf(normA) * sqrtf(normB));
+}
+
+// Math 2: Sigmoid Curve Transformation
+float sigmoidCurve(float value, float k, float midpoint) {
+    return 1.0f / (1.0f + expf(-k * (value - midpoint)));
+}
+
+// Ingest text line into static transitions and build embeddings
 void ingestTextLine(const char* line) {
     char tokens[16][MAX_TOKEN_LEN];
     int num_tokens = tokenizeLine(line, tokens, 16);
     if (num_tokens < 2) return;
 
     for (int i = 0; i < num_tokens - 1; ++i) {
+        // Ensure embeddings exist for vector math
+        float dummy[VECTOR_DIM];
+        getOrCreateEmbedding(tokens[i], dummy);
+        getOrCreateEmbedding(tokens[i+1], dummy);
+
         bool found = false;
         for (int j = 0; j < transition_count; j++) {
             if (strcmp(transitions[j].prev, tokens[i]) == 0 && 
@@ -76,15 +146,12 @@ void ingestTextLine(const char* line) {
                 transitions[transition_count].count = 1;
                 transitions[transition_count].base_prob = 0.0f;
                 transition_count++;
-            } else {
-                Serial.println("[Warning] Transition table capacity reached.");
-                break;
             }
         }
     }
 }
 
-// Finalize probabilities using static indexing
+// Finalize dataset probabilities
 void finalizeDataset() {
     for (int i = 0; i < transition_count; i++) {
         int totalContextCount = 0;
@@ -97,33 +164,11 @@ void finalizeDataset() {
             transitions[i].base_prob = (float)transitions[i].count / (float)totalContextCount;
         }
     }
-    Serial.printf("[Dataset] Finalized. Statically loaded %d transitions.\n", transition_count);
+    Serial.printf("[Dataset] Finalized. %d transitions, %d vocabulary tokens loaded.\n", 
+                  transition_count, vocab_count);
 }
 
-// Math 1: Compute Semantic Similarity via Transition Overlaps
-float computeSemanticSimilarity(const char* wordA, const char* wordB) {
-    float sharedOverlap = 0.0f;
-    float totalA = 0.0f;
-    float totalB = 0.0f;
-
-    for (int i = 0; i < transition_count; i++) {
-        if (strcmp(transitions[i].prev, wordA) == 0) totalA += transitions[i].base_prob;
-        if (strcmp(transitions[i].prev, wordB) == 0) totalB += transitions[i].base_prob;
-        if (strcmp(transitions[i].next, wordA) == 0 && strcmp(transitions[i].next, wordB) == 0) {
-            sharedOverlap += 0.5f;
-        }
-    }
-
-    if (totalA <= 0.0f || totalB <= 0.0f) return 0.1f;
-    return fminf(1.0f, sharedOverlap / sqrtf(totalA * totalB) + 0.2f);
-}
-
-// Math 2: Sigmoid Curve Transformation
-float sigmoidCurve(float value, float k, float midpoint) {
-    return 1.0f / (1.0f + expf(-k * (value - midpoint)));
-}
-
-// Real-Time Static Math Inference Loop
+// Real-Time Math Inference Loop (Cosine Similarity + Sigmoid + Noise)
 void processPromptWithMath(const char* inputPrompt) {
     if (transition_count == 0) {
         Serial.println("[Error] Dataset is empty! Send 'UPLOAD_START' first.");
@@ -141,7 +186,7 @@ void processPromptWithMath(const char* inputPrompt) {
     char outputBuffer[256];
     snprintf(outputBuffer, sizeof(outputBuffer), "%s", inputPrompt);
 
-    Serial.println("\n--- Static-Memory Mathematical Inference ---");
+    Serial.println("\n--- Vector Cosine & Sigmoid Inference ---");
     Serial.printf("Context: %s\n", currentContext);
 
     for (int step = 0; step < 5; step++) {
@@ -150,7 +195,8 @@ void processPromptWithMath(const char* inputPrompt) {
 
         for (int i = 0; i < transition_count; i++) {
             if (strcmp(transitions[i].prev, currentContext) == 0) {
-                float similarity = computeSemanticSimilarity(currentContext, transitions[i].next);
+                // Math Execution: Cosine Similarity & Sigmoid Scaling
+                float similarity = computeCosineSimilarity(currentContext, transitions[i].next);
                 float curveWeight = sigmoidCurve(transitions[i].base_prob, CURVE_K, CURVE_MIDPOINT);
                 
                 float score = logf(fmaxf(transitions[i].base_prob, 1e-12f)) + (curveWeight * 0.5f * similarity);
@@ -174,13 +220,13 @@ void processPromptWithMath(const char* inputPrompt) {
     }
 
     Serial.printf("Output: %s\n", outputBuffer);
-    Serial.println("---------------------------------------------\n");
+    Serial.println------------------------------------------------\n");
 }
 
 void setup() {
     Serial.begin(115200);
     delay(1000);
-    Serial.println("[ESP32-C3] Zero-Heap Static Math Engine Ready.");
+    Serial.println("[ESP32-C3] Zero-Heap Vector Math Engine Ready.");
 }
 
 void loop() {
@@ -192,6 +238,7 @@ void loop() {
         if (inputStr == "UPLOAD_START") {
             current_state = STATE_RECEIVING_DATA;
             transition_count = 0;
+            vocab_count = 0;
             Serial.println("[System] Ready for text lines. Send 'UPLOAD_END' when finished.");
             return;
         }
