@@ -220,7 +220,7 @@ void processPromptWithMath(const char* inputPrompt) {
     }
 
     Serial.printf("Output: %s\n", outputBuffer);
-    Serial.println------------------------------------------------\n");
+    Serial.println("------------------------------------------------\n");
 }
 
 void setup() {
