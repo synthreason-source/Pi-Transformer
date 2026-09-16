@@ -437,7 +437,7 @@ class NGramModel:
             )
 
             merged_vector = (
-                rows[first_index] - rows[second_index]
+                rows[first_index] + rows[second_index]
             ).unsqueeze(0)
 
             merged_members = (
@@ -572,34 +572,24 @@ class NGramModel:
         current_keys = input_keys
 
         for layer in range(self.bilinear_layers):
-            projection_u = self.hash_projection_matrix(
-                current_keys,
-                layer,
-                0,
-                dimension,
+            # u and v now share the SAME hash projection, so their product
+            # is an elementwise square (>= 0 wherever the projection is
+            # nonzero) instead of the product of two uncorrelated random
+            # projections, which cancelled to zero almost immediately.
+            projection = self.hash_projection_matrix(
+                current_keys, layer, 0, dimension,
             )
 
-            projection_v = self.hash_projection_matrix(
-                current_keys,
-                layer,
-                1,
-                dimension,
-            )
+            u = x @ projection
+            v = u
 
-            u = x @ projection_u
-            v = x @ projection_v
+            x = torch.tanh(self.bilinear_scale * u * v)
 
-            x = torch.tanh(
-                self.bilinear_scale * u * v
-            )
-
-            current_keys = [
-                f"L{layer}:{index}"
-                for index in range(dimension)
-            ]
+            current_keys = [f"L{layer}:{index}" for index in range(dimension)]
 
             if not torch.any(x):
                 break
+
 
         x_cpu = x.detach().cpu()
         nonzero_rows, nonzero_columns = torch.nonzero(
