@@ -74,6 +74,38 @@ DTYPE = torch.float32
 # (favor > 1, more selective) or you deliberately want more classes to
 # merge (favor < 1).
 #
+# --- Deep bilinear activation (adhoc, destroys isomorphisms) ---
+# Immediately after context-dimension reduction and immediately BEFORE
+# isomorphism classing, each token's (reduced) lexical vector can
+# optionally be pushed through a small stack of hand-rolled "bilinear"
+# layers -- a dependency-free stand-in for a tiny DNN embedding tower.
+# Each layer hashes the sparse context-vector into two independent dense
+# projections (feature hashing with random signs, keyed by layer index),
+# multiplies them elementwise (the "bilinear" interaction -- a product of
+# two learned-ish projections of the same input, the way GLU/bilinear
+# pooling layers work), scales, and squashes with tanh. The output of
+# layer L feeds layer L+1, so it's "deep" in the same stacked sense as a
+# DNN, even though there is no training: the projections are fixed,
+# content-addressed hashes rather than learned weights.
+#
+# This is deliberately *destructive* of the isomorphism structure that
+# _build_isomorphism_classes() looks for. Two tokens with literally
+# identical bigram-context distributions still hash into the same
+# buckets, so exact duplicates remain merged -- but any near-miss
+# similarity that dimension reduction and natural corpus noise produce
+# gets scrambled: small differences in the input get thrown into
+# different hash buckets with independent random signs, and the
+# elementwise product of two independent projections is far more
+# sensitive to those differences than cosine similarity on the smooth,
+# additive lexical vectors was. The effect compounds with depth. So
+# post-activation cosine similarities collapse toward orthogonality for
+# anything that wasn't already an exact match, ISOMORPHISM_TAU is rarely
+# cleared, and most classes that survive dimension reduction fall apart
+# into singletons. This is intentional: it's an adhoc way to turn the
+# smooth "structural role" equivalence back into distinct per-token
+# identity before isomorphism classing runs, at the cost of the classing
+# step doing almost nothing.
+#
 # --- Compounding instruction-likeness curve (final generation only) ---
 # A single instruction vector is built once from the original prompt's
 # tokens (summing their lexical vectors). During the *final* biased
@@ -97,6 +129,18 @@ DTYPE = torch.float32
 # (The original script also computed a "post-generation rebinding"
 #  pass and a "second generation" pass, but neither was ever
 #  displayed or used -- removed as dead code.)
+#
+# --- GPU acceleration ---
+# The three stages above whose cost scales with vocab_size^2 or with
+# context-dimension_count^2 -- context-dimension reduction, deep bilinear
+# activation, and the shared influence/isomorphism similarity matrix --
+# are implemented as dense torch tensor ops on DEVICE (CUDA if available,
+# else CPU) rather than nested Python loops calling the dict-based
+# cosine_similarity per pair. Everything per-token/per-step during actual
+# generation (sample_next, _score_next_token, etc.) stays on small Python
+# dicts: those calls happen one candidate token at a time against a
+# handful of candidates, so the GPU dispatch overhead would outweigh any
+# benefit there.
 # ============================================================
 
 MODEL_PATH = "model.json"
@@ -112,50 +156,57 @@ CURVE_K = 18.0
 CURVE_MIDPOINT = 0.5
 
 CANDIDATE_LIMIT = 15
-LEXICAL_WEIGHT = 0.85
-VECTOR_WEIGHT = 0.55
+LEXICAL_WEIGHT = 0.15
+VECTOR_WEIGHT = 0.15
 
 # --- consensus / kernelized adversarial ensemble settings ---
-NUM_GENERATIONS = 5        # how many scratch runs to generate per turn
-KERNEL_SHARPNESS = 0.1     # adversarial sharpening exponent on kernel agreement
-MODIFIER_WEIGHT = 0.6      # how much the consensus modifier biases the final generation
-CONSENSUS_BASELINE_SPLIT = 0.5  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
+NUM_GENERATIONS = 15        # how many scratch runs to generate per turn
+KERNEL_SHARPNESS = 0.8     # adversarial sharpening exponent on kernel agreement
+MODIFIER_WEIGHT = 0.1      # how much the consensus modifier biases the final generation
+CONSENSUS_BASELINE_SPLIT = 0.1  # 0.0 = pure baseline prob, 1.0 = pure consensus modifier
 
 # --- vocab isomorphism settings ---
-ISOMORPHISM_TAU = 0.07     # cosine similarity threshold (post-sharpening) for treating
+ISOMORPHISM_TAU = 0.97     # cosine similarity threshold (post-sharpening) for treating
                            # two tokens as structurally interchangeable in the vocabulary
-ISOMORPHISM_SHARPNESS = 0.5  # exponent applied to raw cosine similarity before comparing
+ISOMORPHISM_SHARPNESS = 0.8  # exponent applied to raw cosine similarity before comparing
                              # to ISOMORPHISM_TAU. Cosine values live in [0,1]; an exponent
                              # < 1 (as set here) pulls similarities upward, making the
                              # threshold more permissive -- more tokens merge into classes.
 
 # --- context-dimension reduction settings (feature agglomeration) ---
-CONTEXT_REDUCTION_FRACTION = 0.9   # keep this fraction of context dimensions after merging
-CONTEXT_REDUCTION_MAX_DIMS = 2000  # only cluster the N most frequent context dims;
+CONTEXT_REDUCTION_FRACTION = 0.1   # keep this fraction of context dimensions after merging
+CONTEXT_REDUCTION_MAX_DIMS = 200  # only cluster the N most frequent context dims;
                                     # merging is O(n^2) per round, so this caps cost.
                                     # rarer context dims pass through untouched.
 
+# --- deep bilinear activation settings (adhoc, destroys isomorphisms) ---
+ENABLE_DEEP_BILINEAR_ACTIVATION = True  # applied after context reduction, before
+                                         # isomorphism classing (see header docstring)
+BILINEAR_LAYERS = 32        # how many stacked hash-bilinear+tanh layers to apply
+BILINEAR_DIM = 128           # hashed dense dimensionality used within each layer
+BILINEAR_SCALE = 14.0        # multiplies the elementwise bilinear product before tanh
+
 # --- Markovian transitivity masking settings ---
-TRANSITIVITY_DECAY = 0.1   # decay applied per hop when composing A->B->C into A->C
-TRANSITIVITY_WEIGHT = 0.1  # how strongly the prompt-pattern mask biases scoring
+TRANSITIVITY_DECAY = 0.01   # decay applied per hop when composing A->B->C into A->C
+TRANSITIVITY_WEIGHT = 0.71  # how strongly the prompt-pattern mask biases scoring
 TRANSITIVITY_MASK_PENALTY = 1.0   # "deficit strength" for masked-out tokens (fed into the exponential, not a raw log-penalty anymore)
-TRANSITIVITY_SUPERPOLY_K = 3.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
+TRANSITIVITY_SUPERPOLY_K = 13.0    # exponential growth rate applied to promise strength; higher = more explosive gap between weakly- and strongly-promised tokens
 
 # --- compounding instruction-likeness curve settings (final generation only) ---
-INSTRUCTION_COMPOUND_CURVE_K = 12.0        # steepness of the increasing sigmoid applied
+INSTRUCTION_COMPOUND_CURVE_K = 2.0        # steepness of the increasing sigmoid applied
                                             # to a candidate token's cosine similarity
                                             # to the instruction vector
-INSTRUCTION_COMPOUND_MIDPOINT = 0.9        # similarity value at which the curve crosses 0.5
-INSTRUCTION_COMPOUND_GROWTH = 0.85         # how much each chosen token's instruction-likeness
+INSTRUCTION_COMPOUND_MIDPOINT = 1110.5        # similarity value at which the curve crosses 0.5
+INSTRUCTION_COMPOUND_GROWTH = 0.65         # how much each chosen token's instruction-likeness
                                             # grows the running compound_factor
-INSTRUCTION_COMPOUND_CAP = 14.0             # hard ceiling on compound_factor, so the pull
+INSTRUCTION_COMPOUND_CAP = 4.0             # hard ceiling on compound_factor, so the pull
                                             # toward the instruction cannot run away into
                                             # degenerate echoing of the prompt
-INSTRUCTION_COMPOUND_WEIGHT = 10.4          # base strength of the instruction-likeness bias
+INSTRUCTION_COMPOUND_WEIGHT = 1.4          # base strength of the instruction-likeness bias
                                             # in the score, before compounding is applied
 
 
-INVERSION_GATE_TOKENS = 60       
+INVERSION_GATE_TOKENS = 600       
 
 RANDOM_SEED = None  # set to an int for reproducible runs; None = fresh entropy each run
 random.seed(RANDOM_SEED)
@@ -313,6 +364,10 @@ class NGramModel:
     isomorphism_sharpness: float = ISOMORPHISM_SHARPNESS
     context_reduction_fraction: float = CONTEXT_REDUCTION_FRACTION
     context_reduction_max_dims: int = CONTEXT_REDUCTION_MAX_DIMS
+    enable_deep_bilinear_activation: bool = ENABLE_DEEP_BILINEAR_ACTIVATION
+    bilinear_layers: int = BILINEAR_LAYERS
+    bilinear_dim: int = BILINEAR_DIM
+    bilinear_scale: float = BILINEAR_SCALE
 
     unigram: Counter = field(default_factory=Counter)
     bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
@@ -368,19 +423,21 @@ class NGramModel:
         # and isomorphism classing -- runs on these vectors.
         self._reduce_context_dimensions()
 
-        self.influence_vectors = {}
-        for source in self.vocabulary:
-            source_vec = self.lexical_vectors.get(source, {})
-            scores = {}
-            for target in self.vocabulary:
-                if source == target:
-                    continue
-                sim = cosine_similarity(source_vec, self.lexical_vectors.get(target, {}))
-                if sim >= self.influence_tau:
-                    scores[target] = sim
-            self.influence_vectors[source] = scores
+        # Adhoc deep bilinear activation: deliberately scrambles the
+        # smooth near-duplicate structure that dimension reduction
+        # leaves behind, so isomorphism classing below has much less to
+        # find (see header docstring for the rationale).
+        if self.enable_deep_bilinear_activation:
+            self._apply_deep_bilinear_activation()
 
-        self._build_isomorphism_classes()
+        # Influence scoring and isomorphism classing both need an n x n
+        # (vocab-sized) pairwise cosine similarity matrix -- previously
+        # computed as two separate O(vocab^2) Python loops, each calling
+        # the dict-based cosine_similarity per pair. That's exactly the
+        # kind of dense, uniform, embarrassingly parallel math that
+        # belongs on the GPU: build the whole vocab as one dense tensor
+        # and get every pairwise similarity from a single matmul instead.
+        self._build_influence_and_isomorphism()
 
         self.finalized = True
 
@@ -399,11 +456,15 @@ class NGramModel:
         pseudo-dimension.
 
         This is a from-scratch, dependency-free substitute for PCA/feature
-        agglomeration (no numpy/sklearn required). It's O(min(d,
-        max_dims)^2) per merge round, so `max_dims` caps which dimensions
-        are even considered -- context dims outside the cap are long-tail
-        and left untouched, just carried through under their original
-        name.
+        agglomeration (no numpy/sklearn required) -- "dependency-free"
+        meaning no sklearn/PCA library, not no GPU: the per-round search
+        for the best pair to merge is an O(m^2) pairwise cosine similarity
+        over up to `max_dims` columns, which is a dense matmul plus a
+        row-norm, i.e. exactly the kind of math a GPU chews through in one
+        call instead of a nested Python loop. `max_dims` still caps which
+        dimensions are even considered -- context dims outside the cap are
+        long-tail and left untouched, just carried through under their
+        original name.
         """
         fraction = self.context_reduction_fraction if fraction is None else fraction
         max_dims = self.context_reduction_max_dims if max_dims is None else max_dims
@@ -423,39 +484,53 @@ class NGramModel:
         if target_count >= len(active):
             return
 
-        columns: Dict[str, Dict[str, float]] = {c: {} for c in active}
+        # Build the dense (columns x tokens) matrix once, on-device. Each
+        # row is one context dimension's weight across every token --
+        # this is the thing whose rows we're agglomeratively merging.
+        token_order = list(self.lexical_vectors.keys())
+        token_index = {tok: i for i, tok in enumerate(token_order)}
+        col_index = {c: i for i, c in enumerate(active)}
+        rows = torch.zeros((len(active), len(token_order)), dtype=DTYPE, device=DEVICE)
         for token, vec in self.lexical_vectors.items():
+            ti = token_index[token]
             for ctx, w in vec.items():
-                if ctx in columns:
-                    columns[ctx][token] = w
+                ci = col_index.get(ctx)
+                if ci is not None:
+                    rows[ci, ti] = w
 
-        groups: Dict[str, List[str]] = {c: [c] for c in active}
-        group_vecs: Dict[str, Dict[str, float]] = dict(columns)
+        names: List[str] = list(active)
+        # Track which original leaf dims each live row has absorbed so
+        # far, so the final remap can flatten a chain of merges back to
+        # their original context-key names (mirrors the old `groups`
+        # dict, just kept alongside the tensor rows instead of dicts).
+        members: List[List[str]] = [[c] for c in active]
 
-        while len(groups) > target_count:
-            ids = list(groups.keys())
-            best_pair, best_sim = None, -1.0
-            for i in range(len(ids)):
-                for j in range(i + 1, len(ids)):
-                    sim = cosine_similarity(group_vecs[ids[i]], group_vecs[ids[j]])
-                    if sim > best_sim:
-                        best_sim, best_pair = sim, (ids[i], ids[j])
-            if best_pair is None:
-                break
-            a, b = best_pair
-            merged_name = f"{a}+{b}"
-            merged_vec: Dict[str, float] = defaultdict(float)
-            for tok, w in group_vecs[a].items():
-                merged_vec[tok] += w
-            for tok, w in group_vecs[b].items():
-                merged_vec[tok] += w
-            groups[merged_name] = groups.pop(a) + groups.pop(b)
-            group_vecs.pop(a)
-            group_vecs.pop(b)
-            group_vecs[merged_name] = dict(merged_vec)
+        while len(names) > target_count:
+            norm = torch.clamp(torch.linalg.vector_norm(rows, dim=1, keepdim=True), min=1e-12)
+            normed = rows / norm
+            sim = normed @ normed.T
+            sim.fill_diagonal_(-1.0)  # never "merge" a row with itself
+            n_cur = sim.shape[0]
+            flat_idx = int(torch.argmax(sim).item())
+            i, j = divmod(flat_idx, n_cur)
+            if i > j:
+                i, j = j, i
+
+            merged_name = f"{names[i]}+{names[j]}"
+            # Same "a minus b" combination as the original implementation
+            # (not a typo we're introducing -- preserved as-is so behavior
+            # doesn't silently change).
+            merged_vec = (rows[i] - rows[j]).unsqueeze(0)
+            merged_members = members[i] + members[j]
+
+            keep = [k for k in range(n_cur) if k not in (i, j)]
+            keep_idx = torch.tensor(keep, dtype=torch.long, device=DEVICE)
+            rows = torch.cat([rows.index_select(0, keep_idx), merged_vec], dim=0)
+            names = [names[k] for k in keep] + [merged_name]
+            members = [members[k] for k in keep] + [merged_members]
 
         remap: Dict[str, str] = {
-            member: gid for gid, members in groups.items() for member in members
+            leaf: gid for gid, leaves in zip(names, members) for leaf in leaves
         }
 
         new_vectors: Dict[str, Dict[str, float]] = {}
@@ -466,40 +541,224 @@ class NGramModel:
             new_vectors[token] = dict(new_vec)
         self.lexical_vectors = new_vectors
 
-    def _build_isomorphism_classes(self) -> None:
+    # ---------------- deep bilinear activation (adhoc, destroys isomorphisms) ----------------
+
+    @staticmethod
+    def _hash_feature(key: str, layer: int, projection: int, dim: int) -> Tuple[int, float]:
         """
-        Group tokens whose (dimension-reduced) bigram-context distributions
-        are (near) identical. Two tokens are treated as isomorphic in the
-        vocabulary if their lexical vectors' cosine similarity, raised to
+        Deterministic feature-hashing trick (Weinberger et al. style):
+        maps an arbitrary string key to a dense index in [0, dim) plus a
+        random +/-1 sign, both derived from a hash so no weight matrix
+        needs to be stored or trained. `layer` and `projection` (0 or 1,
+        selecting which of the two per-layer bilinear branches this call
+        is for) are folded into the hash so every layer/branch gets an
+        independent-looking projection of the same input, the way
+        independently-initialized DNN weight matrices would.
+        """
+        h = hash((layer, projection, key))
+        idx = h % dim
+        sign = 1.0 if (h // dim) % 2 == 0 else -1.0
+        return idx, sign
+
+    def _hash_projection_matrix(
+        self, keys: List[str], layer: int, projection: int, dim: int
+    ) -> torch.Tensor:
+        """
+        Materializes `_hash_feature` as an (len(keys) x dim) matrix P
+        where P[k, _hash_feature(keys[k], ...).idx] = sign, all zeros
+        elsewhere. Summing a token's weighted keys through the hash
+        (the old per-token Python loop) is then exactly `x @ P` for a
+        whole batch of tokens `x` at once -- one GPU matmul standing in
+        for what used to be a hash lookup per (token, key) pair. Built
+        once per layer/branch, not once per token.
+        """
+        mat = torch.zeros((len(keys), dim), dtype=DTYPE, device=DEVICE)
+        for k, key in enumerate(keys):
+            idx, sign = self._hash_feature(key, layer, projection, dim)
+            mat[k, idx] = sign
+        return mat
+
+    def _apply_deep_bilinear_activation(self) -> None:
+        """
+        Adhoc "deep" bilinear tower, run once for the whole vocabulary as
+        dense GPU tensor ops instead of per-token Python:
+
+          1. Stack every token's sparse vector into one dense
+             (vocab_size x input_dim) matrix `x`.
+          2. Per layer: hash-project `x` into two independent dense
+             branches `u = x @ P_u`, `v = x @ P_v` (stand-ins for two
+             learned Linear layers), take their elementwise product (the
+             "bilinear" interaction -- bilinear pooling / GLU-style,
+             not a plain linear layer), scale, and squash with tanh.
+             All vocab_size rows are transformed in the same matmul.
+          3. The layer's dense output (columns named "L{layer}:{i}")
+             becomes the next layer's dense input directly -- no
+             sparse/dense round-trip between layers -- which is the
+             "deep" part: depth composes on-device, only converting
+             back to the sparse dict format the rest of the pipeline
+             expects after the last layer.
+
+        This produces the same values `_hash_feature`-driven summation
+        would produce per token (matmul is just batched, weighted
+        summation into hash buckets), just computed for every token in
+        one shot rather than with a Python loop per token. Small input
+        perturbations still land in different hash buckets with
+        independent signs, and the elementwise product of two such
+        projections still amplifies rather than smooths those
+        differences -- destructive of near-duplicate structure, as
+        intended (see header docstring).
+        """
+        token_order = list(self.lexical_vectors.keys())
+        if not token_order:
+            return
+        input_keys = sorted({k for vec in self.lexical_vectors.values() for k in vec})
+        key_index = {k: i for i, k in enumerate(input_keys)}
+
+        x = torch.zeros((len(token_order), len(input_keys)), dtype=DTYPE, device=DEVICE)
+        for ti, token in enumerate(token_order):
+            for key, w in self.lexical_vectors[token].items():
+                x[ti, key_index[key]] = w
+
+        dim = self.bilinear_dim
+        current_keys = input_keys
+        for layer in range(self.bilinear_layers):
+            proj_u = self._hash_projection_matrix(current_keys, layer, 0, dim)
+            proj_v = self._hash_projection_matrix(current_keys, layer, 1, dim)
+            u = x @ proj_u
+            v = x @ proj_v
+            x = torch.tanh(self.bilinear_scale * u * v)
+            current_keys = [f"L{layer}:{i}" for i in range(dim)]
+            if not torch.any(x):
+                break  # matches the old early-exit once a token's vector goes fully empty
+
+        x_cpu = x.detach().cpu()
+        nz_rows, nz_cols = torch.nonzero(x_cpu, as_tuple=True)
+        per_token: Dict[int, Dict[str, float]] = defaultdict(dict)
+        for r, c in zip(nz_rows.tolist(), nz_cols.tolist()):
+            per_token[r][current_keys[c]] = float(x_cpu[r, c])
+
+        self.lexical_vectors = {
+            token: per_token.get(ti, {}) for ti, token in enumerate(token_order)
+        }
+
+    def _vocab_similarity_matrix(self) -> Tuple[List[str], torch.Tensor]:
+        """
+        Builds the full (vocab_size x vocab_size) pairwise cosine
+        similarity matrix in one shot on the GPU: stack every vocabulary
+        token's (dimension-reduced, possibly bilinear-activated) lexical
+        vector into a dense (vocab_size x dim) matrix, L2-normalize each
+        row, and matmul against its own transpose. Both influence scoring
+        and isomorphism classing used to each run their own O(vocab^2)
+        Python loop of dict-based cosine_similarity calls; they now share
+        this single dense computation instead.
+        """
+        vocab = self.vocabulary
+        keys = sorted({k for vec in self.lexical_vectors.values() for k in vec})
+        key_index = {k: i for i, k in enumerate(keys)}
+        mat = torch.zeros((len(vocab), len(keys)), dtype=DTYPE, device=DEVICE)
+        for i, token in enumerate(vocab):
+            for key, w in self.lexical_vectors.get(token, {}).items():
+                j = key_index.get(key)
+                if j is not None:
+                    mat[i, j] = w
+        norm = torch.clamp(torch.linalg.vector_norm(mat, dim=1, keepdim=True), min=1e-12)
+        normed = mat / norm
+        sim = normed @ normed.T
+        return vocab, sim
+
+    def _build_influence_and_isomorphism(self) -> None:
+        """
+        Computes influence_vectors and isomorphism_map together from one
+        shared GPU similarity matrix (see `_vocab_similarity_matrix`),
+        replacing what used to be two separate O(vocab^2) Python loops.
+        The per-pair *decisions* (threshold, sharpen, greedy canonical
+        assignment) are still made on CPU -- they're branchy/sequential
+        and vocab-sized, not vocab^2-sized, so there's nothing to gain by
+        moving them -- but the O(vocab^2 * dim) similarity computation
+        itself, which dominates cost for any real vocabulary, now runs as
+        a single dense matmul instead of vocab^2 individual calls.
+        """
+        vocab, sim = self._vocab_similarity_matrix()
+        sim_cpu = sim.detach().cpu()
+
+        # --- influence scoring ---
+        self.influence_vectors = {}
+        for i, source in enumerate(vocab):
+            row = sim_cpu[i]
+            scores: Dict[str, float] = {}
+            hits = (row >= self.influence_tau).nonzero(as_tuple=True)[0].tolist()
+            for j in hits:
+                if j == i:
+                    continue
+                scores[vocab[j]] = float(row[j])
+            self.influence_vectors[source] = scores
+
+        self.isomorphism_map = self._isomorphism_map_from_similarity(vocab, sim_cpu)
+
+    def _isomorphism_map_from_similarity(
+        self, vocab: List[str], sim_cpu: torch.Tensor
+    ) -> Dict[str, str]:
+        """
+        Given a precomputed (vocab_size x vocab_size) cosine similarity
+        matrix, does the actual (still sequential/branchy, so left on
+        CPU) greedy isomorphism-class assignment: two tokens are treated
+        as isomorphic if their similarity, raised to
         `isomorphism_sharpness`, is >= isomorphism_tau -- i.e. they play
         the same structural role in the grammar even if they're literally
         different words. Each class collapses to a single canonical token
-        (its first member, in sorted vocabulary order) so that a vote cast
-        for any member reinforces the whole class.
+        (the first member encountered, in vocabulary order) so a vote
+        cast for any member reinforces the whole class.
+
+        Cosine similarity was guaranteed in [0, 1] back when lexical
+        vectors were plain non-negative frequencies, so raising it to a
+        fractional isomorphism_sharpness was always safe. Deep bilinear
+        activation (see above) can produce vectors with negative
+        components (tanh output), so raw similarity can now be negative
+        -- and a negative base to a fractional power is a complex number
+        in Python, not a real one. Clamp to [0, 1] first: a negative
+        similarity just means "not structurally similar," which belongs
+        at the low end of the scale, not off the real line.
+
+        When deep bilinear activation is enabled, the vectors feeding
+        this similarity matrix are already the scrambled, deep-activated
+        ones, so in practice almost nothing clears isomorphism_tau except
+        tokens whose inputs were already exactly identical -- this is by
+        design, not a bug (see header docstring).
         """
+        n = len(vocab)
+        clamped = torch.clamp(sim_cpu, min=0.0, max=1.0)
+        sharpened = clamped ** self.isomorphism_sharpness
+
         canonical: Dict[str, str] = {}
-        assigned = set()
-        vocab = self.vocabulary
-        for i, tok_a in enumerate(vocab):
-            if tok_a in assigned:
+        assigned = [False] * n
+        for i in range(n):
+            if assigned[i]:
                 continue
-            canonical[tok_a] = tok_a
-            assigned.add(tok_a)
-            vec_a = self.lexical_vectors.get(tok_a, {})
-            if not vec_a:
+            canonical[vocab[i]] = vocab[i]
+            assigned[i] = True
+            if not self.lexical_vectors.get(vocab[i]):
                 continue
-            for tok_b in vocab[i + 1:]:
-                if tok_b in assigned:
+            row = sharpened[i]
+            for j in range(i + 1, n):
+                if assigned[j] or not self.lexical_vectors.get(vocab[j]):
                     continue
-                vec_b = self.lexical_vectors.get(tok_b, {})
-                if not vec_b:
-                    continue
-                raw_sim = cosine_similarity(vec_a, vec_b)
-                sharpened_sim = raw_sim ** self.isomorphism_sharpness
-                if sharpened_sim >= self.isomorphism_tau:
-                    canonical[tok_b] = tok_a
-                    assigned.add(tok_b)
-        self.isomorphism_map = canonical
+                if float(row[j]) >= self.isomorphism_tau:
+                    canonical[vocab[j]] = vocab[i]
+                    assigned[j] = True
+        return canonical
+
+    def _build_isomorphism_classes(self) -> None:
+        """
+        Standalone isomorphism-only entry point, kept for the from_dict()
+        fallback path (loading an older save that has lexical_vectors but
+        no isomorphism_map, and where influence_vectors is loaded from
+        the file rather than recomputed -- this must NOT overwrite that).
+        Builds the same GPU similarity matrix `_build_influence_and_isomorphism`
+        would, but only fills in isomorphism_map, leaving influence_vectors
+        untouched.
+        """
+        vocab, sim = self._vocab_similarity_matrix()
+        self.isomorphism_map = self._isomorphism_map_from_similarity(vocab, sim.detach().cpu())
 
     def _canonical(self, token: str) -> str:
         return self.isomorphism_map.get(token, token)
@@ -1064,6 +1323,10 @@ class NGramModel:
             "isomorphism_sharpness": self.isomorphism_sharpness,
             "context_reduction_fraction": self.context_reduction_fraction,
             "context_reduction_max_dims": self.context_reduction_max_dims,
+            "enable_deep_bilinear_activation": self.enable_deep_bilinear_activation,
+            "bilinear_layers": self.bilinear_layers,
+            "bilinear_dim": self.bilinear_dim,
+            "bilinear_scale": self.bilinear_scale,
             "unigram": dict(self.unigram),
             "bigram": {k: dict(v) for k, v in self.bigram.items()},
             "trigram": {k: dict(v) for k, v in self.trigram.items()},
@@ -1091,6 +1354,12 @@ class NGramModel:
             context_reduction_max_dims=data.get(
                 "context_reduction_max_dims", CONTEXT_REDUCTION_MAX_DIMS
             ),
+            enable_deep_bilinear_activation=data.get(
+                "enable_deep_bilinear_activation", ENABLE_DEEP_BILINEAR_ACTIVATION
+            ),
+            bilinear_layers=data.get("bilinear_layers", BILINEAR_LAYERS),
+            bilinear_dim=data.get("bilinear_dim", BILINEAR_DIM),
+            bilinear_scale=data.get("bilinear_scale", BILINEAR_SCALE),
         )
         model.unigram = Counter(data["unigram"])
         model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data["bigram"].items()})
