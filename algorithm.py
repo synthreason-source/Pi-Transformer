@@ -1660,109 +1660,229 @@ def load_or_train_model(
     return model
 
 
-def main() -> None:
-    args = parse_args()
 
-    corpus_path = (
-        Path(args.corpus)
-        if args.corpus
-        else Path(input("Filename: ").strip())
-    )
+import argparse
+from pathlib import Path
 
-    if not corpus_path.exists():
-        print(f"\nERROR: {corpus_path} does not exist.")
-        return
+import gradio as gr
 
-    corpus_text = corpus_path.read_text(
-        encoding="utf-8",
-        errors="replace",
-    )
 
-    model_path = Path(args.model)
 
-    model = load_or_train_model(
-        corpus_text=corpus_text,
-        model_path=model_path,
-        disable_bilinear=args.no_bilinear,
-    )
+MODEL_JSON = "model.json"
+DEFAULT_CORPUS_FILE = "corpus.txt"
 
-    print(f"\nDevice: {DEVICE}")
-    print(f"Vocabulary: {len(model.vocabulary)}")
-    print(f"Unigrams: {len(model.unigram)}")
-    print(f"Bigram contexts: {len(model.bigram)}")
-    print(f"Trigram contexts: {len(model.trigram)}")
+TEXT_MODEL: NGramModel | None = None
+CORPUS_SEARCH: CorpusSearch | None = None
+CORPUS_TEXT_CACHE: str | None = None
 
-    isomorphism_classes = (
-        len(set(model.isomorphism_map.values()))
-        if model.isomorphism_map
-        else 0
-    )
 
-    print(
-        f"Isomorphism classes: "
-        f"{isomorphism_classes} "
-        f"from {len(model.isomorphism_map)} tokens"
-    )
-
-    non_conjoint_pairs = (
-        model.non_conjoint_lateral_report(
-            top_n=30,
-            radius=2,
-            threshold=0.999,
+def load_text_model() -> NGramModel:
+    model_path = Path(MODEL_JSON)
+    if not model_path.exists():
+        raise FileNotFoundError(
+            f"{MODEL_JSON} not found. Upload a corpus and click 'Train model' first."
         )
-    )
+    model = NGramModel.load_json(model_path)
+    if not model.finalized:
+        model.finalize()
+    return model
 
-    display_non_conjoint(non_conjoint_pairs)
 
-    search = CorpusSearch(
-        lexical_weight=LEXICAL_WEIGHT,
-        vector_weight=VECTOR_WEIGHT,
-    )
-
+def load_corpus_search(corpus_text: str) -> CorpusSearch:
+    search = CorpusSearch()
     search.build_index(corpus_text)
+    return search
 
-    while True:
-        try:
-            prompt = input("\nUSER: ").strip()
-        except EOFError:
-            print()
-            break
-        except KeyboardInterrupt:
-            print("\nExiting.")
-            break
 
-        if not prompt:
-            print("Empty prompt.")
-            continue
+def reload_globals():
+    global TEXT_MODEL, CORPUS_SEARCH, CORPUS_TEXT_CACHE
 
-        if prompt.lower() in {
-            "exit",
-            "quit",
-            ":q",
-        }:
-            break
+    TEXT_MODEL = load_text_model()
 
-        candidates = search.analyze(
-            prompt,
-            limit=CANDIDATE_LIMIT,
+    if CORPUS_TEXT_CACHE:
+        corpus_text = CORPUS_TEXT_CACHE
+    else:
+        default_path = Path(DEFAULT_CORPUS_FILE)
+        if default_path.exists():
+            corpus_text = default_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+            CORPUS_TEXT_CACHE = corpus_text
+        else:
+            corpus_text = ""
+
+    CORPUS_SEARCH = load_corpus_search(corpus_text)
+
+
+# ----------------- Callbacks (fill with your logic) -----------------
+
+
+def train_model_from_file(corpus_file):
+    global CORPUS_TEXT_CACHE
+
+    if corpus_file is None:
+        return "No corpus file uploaded.", "", ""
+
+    if hasattr(corpus_file, "name"):
+        path = Path(corpus_file.name)
+    else:
+        path = Path(corpus_file)
+
+    if not path.exists():
+        return f"Corpus file not found: {path}", "", ""
+
+    corpus_text = path.read_text(encoding="utf-8", errors="replace")
+    CORPUS_TEXT_CACHE = corpus_text
+
+    model = NGramModel()
+    model.ingest_text(corpus_text)
+    model.finalize()
+
+    model_path = Path(MODEL_JSON)
+    model.save_json(model_path)
+
+    reload_globals()
+
+    sample_lines = "\n".join(corpus_text.splitlines()[:5])
+
+    summary = (
+        f"Vocabulary: {len(model.vocabulary)}\n"
+        f"Unigrams: {len(model.unigram)}\n"
+        f"Bigram contexts: {len(model.bigram)}\n"
+        f"Trigram contexts: {len(model.trigram)}"
+    )
+
+    return f"Model trained and saved to {MODEL_JSON}.", sample_lines, summary
+
+
+def process_camera_image(image, user_prompt: str):
+    # Replace with your actual image→tokens→generation logic
+    if TEXT_MODEL is None or CORPUS_SEARCH is None:
+        return (
+            image,
+            "Model not loaded. Train first.",
+            "",
+            "",
         )
 
-        display_candidates(candidates)
+    # TODO: plug in your image feature + generation code here
+    tokens_text = "image features not implemented yet"
+    corpus_matches = "No matches."
+    generated = "No generation."
 
-        print("\nGenerating without ensemble or inversion...")
+    return image, tokens_text, corpus_matches, generated
 
-        generated = model.generate(
-            prompt=prompt,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            instruction_weight=args.instruction_weight,
-            reform_window=args.reform_window,
-            reform_passes=args.reform_passes,
-        )
 
-        display_generation(generated)
+# --------------------------- UI -------------------------------------
+
+
+with gr.Blocks(title="Camera + Math-Faceted Tau Model") as demo:
+    gr.Markdown(
+        """
+# Camera + Math-Faceted Tau Model
+
+1. Upload any file as corpus.
+2. Click **Train model**.
+3. Use the mirrored webcam to run inference.
+"""
+    )
+
+    # ---- Training section ----
+    gr.Markdown("## 1. Corpus & Training")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            corpus_file_input = gr.File(
+                label="Corpus file (any type)",
+                file_types=["file"],
+            )
+            train_button = gr.Button("Train model", variant="primary")
+
+        with gr.Column(scale=2):
+            train_status = gr.Textbox(
+                label="Training status",
+                lines=2,
+            )
+            corpus_sample = gr.Textbox(
+                label="Corpus sample (first 5 lines)",
+                lines=5,
+            )
+            model_summary = gr.Textbox(
+                label="Model summary",
+                lines=6,
+            )
+
+    train_button.click(
+        fn=train_model_from_file,
+        inputs=[corpus_file_input],
+        outputs=[train_status, corpus_sample, model_summary],
+    )
+
+    # ---- Camera & inference section ----
+    gr.Markdown("## 2. Camera + Inference")
+
+    with gr.Row():
+        with gr.Column(scale=1):
+            camera = gr.Image(
+                sources=["webcam", "upload"],
+                type="numpy",
+                label="Camera image (mirrored)",
+                webcam_options=gr.WebcamOptions(mirror=True),
+            )
+            user_prompt = gr.Textbox(
+                label="Optional question",
+                lines=3,
+            )
+            recognize_button = gr.Button(
+                "Process image",
+                variant="primary",
+            )
+
+        with gr.Column(scale=2):
+            processed_image = gr.Image(
+                label="Processed image",
+                type="numpy",
+            )
+            feature_tokens_output = gr.Textbox(
+                label="Image-derived feature tokens",
+                lines=4,
+            )
+            corpus_output = gr.Textbox(
+                label="Corpus matches",
+                lines=6,
+            )
+            generated_output = gr.Textbox(
+                label="Tau model response",
+                lines=8,
+            )
+
+    recognize_button.click(
+        fn=process_camera_image,
+        inputs=[camera, user_prompt],
+        outputs=[
+            processed_image,
+            feature_tokens_output,
+            corpus_output,
+            generated_output,
+        ],
+    )
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--share", action="store_true")
+    parser.add_argument("--server-name", default="127.0.0.1")
+    parser.add_argument("--server-port", type=int, default=7860)
+    args = parser.parse_args()
+
+    try:
+        reload_globals()
+    except FileNotFoundError:
+        pass
+
+    demo.launch(
+        server_name=args.server_name,
+        server_port=args.server_port,
+        share=args.share,
+    )
