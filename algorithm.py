@@ -7,13 +7,19 @@ What's kept (the actual generation kernel):
   - tokenize / n-gram counting (unigram, bigram, trigram)
   - trigram -> bigram -> unigram backoff distribution
   - lexical context vectors (bigram-context bag-of-words per token)
-  - cosine-similarity bias from an "instruction vector" (used for the
-    image -> text steering) folded into next-token scores
+  - cosine-similarity bias from an "instruction vector" folded into
+    next-token scores (still usable by any caller, just no longer fed by
+    a camera image -- see below)
   - temperature + top-k sampling
   - corpus lexical search (unchanged, it was already minimal)
-  - camera image -> fixed-size feature tensor -> random projection into
-    the model's lexical-vector space (unchanged, it was already minimal)
-  - the Gradio UI
+  - the Gradio UI, now text-only (no image/webcam input)
+
+Also removed in this pass: the camera/webcam pipeline (image capture,
+extract_raw_image_tensor, project_image_to_lexical_vector) and the torch
+dependency it existed for. The kernel never needed torch -- it was only
+used to turn a webcam frame into an instruction vector. With that gone the
+app is pure Python + numpy (numpy is kept for the entropy-matrix formulas
+below).
 
 What's removed (previously ~90% of the "math" in the file), because none of
 it changed the kernel's behavior in a way the app's own callers exercised,
@@ -43,11 +49,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import torch
 import gradio as gr
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-DTYPE = torch.float32
 
 MODEL_PATH = "model.json"
 DEFAULT_CORPUS_FILE = "corpus.txt"
@@ -274,7 +276,8 @@ class NGramModel:
     This is the entire kernel: count n-grams, back off trigram -> bigram ->
     unigram for the next-token distribution, and optionally nudge scores
     toward tokens whose bigram-context vector is similar to an external
-    "instruction vector" (e.g. one derived from a camera image).
+    "instruction vector" (kept as a general hook; nothing in this app
+    currently supplies one now that the image pipeline is gone).
     """
 
     eos_token: str = "<eos>"
@@ -315,8 +318,8 @@ class NGramModel:
             self.vocabulary.append(self.unk_token)
 
         # lexical vector for a token = normalized distribution of the
-        # bigram contexts it appears after. This alone is what the image
-        # projection and instruction-bias cosine similarity operate on.
+        # bigram contexts it appears after. This is what the
+        # instruction-bias cosine similarity operates on.
         token_contexts: Dict[str, Counter] = defaultdict(Counter)
         for context, counts in self.bigram.items():
             for token, count in counts.items():
@@ -481,67 +484,6 @@ class NGramModel:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-# --------------------- image -> lexical-space projection -----------------
-
-def extract_raw_image_tensor(image: Any, n_bins: int = 8) -> torch.Tensor:
-    if image is None:
-        return torch.zeros(3 + 3 + 2 + (3 * n_bins), dtype=DTYPE, device=DEVICE)
-
-    if hasattr(image, "convert"):
-        image = np.array(image.convert("RGB"))
-    image = np.asarray(image)
-
-    if image.ndim == 2:
-        image = np.stack([image, image, image], axis=-1)
-    if image.shape[-1] == 1:
-        image = np.repeat(image, 3, axis=-1)
-
-    img = image.astype(np.float32)
-    means = [float(img[:, :, c].mean()) / 255.0 for c in range(3)]
-    stds = [float(img[:, :, c].std()) / 255.0 for c in range(3)]
-
-    gray = img.mean(axis=-1)
-    brightness = float(gray.mean()) / 255.0
-    contrast = float(gray.std()) / 255.0
-
-    hist_features = []
-    for c in range(3):
-        channel = img[:, :, c].ravel()
-        hist, _ = np.histogram(channel, bins=n_bins, range=(0.0, 255.0))
-        total = hist.sum()
-        probs = hist.astype(np.float32) / total if total else np.zeros_like(hist, dtype=np.float32)
-        hist_features.extend(probs.tolist())
-
-    feature_vector = means + stds + [brightness, contrast] + hist_features
-    return torch.tensor(feature_vector, dtype=DTYPE, device=DEVICE)
-
-
-def project_image_to_lexical_vector(model: NGramModel, image: Any) -> Dict[str, float]:
-    if not model.finalized:
-        model.finalize()
-
-    context_keys = sorted({k for v in model.lexical_vectors.values() for k in v})
-    if not context_keys:
-        return {}
-
-    img_tensor = extract_raw_image_tensor(image)
-
-    generator = torch.Generator(device=DEVICE)
-    generator.manual_seed(42)
-    projection_matrix = torch.randn(
-        (img_tensor.shape[0], len(context_keys)), generator=generator, dtype=DTYPE, device=DEVICE
-    )
-    projection_matrix = torch.nn.functional.normalize(projection_matrix, dim=0)
-
-    projected = torch.tanh(img_tensor @ projection_matrix).detach().cpu()
-
-    return {
-        key: float(projected[i].item())
-        for i, key in enumerate(context_keys)
-        if abs(float(projected[i].item())) > 1e-6
-    }
-
-
 # ------------------------- globals & UI wiring ---------------------------
 
 TEXT_MODEL: NGramModel | None = None
@@ -620,11 +562,10 @@ def train_model_from_file(corpus_file):
     return f"Model trained and saved to {MODEL_PATH}.", sample_lines, summary
 
 
-def process_camera_image(image, user_prompt: str):
+def generate_from_prompt(user_prompt: str):
     if TEXT_MODEL is None or CORPUS_SEARCH is None:
-        return image, "Model not loaded. Upload a corpus and click 'Train model' first.", "", ""
+        return "Model not loaded. Upload a corpus and click 'Train model' first.", ""
 
-    image_vector = project_image_to_lexical_vector(TEXT_MODEL, image)
     prompt = user_prompt.strip() if user_prompt and user_prompt.strip() else "<bos>"
 
     generated = TEXT_MODEL.generate(
@@ -632,23 +573,20 @@ def process_camera_image(image, user_prompt: str):
         max_new_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
-        instruction_vector=image_vector,
-        instruction_weight=INSTRUCTION_WEIGHT,
     )
     corpus_matches = format_matches(prompt, limit=5) if prompt != "<bos>" else "No prompt provided for corpus search."
-    vector_summary = f"Projected {len(image_vector)} active dimensions into model lexical space."
 
-    return image, vector_summary, corpus_matches, generated
+    return corpus_matches, generated
 
 
-with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
+with gr.Blocks(title="Tau Model") as demo:
     gr.Markdown(
         """
-# Camera Tensor-Faceted Tau Model
+# Tau Model
 
 1. Upload any file as corpus.
 2. Click **Train model**.
-3. Use the webcam/upload to project image tensors directly into model inference.
+3. Enter a prompt and generate text.
 """
     )
 
@@ -668,25 +606,19 @@ with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
         outputs=[train_status, corpus_sample, model_summary],
     )
 
-    gr.Markdown("## 2. Camera + Tensor Inference")
+    gr.Markdown("## 2. Text Generation")
     with gr.Row():
         with gr.Column(scale=1):
-            camera = gr.Image(
-                sources=["webcam", "upload"], type="numpy", label="Camera image",
-                webcam_options=gr.WebcamOptions(mirror=False),
-            )
-            user_prompt = gr.Textbox(label="Optional text prompt", lines=3)
-            recognize_button = gr.Button("Process image tensor", variant="primary")
+            user_prompt = gr.Textbox(label="Prompt", lines=3)
+            generate_button = gr.Button("Generate", variant="primary")
         with gr.Column(scale=2):
-            processed_image = gr.Image(label="Processed image", type="numpy")
-            feature_tokens_output = gr.Textbox(label="Image Tensor Mapping Status", lines=2)
             corpus_output = gr.Textbox(label="Corpus matches", lines=6)
             generated_output = gr.Textbox(label="Tau model response", lines=8)
 
-    recognize_button.click(
-        fn=process_camera_image,
-        inputs=[camera, user_prompt],
-        outputs=[processed_image, feature_tokens_output, corpus_output, generated_output],
+    generate_button.click(
+        fn=generate_from_prompt,
+        inputs=[user_prompt],
+        outputs=[corpus_output, generated_output],
     )
 
 
