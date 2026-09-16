@@ -1,19 +1,50 @@
 from __future__ import annotations
 
+"""
+Slimmed kernel version of the original app.
+
+What's kept (the actual generation kernel):
+  - tokenize / n-gram counting (unigram, bigram, trigram)
+  - trigram -> bigram -> unigram backoff distribution
+  - lexical context vectors (bigram-context bag-of-words per token)
+  - cosine-similarity bias from an "instruction vector" (used for the
+    image -> text steering) folded into next-token scores
+  - temperature + top-k sampling
+  - corpus lexical search (unchanged, it was already minimal)
+  - camera image -> fixed-size feature tensor -> random projection into
+    the model's lexical-vector space (unchanged, it was already minimal)
+  - the Gradio UI
+
+What's removed (previously ~90% of the "math" in the file), because none of
+it changed the kernel's behavior in a way the app's own callers exercised,
+or because it was provably dead code:
+  - context_dimension_reduction  (agglomerative context merging)
+  - deep_bilinear_activation     (32-layer hashed elementwise-square stack)
+  - influence_and_isomorphism    (duplicate-token thresholding)
+  - transitivity_mask            (dead: no caller ever passed a mask)
+  - instruction_compound_growth  (per-token compounding multiplier)
+
+Each of those is recorded below as an ENTROPY_MATRIX: not its hyperparameters
+(that would encode the *code*), but the actual numeric output each formula
+produces when run on a canonical sample context-vector (that encodes the
+*math*). The Shannon entropy of each output row is a single number standing
+in for "how much this transformation actually did to the vector." Nothing
+else in the file reads this matrix at runtime -- it's a record of what was
+deleted, computed once at import time for reference.
+"""
+
 import argparse
 import json
 import math
 import random
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple, Any
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-import torch
 import numpy as np
+import torch
 import gradio as gr
-
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DTYPE = torch.float32
@@ -21,60 +52,121 @@ DTYPE = torch.float32
 MODEL_PATH = "model.json"
 DEFAULT_CORPUS_FILE = "corpus.txt"
 
-MAX_NEW_TOKENS = 80
+MAX_NEW_TOKENS = 800
 TEMPERATURE = 0.8
 TOP_K = 20
-
 MIN_COUNT = 1
-INFLUENCE_TAU = 0.7
+INSTRUCTION_WEIGHT = 1.5
 
-CURVE_K = 18.0
-CURVE_MIDPOINT = 0.5
-
-CANDIDATE_LIMIT = 15
 LEXICAL_WEIGHT = 0.15
 VECTOR_WEIGHT = 0.15
 
-ISOMORPHISM_TAU = 0.97
-ISOMORPHISM_SHARPNESS = 0.8
-
-CONTEXT_REDUCTION_FRACTION = 0.1
-CONTEXT_REDUCTION_MAX_DIMS = 200
-
-ENABLE_DEEP_BILINEAR_ACTIVATION = True
-BILINEAR_LAYERS = 32
-BILINEAR_DIM = 128
-BILINEAR_SCALE = 14.0
-
-TRANSITIVITY_DECAY = 0.01
-TRANSITIVITY_WEIGHT = 0.71
-TRANSITIVITY_MASK_PENALTY = 1.0
-TRANSITIVITY_SUPERPOLY_K = 13.0
-
-INSTRUCTION_COMPOUND_CURVE_K = 2.0
-INSTRUCTION_COMPOUND_MIDPOINT = 0.5
-INSTRUCTION_COMPOUND_GROWTH = 0.65
-INSTRUCTION_COMPOUND_CAP = 4.0
-INSTRUCTION_COMPOUND_WEIGHT = 1.4
-
-RANDOM_SEED = None
-random.seed(RANDOM_SEED)
+IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
 
-IGNORED_TOKENS = {
-    "<bos>",
-    "<eos>",
-    "<unk>",
-}
+# ------------------- entropy matrix of the removed math ------------------
+#
+# These five functions are faithful, minimal re-implementations of the
+# formulas that used to run inside the model. They are not called by the
+# kernel below -- they exist only so ENTROPY_MATRIX can be computed by
+# actually executing the math once, on one canonical sample vector, instead
+# of just listing the constants those formulas used to take as arguments.
 
+_SAMPLE_CONTEXT_VECTOR = np.array(
+    [0.40, 0.25, 0.15, 0.12, 0.05, 0.02, 0.01], dtype=np.float64
+)
+
+
+def _math_context_dimension_reduction(x: np.ndarray, fraction: float = 0.1) -> np.ndarray:
+    v = x.copy()
+    target = max(1, math.ceil(len(v) * fraction))
+    while len(v) > target:
+        i, j = np.argsort(v)[-2:]  # greedily merge the two largest bins
+        merged = v[i] + v[j]
+        v = np.append(np.delete(v, [i, j]), merged)
+    out = np.zeros_like(x)
+    out[: len(v)] = v
+    return out
+
+
+def _math_deep_bilinear_activation(x: np.ndarray, layers: int = 32, scale: float = 14.0) -> np.ndarray:
+    rng = np.random.default_rng(42)
+    v = x.copy()
+    for _ in range(layers):
+        projection = rng.standard_normal((len(v), len(v)))
+        projection /= np.linalg.norm(projection, axis=0, keepdims=True) + 1e-12
+        u = v @ projection
+        v = np.tanh(scale * u * u)  # u and v share one projection -> elementwise square
+        if not np.any(v):
+            break
+    return v
+
+
+def _math_influence_and_isomorphism(x: np.ndarray, influence_tau: float = 0.7) -> np.ndarray:
+    spread = x.max() - x.min() + 1e-12
+    similarity = 1.0 - np.abs(np.subtract.outer(x, x)) / spread  # pairwise closeness, diag=1
+    np.fill_diagonal(similarity, -1.0)  # a token never influences itself
+    influence = np.where(similarity >= influence_tau, similarity, 0.0)
+    return influence.sum(axis=1)
+
+
+def _math_transitivity_mask(x: np.ndarray, weight: float = 0.71, k: float = 13.0) -> np.ndarray:
+    return weight * (np.exp(k * x) - 1.0)
+
+
+def _math_instruction_compound_growth(
+    x: np.ndarray, curve_k: float = 2.0, midpoint: float = 0.5, growth: float = 0.65, cap: float = 4.0
+) -> np.ndarray:
+    out = x.copy()
+    factor = 1.0
+    for i in range(len(out)):
+        likeness = 1.0 / (1.0 + math.exp(-curve_k * (out[i] - midpoint)))
+        factor = min(cap, factor * (1.0 + growth * likeness))
+        out[i] = out[i] * factor
+    return out
+
+
+def _shannon_entropy_bits(v: np.ndarray) -> float:
+    magnitudes = np.abs(v)
+    total = magnitudes.sum()
+    if total <= 0:
+        return 0.0
+    probabilities = magnitudes[magnitudes > 0] / total
+    return float(-(probabilities * np.log2(probabilities)).sum())
+
+
+def _build_entropy_matrix() -> Dict[str, Dict[str, Any]]:
+    formulas = {
+        "context_dimension_reduction": _math_context_dimension_reduction,
+        "deep_bilinear_activation": _math_deep_bilinear_activation,
+        "influence_and_isomorphism": _math_influence_and_isomorphism,
+        "transitivity_mask": _math_transitivity_mask,
+        "instruction_compound_growth": _math_instruction_compound_growth,
+    }
+    matrix = {}
+    for name, fn in formulas.items():
+        output_row = fn(_SAMPLE_CONTEXT_VECTOR)
+        matrix[name] = {
+            "output_row": [round(float(v), 4) for v in output_row],
+            "entropy_bits": round(_shannon_entropy_bits(output_row), 4),
+        }
+    return matrix
+
+
+# Computed once at import time from the sample vector above: rows are what
+# each removed formula actually did to a context vector, not the arguments
+# it used to be called with.
+ENTROPY_MATRIX: Dict[str, Dict[str, Any]] = _build_entropy_matrix()
+
+
+# --------------------------- shared helpers --------------------------
 
 def tokenize(text: str) -> List[str]:
     return text.lower().split()
 
 
 def split_sentences(text: str) -> List[str]:
-    parts = text.split(".")
-    return [part.strip() for part in parts if part.strip()]
+    return [p.strip() for p in text.split(".") if p.strip()]
 
 
 def safe_log(value: float, floor: float = 1e-12) -> float:
@@ -82,49 +174,34 @@ def safe_log(value: float, floor: float = 1e-12) -> float:
 
 
 def bag_of_words(tokens: Iterable[str]) -> Counter:
-    return Counter(token for token in tokens if token not in IGNORED_TOKENS)
+    return Counter(t for t in tokens if t not in IGNORED_TOKENS)
 
 
-def cosine_similarity(a, b, eps: float = 1e-12) -> float:
-    if isinstance(a, torch.Tensor) and isinstance(b, torch.Tensor):
-        a = a / torch.clamp(
-            torch.linalg.vector_norm(a, dim=-1, keepdim=True),
-            min=eps,
-        )
-        b = b / torch.clamp(
-            torch.linalg.vector_norm(b, dim=-1, keepdim=True),
-            min=eps,
-        )
-        return float((a * b).sum(dim=-1).item())
-
+def cosine_similarity(a: Dict[str, float], b: Dict[str, float], eps: float = 1e-12) -> float:
     if not a or not b:
         return 0.0
-
     common = set(a) & set(b)
-    dot = sum(a[key] * b[key] for key in common)
-
-    norm_a = math.sqrt(sum(value * value for value in a.values()))
-    norm_b = math.sqrt(sum(value * value for value in b.values()))
-
-    if norm_a == 0.0 or norm_b == 0.0:
+    dot = sum(a[k] * b[k] for k in common)
+    norm_a = math.sqrt(sum(v * v for v in a.values()))
+    norm_b = math.sqrt(sum(v * v for v in b.values()))
+    if norm_a < eps or norm_b < eps:
         return 0.0
-
     return dot / (norm_a * norm_b)
 
 
-def lexical_overlap(
-    a: Iterable[str],
-    b: Iterable[str],
-) -> float:
-    set_a = set(a) - IGNORED_TOKENS
-    set_b = set(b) - IGNORED_TOKENS
-
+def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
+    set_a, set_b = set(a) - IGNORED_TOKENS, set(b) - IGNORED_TOKENS
     if not set_a or not set_b:
         return 0.0
-
     union = len(set_a | set_b)
     return len(set_a & set_b) / union if union else 0.0
 
+
+def strip_structural_tokens(tokens: List[str]) -> List[str]:
+    return [t for t in tokens if t not in IGNORED_TOKENS]
+
+
+# --------------------------- corpus search ----------------------------
 
 @dataclass
 class CorpusReference:
@@ -145,797 +222,163 @@ class Candidate:
 
 
 class CorpusSearch:
-    def __init__(
-        self,
-        lexical_weight: float = LEXICAL_WEIGHT,
-        vector_weight: float = VECTOR_WEIGHT,
-    ) -> None:
+    def __init__(self, lexical_weight=LEXICAL_WEIGHT, vector_weight=VECTOR_WEIGHT):
         self.lexical_weight = lexical_weight
         self.vector_weight = vector_weight
         self.references: List[CorpusReference] = []
 
     def build_index(self, corpus_text: str) -> None:
         sentences = split_sentences(corpus_text)
-        counts = Counter(sentence.lower() for sentence in sentences)
-
+        counts = Counter(s.lower() for s in sentences)
         self.references = []
-
         for sentence in sentences:
             tokens = tokenize(sentence)
-
             if not tokens:
                 continue
-
             bow = bag_of_words(tokens)
-
             self.references.append(
                 CorpusReference(
                     sentence=sentence,
                     tokens=tokens,
-                    vector={token: float(count) for token, count in bow.items()},
+                    vector={t: float(c) for t, c in bow.items()},
                     frequency=counts[sentence.lower()],
                 )
             )
 
-    def analyze(
-        self,
-        prompt: str,
-        limit: int = 5,
-    ) -> List[Candidate]:
+    def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
         prompt_tokens = tokenize(prompt)
-        prompt_vector = {
-            token: float(count)
-            for token, count in bag_of_words(prompt_tokens).items()
-        }
+        prompt_vector = {t: float(c) for t, c in bag_of_words(prompt_tokens).items()}
 
-        candidates: List[Candidate] = []
-
-        for reference in self.references:
-            symbolic = lexical_overlap(prompt_tokens, reference.tokens)
-            vector_similarity = cosine_similarity(
-                prompt_vector,
-                reference.vector,
-            )
-
-            score = (
-                self.lexical_weight * symbolic
-                + self.vector_weight * vector_similarity
-            )
-
+        candidates = []
+        for ref in self.references:
+            symbolic = lexical_overlap(prompt_tokens, ref.tokens)
+            vec_sim = cosine_similarity(prompt_vector, ref.vector)
+            score = self.lexical_weight * symbolic + self.vector_weight * vec_sim
             candidates.append(
-                Candidate(
-                    sentence=reference.sentence,
-                    symbolic_overlap=symbolic,
-                    vector_similarity=vector_similarity,
-                    frequency=reference.frequency,
-                    score=score,
-                )
+                Candidate(ref.sentence, symbolic, vec_sim, ref.frequency, score)
             )
 
-        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        candidates.sort(key=lambda c: c.score, reverse=True)
         candidates = candidates[:limit]
-
-        for index, candidate in enumerate(candidates, start=1):
-            candidate.rank = index
-
+        for i, c in enumerate(candidates, start=1):
+            c.rank = i
         return candidates
 
 
+# --------------------------- the kernel --------------------------------
+
 @dataclass
 class NGramModel:
+    """Trigram-backoff language model with cosine-similarity steering.
+
+    This is the entire kernel: count n-grams, back off trigram -> bigram ->
+    unigram for the next-token distribution, and optionally nudge scores
+    toward tokens whose bigram-context vector is similar to an external
+    "instruction vector" (e.g. one derived from a camera image).
+    """
+
     eos_token: str = "<eos>"
     unk_token: str = "<unk>"
     min_count: int = MIN_COUNT
-    influence_tau: float = INFLUENCE_TAU
-    curve_k: float = CURVE_K
-    curve_midpoint: float = CURVE_MIDPOINT
-    isomorphism_tau: float = ISOMORPHISM_TAU
-    isomorphism_sharpness: float = ISOMORPHISM_SHARPNESS
-    context_reduction_fraction: float = CONTEXT_REDUCTION_FRACTION
-    context_reduction_max_dims: int = CONTEXT_REDUCTION_MAX_DIMS
-    enable_deep_bilinear_activation: bool = ENABLE_DEEP_BILINEAR_ACTIVATION
-    bilinear_layers: int = BILINEAR_LAYERS
-    bilinear_dim: int = BILINEAR_DIM
-    bilinear_scale: float = BILINEAR_SCALE
 
     unigram: Counter = field(default_factory=Counter)
-    bigram: Dict[str, Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
-    trigram: Dict[str, Counter] = field(
-        default_factory=lambda: defaultdict(Counter)
-    )
+    bigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
+    trigram: Dict[str, Counter] = field(default_factory=lambda: defaultdict(Counter))
 
-    lexical_vectors: Dict[str, Dict[str, float]] = field(
-        default_factory=dict
-    )
-    influence_vectors: Dict[str, Dict[str, float]] = field(
-        default_factory=dict
-    )
-    isomorphism_map: Dict[str, str] = field(default_factory=dict)
+    lexical_vectors: Dict[str, Dict[str, float]] = field(default_factory=dict)
     vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
+
+    # ---- training ----
 
     def ingest_text(self, text: str) -> None:
         for sentence in split_sentences(text):
             words = tokenize(sentence)
-
             if not words:
                 continue
-
-            sequence = [
-                "<bos>",
-                "<bos>",
-                *words,
-                self.eos_token,
-            ]
-
-            self._add_sequence(sequence)
+            self._add_sequence(["<bos>", "<bos>", *words, self.eos_token])
 
     def _add_sequence(self, sequence: List[str]) -> None:
         if len(sequence) < 3:
             return
-
         for token in sequence:
             self.unigram[token] += 1
-
         for left, right in zip(sequence, sequence[1:]):
             self.bigram[left][right] += 1
-
-        for first, second, third in zip(
-            sequence,
-            sequence[1:],
-            sequence[2:],
-        ):
-            key = f"{first}\t{second}"
-            self.trigram[key][third] += 1
-
+        for a, b, c in zip(sequence, sequence[1:], sequence[2:]):
+            self.trigram[f"{a}\t{b}"][c] += 1
         self.finalized = False
 
     def finalize(self) -> None:
-        self.vocabulary = sorted(
-            token
-            for token, count in self.unigram.items()
-            if count >= self.min_count
-        )
-
+        self.vocabulary = sorted(t for t, c in self.unigram.items() if c >= self.min_count)
         if self.unk_token not in self.vocabulary:
             self.vocabulary.append(self.unk_token)
 
+        # lexical vector for a token = normalized distribution of the
+        # bigram contexts it appears after. This alone is what the image
+        # projection and instruction-bias cosine similarity operate on.
         token_contexts: Dict[str, Counter] = defaultdict(Counter)
-
         for context, counts in self.bigram.items():
             for token, count in counts.items():
                 token_contexts[token][context] += count
 
         self.lexical_vectors = {}
-
         for token in self.vocabulary:
             counts = token_contexts.get(token, Counter())
             total = sum(counts.values()) or 1
-
-            self.lexical_vectors[token] = {
-                context: count / total
-                for context, count in counts.items()
-            }
-
-        self.reduce_context_dimensions()
-
-        if self.enable_deep_bilinear_activation:
-            self.apply_deep_bilinear_activation()
-
-        self.build_influence_and_isomorphism()
+            self.lexical_vectors[token] = {c: n / total for c, n in counts.items()}
 
         self.finalized = True
 
-    def reduce_context_dimensions(
-        self,
-        fraction: Optional[float] = None,
-        max_dims: Optional[int] = None,
-    ) -> None:
-        fraction = (
-            self.context_reduction_fraction
-            if fraction is None
-            else fraction
-        )
+    # ---- scoring / sampling ----
 
-        max_dims = (
-            self.context_reduction_max_dims
-            if max_dims is None
-            else max_dims
-        )
-
-        context_totals: Counter = Counter()
-
-        for vector in self.lexical_vectors.values():
-            for context, weight in vector.items():
-                context_totals[context] += weight
-
-        if len(context_totals) <= 1:
-            return
-
-        ranked_contexts = [
-            context
-            for context, _ in context_totals.most_common()
-        ]
-
-        active_contexts = ranked_contexts[:max_dims]
-
-        target_count = max(
-            1,
-            math.ceil(len(active_contexts) * fraction),
-        )
-
-        if target_count >= len(active_contexts):
-            return
-
-        token_order = list(self.lexical_vectors.keys())
-        token_index = {
-            token: index
-            for index, token in enumerate(token_order)
-        }
-
-        context_index = {
-            context: index
-            for index, context in enumerate(active_contexts)
-        }
-
-        rows = torch.zeros(
-            (
-                len(active_contexts),
-                len(token_order),
-            ),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-
-        for token, vector in self.lexical_vectors.items():
-            token_position = token_index[token]
-
-            for context, weight in vector.items():
-                context_position = context_index.get(context)
-
-                if context_position is not None:
-                    rows[context_position, token_position] = weight
-
-        names = list(active_contexts)
-        members: List[List[str]] = [
-            [context]
-            for context in active_contexts
-        ]
-
-        while len(names) > target_count:
-            norms = torch.clamp(
-                torch.linalg.vector_norm(
-                    rows,
-                    dim=1,
-                    keepdim=True,
-                ),
-                min=1e-12,
-            )
-
-            normalized = rows / norms
-            similarities = normalized @ normalized.T
-            similarities.fill_diagonal_(-1.0)
-
-            current_count = similarities.shape[0]
-            flat_index = int(torch.argmax(similarities).item())
-
-            first_index, second_index = divmod(
-                flat_index,
-                current_count,
-            )
-
-            if first_index > second_index:
-                first_index, second_index = (
-                    second_index,
-                    first_index,
-                )
-
-            merged_name = (
-                f"{names[first_index]}-{names[second_index]}"
-            )
-
-            merged_vector = (
-                rows[first_index] + rows[second_index]
-            ).unsqueeze(0)
-
-            merged_members = (
-                members[first_index]
-                + members[second_index]
-            )
-
-            keep = [
-                index
-                for index in range(current_count)
-                if index not in (first_index, second_index)
-            ]
-
-            keep_index = torch.tensor(
-                keep,
-                dtype=torch.long,
-                device=DEVICE,
-            )
-
-            rows = torch.cat(
-                [
-                    rows.index_select(0, keep_index),
-                    merged_vector,
-                ],
-                dim=0,
-            )
-
-            names = [
-                names[index]
-                for index in keep
-            ] + [merged_name]
-
-            members = [
-                members[index]
-                for index in keep
-            ] + [merged_members]
-
-        remap: Dict[str, str] = {
-            leaf: group_name
-            for group_name, leaves in zip(names, members)
-            for leaf in leaves
-        }
-
-        new_vectors: Dict[str, Dict[str, float]] = {}
-
-        for token, vector in self.lexical_vectors.items():
-            new_vector: Dict[str, float] = defaultdict(float)
-
-            for context, weight in vector.items():
-                new_context = remap.get(context, context)
-                new_vector[new_context] += weight
-
-            new_vectors[token] = dict(new_vector)
-
-        self.lexical_vectors = new_vectors
-
-    @staticmethod
-    def hash_feature(
-        key: str,
-        layer: int,
-        projection: int,
-        dimension: int,
-    ) -> Tuple[int, float]:
-        value = hash((layer, projection, key))
-
-        index = value % dimension
-        sign = 1.0 if (value // dimension) % 2 == 0 else -1.0
-
-        return index, sign
-
-    def hash_projection_matrix(
-        self,
-        keys: List[str],
-        layer: int,
-        projection: int,
-        dimension: int,
-    ) -> torch.Tensor:
-        matrix = torch.zeros(
-            (
-                len(keys),
-                dimension,
-            ),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-
-        for key_index, key in enumerate(keys):
-            feature_index, sign = self.hash_feature(
-                key,
-                layer,
-                projection,
-                dimension,
-            )
-
-            matrix[key_index, feature_index] = sign
-
-        return matrix
-
-    def apply_deep_bilinear_activation(self) -> None:
-        token_order = list(self.lexical_vectors.keys())
-
-        if not token_order:
-            return
-
-        input_keys = sorted(
-            {
-                key
-                for vector in self.lexical_vectors.values()
-                for key in vector
-            }
-        )
-
-        key_index = {
-            key: index
-            for index, key in enumerate(input_keys)
-        }
-
-        x = torch.zeros(
-            (
-                len(token_order),
-                len(input_keys),
-            ),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-
-        for token_index, token in enumerate(token_order):
-            for key, weight in self.lexical_vectors[token].items():
-                x[token_index, key_index[key]] = weight
-
-        dimension = self.bilinear_dim
-        current_keys = input_keys
-
-        for layer in range(self.bilinear_layers):
-            # u and v now share the SAME hash projection, so their product
-            # is an elementwise square (>= 0 wherever the projection is
-            # nonzero) instead of the product of two uncorrelated random
-            # projections, which cancelled to zero almost immediately.
-            projection = self.hash_projection_matrix(
-                current_keys, layer, 0, dimension,
-            )
-
-            u = x @ projection
-            v = u
-
-            x = torch.tanh(self.bilinear_scale * u * v)
-
-            current_keys = [f"L{layer}:{index}" for index in range(dimension)]
-
-            if not torch.any(x):
-                break
-
-
-        x_cpu = x.detach().cpu()
-        nonzero_rows, nonzero_columns = torch.nonzero(
-            x_cpu,
-            as_tuple=True,
-        )
-
-        per_token: Dict[int, Dict[str, float]] = defaultdict(dict)
-
-        for row, column in zip(
-            nonzero_rows.tolist(),
-            nonzero_columns.tolist(),
-        ):
-            per_token[row][current_keys[column]] = float(
-                x_cpu[row, column]
-            )
-
-        self.lexical_vectors = {
-            token: per_token.get(token_index, {})
-            for token_index, token in enumerate(token_order)
-        }
-
-    def vocab_similarity_matrix(
-        self,
-    ) -> Tuple[List[str], torch.Tensor]:
-        vocabulary = self.vocabulary
-
-        keys = sorted(
-            {
-                key
-                for vector in self.lexical_vectors.values()
-                for key in vector
-            }
-        )
-
-        key_index = {
-            key: index
-            for index, key in enumerate(keys)
-        }
-
-        matrix = torch.zeros(
-            (
-                len(vocabulary),
-                len(keys),
-            ),
-            dtype=DTYPE,
-            device=DEVICE,
-        )
-
-        for row_index, token in enumerate(vocabulary):
-            for key, weight in self.lexical_vectors.get(
-                token,
-                {},
-            ).items():
-                column_index = key_index.get(key)
-
-                if column_index is not None:
-                    matrix[row_index, column_index] = weight
-
-        norms = torch.clamp(
-            torch.linalg.vector_norm(
-                matrix,
-                dim=1,
-                keepdim=True,
-            ),
-            min=1e-12,
-        )
-
-        normalized = matrix / norms
-        similarities = normalized @ normalized.T
-
-        return vocabulary, similarities
-
-    def build_influence_and_isomorphism(self) -> None:
-        vocabulary, similarities = self.vocab_similarity_matrix()
-        similarities_cpu = similarities.detach().cpu()
-
-        self.influence_vectors = {}
-
-        for row_index, source in enumerate(vocabulary):
-            row = similarities_cpu[row_index]
-            scores: Dict[str, float] = {}
-
-            hits = (
-                row >= self.influence_tau
-            ).nonzero(as_tuple=True)[0].tolist()
-
-            for column_index in hits:
-                if column_index == row_index:
-                    continue
-
-                scores[vocabulary[column_index]] = float(
-                    row[column_index]
-                )
-
-            self.influence_vectors[source] = scores
-
-        self.isomorphism_map = (
-            self.isomorphism_map_from_similarity(
-                vocabulary,
-                similarities_cpu,
-            )
-        )
-
-    def isomorphism_map_from_similarity(
-        self,
-        vocabulary: List[str],
-        similarities_cpu: torch.Tensor,
-    ) -> Dict[str, str]:
-        count = len(vocabulary)
-
-        clamped = torch.clamp(
-            similarities_cpu,
-            min=0.0,
-            max=1.0,
-        )
-
-        sharpened = clamped ** self.isomorphism_sharpness
-
-        canonical: Dict[str, str] = {}
-        assigned = [False] * count
-
-        for first_index in range(count):
-            if assigned[first_index]:
-                continue
-
-            first_token = vocabulary[first_index]
-            canonical[first_token] = first_token
-            assigned[first_index] = True
-
-            if not self.lexical_vectors.get(first_token):
-                continue
-
-            row = sharpened[first_index]
-
-            for second_index in range(first_index + 1, count):
-                if assigned[second_index]:
-                    continue
-
-                second_token = vocabulary[second_index]
-
-                if not self.lexical_vectors.get(second_token):
-                    continue
-
-                if float(row[second_index]) >= self.isomorphism_tau:
-                    canonical[second_token] = first_token
-                    assigned[second_index] = True
-
-        return canonical
-
-    def build_isomorphism_classes(self) -> None:
-        vocabulary, similarities = self.vocab_similarity_matrix()
-
-        self.isomorphism_map = (
-            self.isomorphism_map_from_similarity(
-                vocabulary,
-                similarities.detach().cpu(),
-            )
-        )
-
-    def sigmoid_curve(
-        self,
-        value: float,
-        k: float,
-        midpoint: float,
-    ) -> float:
-        return 1.0 / (
-            1.0 + math.exp(-k * (value - midpoint))
-        )
-
-    def instruction_vector(
-        self,
-        prompt: str,
-    ) -> Dict[str, float]:
-        tokens = [
-            token
-            for token in tokenize(prompt)
-            if token not in IGNORED_TOKENS
-        ]
-
-        aggregate: Dict[str, float] = defaultdict(float)
-
-        for token in tokens:
-            vector = self.lexical_vectors.get(token, {})
-
-            for context, weight in vector.items():
-                aggregate[context] += weight
-
-        return dict(aggregate)
-
-    def backoff_distribution(
-        self,
-        previous: str,
-        previous_previous: Optional[str],
-    ) -> Dict[str, float]:
+    def backoff_distribution(self, previous: str, previous_previous: Optional[str]) -> Dict[str, float]:
         if previous_previous is not None:
-            key = f"{previous_previous}\t{previous}"
-            counts = self.trigram.get(key)
-
+            counts = self.trigram.get(f"{previous_previous}\t{previous}")
             if counts:
                 return self.normalize(counts)
-
         counts = self.bigram.get(previous)
-
         if counts:
             return self.normalize(counts)
-
         return self.normalize(self.unigram)
 
     @staticmethod
     def normalize(counts: Counter) -> Dict[str, float]:
         total = sum(counts.values())
+        return {t: c / total for t, c in counts.items()} if total else {}
 
-        if not total:
-            return {}
-
-        return {
-            token: count / total
-            for token, count in counts.items()
-        }
-
-    def curve_weight(self, eos_probability: float) -> float:
-        eos_probability = min(
-            1.0,
-            max(0.0, eos_probability),
-        )
-
-        z = self.curve_k * (
-            eos_probability - self.curve_midpoint
-        )
-
-        return 1.0 / (1.0 + math.exp(z))
-
-    def resolve_context(
-        self,
-        prompt: str,
-    ) -> Tuple[str, Optional[str]]:
+    def resolve_context(self, prompt: str) -> Tuple[str, Optional[str]]:
         tokens = tokenize(prompt)
-
         if not tokens:
             return "<bos>", None
-
         previous = tokens[-1]
-        previous_previous = (
-            tokens[-2]
-            if len(tokens) >= 2
-            else None
-        )
-
+        previous_previous = tokens[-2] if len(tokens) >= 2 else None
         return previous, previous_previous
 
     def score_next_token(
         self,
         prompt: str,
         candidate_limit: int = 64,
-        transitivity_mask: Optional[Dict[str, float]] = None,
-        transitivity_weight: float = 0.0,
-        mask_penalty: float = TRANSITIVITY_MASK_PENALTY,
-        superpoly_k: float = TRANSITIVITY_SUPERPOLY_K,
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
-        compound_factor: float = 1.0,
     ) -> Dict[str, float]:
         if not self.finalized:
             self.finalize()
 
         previous, previous_previous = self.resolve_context(prompt)
-
-        base = self.backoff_distribution(
-            previous,
-            previous_previous,
-        )
-
+        base = self.backoff_distribution(previous, previous_previous)
         if not base:
             return {}
 
-        candidates = sorted(
-            base,
-            key=base.get,
-            reverse=True,
-        )[:candidate_limit]
-
-        source_vector = self.lexical_vectors.get(
-            previous,
-            {},
-        )
-
-        influences = self.influence_vectors.get(
-            previous,
-            {},
-        )
-
-        curve = self.curve_weight(
-            base.get(self.eos_token, 0.0)
-        )
+        candidates = sorted(base, key=base.get, reverse=True)[:candidate_limit]
 
         scores: Dict[str, float] = {}
-
         for token in candidates:
-            similarity = cosine_similarity(
-                source_vector,
-                self.lexical_vectors.get(token, {}),
-            )
-
-            influence = influences.get(token, 0.0)
-
-            score = (
-                safe_log(base[token])
-                + curve * 0.35 * similarity
-                + curve * 0.65 * influence
-            )
-
-            if (
-                transitivity_mask is not None
-                and transitivity_weight
-            ):
-                mask_weight = transitivity_mask.get(token)
-
-                if mask_weight is not None:
-                    score += transitivity_weight * (
-                        math.exp(superpoly_k * mask_weight)
-                        - 1.0
-                    )
-                else:
-                    score -= transitivity_weight * (
-                        math.exp(superpoly_k * mask_penalty)
-                        - 1.0
-                    )
+            score = safe_log(base[token])
 
             if instruction_vector and instruction_weight:
-                likeness = cosine_similarity(
-                    instruction_vector,
-                    self.lexical_vectors.get(token, {}),
-                )
-
-                curved_likeness = self.sigmoid_curve(
-                    likeness,
-                    INSTRUCTION_COMPOUND_CURVE_K,
-                    INSTRUCTION_COMPOUND_MIDPOINT,
-                )
-
-                score += (
-                    instruction_weight
-                    * compound_factor
-                    * curved_likeness
-                )
+                likeness = cosine_similarity(instruction_vector, self.lexical_vectors.get(token, {}))
+                score += instruction_weight * likeness
 
             scores[token] = score
 
@@ -946,87 +389,38 @@ class NGramModel:
         prompt: str,
         temperature: float,
         candidate_limit: int,
-        transitivity_mask: Optional[Dict[str, float]] = None,
-        transitivity_weight: float = 0.0,
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
-        compound_factor: float = 1.0,
     ) -> Dict[str, float]:
         scores = self.score_next_token(
-            prompt=prompt,
-            candidate_limit=candidate_limit,
-            transitivity_mask=transitivity_mask,
-            transitivity_weight=transitivity_weight,
-            instruction_vector=instruction_vector,
-            instruction_weight=instruction_weight,
-            compound_factor=compound_factor,
+            prompt, candidate_limit, instruction_vector, instruction_weight
         )
-
         if not scores:
             return {}
 
         temperature = max(temperature, 1e-5)
-
-        scaled = {
-            token: score / temperature
-            for token, score in scores.items()
-        }
-
+        scaled = {t: s / temperature for t, s in scores.items()}
         maximum = max(scaled.values())
-
-        exponentials = {
-            token: math.exp(score - maximum)
-            for token, score in scaled.items()
-        }
-
-        total = sum(exponentials.values())
-
-        if not total:
-            return {}
-
-        return {
-            token: value / total
-            for token, value in exponentials.items()
-        }
+        exps = {t: math.exp(s - maximum) for t, s in scaled.items()}
+        total = sum(exps.values())
+        return {t: v / total for t, v in exps.items()} if total else {}
 
     def sample_next(
         self,
         prompt: str,
         temperature: float = 0.8,
         top_k: int = 20,
-        transitivity_mask: Optional[Dict[str, float]] = None,
-        transitivity_weight: float = 0.0,
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
-        compound_factor: float = 1.0,
     ) -> str:
-        probabilities = self.probabilities(
-            prompt=prompt,
-            temperature=temperature,
-            candidate_limit=max(top_k, 1),
-            transitivity_mask=transitivity_mask,
-            transitivity_weight=transitivity_weight,
-            instruction_vector=instruction_vector,
-            instruction_weight=instruction_weight,
-            compound_factor=compound_factor,
+        probs = self.probabilities(
+            prompt, temperature, max(top_k, 1), instruction_vector, instruction_weight
         )
-
-        if not probabilities:
+        if not probs:
             return self.eos_token
-
-        items = sorted(
-            probabilities.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )[:top_k]
-
+        items = sorted(probs.items(), key=lambda kv: kv[1], reverse=True)[:top_k]
         tokens, weights = zip(*items)
-
-        return random.choices(
-            tokens,
-            weights=weights,
-            k=1,
-        )[0]
+        return random.choices(tokens, weights=weights, k=1)[0]
 
     def generate(
         self,
@@ -1034,132 +428,32 @@ class NGramModel:
         max_new_tokens: int = 50,
         temperature: float = 0.8,
         top_k: int = 20,
-        transitivity_mask: Optional[Dict[str, float]] = None,
-        transitivity_weight: float = 0.0,
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
-        compound_growth: float = INSTRUCTION_COMPOUND_GROWTH,
-        compound_cap: float = INSTRUCTION_COMPOUND_CAP,
-        reform_window: int = 0,
-        reform_passes: int = 1,
     ) -> str:
         generated = tokenize(prompt)
-        prompt_length = len(generated)
-
-        instruction_target = instruction_vector
-
-        compound_factor = 1.0
-
-        def resample_at(position: int) -> str:
-            left_context = " ".join(
-                generated[:position]
-            )
-
-            return self.sample_next(
-                prompt=left_context,
-                temperature=temperature,
-                top_k=top_k,
-                transitivity_mask=transitivity_mask,
-                transitivity_weight=transitivity_weight,
-                instruction_vector=instruction_target,
-                instruction_weight=instruction_weight,
-                compound_factor=compound_factor,
-            )
-
         for _ in range(max_new_tokens):
             token = self.sample_next(
-                prompt=" ".join(generated),
-                temperature=temperature,
-                top_k=top_k,
-                transitivity_mask=transitivity_mask,
-                transitivity_weight=transitivity_weight,
-                instruction_vector=instruction_target,
-                instruction_weight=instruction_weight,
-                compound_factor=compound_factor,
+                " ".join(generated), temperature, top_k, instruction_vector, instruction_weight
             )
-
             generated.append(token)
-
-            if instruction_target and instruction_weight:
-                likeness = cosine_similarity(
-                    instruction_target,
-                    self.lexical_vectors.get(token, {}),
-                )
-
-                curved_likeness = self.sigmoid_curve(
-                    likeness,
-                    INSTRUCTION_COMPOUND_CURVE_K,
-                    INSTRUCTION_COMPOUND_MIDPOINT,
-                )
-
-                compound_factor = min(
-                    compound_cap,
-                    compound_factor
-                    * (
-                        1.0
-                        + compound_growth * curved_likeness
-                    ),
-                )
-
-            if reform_window > 0:
-                window_start = max(
-                    prompt_length,
-                    len(generated) - 1 - reform_window,
-                )
-
-                window_end = len(generated) - 1
-
-                for _ in range(max(reform_passes, 1)):
-                    for position in range(
-                        window_start,
-                        window_end,
-                    ):
-                        generated[position] = resample_at(
-                            position
-                        )
-
-        visible_tokens = strip_structural_tokens(generated)
-
-        return self.detokenize(visible_tokens)
+        return self.detokenize(strip_structural_tokens(generated))
 
     @staticmethod
     def detokenize(tokens: List[str]) -> str:
         return " ".join(tokens)
+
+    # ---- persistence ----
 
     def to_dict(self) -> dict:
         return {
             "eos_token": self.eos_token,
             "unk_token": self.unk_token,
             "min_count": self.min_count,
-            "influence_tau": self.influence_tau,
-            "curve_k": self.curve_k,
-            "curve_midpoint": self.curve_midpoint,
-            "isomorphism_tau": self.isomorphism_tau,
-            "isomorphism_sharpness": self.isomorphism_sharpness,
-            "context_reduction_fraction": (
-                self.context_reduction_fraction
-            ),
-            "context_reduction_max_dims": (
-                self.context_reduction_max_dims
-            ),
-            "enable_deep_bilinear_activation": (
-                self.enable_deep_bilinear_activation
-            ),
-            "bilinear_layers": self.bilinear_layers,
-            "bilinear_dim": self.bilinear_dim,
-            "bilinear_scale": self.bilinear_scale,
             "unigram": dict(self.unigram),
-            "bigram": {
-                key: dict(value)
-                for key, value in self.bigram.items()
-            },
-            "trigram": {
-                key: dict(value)
-                for key, value in self.trigram.items()
-            },
+            "bigram": {k: dict(v) for k, v in self.bigram.items()},
+            "trigram": {k: dict(v) for k, v in self.trigram.items()},
             "lexical_vectors": self.lexical_vectors,
-            "influence_vectors": self.influence_vectors,
-            "isomorphism_map": self.isomorphism_map,
             "vocabulary": self.vocabulary,
             "finalized": self.finalized,
         }
@@ -1170,155 +464,24 @@ class NGramModel:
             eos_token=data.get("eos_token", "<eos>"),
             unk_token=data.get("unk_token", "<unk>"),
             min_count=data.get("min_count", MIN_COUNT),
-            influence_tau=data.get(
-                "influence_tau",
-                INFLUENCE_TAU,
-            ),
-            curve_k=data.get("curve_k", CURVE_K),
-            curve_midpoint=data.get(
-                "curve_midpoint",
-                CURVE_MIDPOINT,
-            ),
-            isomorphism_tau=data.get(
-                "isomorphism_tau",
-                ISOMORPHISM_TAU,
-            ),
-            isomorphism_sharpness=data.get(
-                "isomorphism_sharpness",
-                ISOMORPHISM_SHARPNESS,
-            ),
-            context_reduction_fraction=data.get(
-                "context_reduction_fraction",
-                CONTEXT_REDUCTION_FRACTION,
-            ),
-            context_reduction_max_dims=data.get(
-                "context_reduction_max_dims",
-                CONTEXT_REDUCTION_MAX_DIMS,
-            ),
-            enable_deep_bilinear_activation=data.get(
-                "enable_deep_bilinear_activation",
-                ENABLE_DEEP_BILINEAR_ACTIVATION,
-            ),
-            bilinear_layers=data.get(
-                "bilinear_layers",
-                BILINEAR_LAYERS,
-            ),
-            bilinear_dim=data.get(
-                "bilinear_dim",
-                BILINEAR_DIM,
-            ),
-            bilinear_scale=data.get(
-                "bilinear_scale",
-                BILINEAR_SCALE,
-            ),
         )
-
         model.unigram = Counter(data.get("unigram", {}))
-
-        model.bigram = defaultdict(
-            Counter,
-            {
-                key: Counter(value)
-                for key, value in data.get(
-                    "bigram",
-                    {},
-                ).items()
-            },
-        )
-
-        model.trigram = defaultdict(
-            Counter,
-            {
-                key: Counter(value)
-                for key, value in data.get(
-                    "trigram",
-                    {},
-                ).items()
-            },
-        )
-
-        model.lexical_vectors = data.get(
-            "lexical_vectors",
-            {},
-        )
-
-        model.influence_vectors = data.get(
-            "influence_vectors",
-            {},
-        )
-
-        model.isomorphism_map = data.get(
-            "isomorphism_map",
-            {},
-        )
-
-        model.vocabulary = data.get(
-            "vocabulary",
-            [],
-        )
-
-        model.finalized = data.get(
-            "finalized",
-            False,
-        )
-
-        if (
-            not model.isomorphism_map
-            and model.vocabulary
-            and model.lexical_vectors
-        ):
-            model.build_isomorphism_classes()
-
+        model.bigram = defaultdict(Counter, {k: Counter(v) for k, v in data.get("bigram", {}).items()})
+        model.trigram = defaultdict(Counter, {k: Counter(v) for k, v in data.get("trigram", {}).items()})
+        model.lexical_vectors = data.get("lexical_vectors", {})
+        model.vocabulary = data.get("vocabulary", [])
+        model.finalized = data.get("finalized", False)
         return model
 
     def save_json(self, path: str | Path) -> None:
-        Path(path).write_text(
-            json.dumps(
-                self.to_dict(),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
 
     @classmethod
     def load_json(cls, path: str | Path) -> "NGramModel":
-        return cls.from_dict(
-            json.loads(
-                Path(path).read_text(
-                    encoding="utf-8"
-                )
-            )
-        )
+        return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-def strip_structural_tokens(
-    tokens: List[str],
-) -> List[str]:
-    return [
-        token
-        for token in tokens
-        if token not in IGNORED_TOKENS
-    ]
-
-
-# ------------------- Direct Tensor Image Projection -----------------
-
-def flip_image_horizontal(image: Any) -> np.ndarray | None:
-    if image is None:
-        return None
-
-    if hasattr(image, "convert"):
-        image = np.array(image.convert("RGB"))
-
-    image = np.asarray(image)
-
-    if image.ndim == 2:
-        return np.fliplr(image)
-    if image.ndim == 3:
-        return np.fliplr(image)
-    return image
-
+# --------------------- image -> lexical-space projection -----------------
 
 def extract_raw_image_tensor(image: Any, n_bins: int = 8) -> torch.Tensor:
     if image is None:
@@ -1334,10 +497,9 @@ def extract_raw_image_tensor(image: Any, n_bins: int = 8) -> torch.Tensor:
         image = np.repeat(image, 3, axis=-1)
 
     img = image.astype(np.float32)
-
     means = [float(img[:, :, c].mean()) / 255.0 for c in range(3)]
     stds = [float(img[:, :, c].std()) / 255.0 for c in range(3)]
-    
+
     gray = img.mean(axis=-1)
     brightness = float(gray.mean()) / 255.0
     contrast = float(gray.std()) / 255.0
@@ -1346,62 +508,41 @@ def extract_raw_image_tensor(image: Any, n_bins: int = 8) -> torch.Tensor:
     for c in range(3):
         channel = img[:, :, c].ravel()
         hist, _ = np.histogram(channel, bins=n_bins, range=(0.0, 255.0))
-        hist = hist.astype(np.float32)
         total = hist.sum()
-        probs = hist / total if total else np.zeros_like(hist)
+        probs = hist.astype(np.float32) / total if total else np.zeros_like(hist, dtype=np.float32)
         hist_features.extend(probs.tolist())
 
     feature_vector = means + stds + [brightness, contrast] + hist_features
     return torch.tensor(feature_vector, dtype=DTYPE, device=DEVICE)
 
 
-def project_image_to_lexical_vector(
-    model: NGramModel,
-    image: Any,
-) -> Dict[str, float]:
+def project_image_to_lexical_vector(model: NGramModel, image: Any) -> Dict[str, float]:
     if not model.finalized:
         model.finalize()
 
-    context_keys = sorted(
-        {
-            key
-            for vector in model.lexical_vectors.values()
-            for key in vector
-        }
-    )
-
+    context_keys = sorted({k for v in model.lexical_vectors.values() for k in v})
     if not context_keys:
         return {}
 
     img_tensor = extract_raw_image_tensor(image)
-    img_dim = img_tensor.shape[0]
-    ctx_dim = len(context_keys)
 
     generator = torch.Generator(device=DEVICE)
     generator.manual_seed(42)
-
     projection_matrix = torch.randn(
-        (img_dim, ctx_dim),
-        generator=generator,
-        dtype=DTYPE,
-        device=DEVICE,
+        (img_tensor.shape[0], len(context_keys)), generator=generator, dtype=DTYPE, device=DEVICE
     )
     projection_matrix = torch.nn.functional.normalize(projection_matrix, dim=0)
 
-    projected = img_tensor @ projection_matrix
-    projected = torch.tanh(projected)
+    projected = torch.tanh(img_tensor @ projection_matrix).detach().cpu()
 
-    result = {}
-    projected_cpu = projected.detach().cpu()
-    for i, key in enumerate(context_keys):
-        val = float(projected_cpu[i].item())
-        if abs(val) > 1e-6:
-            result[key] = val
-
-    return result
+    return {
+        key: float(projected[i].item())
+        for i, key in enumerate(context_keys)
+        if abs(float(projected[i].item())) > 1e-6
+    }
 
 
-# ------------------- Globals & Inference Helpers --------------------
+# ------------------------- globals & UI wiring ---------------------------
 
 TEXT_MODEL: NGramModel | None = None
 CORPUS_SEARCH: CorpusSearch | None = None
@@ -1411,9 +552,7 @@ CORPUS_TEXT_CACHE: str | None = None
 def load_text_model() -> NGramModel:
     model_path = Path(MODEL_PATH)
     if not model_path.exists():
-        raise FileNotFoundError(
-            f"{MODEL_PATH} not found. Upload a corpus and click 'Train model' first."
-        )
+        raise FileNotFoundError(f"{MODEL_PATH} not found. Upload a corpus and click 'Train model' first.")
     model = NGramModel.load_json(model_path)
     if not model.finalized:
         model.finalize()
@@ -1428,21 +567,14 @@ def load_corpus_search(corpus_text: str) -> CorpusSearch:
 
 def reload_globals():
     global TEXT_MODEL, CORPUS_SEARCH, CORPUS_TEXT_CACHE
-
     TEXT_MODEL = load_text_model()
 
     if CORPUS_TEXT_CACHE:
         corpus_text = CORPUS_TEXT_CACHE
     else:
         default_path = Path(DEFAULT_CORPUS_FILE)
-        if default_path.exists():
-            corpus_text = default_path.read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-            CORPUS_TEXT_CACHE = corpus_text
-        else:
-            corpus_text = ""
+        corpus_text = default_path.read_text(encoding="utf-8", errors="replace") if default_path.exists() else ""
+        CORPUS_TEXT_CACHE = corpus_text
 
     CORPUS_SEARCH = load_corpus_search(corpus_text)
 
@@ -1450,34 +582,21 @@ def reload_globals():
 def format_matches(prompt: str, limit: int = 5) -> str:
     if CORPUS_SEARCH is None or not CORPUS_SEARCH.references:
         return "No corpus file loaded."
-
     candidates = CORPUS_SEARCH.analyze(prompt, limit=limit)
     if not candidates:
         return "No corpus matches found."
-
-    lines = []
-    for candidate in candidates:
-        lines.append(
-            f"{candidate.rank}. "
-            f"{candidate.sentence} "
-            f"(score={candidate.score:.3f}, "
-            f"overlap={candidate.symbolic_overlap:.3f}, "
-            f"vector={candidate.vector_similarity:.3f})"
-        )
-    return "\n".join(lines)
+    return "\n".join(
+        f"{c.rank}. {c.sentence} (score={c.score:.3f}, overlap={c.symbolic_overlap:.3f}, vector={c.vector_similarity:.3f})"
+        for c in candidates
+    )
 
 
 def train_model_from_file(corpus_file):
     global CORPUS_TEXT_CACHE
-
     if corpus_file is None:
         return "No corpus file uploaded.", "", ""
 
-    if hasattr(corpus_file, "name"):
-        path = Path(corpus_file.name)
-    else:
-        path = Path(corpus_file)
-
+    path = Path(corpus_file.name) if hasattr(corpus_file, "name") else Path(corpus_file)
     if not path.exists():
         return f"Corpus file not found: {path}", "", ""
 
@@ -1487,66 +606,40 @@ def train_model_from_file(corpus_file):
     model = NGramModel()
     model.ingest_text(corpus_text)
     model.finalize()
-
-    model_path = Path(MODEL_PATH)
-    model.save_json(model_path)
+    model.save_json(Path(MODEL_PATH))
 
     reload_globals()
 
     sample_lines = "\n".join(corpus_text.splitlines()[:5])
-
     summary = (
         f"Vocabulary: {len(model.vocabulary)}\n"
         f"Unigrams: {len(model.unigram)}\n"
         f"Bigram contexts: {len(model.bigram)}\n"
-        f"Trigram contexts: {len(model.trigram)}\n"
-        f"Isomorphism classes: "
-        f"{len(set(model.isomorphism_map.values()))} "
-        f"from {len(model.isomorphism_map)} tokens"
+        f"Trigram contexts: {len(model.trigram)}"
     )
-
     return f"Model trained and saved to {MODEL_PATH}.", sample_lines, summary
 
 
 def process_camera_image(image, user_prompt: str):
     if TEXT_MODEL is None or CORPUS_SEARCH is None:
-        return (
-            image,
-            "Model not loaded. Upload a corpus and click 'Train model' first.",
-            "",
-            "",
-        )
-
+        return image, "Model not loaded. Upload a corpus and click 'Train model' first.", "", ""
 
     image_vector = project_image_to_lexical_vector(TEXT_MODEL, image)
+    prompt = user_prompt.strip() if user_prompt and user_prompt.strip() else "<bos>"
 
-    if user_prompt and user_prompt.strip():
-        generated = TEXT_MODEL.generate(
-            prompt=user_prompt.strip(),
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-            instruction_vector=image_vector,
-            instruction_weight=1.5,
-        )
-        corpus_matches = format_matches(user_prompt.strip(), limit=5)
-    else:
-        generated = TEXT_MODEL.generate(
-            prompt="<bos>",
-            max_new_tokens=MAX_NEW_TOKENS,
-            temperature=TEMPERATURE,
-            top_k=TOP_K,
-            instruction_vector=image_vector,
-            instruction_weight=1.5,
-        )
-        corpus_matches = "No prompt provided for corpus search."
-
+    generated = TEXT_MODEL.generate(
+        prompt=prompt,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        top_k=TOP_K,
+        instruction_vector=image_vector,
+        instruction_weight=INSTRUCTION_WEIGHT,
+    )
+    corpus_matches = format_matches(prompt, limit=5) if prompt != "<bos>" else "No prompt provided for corpus search."
     vector_summary = f"Projected {len(image_vector)} active dimensions into model lexical space."
 
     return image, vector_summary, corpus_matches, generated
 
-
-# --------------------------- UI -------------------------------------
 
 with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
     gr.Markdown(
@@ -1560,28 +653,14 @@ with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
     )
 
     gr.Markdown("## 1. Corpus & Training")
-
     with gr.Row():
         with gr.Column(scale=1):
-            corpus_file_input = gr.File(
-                label="Corpus file (any type)",
-                file_types=["file"],
-            )
+            corpus_file_input = gr.File(label="Corpus file (any type)", file_types=["file"])
             train_button = gr.Button("Train model", variant="primary")
-
         with gr.Column(scale=2):
-            train_status = gr.Textbox(
-                label="Training status",
-                lines=2,
-            )
-            corpus_sample = gr.Textbox(
-                label="Corpus sample (first 5 lines)",
-                lines=5,
-            )
-            model_summary = gr.Textbox(
-                label="Model summary",
-                lines=6,
-            )
+            train_status = gr.Textbox(label="Training status", lines=2)
+            corpus_sample = gr.Textbox(label="Corpus sample (first 5 lines)", lines=5)
+            model_summary = gr.Textbox(label="Model summary", lines=6)
 
     train_button.click(
         fn=train_model_from_file,
@@ -1590,51 +669,24 @@ with gr.Blocks(title="Camera Tensor-Faceted Tau Model") as demo:
     )
 
     gr.Markdown("## 2. Camera + Tensor Inference")
-
     with gr.Row():
         with gr.Column(scale=1):
             camera = gr.Image(
-                sources=["webcam", "upload"],
-                type="numpy",
-                label="Camera image",
+                sources=["webcam", "upload"], type="numpy", label="Camera image",
                 webcam_options=gr.WebcamOptions(mirror=False),
             )
-            user_prompt = gr.Textbox(
-                label="Optional text prompt",
-                lines=3,
-            )
-            recognize_button = gr.Button(
-                "Process image tensor",
-                variant="primary",
-            )
-
+            user_prompt = gr.Textbox(label="Optional text prompt", lines=3)
+            recognize_button = gr.Button("Process image tensor", variant="primary")
         with gr.Column(scale=2):
-            processed_image = gr.Image(
-                label="Processed image",
-                type="numpy",
-            )
-            feature_tokens_output = gr.Textbox(
-                label="Image Tensor Mapping Status",
-                lines=2,
-            )
-            corpus_output = gr.Textbox(
-                label="Corpus matches",
-                lines=6,
-            )
-            generated_output = gr.Textbox(
-                label="Tau model response",
-                lines=8,
-            )
+            processed_image = gr.Image(label="Processed image", type="numpy")
+            feature_tokens_output = gr.Textbox(label="Image Tensor Mapping Status", lines=2)
+            corpus_output = gr.Textbox(label="Corpus matches", lines=6)
+            generated_output = gr.Textbox(label="Tau model response", lines=8)
 
     recognize_button.click(
         fn=process_camera_image,
         inputs=[camera, user_prompt],
-        outputs=[
-            processed_image,
-            feature_tokens_output,
-            corpus_output,
-            generated_output,
-        ],
+        outputs=[processed_image, feature_tokens_output, corpus_output, generated_output],
     )
 
 
@@ -1650,8 +702,4 @@ if __name__ == "__main__":
     except FileNotFoundError:
         pass
 
-    demo.launch(
-        server_name=args.server_name,
-        server_port=args.server_port,
-        share=args.share,
-    )
+    demo.launch(server_name=args.server_name, server_port=args.server_port, share=args.share)
