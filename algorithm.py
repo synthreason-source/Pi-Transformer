@@ -1517,8 +1517,8 @@ def process_camera_image(image, user_prompt: str):
             "",
         )
 
-    flipped = flip_image_horizontal(image)
-    image_vector = project_image_to_lexical_vector(TEXT_MODEL, flipped)
+
+    image_vector = project_image_to_lexical_vector(TEXT_MODEL, image)
 
     if user_prompt and user_prompt.strip():
         generated = TEXT_MODEL.generate(
@@ -1543,7 +1543,7 @@ def process_camera_image(image, user_prompt: str):
 
     vector_summary = f"Projected {len(image_vector)} active dimensions into model lexical space."
 
-    return flipped, vector_summary, corpus_matches, generated
+    return image, vector_summary, corpus_matches, generated
 
 
 # --------------------------- UI -------------------------------------
