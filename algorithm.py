@@ -1,42 +1,24 @@
 from __future__ import annotations
 
 """
-Slimmed kernel version of the original app.
+Krylov Complexity Detector based on n-gram language model kernel.
 
-What's kept (the actual generation kernel):
-  - tokenize / n-gram counting (unigram, bigram, trigram)
-  - trigram -> bigram -> unigram backoff distribution
-  - lexical context vectors (bigram-context bag-of-words per token)
-  - cosine-similarity bias from an "instruction vector" folded into
-    next-token scores (still usable by any caller, just no longer fed by
-    a camera image -- see below)
-  - temperature + top-k sampling
-  - corpus lexical search (unchanged, it was already minimal)
-  - the Gradio UI, now text-only (no image/webcam input)
+What's new:
+  - Krylov subspace construction via Lanczos algorithm on token transition operators
+  - Lanczos coefficients {a_n, b_n} capture the "dynamics" of sequence evolution
+  - Krylov complexity K(t) = Σ n |φ_n(t)|² measures operator spreading
+  - Anomaly detection via deviation from expected Lanczos coefficient growth
+  - Krylov entropy as complementary disorder measure
+  - Change-point detection in sequences via sliding-window K-complexity
 
-Also removed in this pass: the camera/webcam pipeline (image capture,
-extract_raw_image_tensor, project_image_to_lexical_vector) and the torch
-dependency it existed for. The kernel never needed torch -- it was only
-used to turn a webcam frame into an instruction vector. With that gone the
-app is pure Python + numpy (numpy is kept for the entropy-matrix formulas
-below).
+The detector treats the trained n-gram model as defining a Liouvillian/operator
+that governs token transitions. By running Lanczos recursion on this operator
+starting from different seed tokens/contexts, we get:
+  1. Lanczos coefficients that characterize the "dynamical structure"
+  2. Krylov complexity growth curves that detect structural breaks
+  3. Anomaly scores based on coefficient pattern deviations
 
-What's removed (previously ~90% of the "math" in the file), because none of
-it changed the kernel's behavior in a way the app's own callers exercised,
-or because it was provably dead code:
-  - context_dimension_reduction  (agglomerative context merging)
-  - deep_bilinear_activation     (32-layer hashed elementwise-square stack)
-  - influence_and_isomorphism    (duplicate-token thresholding)
-  - transitivity_mask            (dead: no caller ever passed a mask)
-  - instruction_compound_growth  (per-token compounding multiplier)
-
-Each of those is recorded below as an ENTROPY_MATRIX: not its hyperparameters
-(that would encode the *code*), but the actual numeric output each formula
-produces when run on a canonical sample context-vector (that encodes the
-*math*). The Shannon entropy of each output row is a single number standing
-in for "how much this transformation actually did to the vector." Nothing
-else in the file reads this matrix at runtime -- it's a record of what was
-deleted, computed once at import time for reference.
+Still pure Python + numpy. No torch. Gradio UI updated with detector controls.
 """
 
 import argparse
@@ -60,75 +42,36 @@ TOP_K = 20
 MIN_COUNT = 1
 INSTRUCTION_WEIGHT = 1.5
 
+PARADIGM_STEPS = 10
+PARADIGM_WEIGHT = 1.2
+
 LEXICAL_WEIGHT = 0.15
 VECTOR_WEIGHT = 0.15
 
 IGNORED_TOKENS = {"<bos>", "<eos>", "<unk>"}
 
-
-# ------------------- entropy matrix of the removed math ------------------
-#
-# These five functions are faithful, minimal re-implementations of the
-# formulas that used to run inside the model. They are not called by the
-# kernel below -- they exist only so ENTROPY_MATRIX can be computed by
-# actually executing the math once, on one canonical sample vector, instead
-# of just listing the constants those formulas used to take as arguments.
-
-_SAMPLE_CONTEXT_VECTOR = np.array(
-    [0.40, 0.25, 0.15, 0.12, 0.05, 0.02, 0.01], dtype=np.float64
-)
+# Krylov detector parameters
+KRYLOV_MAX_ITER = 50
+KRYLOV_WINDOW_SIZE = 5
+KRYLOV_STRIDE = 1
+ANOMALY_THRESHOLD = 2.0  # standard deviations
 
 
-def _math_context_dimension_reduction(x: np.ndarray, fraction: float = 0.1) -> np.ndarray:
-    v = x.copy()
-    target = max(1, math.ceil(len(v) * fraction))
-    while len(v) > target:
-        i, j = np.argsort(v)[-2:]  # greedily merge the two largest bins
-        merged = v[i] + v[j]
-        v = np.append(np.delete(v, [i, j]), merged)
-    out = np.zeros_like(x)
-    out[: len(v)] = v
-    return out
+# ------------------- Krylov complexity core ------------------
 
-
-def _math_deep_bilinear_activation(x: np.ndarray, layers: int = 32, scale: float = 14.0) -> np.ndarray:
-    rng = np.random.default_rng(42)
-    v = x.copy()
-    for _ in range(layers):
-        projection = rng.standard_normal((len(v), len(v)))
-        projection /= np.linalg.norm(projection, axis=0, keepdims=True) + 1e-12
-        u = v @ projection
-        v = np.tanh(scale * u * u)  # u and v share one projection -> elementwise square
-        if not np.any(v):
-            break
-    return v
-
-
-def _math_influence_and_isomorphism(x: np.ndarray, influence_tau: float = 0.7) -> np.ndarray:
-    spread = x.max() - x.min() + 1e-12
-    similarity = 1.0 - np.abs(np.subtract.outer(x, x)) / spread  # pairwise closeness, diag=1
-    np.fill_diagonal(similarity, -1.0)  # a token never influences itself
-    influence = np.where(similarity >= influence_tau, similarity, 0.0)
-    return influence.sum(axis=1)
-
-
-def _math_transitivity_mask(x: np.ndarray, weight: float = 0.71, k: float = 13.0) -> np.ndarray:
-    return weight * (np.exp(k * x) - 1.0)
-
-
-def _math_instruction_compound_growth(
-    x: np.ndarray, curve_k: float = 2.0, midpoint: float = 0.5, growth: float = 0.65, cap: float = 4.0
-) -> np.ndarray:
-    out = x.copy()
-    factor = 1.0
-    for i in range(len(out)):
-        likeness = 1.0 / (1.0 + math.exp(-curve_k * (out[i] - midpoint)))
-        factor = min(cap, factor * (1.0 + growth * likeness))
-        out[i] = out[i] * factor
-    return out
+@dataclass
+class KrylovResult:
+    """Results from Krylov complexity analysis."""
+    lanczos_a: List[float]  # diagonal coefficients
+    lanczos_b: List[float]  # off-diagonal coefficients
+    complexity_curve: List[float]  # K(t) over "time" steps
+    krylov_entropy: float  # entropy of |φ_n|² distribution
+    anomaly_score: float  # deviation from expected b_n pattern
+    basis_size: int  # actual Krylov dimension reached
 
 
 def _shannon_entropy_bits(v: np.ndarray) -> float:
+    """Shannon entropy in bits for a probability distribution."""
     magnitudes = np.abs(v)
     total = magnitudes.sum()
     if total <= 0:
@@ -137,28 +80,312 @@ def _shannon_entropy_bits(v: np.ndarray) -> float:
     return float(-(probabilities * np.log2(probabilities)).sum())
 
 
-def _build_entropy_matrix() -> Dict[str, Dict[str, Any]]:
-    formulas = {
-        "context_dimension_reduction": _math_context_dimension_reduction,
-        "deep_bilinear_activation": _math_deep_bilinear_activation,
-        "influence_and_isomorphism": _math_influence_and_isomorphism,
-        "transitivity_mask": _math_transitivity_mask,
-        "instruction_compound_growth": _math_instruction_compound_growth,
-    }
-    matrix = {}
-    for name, fn in formulas.items():
-        output_row = fn(_SAMPLE_CONTEXT_VECTOR)
-        matrix[name] = {
-            "output_row": [round(float(v), 4) for v in output_row],
-            "entropy_bits": round(_shannon_entropy_bits(output_row), 4),
-        }
-    return matrix
+def _lanczos_recursion(
+    operator_matrix: np.ndarray,
+    initial_vector: np.ndarray,
+    max_iter: int = 50,
+    tolerance: float = 1e-10
+) -> Tuple[List[float], List[float], int]:
+    """
+    Lanczos algorithm for tridiagonalization.
+    
+    Given a symmetric operator L and starting vector v_0, produces:
+      - a_n = ⟨v_n | L | v_n⟩ (diagonal)
+      - b_n = ‖w_n‖ where w_n = L v_n - a_n v_n - b_{n-1} v_{n-1}
+    
+    The b_n coefficients control spreading in Krylov space.
+    Returns (a_coeffs, b_coeffs, actual_iterations).
+    """
+    n = operator_matrix.shape[0]
+    if n == 0:
+        return [], [], 0
+    
+    # Normalize initial vector
+    v_prev = np.zeros(n, dtype=np.float64)
+    v_curr = initial_vector / (np.linalg.norm(initial_vector) + 1e-12)
+    
+    a_coeffs = []
+    b_coeffs = []
+    b_prev = 0.0
+    
+    for iteration in range(max_iter):
+        # w = L v_n
+        w = operator_matrix @ v_curr
+        
+        # a_n = ⟨v_n | L | v_n⟩ = ⟨v_n | w⟩
+        a_n = float(np.dot(v_curr, w))
+        a_coeffs.append(a_n)
+        
+        # w = w - a_n v_n - b_{n-1} v_{n-1}
+        w = w - a_n * v_curr
+        if iteration > 0:
+            w = w - b_prev * v_prev
+        
+        # b_n = ‖w‖
+        b_n = np.linalg.norm(w)
+        
+        # Check for breakdown (exact Krylov subspace found)
+        if b_n < tolerance or iteration == max_iter - 1:
+            b_coeffs.append(0.0)  # terminal b_n
+            return a_coeffs, b_coeffs, iteration + 1
+        
+        b_coeffs.append(b_n)
+        b_prev = b_n
+        
+        # Prepare next iteration
+        v_prev = v_curr.copy()
+        v_curr = w / (b_n + 1e-12)
+    
+    return a_coeffs, b_coeffs, max_iter
 
 
-# Computed once at import time from the sample vector above: rows are what
-# each removed formula actually did to a context vector, not the arguments
-# it used to be called with.
-ENTROPY_MATRIX: Dict[str, Dict[str, Any]] = _build_entropy_matrix()
+def _build_transition_operator(model: "NGramModel", context_tokens: List[str]) -> Tuple[np.ndarray, List[str], Dict[str, int]]:
+    """
+    Build a finite-dimensional transition operator from n-gram statistics.
+    
+    For a given context (previous tokens), construct a matrix where:
+      L[i,j] = P(token_j | context_i) - stationary baseline
+    
+    This operator governs how probability mass flows between tokens.
+    Returns (operator_matrix, token_list, token_to_idx).
+    """
+    if not model.finalized:
+        model.finalize()
+    
+    # Get active vocabulary for this context
+    if context_tokens:
+        # Condition on recent context
+        ctx = context_tokens[-2:] if len(context_tokens) >= 2 else context_tokens
+        base_dist = model.backoff_distribution(ctx[-1], ctx[-2] if len(ctx) > 1 else None)
+    else:
+        base_dist = model.normalize(model.unigram)
+    
+    # Select top-K tokens by probability for tractable matrix size
+    sorted_tokens = sorted(base_dist.items(), key=lambda x: x[1], reverse=True)
+    max_dim = min(64, len(sorted_tokens))  # cap matrix size
+    active_tokens = [t for t, _ in sorted_tokens[:max_dim]]
+    
+    if len(active_tokens) < 2:
+        return np.zeros((1, 1)), active_tokens or ["<unk>"], {t: i for i, t in enumerate(active_tokens or ["<unk>"])}
+    
+    token_to_idx = {t: i for i, t in enumerate(active_tokens)}
+    n = len(active_tokens)
+    
+    # Build operator: L[i,j] = transition rate from token i to token j
+    # Use log-probability differences to capture "force" driving transitions
+    L = np.zeros((n, n), dtype=np.float64)
+    
+    for i, token_i in enumerate(active_tokens):
+        # Get distribution after token_i
+        next_dist = model.backoff_distribution(token_i, context_tokens[-1] if context_tokens else None)
+        
+        for j, token_j in enumerate(active_tokens):
+            p_ij = next_dist.get(token_j, 1e-12)
+            p_baseline = base_dist.get(token_j, 1e-12)
+            
+            # Log-ratio captures deviation from stationary
+            if p_ij > 1e-12 and p_baseline > 1e-12:
+                L[i, j] = math.log(p_ij / p_baseline)
+            else:
+                L[i, j] = 0.0
+    
+    # Symmetrize for Lanczos (L + L^T) / 2
+    L = (L + L.T) / 2.0
+    
+    return L, active_tokens, token_to_idx
+
+def _compute_krylov_complexity(
+    model: "NGramModel",
+    seed_context: List[str],
+    max_iter: int = KRYLOV_MAX_ITER,
+    time_steps: int = 20
+) -> KrylovResult:
+    """
+    Compute Krylov complexity for sequence evolution from a seed context.
+    
+    Steps:
+      1. Build transition operator L from n-gram model
+      2. Choose initial vector (one-hot on seed token or uniform)
+      3. Run Lanczos to get {a_n, b_n}
+      4. Compute complexity curve K(t) = Σ n |φ_n(t)|²
+      5. Compute Krylov entropy and anomaly score
+    
+    Returns KrylovResult with all diagnostics.
+    """
+    if not model.finalized:
+        model.finalize()
+    
+    # Build operator
+    L, tokens, token_to_idx = _build_transition_operator(model, seed_context)
+    n_dim = L.shape[0]
+    
+    if n_dim < 2:
+        return KrylovResult(
+            lanczos_a=[0.0],
+            lanczos_b=[0.0],
+            complexity_curve=[0.0],
+            krylov_entropy=0.0,
+            anomaly_score=0.0,
+            basis_size=1
+        )
+    
+    # Initial vector: localized on first token of seed, or uniform
+    if seed_context and seed_context[-1] in token_to_idx:
+        v0 = np.zeros(n_dim, dtype=np.float64)
+        v0[token_to_idx[seed_context[-1]]] = 1.0
+    else:
+        v0 = np.ones(n_dim, dtype=np.float64) / math.sqrt(n_dim)
+    
+    # Lanczos recursion
+    a_coeffs, b_coeffs, actual_iter = _lanczos_recursion(L, v0, max_iter=max_iter)
+    
+    # Compute complexity curve K(t) for t = 0, 1, ..., time_steps
+    # Using the formula K(t) = Σ n n |φ_n(t)|² where φ_n(t) comes from e^{iLt} v0
+    # Approximate via Chebyshev expansion or direct diagonalization for small matrices
+    
+    # For detector purposes, use simplified model:
+    # K(t) ≈ Σ_{n=0}^{K-1} n * (b_1² t² / n!²) for early times (universal growth)
+    complexity_curve = []
+    for t_step in range(time_steps):
+        t = t_step * 0.5  # time scale
+        
+        # Approximate |φ_n(t)|² using Bessel-like spreading
+        # For chaotic systems: |φ_n(t)|² ~ (b t)^{2n} / (n!)² initially
+        phi_sq = []
+        for n_idx in range(len(b_coeffs) - 1):
+            b_effective = np.mean(b_coeffs[:min(n_idx+1, len(b_coeffs)-1)]) if b_coeffs else 1.0
+            if n_idx == 0:
+                prob = max(0.0, 1.0 - b_effective * t)
+            else:
+                # Heuristic spreading model
+                prob = (b_effective * t) ** (2 * n_idx) / math.factorial(n_idx + 1) ** 2
+                prob = min(prob, 1.0)
+            phi_sq.append(prob)
+        
+        # Normalize
+        total = sum(phi_sq) + 1e-12
+        phi_sq = [p / total for p in phi_sq]
+        
+        # K(t) = Σ n |φ_n|²
+        K_t = sum(n * p for n, p in enumerate(phi_sq))
+        complexity_curve.append(K_t)
+    
+    # Krylov entropy: S = -Σ |φ_n|² log |φ_n|²
+    # Use final distribution in complexity curve calculation
+    phi_final = []
+    for n_idx in range(len(b_coeffs) - 1):
+        b_effective = np.mean(b_coeffs[:min(n_idx+1, len(b_coeffs)-1)]) if b_coeffs else 1.0
+        t = (time_steps - 1) * 0.5
+        if n_idx == 0:
+            prob = max(0.0, 1.0 - b_effective * t)
+        else:
+            prob = (b_effective * t) ** (2 * n_idx) / math.factorial(n_idx + 1) ** 2
+            prob = min(prob, 1.0)
+        phi_final.append(prob)
+    
+    total = sum(phi_final) + 1e-12
+    phi_final = [p / total for p in phi_final]
+    krylov_entropy = _shannon_entropy_bits(np.array(phi_final))
+    
+    # Anomaly score: deviation of b_n from smooth growth
+    # Expected: b_n grows linearly or saturates for chaotic systems
+    # Anomalous: erratic b_n pattern
+    if len(b_coeffs) > 3:
+        b_nonzero = [b for b in b_coeffs[:-1] if b > 1e-6]  # exclude terminal zero
+        if len(b_nonzero) > 2:
+            # Fit linear trend
+            x = np.arange(len(b_nonzero))
+            y = np.array(b_nonzero)
+            coeffs = np.polyfit(x, y, 1)
+            trend = coeffs[0] * x + coeffs[1]
+            residuals = y - trend
+            std_residual = np.std(residuals)
+            mean_b = np.mean(b_nonzero)
+            anomaly_score = std_residual / (mean_b + 1e-6)
+        else:
+            anomaly_score = 0.0
+    else:
+        anomaly_score = 0.0
+    
+    return KrylovResult(
+        lanczos_a=a_coeffs,
+        lanczos_b=b_coeffs,
+        complexity_curve=complexity_curve,
+        krylov_entropy=krylov_entropy,
+        anomaly_score=anomaly_score,
+        basis_size=actual_iter
+    )
+
+
+def _sliding_window_krylov(
+    model: "NGramModel",
+    token_sequence: List[str],
+    window_size: int = KRYLOV_WINDOW_SIZE,
+    stride: int = KRYLOV_STRIDE
+) -> List[Tuple[int, KrylovResult]]:
+    """
+    Compute Krylov complexity in sliding windows across a sequence.
+    
+    Returns list of (window_start_index, KrylovResult) for anomaly detection.
+    """
+    results = []
+    
+    for start in range(0, len(token_sequence) - window_size + 1, stride):
+        window = token_sequence[start:start + window_size]
+        krylov_result = _compute_krylov_complexity(model, window)
+        results.append((start, krylov_result))
+    
+    return results
+
+
+def _detect_anomalies(
+    krylov_results: List[Tuple[int, KrylovResult]],
+    threshold: float = ANOMALY_THRESHOLD
+) -> List[Tuple[int, float]]:
+    """
+    Detect anomalous windows based on Krylov metrics.
+    
+    Anomaly if:
+      - anomaly_score > threshold * median(anomaly_scores)
+      - OR krylov_entropy deviates significantly
+      - OR lanczos_b pattern breaks
+    
+    Returns list of (position, combined_anomaly_score).
+    """
+    if not krylov_results:
+        return []
+    
+    # Collect metrics
+    anomaly_scores = [r[1].anomaly_score for r in krylov_results]
+    entropies = [r[1].krylov_entropy for r in krylov_results]
+    basis_sizes = [r[1].basis_size for r in krylov_results]
+    
+    if not anomaly_scores:
+        return []
+    
+    median_anomaly = np.median(anomaly_scores)
+    std_anomaly = np.std(anomaly_scores) + 1e-6
+    median_entropy = np.median(entropies)
+    std_entropy = np.std(entropies) + 1e-6
+    
+    anomalies = []
+    for idx, (start_pos, result) in enumerate(krylov_results):
+        # Combined z-score
+        z_anomaly = (result.anomaly_score - median_anomaly) / std_anomaly
+        z_entropy = abs(result.krylov_entropy - median_entropy) / std_entropy
+        
+        # Basis size collapse can indicate structural break
+        z_basis = 0.0
+        if median_basis := np.median(basis_sizes):
+            if result.basis_size < 0.5 * median_basis:
+                z_basis = 2.0
+        
+        combined_score = max(z_anomaly, z_entropy, z_basis)
+        
+        if combined_score > threshold:
+            anomalies.append((start_pos, combined_score))
+    
+    return anomalies
 
 
 # --------------------------- shared helpers --------------------------
@@ -201,6 +428,35 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
 
 def strip_structural_tokens(tokens: List[str]) -> List[str]:
     return [t for t in tokens if t not in IGNORED_TOKENS]
+
+
+def _dense_matrix_from_vectors(vectors: List[Dict[str, float]]) -> Tuple[np.ndarray, List[str]]:
+    """Stack sparse dict-vectors into one dense matrix over their shared key space."""
+    keys = sorted({k for v in vectors for k in v})
+    key_index = {k: i for i, k in enumerate(keys)}
+    matrix = np.zeros((len(vectors), len(keys)), dtype=np.float64)
+    for row, vector in enumerate(vectors):
+        for key, weight in vector.items():
+            matrix[row, key_index[key]] = weight
+    return matrix, keys
+
+
+def _dominant_eigenvector(matrix: np.ndarray, iterations: int = 100) -> np.ndarray:
+    """Power iteration for the leading eigenvector of a symmetric matrix."""
+    n = matrix.shape[0]
+    if n == 0:
+        return np.zeros(0)
+    vector = np.ones(n, dtype=np.float64) / math.sqrt(n)
+    for _ in range(iterations):
+        next_vector = matrix @ vector
+        norm = np.linalg.norm(next_vector)
+        if norm < 1e-12:
+            return vector
+        next_vector = next_vector / norm
+        if np.allclose(next_vector, vector, atol=1e-10) or np.allclose(next_vector, -vector, atol=1e-10):
+            return next_vector
+        vector = next_vector
+    return vector
 
 
 # --------------------------- corpus search ----------------------------
@@ -271,14 +527,7 @@ class CorpusSearch:
 
 @dataclass
 class NGramModel:
-    """Trigram-backoff language model with cosine-similarity steering.
-
-    This is the entire kernel: count n-grams, back off trigram -> bigram ->
-    unigram for the next-token distribution, and optionally nudge scores
-    toward tokens whose bigram-context vector is similar to an external
-    "instruction vector" (kept as a general hook; nothing in this app
-    currently supplies one now that the image pipeline is gone).
-    """
+    """Trigram-backoff language model with Krylov complexity detector."""
 
     eos_token: str = "<eos>"
     unk_token: str = "<unk>"
@@ -317,9 +566,6 @@ class NGramModel:
         if self.unk_token not in self.vocabulary:
             self.vocabulary.append(self.unk_token)
 
-        # lexical vector for a token = normalized distribution of the
-        # bigram contexts it appears after. This is what the
-        # instruction-bias cosine similarity operates on.
         token_contexts: Dict[str, Counter] = defaultdict(Counter)
         for context, counts in self.bigram.items():
             for token, count in counts.items():
@@ -332,6 +578,34 @@ class NGramModel:
             self.lexical_vectors[token] = {c: n / total for c, n in counts.items()}
 
         self.finalized = True
+
+    # ---- prompt kernel (paradigm for the conversation) ----
+
+    def prompt_kernel_vector(self, prompt: str) -> Dict[str, float]:
+        if not self.finalized:
+            self.finalize()
+
+        tokens = [t for t in tokenize(prompt) if t not in IGNORED_TOKENS]
+        tokens = [t for t in tokens if self.lexical_vectors.get(t)]
+        if not tokens:
+            return {}
+
+        vectors = [self.lexical_vectors[t] for t in tokens]
+        matrix, keys = _dense_matrix_from_vectors(vectors)
+
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        norms[norms < 1e-12] = 1.0
+        normalized = matrix / norms
+
+        kernel = normalized @ normalized.T
+        weights = np.abs(_dominant_eigenvector(kernel))
+        total = weights.sum()
+        if total < 1e-12:
+            return {}
+        weights = weights / total
+
+        paradigm = weights @ matrix
+        return {key: float(w) for key, w in zip(keys, paradigm) if abs(w) > 1e-9}
 
     # ---- scoring / sampling ----
 
@@ -433,13 +707,24 @@ class NGramModel:
         top_k: int = 20,
         instruction_vector: Optional[Dict[str, float]] = None,
         instruction_weight: float = 0.0,
+        paradigm_steps: int = 0,
+        paradigm_weight: float = PARADIGM_WEIGHT,
     ) -> str:
         generated = tokenize(prompt)
-        for _ in range(max_new_tokens):
+
+        paradigm_vector = self.prompt_kernel_vector(prompt) if paradigm_steps > 0 else None
+
+        for step in range(max_new_tokens):
+            if paradigm_vector and step < paradigm_steps:
+                active_vector, active_weight = paradigm_vector, paradigm_weight
+            else:
+                active_vector, active_weight = instruction_vector, instruction_weight
+
             token = self.sample_next(
-                " ".join(generated), temperature, top_k, instruction_vector, instruction_weight
+                " ".join(generated), temperature, top_k, active_vector, active_weight
             )
             generated.append(token)
+
         return self.detokenize(strip_structural_tokens(generated))
 
     @staticmethod
@@ -562,7 +847,7 @@ def train_model_from_file(corpus_file):
     return f"Model trained and saved to {MODEL_PATH}.", sample_lines, summary
 
 
-def generate_from_prompt(user_prompt: str):
+def generate_from_prompt(user_prompt: str, paradigm_steps: int):
     if TEXT_MODEL is None or CORPUS_SEARCH is None:
         return "Model not loaded. Upload a corpus and click 'Train model' first.", ""
 
@@ -573,20 +858,162 @@ def generate_from_prompt(user_prompt: str):
         max_new_tokens=MAX_NEW_TOKENS,
         temperature=TEMPERATURE,
         top_k=TOP_K,
+        paradigm_steps=int(paradigm_steps),
+        paradigm_weight=PARADIGM_WEIGHT,
     )
     corpus_matches = format_matches(prompt, limit=5) if prompt != "<bos>" else "No prompt provided for corpus search."
 
     return corpus_matches, generated
 
 
-with gr.Blocks(title="Tau Model") as demo:
+# ------------------------- Krylov detector UI functions -------------------------
+
+def analyze_krylov_single(prompt: str, max_iter: int) -> str:
+    """Analyze Krylov complexity for a single prompt."""
+    if TEXT_MODEL is None:
+        return "Model not loaded."
+    
+    tokens = tokenize(prompt)
+    if not tokens:
+        return "Empty prompt."
+    
+    result = _compute_krylov_complexity(TEXT_MODEL, tokens, max_iter=max_iter)
+    
+    output_lines = [
+        f"Krylov Analysis for: '{prompt[:50]}...' ",
+        "",
+        f"Basis size: {result.basis_size}",
+        f"Lanczos a (diagonal): {[round(a, 4) for a in result.lanczos_a[:10]]}{'...' if len(result.lanczos_a) > 10 else ''}",
+        f"Lanczos b (off-diagonal): {[round(b, 4) for b in result.lanczos_b[:10]]}{'...' if len(result.lanczos_b) > 10 else ''}",
+        "",
+        f"Krylov entropy: {result.krylov_entropy:.4f} bits",
+        f"Anomaly score: {result.anomaly_score:.4f}",
+        "",
+        "Complexity curve K(t):",
+    ]
+    
+    for t, k_val in enumerate(result.complexity_curve):
+        output_lines.append(f"  t={t}: K = {k_val:.4f}")
+    
+    return "\n".join(output_lines)
+
+
+def analyze_krylov_sequence(sequence_text: str, window_size: int, stride: int, threshold: float) -> str:
+    """Analyze Krylov complexity across a token sequence with sliding windows."""
+    if TEXT_MODEL is None:
+        return "Model not loaded."
+    
+    tokens = tokenize(sequence_text)
+    if len(tokens) < window_size:
+        return f"Sequence too short ({len(tokens)} tokens). Need at least {window_size}."
+    
+    # Sliding window analysis
+    window_results = _sliding_window_krylov(TEXT_MODEL, tokens, window_size=window_size, stride=stride)
+    
+    if not window_results:
+        return "No windows analyzed."
+    
+    # Detect anomalies
+    anomalies = _detect_anomalies(window_results, threshold=threshold)
+    
+    # Build output
+    output_lines = [
+        f"Krylov Sequence Analysis",
+        f"Sequence length: {len(tokens)} tokens",
+        f"Window size: {window_size}, stride: {stride}",
+        "",
+        "Window-by-window results:",
+    ]
+    
+    for start_pos, result in window_results:
+        anomaly_flag = " [ANOMALY]" if any(abs(start_pos - a[0]) < stride for a in anomalies) else ""
+        output_lines.append(
+            f"  Window {start_pos}-{start_pos + window_size}: "
+            f"K={result.complexity_curve[-1]:.3f}, "
+            f"S={result.krylov_entropy:.3f}, "
+            f"anomaly={result.anomaly_score:.3f}{anomaly_flag}"
+        )
+    
+    if anomalies:
+        output_lines.append("")
+        output_lines.append(f"Detected {len(anomalies)} anomalies at positions:")
+        for pos, score in anomalies:
+            output_lines.append(f"  Position {pos}: score = {score:.3f}")
+    else:
+        output_lines.append("")
+        output_lines.append("No anomalies detected.")
+    
+    return "\n".join(output_lines)
+
+
+def detect_change_points(sequence_text: str, window_size: int) -> str:
+    """Detect structural change points in sequence via Krylov complexity."""
+    if TEXT_MODEL is None:
+        return "Model not loaded."
+    
+    tokens = tokenize(sequence_text)
+    if len(tokens) < 2 * window_size:
+        return f"Sequence too short for change-point detection."
+    
+    # Compute Krylov complexity in overlapping windows
+    stride = max(1, window_size // 4)
+    window_results = _sliding_window_krylov(TEXT_MODEL, tokens, window_size=window_size, stride=stride)
+    
+    if len(window_results) < 3:
+        return "Not enough windows for change-point detection."
+    
+    # Look for sudden changes in complexity or entropy
+    change_points = []
+    prev_result = None
+    
+    for start_pos, result in window_results:
+        if prev_result is not None:
+            # Detect jumps
+            delta_k = abs(result.complexity_curve[-1] - prev_result.complexity_curve[-1])
+            delta_s = abs(result.krylov_entropy - prev_result.krylov_entropy)
+            delta_anomaly = abs(result.anomaly_score - prev_result.anomaly_score)
+            
+            # Threshold for change
+            if delta_k > 0.5 or delta_s > 0.3 or delta_anomaly > 1.0:
+                change_points.append((start_pos, delta_k, delta_s, delta_anomaly))
+        
+        prev_result = result
+    
+    # Format output
+    output_lines = [
+        f"Change-Point Detection Results",
+        f"Sequence: {len(tokens)} tokens, window size: {window_size}",
+        "",
+    ]
+    
+    if change_points:
+        output_lines.append(f"Found {len(change_points)} potential change points:")
+        for pos, dk, ds, da in change_points:
+            output_lines.append(
+                f"  Position {pos}: ΔK={dk:.3f}, ΔS={ds:.3f}, Δanomaly={da:.3f}"
+            )
+    else:
+        output_lines.append("No significant change points detected.")
+        output_lines.append("")
+        output_lines.append("Sequence appears structurally homogeneous by Krylov metrics.")
+    
+    return "\n".join(output_lines)
+
+
+# ------------------------- Gradio UI ---------------------------
+
+with gr.Blocks(title="Krylov Detector") as demo:
     gr.Markdown(
         """
-# Tau Model
+# Krylov Complexity Detector
 
-1. Upload any file as corpus.
-2. Click **Train model**.
-3. Enter a prompt and generate text.
+N-gram language model + Krylov subspace analysis for sequence anomaly detection.
+
+**Workflow:**
+1. Upload corpus → Train model
+2. Use Krylov analysis tabs to detect anomalies, change-points, and structural breaks
+3. Lanczos coefficients {a_n, b_n} characterize the "dynamics" of token transitions
+4. Krylov complexity K(t) measures operator spreading - sudden changes indicate anomalies
 """
     )
 
@@ -606,20 +1033,110 @@ with gr.Blocks(title="Tau Model") as demo:
         outputs=[train_status, corpus_sample, model_summary],
     )
 
-    gr.Markdown("## 2. Text Generation")
-    with gr.Row():
-        with gr.Column(scale=1):
-            user_prompt = gr.Textbox(label="Prompt", lines=3)
-            generate_button = gr.Button("Generate", variant="primary")
-        with gr.Column(scale=2):
-            corpus_output = gr.Textbox(label="Corpus matches", lines=6)
-            generated_output = gr.Textbox(label="Tau model response", lines=8)
+    with gr.Tab("Single Prompt Analysis"):
+        gr.Markdown(
+            """
+### Krylov Analysis for Single Prompt
 
-    generate_button.click(
-        fn=generate_from_prompt,
-        inputs=[user_prompt],
-        outputs=[corpus_output, generated_output],
-    )
+Computes Lanczos coefficients and complexity curve for one prompt's token dynamics.
+"""
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                krylov_prompt = gr.Textbox(label="Prompt to analyze", lines=3)
+                krylov_max_iter = gr.Slider(
+                    minimum=5, maximum=100, value=30, step=1,
+                    label="Max Lanczos iterations"
+                )
+                krylov_analyze_btn = gr.Button("Analyze", variant="primary")
+            with gr.Column(scale=2):
+                krylov_output = gr.Textbox(label="Krylov analysis results", lines=15)
+
+        krylov_analyze_btn.click(
+            fn=analyze_krylov_single,
+            inputs=[krylov_prompt, krylov_max_iter],
+            outputs=[krylov_output],
+        )
+
+    with gr.Tab("Sequence Anomaly Detection"):
+        gr.Markdown(
+            """
+### Sliding-Window Anomaly Detection
+
+Scans a sequence with sliding windows, computing Krylov complexity for each.
+Anomalies flagged where Lanczos b_n pattern deviates or complexity jumps.
+"""
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                anomaly_sequence = gr.Textbox(label="Sequence to scan", lines=5)
+                anomaly_window = gr.Slider(
+                    minimum=5, maximum=50, value=5, step=1,
+                    label="Window size"
+                )
+                anomaly_stride = gr.Slider(
+                    minimum=1, maximum=20, value=1, step=1,
+                    label="Stride"
+                )
+                anomaly_threshold = gr.Slider(
+                    minimum=0.5, maximum=5.0, value=2.0, step=0.1,
+                    label="Anomaly threshold (std devs)"
+                )
+                anomaly_detect_btn = gr.Button("Detect anomalies", variant="primary")
+            with gr.Column(scale=2):
+                anomaly_output = gr.Textbox(label="Anomaly detection results", lines=15)
+
+        anomaly_detect_btn.click(
+            fn=analyze_krylov_sequence,
+            inputs=[anomaly_sequence, anomaly_window, anomaly_stride, anomaly_threshold],
+            outputs=[anomaly_output],
+        )
+
+    with gr.Tab("Change-Point Detection"):
+        gr.Markdown(
+            """
+### Structural Change-Point Detection
+
+Identifies positions where Krylov complexity or entropy changes abruptly,
+indicating potential topic shifts, style changes, or structural breaks.
+"""
+        )
+        with gr.Row():
+            with gr.Column(scale=1):
+                changepoint_sequence = gr.Textbox(label="Sequence to analyze", lines=5)
+                changepoint_window = gr.Slider(
+                    minimum=10, maximum=100, value=30, step=1,
+                    label="Window size"
+                )
+                changepoint_detect_btn = gr.Button("Detect change points", variant="primary")
+            with gr.Column(scale=2):
+                changepoint_output = gr.Textbox(label="Change-point detection results", lines=15)
+
+        changepoint_detect_btn.click(
+            fn=detect_change_points,
+            inputs=[changepoint_sequence, changepoint_window],
+            outputs=[changepoint_output],
+        )
+
+    with gr.Tab("Text Generation (Original)"):
+        gr.Markdown("## Text Generation")
+        with gr.Row():
+            with gr.Column(scale=1):
+                user_prompt = gr.Textbox(label="Prompt", lines=3)
+                paradigm_steps_input = gr.Slider(
+                    minimum=0, maximum=50, value=PARADIGM_STEPS, step=1,
+                    label="Paradigm steps (n)",
+                )
+                generate_button = gr.Button("Generate", variant="primary")
+            with gr.Column(scale=2):
+                corpus_output = gr.Textbox(label="Corpus matches", lines=6)
+                generated_output = gr.Textbox(label="Tau model response", lines=8)
+
+        generate_button.click(
+            fn=generate_from_prompt,
+            inputs=[user_prompt, paradigm_steps_input],
+            outputs=[corpus_output, generated_output],
+        )
 
 
 if __name__ == "__main__":
