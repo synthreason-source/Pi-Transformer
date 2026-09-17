@@ -926,10 +926,14 @@ def analyze_krylov_sequence(sequence_text: str, window_size: int, stride: int, t
     ]
     
     for start_pos, result in window_results:
+        # Get the actual words in this window
+        window_tokens = tokens[start_pos:start_pos + window_size]
+        window_text = " ".join(window_tokens[:10]) + ("..." if len(window_tokens) > 10 else "")
+        
         anomaly_flag = " [ANOMALY]" if any(abs(start_pos - a[0]) < stride for a in anomalies) else ""
         output_lines.append(
-            f"  Window {start_pos}-{start_pos + window_size}: "
-            f"K={result.complexity_curve[-1]:.3f}, "
+            f"\n  Window {start_pos}-{start_pos + window_size}: {window_text}"
+            f"\n    K={result.complexity_curve[-1]:.3f}, "
             f"S={result.krylov_entropy:.3f}, "
             f"anomaly={result.anomaly_score:.3f}{anomaly_flag}"
         )
@@ -938,13 +942,15 @@ def analyze_krylov_sequence(sequence_text: str, window_size: int, stride: int, t
         output_lines.append("")
         output_lines.append(f"Detected {len(anomalies)} anomalies at positions:")
         for pos, score in anomalies:
-            output_lines.append(f"  Position {pos}: score = {score:.3f}")
+            # Show words at anomaly position
+            anomaly_tokens = tokens[pos:pos + min(10, len(tokens) - pos)]
+            anomaly_text = " ".join(anomaly_tokens)
+            output_lines.append(f"  Position {pos}: {anomaly_text} (score = {score:.3f})")
     else:
         output_lines.append("")
         output_lines.append("No anomalies detected.")
     
     return "\n".join(output_lines)
-
 
 def detect_change_points(sequence_text: str, window_size: int) -> str:
     """Detect structural change points in sequence via Krylov complexity."""
@@ -989,8 +995,12 @@ def detect_change_points(sequence_text: str, window_size: int) -> str:
     if change_points:
         output_lines.append(f"Found {len(change_points)} potential change points:")
         for pos, dk, ds, da in change_points:
+            # Show words around change point
+            context_tokens = tokens[max(0, pos-2):pos + min(8, len(tokens) - pos)]
+            context_text = " ".join(context_tokens)
             output_lines.append(
-                f"  Position {pos}: ΔK={dk:.3f}, ΔS={ds:.3f}, Δanomaly={da:.3f}"
+                f"  Position {pos}: ...{context_text}..."
+                f"\n    ΔK={dk:.3f}, ΔS={ds:.3f}, Δanomaly={da:.3f}"
             )
     else:
         output_lines.append("No significant change points detected.")
@@ -998,8 +1008,6 @@ def detect_change_points(sequence_text: str, window_size: int) -> str:
         output_lines.append("Sequence appears structurally homogeneous by Krylov metrics.")
     
     return "\n".join(output_lines)
-
-
 # ------------------------- Gradio UI ---------------------------
 
 with gr.Blocks(title="Krylov Detector") as demo:
