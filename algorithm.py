@@ -1264,8 +1264,8 @@ class NGramModel:
         return (
             CONTEXT_WEIGHT
             * local_similarity
-            + PROMPT_CONTEXT_WEIGHT
-            * prompt_similarity
+            * -np.sum(PROMPT_CONTEXT_WEIGHT
+            * prompt_similarity)
             + KRYLOV_CONTEXT_WEIGHT
             * krylov_signal
             + RECENCY_WEIGHT
