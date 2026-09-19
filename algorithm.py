@@ -21,38 +21,30 @@ DEFAULT_TEMPERATURE = 0.8
 DEFAULT_TOP_K = 20
 
 MIN_COUNT = 1
-# Additive ("Laplace-style") smoothing applied to observed counts before
-# they're turned into a probability distribution. This is the only knob
-# that shapes how "flat" vs "peaky" sampling is -- it is applied directly
-# to real corpus counts, nothing else.
 SMOOTHING_ALPHA = 0.05
 
 IMAGE_BIAS_WEIGHT = 1.2
 
-# When True, every cosine similarity in this file ignores a global sign flip
-# of either vector (cos(a, b) == cos(a, -b) == cos(-a, b)), i.e. it returns
-# |cos|, in [0, 1]. Set to False to get the plain signed cosine in [-1, 1].
 SIGN_INVARIANT_SIMILARITY = True
 
-# Chain-of-thought structuring (see ChainOfThought below).
 COT_STEPS = 4
-COT_STATE_DECAY = 0.5        # how much of the earlier reasoning state carries forward
-COT_MIN_RELEVANCE = 0.05     # a step must be at least this similar to the running state
-COT_REDUNDANCY_LIMIT = 0.9   # skip steps this similar to an already-chosen step
-COT_TOP_N = 3                # sample the next step from the best N candidates
+COT_STATE_DECAY = 0.5
+COT_MIN_RELEVANCE = 0.05
+COT_REDUNDANCY_LIMIT = 0.9
+COT_TOP_N = 3
 
-# Reasoning -> generation modifiers (see ReasoningSubstrate below).
-COT_SEED_WORDS = 12          # how many reasoning-state words become bias seeds
-COT_BIAS_WEIGHT = 0.6        # weight of reasoning seeds relative to image seeds
-GENERATE_REFRESH_EVERY = 8   # re-derive the bias from the evolving state every N tokens
+COT_SEED_WORDS = 12
+COT_BIAS_WEIGHT = 0.6
+GENERATE_REFRESH_EVERY = 8
 
-# A small, fixed vocabulary of "descriptor" words tied to simple visual
-# properties (brightness / warmth / greenness). None of these words are
-# forced into the model -- at generation time we only ever use the ones
-# that actually appear in the trained corpus, and we bias generation
-# using their *real* bigram follow-on counts from that corpus. So the
-# camera feature never injects anything that isn't grounded in dataset
-# statistics.
+USE_HEMICUBE = True
+HC_RES = 6
+HC_MAX_DEPTH = 4
+HC_MIN_MEMBERS = 3
+HC_HOMOGENEITY_STOP = 0.6
+HC_FIELD_WEIGHT = 0.8
+HC_IMAGE_SIZE = 640
+
 IMAGE_DESCRIPTOR_WORDS: Dict[str, List[str]] = {
     "bright": ["bright", "light", "sunny", "white", "day"],
     "dark": ["dark", "night", "shadow", "black", "dim"],
@@ -89,12 +81,6 @@ def cosine_similarity(
     b: Dict[str, float],
     sign_invariant: bool = SIGN_INVARIANT_SIMILARITY,
 ) -> float:
-    """Cosine similarity between two sparse vectors (dicts).
-
-    With sign_invariant=True (default) the result is |cos|, so a global
-    sign flip of either vector doesn't change it. Works for signed vectors
-    too (e.g. the image descriptor axes), not just non-negative counts.
-    """
     if not a or not b:
         return 0.0
 
@@ -115,7 +101,6 @@ def cosine_similarity(
 def align_sign(
     a: Dict[str, float], b: Dict[str, float]
 ) -> Tuple[Dict[str, float], float]:
-    """Flip b (if needed) so that dot(a, b) >= 0. Returns (aligned_b, sign)."""
     dot = sum(a[key] * b[key] for key in set(a) & set(b))
     sign = 1.0 if dot >= 0 else -1.0
 
@@ -131,6 +116,30 @@ def lexical_overlap(a: Iterable[str], b: Iterable[str]) -> float:
 
     union = len(set_a | set_b)
     return len(set_a & set_b) / union if union else 0.0
+
+
+def vdot(a: Dict[str, float], b: Dict[str, float]) -> float:
+    if len(a) > len(b):
+        a, b = b, a
+    return sum(value * b[key] for key, value in a.items() if key in b)
+
+
+def vnorm(a: Dict[str, float]) -> float:
+    return math.sqrt(sum(value * value for value in a.values()))
+
+
+def vaxpy(a: Dict[str, float], b: Dict[str, float], scale: float) -> Dict[str, float]:
+    out = dict(a)
+    for key, value in b.items():
+        out[key] = out.get(key, 0.0) + scale * value
+    return out
+
+
+def vunit(a: Dict[str, float]) -> Dict[str, float]:
+    norm = vnorm(a)
+    if norm <= 0.0:
+        return {}
+    return {key: value / norm for key, value in a.items()}
 
 
 @dataclass
@@ -152,14 +161,6 @@ class Candidate:
 
 
 class CorpusSearch:
-    """Finds corpus sentences related to a prompt using plain lexical
-    overlap (Jaccard) and a term-frequency cosine similarity. Both
-    signals come directly from counting words in the dataset -- no
-    learned embeddings involved.
-
-    The cosine term is sign-invariant by default (see SIGN_INVARIANT_SIMILARITY).
-    """
-
     def __init__(
         self,
         lexical_weight: float = 0.5,
@@ -171,13 +172,19 @@ class CorpusSearch:
         self.sign_invariant = sign_invariant
         self.references: List[CorpusReference] = []
         self.doc_freq: Counter = Counter()
+        self.weighted: List[Dict[str, float]] = []
 
     def idf(self, token: str) -> float:
-        """How distinctive a word is, from real sentence counts in the corpus.
-        A word in every sentence gets 0; rarer words get more.
-        """
         n = len(self.references)
         return math.log((1 + n) / (1 + self.doc_freq.get(token, 0)))
+
+    def weight_vector(self, vector: Dict[str, float]) -> Dict[str, float]:
+        out: Dict[str, float] = {}
+        for token, weight in vector.items():
+            value = weight * self.idf(token)
+            if value > 0.0:
+                out[token] = value
+        return out
 
     def build_index(self, corpus_text: str) -> None:
         sentences = split_sentences(corpus_text)
@@ -185,6 +192,7 @@ class CorpusSearch:
 
         self.references = []
         self.doc_freq = Counter()
+        self.weighted = []
 
         for sentence in sentences:
             tokens = tokenize(sentence)
@@ -203,6 +211,8 @@ class CorpusSearch:
                     frequency=counts[sentence.lower()],
                 )
             )
+
+        self.weighted = [self.weight_vector(ref.vector) for ref in self.references]
 
     def analyze(self, prompt: str, limit: int = 5) -> List[Candidate]:
         prompt_tokens = tokenize(prompt)
@@ -243,16 +253,6 @@ class CorpusSearch:
 
 @dataclass
 class NGramModel:
-    """A trigram-with-backoff language model.
-
-    Every probability used for sampling is computed directly from counts
-    observed in the training corpus (with light additive smoothing).
-    Generation is genuinely stochastic: at each step we draw the next
-    token from that real probability distribution via `random.choices`,
-    so the same prompt can legitimately produce different continuations
-    from one run to the next.
-    """
-
     eos_token: str = "<eos>"
     unk_token: str = "<unk>"
     min_count: int = MIN_COUNT
@@ -264,10 +264,6 @@ class NGramModel:
 
     vocabulary: List[str] = field(default_factory=list)
     finalized: bool = False
-
-    # ---------------------------------------------------------------- #
-    # Training
-    # ---------------------------------------------------------------- #
 
     def ingest_text(self, text: str) -> None:
         for sentence in split_sentences(text):
@@ -305,14 +301,7 @@ class NGramModel:
 
         self.finalized = True
 
-    # ---------------------------------------------------------------- #
-    # Probability estimation (this is the whole "algorithm" now)
-    # ---------------------------------------------------------------- #
-
     def _smoothed_distribution(self, counts: Counter) -> Dict[str, float]:
-        """Turn a Counter of observed next-token counts into a probability
-        distribution using additive smoothing over the observed support.
-        """
         if not counts:
             return {}
 
@@ -324,10 +313,6 @@ class NGramModel:
     def backoff_distribution(
         self, previous: str, previous_previous: Optional[str]
     ) -> Dict[str, float]:
-        """Trigram -> bigram -> unigram backoff. Each level's probabilities
-        are estimated purely from how often that continuation was actually
-        seen in the corpus.
-        """
         if previous_previous is not None:
             key = f"{previous_previous}\t{previous}"
             counts = self.trigram.get(key)
@@ -343,11 +328,6 @@ class NGramModel:
         return self._smoothed_distribution(self.unigram)
 
     def cooccurrence_bias(self, seed_weights: Dict[str, float]) -> Dict[str, float]:
-        """Given a set of seed words (e.g. derived from an image) and their
-        weights, return a bias distribution built entirely from real bigram
-        follow-on counts of those seed words in the corpus: "what actually
-        tends to come after this word in the dataset".
-        """
         bias: Dict[str, float] = defaultdict(float)
 
         for word, weight in seed_weights.items():
@@ -375,10 +355,6 @@ class NGramModel:
 
         return previous, previous_previous
 
-    # ---------------------------------------------------------------- #
-    # Sampling
-    # ---------------------------------------------------------------- #
-
     def sample_next(
         self,
         tokens: List[str],
@@ -398,10 +374,6 @@ class NGramModel:
 
         temperature = max(temperature, 1e-5)
 
-        # Combine the dataset-derived log-probability with an optional
-        # dataset-derived bias term (also just real bigram statistics),
-        # then temperature-scale and renormalize -- standard stochastic
-        # sampling, nothing invented.
         adjusted: Dict[str, float] = {}
 
         for token, probability in distribution.items():
@@ -432,10 +404,10 @@ class NGramModel:
         ] = None,
         refresh_every: int = GENERATE_REFRESH_EVERY,
     ) -> str:
-        generated = tokenize(prompt)
+        prompt_tokens = tokenize(prompt)
+        generated = list(prompt_tokens)
 
         for step in range(max_new_tokens):
-            # Optionally re-derive the bias from the text generated so far.
             if bias_provider is not None and step % max(1, refresh_every) == 0:
                 bias, bias_weight = bias_provider(generated)
 
@@ -447,15 +419,15 @@ class NGramModel:
                 bias_weight=bias_weight,
             )
 
+            if token == self.eos_token:
+                break
+
             generated.append(token)
 
-        visible_tokens = [token for token in generated if token not in IGNORED_TOKENS]
+        continuation = generated[len(prompt_tokens):]
+        visible_tokens = [token for token in continuation if token not in IGNORED_TOKENS]
 
         return " ".join(visible_tokens)
-
-    # ---------------------------------------------------------------- #
-    # Persistence
-    # ---------------------------------------------------------------- #
 
     def to_dict(self) -> dict:
         return {
@@ -507,23 +479,363 @@ class NGramModel:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
 
 
-# ------------------------- Chain of thought --------------------------
-#
-# Structured reasoning built from the corpus itself. Each step is a real
-# corpus sentence, chosen by sign-invariant cosine similarity against a
-# running "reasoning state". The state compounds: after every step it is
-# decayed and the chosen sentence's vector is added, so later steps follow
-# from everything said so far, not just the prompt. A step is skipped if it
-# is nearly identical (also by sign-invariant cosine) to a step already
-# taken, which keeps the chain moving forward instead of repeating itself.
+@dataclass
+class HemiCell:
+    face: str
+    row: int
+    col: int
+    members: List[int]
+    weight: float
+    centroid: Dict[str, float]
+    homogeneity: float
+    children: Optional["HemiCube"] = None
+
+
+def hemicube_cell(dx: float, dy: float, dz: float, res: int) -> Tuple[str, int, int, float]:
+    half = max(1, res // 2)
+    ax, ay = abs(dx), abs(dy)
+
+    def bucket(value: float, n: int) -> int:
+        return max(0, min(n - 1, int(value * n)))
+
+    if dz > 0.0 and dz >= max(ax, ay):
+        px, py = dx / dz, dy / dz
+        col = bucket((px + 1.0) / 2.0, res)
+        row = bucket((py + 1.0) / 2.0, res)
+        ff = 1.0 / (math.pi * (px * px + py * py + 1.0) ** 2)
+        return "top", row, col, ff
+
+    if ax >= ay:
+        face = "+x" if dx >= 0 else "-x"
+        s, h = dy / ax, dz / ax
+    else:
+        face = "+y" if dy >= 0 else "-y"
+        s, h = dx / ay, dz / ay
+
+    col = bucket((s + 1.0) / 2.0, res)
+    row = bucket(h, half)
+    ff = h / (math.pi * (s * s + h * h + 1.0) ** 2)
+
+    return face, row, col, ff
+
+
+class HemiCube:
+    def __init__(
+        self,
+        vectors: List[Dict[str, float]],
+        indices: List[int],
+        normal: Dict[str, float],
+        depth: int = 0,
+        res: int = HC_RES,
+        max_depth: int = HC_MAX_DEPTH,
+        min_members: int = HC_MIN_MEMBERS,
+        stop: float = HC_HOMOGENEITY_STOP,
+        sign_invariant: bool = SIGN_INVARIANT_SIMILARITY,
+    ) -> None:
+        self.depth = depth
+        self.res = max(2, res)
+        self.half = max(1, self.res // 2)
+        self.max_depth = max_depth
+        self.min_members = max(2, min_members)
+        self.stop = stop
+        self.sign_invariant = sign_invariant
+        self.normal: Dict[str, float] = {}
+        self.cells: Dict[Tuple[str, int, int], HemiCell] = {}
+
+        self._build(vectors, indices, normal)
+
+    def _build(
+        self, vectors: List[Dict[str, float]], indices: List[int], normal: Dict[str, float]
+    ) -> None:
+        members = [i for i in indices if vectors[i]]
+
+        if not members:
+            return
+
+        n = vunit(normal)
+
+        if not n:
+            total: Dict[str, float] = {}
+            for i in members:
+                for key, value in vunit(vectors[i]).items():
+                    total[key] = total.get(key, 0.0) + value
+            n = vunit(total)
+
+        if not n:
+            return
+
+        self.normal = n
+        u, v = self._tangents(vectors, members, n)
+
+        buckets: Dict[Tuple[str, int, int], List[Tuple[int, float, float]]] = defaultdict(list)
+
+        for i in members:
+            vec = vectors[i]
+            mag = vnorm(vec)
+
+            if mag <= 0.0:
+                continue
+
+            a = vdot(vec, n)
+            x = vdot(vec, u) if u else 0.0
+            y = vdot(vec, v) if v else 0.0
+
+            if a < 0.0:
+                if not self.sign_invariant:
+                    continue
+                a, x, y = -a, -x, -y
+
+            t = math.sqrt(a * a + x * x + y * y)
+
+            if t <= 1e-12:
+                continue
+
+            face, row, col, ff = hemicube_cell(x / t, y / t, a / t, self.res)
+            captured = min(1.0, t / mag)
+            buckets[(face, row, col)].append((i, ff, captured))
+
+        for key, items in buckets.items():
+            ids = [i for i, _, _ in items]
+            weight = sum(ff * captured for _, ff, captured in items)
+            centroid, homogeneity = self._centroid(vectors, ids)
+
+            cell = HemiCell(
+                face=key[0],
+                row=key[1],
+                col=key[2],
+                members=ids,
+                weight=weight,
+                centroid=centroid,
+                homogeneity=homogeneity,
+            )
+
+            if (
+                homogeneity < self.stop
+                and len(ids) >= self.min_members
+                and self.depth < self.max_depth
+                and centroid
+            ):
+                child = HemiCube(
+                    vectors,
+                    ids,
+                    centroid,
+                    depth=self.depth + 1,
+                    res=self.res,
+                    max_depth=self.max_depth,
+                    min_members=self.min_members,
+                    stop=self.stop,
+                    sign_invariant=self.sign_invariant,
+                )
+                if child.cells:
+                    cell.children = child
+
+            self.cells[key] = cell
+
+    def _tangents(
+        self,
+        vectors: List[Dict[str, float]],
+        members: List[int],
+        n: Dict[str, float],
+    ) -> Tuple[Dict[str, float], Dict[str, float]]:
+        residuals: List[Dict[str, float]] = []
+        for i in members:
+            vec = vectors[i]
+            residuals.append(vaxpy(vec, n, -vdot(vec, n)))
+
+        best, best_norm = {}, 0.0
+        for r in residuals:
+            rn = vnorm(r)
+            if rn > best_norm:
+                best, best_norm = r, rn
+
+        u = {k: value / best_norm for k, value in best.items()} if best_norm > 1e-12 else {}
+
+        best, best_norm = {}, 0.0
+        for r in residuals:
+            if u:
+                r = vaxpy(r, u, -vdot(r, u))
+            rn = vnorm(r)
+            if rn > best_norm:
+                best, best_norm = r, rn
+
+        v = {k: value / best_norm for k, value in best.items()} if best_norm > 1e-12 else {}
+
+        return u, v
+
+    def _centroid(
+        self, vectors: List[Dict[str, float]], ids: List[int]
+    ) -> Tuple[Dict[str, float], float]:
+        acc: Dict[str, float] = {}
+        count = 0
+
+        for i in ids:
+            unit = vunit(vectors[i])
+
+            if not unit:
+                continue
+
+            if self.sign_invariant and acc:
+                unit, _ = align_sign(acc, unit)
+
+            for key, value in unit.items():
+                acc[key] = acc.get(key, 0.0) + value
+
+            count += 1
+
+        if not count:
+            return {}, 0.0
+
+        return vunit(acc), min(1.0, vnorm(acc) / count)
+
+    def level_counts(self) -> List[int]:
+        counts: List[int] = []
+        carried = 0
+        frontier: List[HemiCube] = [self]
+
+        while frontier:
+            cells = [c for cube in frontier for c in cube.cells.values()]
+            counts.append(len(cells) + carried)
+            carried += sum(1 for c in cells if c.children is None)
+            frontier = [c.children for c in cells if c.children is not None]
+
+        return counts
+
+    def fractal_dimension(self) -> float:
+        counts = [c for c in self.level_counts() if c > 0]
+
+        if len(counts) < 2:
+            return 0.0
+
+        xs = [level * math.log(self.res) for level in range(len(counts))]
+        ys = [math.log(c) for c in counts]
+        mean_x = sum(xs) / len(xs)
+        mean_y = sum(ys) / len(ys)
+        denom = sum((x - mean_x) ** 2 for x in xs)
+
+        if denom == 0.0:
+            return 0.0
+
+        return sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom
+
+    def depth_reached(self) -> int:
+        return len(self.level_counts()) - 1
+
+    def describe(self, sentences: List[str], limit: int = 6, indent: int = 0) -> List[str]:
+        lines: List[str] = []
+        pad = "  " * indent
+        ranked = sorted(self.cells.values(), key=lambda c: c.weight, reverse=True)
+        shown = max(2, limit - indent)
+
+        for cell in ranked[:shown]:
+            tag = (
+                f"{pad}{cell.face}({cell.row},{cell.col}) n={len(cell.members)} "
+                f"weight={cell.weight:.3f} homogeneity={cell.homogeneity:.2f}"
+            )
+
+            if cell.children is None:
+                preview = sentences[cell.members[0]]
+                if len(preview) > 70:
+                    preview = preview[:67] + "..."
+                lines.append(f"{tag} | {preview}")
+            else:
+                lines.append(f"{tag} -> re-project")
+                lines.extend(cell.children.describe(sentences, limit, indent + 1))
+
+        if len(ranked) > shown:
+            lines.append(f"{pad}... {len(ranked) - shown} more cells")
+
+        return lines
+
+    def _net_position(self, cell: HemiCell) -> Tuple[int, int]:
+        res, half = self.res, self.half
+
+        if cell.face == "top":
+            return half + cell.row, half + cell.col
+        if cell.face == "+x":
+            return half + cell.col, half + res + (half - 1 - cell.row)
+        if cell.face == "-x":
+            return half + cell.col, cell.row
+        if cell.face == "+y":
+            return half + res + (half - 1 - cell.row), half + cell.col
+        return cell.row, half + cell.col
+
+    @staticmethod
+    def _cell_color(cell: HemiCell, peak: float, depth: int) -> np.ndarray:
+        h = cell.homogeneity
+        energy = 0.35 + 0.65 * math.sqrt(min(1.0, cell.weight / peak)) if peak > 0 else 0.5
+        rgb = np.array([255.0 * (1.0 - h), 200.0 * h, 90.0 + 40.0 * min(depth, 4)])
+        return np.clip(rgb * energy, 0, 255)
+
+    def render(self, size: int = HC_IMAGE_SIZE) -> np.ndarray:
+        canvas = np.zeros((size, size, 3), dtype=np.uint8)
+        canvas[:, :] = (12, 12, 18)
+        self._paint(canvas, 0.0, 0.0, float(size))
+        return canvas
+
+    def _paint(self, canvas: np.ndarray, x0: float, y0: float, size: float) -> None:
+        net = self.res + 2 * self.half
+        unit = size / net
+        peak = max((c.weight for c in self.cells.values()), default=0.0)
+
+        for cell in self.cells.values():
+            r, c = self._net_position(cell)
+            xs, xe = int(round(x0 + c * unit)), int(round(x0 + (c + 1) * unit))
+            ys, ye = int(round(y0 + r * unit)), int(round(y0 + (r + 1) * unit))
+
+            if xe <= xs or ye <= ys:
+                continue
+
+            color = self._cell_color(cell, peak, self.depth)
+
+            if cell.children is not None and unit >= 4.0:
+                canvas[ys:ye, xs:xe] = (color * 0.3).astype(np.uint8)
+                cell.children._paint(canvas, x0 + c * unit, y0 + r * unit, unit)
+            else:
+                canvas[ys:ye, xs:xe] = color.astype(np.uint8)
+                if ye - ys >= 4 and xe - xs >= 4:
+                    edge = (color * 0.5).astype(np.uint8)
+                    canvas[ys, xs:xe] = edge
+                    canvas[ye - 1, xs:xe] = edge
+                    canvas[ys:ye, xs] = edge
+                    canvas[ys:ye, xe - 1] = edge
+
+
+def build_semantic_tree(
+    search: CorpusSearch, state: Dict[str, float], **kwargs: Any
+) -> HemiCube:
+    return HemiCube(
+        search.weighted,
+        list(range(len(search.references))),
+        search.weight_vector(state),
+        sign_invariant=search.sign_invariant,
+        **kwargs,
+    )
+
+
+def describe_tree(cube: HemiCube, search: CorpusSearch) -> str:
+    if not cube.cells:
+        return "Hemicube is empty (no usable sentences)."
+
+    counts = cube.level_counts()
+    header = [
+        f"Depth reached: {cube.depth_reached()} (max {cube.max_depth})",
+        f"Occupied cells per level: {counts}",
+        f"Box-counting dimension: {cube.fractal_dimension():.3f}",
+        "",
+    ]
+    sentences = [ref.sentence for ref in search.references]
+
+    return "\n".join(header + cube.describe(sentences))
 
 
 @dataclass
 class ThoughtStep:
     index: int
     sentence: str
-    relevance: float  # cosine to the running state when chosen
-    novelty: float    # 1 - max cosine to earlier steps (1.0 for the first step)
+    relevance: float
+    novelty: float
+    path: str = ""
+    homogeneity: float = 0.0
 
 
 class ChainOfThought:
@@ -541,9 +853,63 @@ class ChainOfThought:
         self.redundancy_limit = redundancy_limit
         self.top_n = max(1, top_n)
         self.last_state: Dict[str, float] = {}
+        self.last_field: Dict[str, float] = {}
 
     def _cos(self, a: Dict[str, float], b: Dict[str, float]) -> float:
         return cosine_similarity(a, b, sign_invariant=self.search.sign_invariant)
+
+    def _begin(self) -> None:
+        self.last_field = {}
+
+    def _score_candidates(
+        self,
+        state: Dict[str, float],
+        chosen_vectors: List[Dict[str, float]],
+        used: set,
+    ) -> List[Tuple[float, int, float, float]]:
+        scored: List[Tuple[float, int, float, float]] = []
+
+        for idx, reference in enumerate(self.search.references):
+            if idx in used:
+                continue
+
+            relevance = self._cos(state, reference.vector)
+
+            if relevance < self.min_relevance:
+                continue
+
+            overlap = max(
+                (self._cos(reference.vector, v) for v in chosen_vectors),
+                default=0.0,
+            )
+
+            if overlap >= self.redundancy_limit:
+                continue
+
+            novelty = 1.0 - overlap
+            scored.append((relevance * novelty, idx, relevance, novelty))
+
+        return scored
+
+    def _pick(
+        self,
+        state: Dict[str, float],
+        chosen_vectors: List[Dict[str, float]],
+        used: set,
+    ) -> Optional[Tuple[int, float, float, str, float]]:
+        scored = self._score_candidates(state, chosen_vectors, used)
+
+        if not scored:
+            return None
+
+        scored.sort(key=lambda item: item[0], reverse=True)
+        pool = scored[: self.top_n]
+
+        _, idx, relevance, novelty = random.choices(
+            pool, weights=[item[0] for item in pool], k=1
+        )[0]
+
+        return idx, relevance, novelty, "", 0.0
 
     def run(self, prompt: str, steps: int = COT_STEPS) -> List[ThoughtStep]:
         state: Dict[str, float] = {
@@ -554,39 +920,15 @@ class ChainOfThought:
         used: set = set()
         chain: List[ThoughtStep] = []
 
+        self._begin()
+
         for _ in range(steps):
-            scored: List[Tuple[float, int, float, float]] = []
+            pick = self._pick(state, chosen_vectors, used)
 
-            for idx, reference in enumerate(self.search.references):
-                if idx in used:
-                    continue
-
-                relevance = self._cos(state, reference.vector)
-
-                if relevance < self.min_relevance:
-                    continue
-
-                overlap = max(
-                    (self._cos(reference.vector, v) for v in chosen_vectors),
-                    default=0.0,
-                )
-
-                if overlap >= self.redundancy_limit:
-                    continue
-
-                novelty = 1.0 - overlap
-                scored.append((relevance * novelty, idx, relevance, novelty))
-
-            if not scored:
+            if pick is None:
                 break
 
-            scored.sort(key=lambda item: item[0], reverse=True)
-            pool = scored[: self.top_n]
-
-            # Stochastic like the rest of the app, but only among the best few.
-            _, idx, relevance, novelty = random.choices(
-                pool, weights=[item[0] for item in pool], k=1
-            )[0]
+            idx, relevance, novelty, path, homogeneity = pick
 
             reference = self.search.references[idx]
             used.add(idx)
@@ -598,10 +940,11 @@ class ChainOfThought:
                     sentence=reference.sentence,
                     relevance=relevance,
                     novelty=novelty,
+                    path=path,
+                    homogeneity=homogeneity,
                 )
             )
 
-            # Compound the state: decay what we had, add what we just said.
             state = {token: self.decay * weight for token, weight in state.items()}
             for token, weight in reference.vector.items():
                 state[token] = state.get(token, 0.0) + weight
@@ -611,16 +954,107 @@ class ChainOfThought:
         return chain
 
 
+class HemicubeChainOfThought(ChainOfThought):
+    def __init__(
+        self,
+        search: CorpusSearch,
+        res: int = HC_RES,
+        max_depth: int = HC_MAX_DEPTH,
+        min_members: int = HC_MIN_MEMBERS,
+        stop: float = HC_HOMOGENEITY_STOP,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(search, **kwargs)
+        self.res = res
+        self.max_depth = max_depth
+        self.min_members = min_members
+        self.stop = stop
+        self.last_cube: Optional[HemiCube] = None
+
+    @staticmethod
+    def _energy(cell: HemiCell) -> float:
+        return cell.weight * (0.25 + 0.75 * cell.homogeneity)
+
+    def _pick(
+        self,
+        state: Dict[str, float],
+        chosen_vectors: List[Dict[str, float]],
+        used: set,
+    ) -> Optional[Tuple[int, float, float, str, float]]:
+        scored = self._score_candidates(state, chosen_vectors, used)
+
+        if not scored:
+            return None
+
+        info = {idx: (relevance, novelty, score) for score, idx, relevance, novelty in scored}
+
+        cube = HemiCube(
+            self.search.weighted,
+            list(info),
+            self.search.weight_vector(state),
+            res=self.res,
+            max_depth=self.max_depth,
+            min_members=self.min_members,
+            stop=self.stop,
+            sign_invariant=self.search.sign_invariant,
+        )
+        self.last_cube = cube
+
+        if not cube.cells:
+            return ChainOfThought._pick(self, state, chosen_vectors, used)
+
+        path: List[str] = []
+        current = cube
+        cell: Optional[HemiCell] = None
+
+        while current is not None and current.cells:
+            ranked = sorted(current.cells.values(), key=self._energy, reverse=True)
+            pool = ranked[: self.top_n]
+            cell = random.choices(
+                pool, weights=[max(self._energy(c), 1e-9) for c in pool], k=1
+            )[0]
+            path.append(f"{cell.face}({cell.row},{cell.col})")
+            current = cell.children
+
+        assert cell is not None
+
+        members = [i for i in cell.members if i in info]
+
+        if not members:
+            return ChainOfThought._pick(self, state, chosen_vectors, used)
+
+        members.sort(key=lambda i: info[i][2], reverse=True)
+        pool_ids = members[: self.top_n]
+        idx = random.choices(
+            pool_ids, weights=[max(info[i][2], 1e-9) for i in pool_ids], k=1
+        )[0]
+
+        self.last_field = vaxpy(
+            self.last_field, cell.centroid, 0.5 + 0.5 * cell.homogeneity
+        )
+
+        relevance, novelty, _ = info[idx]
+
+        return idx, relevance, novelty, " > ".join(path), cell.homogeneity
+
+
+def make_chain(search: CorpusSearch, use_hemicube: bool = USE_HEMICUBE) -> ChainOfThought:
+    return HemicubeChainOfThought(search) if use_hemicube else ChainOfThought(search)
+
+
 def format_chain(chain: List[ThoughtStep]) -> str:
     if not chain:
         return "No reasoning steps found for that prompt."
 
     lines = []
     for step in chain:
-        lines.append(
+        line = (
             f"Step {step.index}: {step.sentence}.  "
-            f"(relevance={step.relevance:.3f}, novelty={step.novelty:.3f})"
+            f"(relevance={step.relevance:.3f}, novelty={step.novelty:.3f}"
         )
+        if step.path:
+            line += f", homogeneity={step.homogeneity:.2f}, path={step.path}"
+        lines.append(line + ")")
     lines.append(f"Conclusion: {chain[-1].sentence}.")
 
     return "\n".join(lines)
@@ -638,20 +1072,6 @@ def merge_seed_weights(
 
 
 class ReasoningSubstrate:
-    """Feeds the reasoning state into generation as corpus modifiers.
-
-    1. Seeds: the most distinctive words in the reasoning state (state weight
-       x idf, so "the"/"is" drop out) become seed words. They go through the
-       same NGramModel.cooccurrence_bias as the image seeds, i.e. real bigram
-       follow-on counts from the corpus.
-    2. Compounding: as text is generated, the state is decayed and the new
-       tokens are added, so the seeds keep tracking what has been said.
-    3. Adaptive strength: the sign-invariant cosine between the evolving state
-       and the original reasoning state measures how far generation has
-       drifted. The bias weight is scaled by 1 + (1 - alignment), so it
-       pulls harder as the text drifts away from the reasoning.
-    """
-
     def __init__(
         self,
         model: NGramModel,
@@ -660,6 +1080,7 @@ class ReasoningSubstrate:
         prompt_length: int = 0,
         decay: float = COT_STATE_DECAY,
         top_words: int = COT_SEED_WORDS,
+        field: Optional[Dict[str, float]] = None,
     ) -> None:
         self.model = model
         self.search = search
@@ -667,7 +1088,8 @@ class ReasoningSubstrate:
         self.state = dict(initial_state)
         self.decay = decay
         self.top_words = top_words
-        self._seen = prompt_length  # prompt tokens are already in the state
+        self.field = dict(field) if field else {}
+        self._seen = prompt_length
 
     def seed_weights(self) -> Dict[str, float]:
         weighted = {
@@ -676,6 +1098,17 @@ class ReasoningSubstrate:
             if token in self.model.unigram and token not in IGNORED_TOKENS
         }
         weighted = {token: w for token, w in weighted.items() if w > 0}
+
+        if self.field:
+            scale = max(weighted.values(), default=0.0) or 1.0
+            field_peak = max(self.field.values(), default=0.0)
+
+            if field_peak > 0:
+                for token, w in self.field.items():
+                    if w > 0 and token in self.model.unigram and token not in IGNORED_TOKENS:
+                        weighted[token] = weighted.get(token, 0.0) + (
+                            HC_FIELD_WEIGHT * scale * w / field_peak
+                        )
 
         top = sorted(weighted.items(), key=lambda item: item[1], reverse=True)
         top = top[: self.top_words]
@@ -704,10 +1137,9 @@ class ReasoningSubstrate:
     def provider(
         self, base_seeds: Dict[str, float], base_weight: float
     ) -> Callable[[List[str]], Tuple[Optional[Dict[str, float]], float]]:
-        """Build the callable NGramModel.generate uses to refresh its bias."""
-
         def refresh(generated: List[str]) -> Tuple[Optional[Dict[str, float]], float]:
-            self.update(generated[self._seen :])
+            new_tokens = generated[self._seen:]
+            self.update(new_tokens)
             self._seen = len(generated)
 
             seeds = merge_seed_weights(base_seeds, self.seed_weights(), COT_BIAS_WEIGHT)
@@ -716,16 +1148,6 @@ class ReasoningSubstrate:
             return self.model.cooccurrence_bias(seeds), base_weight * scale
 
         return refresh
-
-
-# ----------------------- Image -> dataset bias -----------------------
-#
-# The camera feature no longer hashes pixels into a random high-dimensional
-# "lexical space" via an untrained projection matrix. Instead it computes a
-# few simple, interpretable image statistics (brightness, warmth, greenness),
-# maps each one to a short list of descriptor words, keeps only the
-# descriptor words that actually occur in the trained corpus, and biases
-# generation using those words' *real* bigram follow-on statistics.
 
 
 def extract_image_descriptors(image: Any) -> Dict[str, float]:
@@ -768,13 +1190,11 @@ def image_seed_words(model: NGramModel, image: Any) -> Dict[str, float]:
             continue
 
         for word in IMAGE_DESCRIPTOR_WORDS.get(descriptor_key, []):
-            if word in model.unigram:  # only use words that exist in the corpus
+            if word in model.unigram:
                 seed_weights[word] = seed_weights.get(word, 0.0) + intensity
 
     return seed_weights
 
-
-# ------------------- Globals & Inference Helpers --------------------
 
 TEXT_MODEL: NGramModel | None = None
 CORPUS_SEARCH: CorpusSearch | None = None
@@ -888,19 +1308,18 @@ def process_camera_image(image, user_prompt: str):
 
     prompt = user_prompt.strip() if user_prompt and user_prompt.strip() else ""
 
-    # Reasoning substrate: run the chain over the prompt, then let its
-    # compounded state drive the generation modifiers alongside the image.
     chain: List[ThoughtStep] = []
     substrate: Optional[ReasoningSubstrate] = None
 
     if prompt and CORPUS_SEARCH.references:
-        cot = ChainOfThought(CORPUS_SEARCH)
+        cot = make_chain(CORPUS_SEARCH)
         chain = cot.run(prompt, steps=COT_STEPS)
         substrate = ReasoningSubstrate(
             TEXT_MODEL,
             CORPUS_SEARCH,
             cot.last_state,
             prompt_length=len(tokenize(prompt)),
+            field=cot.last_field,
         )
 
     reasoning_seeds = substrate.seed_weights() if substrate else {}
@@ -946,19 +1365,27 @@ def process_camera_image(image, user_prompt: str):
     return image, bias_summary, corpus_matches, generated
 
 
-def run_chain_of_thought(prompt: str, n_steps: int) -> str:
+def run_chain_of_thought(prompt: str, n_steps: int, use_hemicube: bool = USE_HEMICUBE):
     if CORPUS_SEARCH is None or not CORPUS_SEARCH.references:
-        return "No corpus loaded. Upload a corpus and click 'Train model' first."
+        return "No corpus loaded. Upload a corpus and click 'Train model' first.", None, ""
 
     if not prompt or not prompt.strip():
-        return "Enter a prompt first."
+        return "Enter a prompt first.", None, ""
 
-    chain = ChainOfThought(CORPUS_SEARCH).run(prompt, steps=int(n_steps))
+    cot = make_chain(CORPUS_SEARCH, use_hemicube=bool(use_hemicube))
+    chain = cot.run(prompt, steps=int(n_steps))
 
-    return format_chain(chain)
+    image = None
+    tree_text = ""
 
+    if use_hemicube and cot.last_state:
+        tree = build_semantic_tree(CORPUS_SEARCH, cot.last_state)
+        if tree.cells:
+            image = tree.render()
+            tree_text = describe_tree(tree, CORPUS_SEARCH)
 
-# --------------------------- UI -------------------------------------
+    return format_chain(chain), image, tree_text
+
 
 with gr.Blocks(title="Stochastic N-Gram Model") as demo:
     gr.Markdown(
@@ -974,6 +1401,13 @@ with gr.Blocks(title="Stochastic N-Gram Model") as demo:
 Every probability used for generation is computed directly from n-gram
 counts observed in the corpus; text is sampled stochastically from that
 distribution, so re-running the same prompt can give different results.
+
+The generation process uses a **hemicube recursion** over the corpus:
+sentences are projected onto a half-cube oriented on the current reasoning
+state. Cells that are not homogeneous are re-projected on their own centroid,
+producing a self-similar tree; the chain of thought descends that tree to
+select steps. The resulting state then biases token sampling via real bigram
+statistics from the corpus.
 """
     )
 
@@ -1017,7 +1451,7 @@ distribution, so re-running the same prompt can give different results.
                 label="Bias words (image + reasoning)", lines=4
             )
             corpus_output = gr.Textbox(label="Corpus matches", lines=6)
-            generated_output = gr.Textbox(label="Generated text", lines=8)
+            generated_output = gr.Textbox(label="Generated text", lines=12)
 
     recognize_button.click(
         fn=process_camera_image,
@@ -1028,25 +1462,6 @@ distribution, so re-running the same prompt can give different results.
             corpus_output,
             generated_output,
         ],
-    )
-
-    gr.Markdown("## 3. Structured reasoning (chain of thought)")
-
-    with gr.Row():
-        with gr.Column(scale=1):
-            cot_prompt = gr.Textbox(label="Question or topic", lines=3)
-            cot_steps = gr.Slider(
-                minimum=1, maximum=8, value=COT_STEPS, step=1, label="Steps"
-            )
-            cot_button = gr.Button("Reason", variant="primary")
-
-        with gr.Column(scale=2):
-            cot_output = gr.Textbox(label="Reasoning chain", lines=12)
-
-    cot_button.click(
-        fn=run_chain_of_thought,
-        inputs=[cot_prompt, cot_steps],
-        outputs=[cot_output],
     )
 
 
