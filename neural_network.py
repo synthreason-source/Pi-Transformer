@@ -6,8 +6,22 @@ from pathlib import Path
 
 import numpy as np
 
-
 class TestCasePredictor:
+    """
+    Small feed-forward classifier implemented from scratch with NumPy.
+
+    Input:
+        X: shape (samples, features)
+
+    Output:
+        One probability for every test case/class.
+
+    Example classes:
+        0 = test case A
+        1 = test case B
+        2 = test case C
+    """
+
     def __init__(
         self,
         input_dim: int,
@@ -21,25 +35,28 @@ class TestCasePredictor:
 
         self.rng = np.random.default_rng(seed)
 
+        # He/Xavier-style small initialization
         self.W1 = self.rng.normal(
             0.0,
             np.sqrt(2.0 / input_dim),
             size=(input_dim, hidden_dim),
-        ).astype(np.float32)
-        self.b1 = np.zeros(hidden_dim, dtype=np.float32)
+        )
+        self.b1 = np.zeros(hidden_dim)
 
         self.W2 = self.rng.normal(
             0.0,
             np.sqrt(2.0 / hidden_dim),
             size=(hidden_dim, output_dim),
-        ).astype(np.float32)
-        self.b2 = np.zeros(output_dim, dtype=np.float32)
+        )
+        self.b2 = np.zeros(output_dim)
 
-        self.mean = np.zeros(input_dim, dtype=np.float32)
-        self.std = np.ones(input_dim, dtype=np.float32)
+        # Feature normalization statistics
+        self.mean = np.zeros(input_dim)
+        self.std = np.ones(input_dim)
+        self.rng = np.random.default_rng(seed)
 
     # ------------------------------------------------------------------
-    # Custom probability step
+    # Your custom probability step
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -48,33 +65,67 @@ class TestCasePredictor:
         temperature: float = 1.0,
         eps: float = 1e-12,
     ) -> np.ndarray:
-        raw = np.asarray(p_t, dtype=np.float32)
+        """
+        Converts raw neural-network scores into probabilities.
+
+        This preserves the structure of your supplied function:
+
+            raw = p_t
+            condition = exp(max(raw, eps)) >= cos(p_t)
+            logits = where(condition, exp(max(raw, eps)), raw / 2)
+
+            scaled = logits / temperature
+            shifted = scaled - max(scaled)
+            exp_s = exp(shifted)
+            p_next = exp_s / sum(exp_s)
+
+        The implementation supports both one vector and a batch.
+        """
+
+        raw = np.asarray(p_t, dtype=np.float64)
 
         if temperature <= 0:
             raise ValueError("temperature must be greater than zero")
 
-        safe_raw = np.clip(raw, a_min=None, a_max=85.0)
-        condition = np.exp(np.maximum(safe_raw, eps)) >= np.cos(raw)
-
-        logits = np.where(
-            condition,
-            np.exp(np.maximum(safe_raw, eps)),
-            raw / 2.0,
-        )
-
-        scaled = logits / temperature
-
         if raw.ndim == 1:
+            condition = (
+                np.exp(np.maximum(raw, eps))
+                >= np.cos(raw)
+            )
+
+            logits = np.where(
+                condition,
+                np.exp(np.maximum(raw, eps)),
+                raw / 2.0,
+            )
+
+            scaled = logits / temperature
             shifted = scaled - np.max(scaled)
             exp_s = np.exp(shifted)
             return exp_s / np.sum(exp_s)
-        
+
         if raw.ndim == 2:
+            condition = (
+                np.exp(np.maximum(raw, eps))
+                >= np.cos(raw)
+            )
+
+            logits = np.where(
+                condition,
+                np.exp(np.maximum(raw, eps)),
+                raw / 2.0,
+            )
+
+            scaled = logits / temperature
             shifted = scaled - np.max(scaled, axis=1, keepdims=True)
             exp_s = np.exp(shifted)
             return exp_s / np.sum(exp_s, axis=1, keepdims=True)
 
         raise ValueError("p_t must have shape (classes,) or (samples, classes)")
+
+    # ------------------------------------------------------------------
+    # Ordinary training softmax
+    # ------------------------------------------------------------------
 
     @staticmethod
     def softmax(logits: np.ndarray) -> np.ndarray:
@@ -88,30 +139,48 @@ class TestCasePredictor:
 
     @staticmethod
     def relu_derivative(x: np.ndarray) -> np.ndarray:
-        return (x > 0.0).astype(np.float32)
+        return (x > 0.0).astype(np.float64)
 
     # ------------------------------------------------------------------
-    # Forward & Backward Pass
+    # Forward pass
     # ------------------------------------------------------------------
 
     def forward(self, X: np.ndarray):
         z1 = X @ self.W1 + self.b1
         a1 = self.relu(z1)
+
         logits = a1 @ self.W2 + self.b2
+
+        # Standard softmax is used during training because its gradient
+        # combines cleanly with cross-entropy.
         probabilities = self.softmax(logits)
+
         cache = (X, z1, a1, logits, probabilities)
         return probabilities, cache
 
+    # ------------------------------------------------------------------
+    # Loss and backpropagation
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def cross_entropy(probabilities: np.ndarray, y: np.ndarray, eps: float = 1e-12) -> float:
+    def cross_entropy(
+        probabilities: np.ndarray,
+        y: np.ndarray,
+        eps: float = 1e-12,
+    ) -> float:
         sample_count = len(y)
         selected = probabilities[np.arange(sample_count), y]
         return float(-np.mean(np.log(np.maximum(selected, eps))))
 
-    def backward(self, cache, y: np.ndarray):
+    def backward(
+        self,
+        cache,
+        y: np.ndarray,
+    ):
         X, z1, a1, logits, probabilities = cache
         batch_size = X.shape[0]
 
+        # Derivative of softmax + cross-entropy
         d_logits = probabilities.copy()
         d_logits[np.arange(batch_size), y] -= 1.0
         d_logits /= batch_size
@@ -127,23 +196,18 @@ class TestCasePredictor:
 
         return dW1, db1, dW2, db2
 
-    def update(self, gradients, learning_rate: float):
+    def update(
+        self,
+        gradients,
+        learning_rate: float,
+    ):
         dW1, db1, dW2, db2 = gradients
+
         self.W1 -= learning_rate * dW1
         self.b1 -= learning_rate * db1
+
         self.W2 -= learning_rate * dW2
         self.b2 -= learning_rate * db2
-
-    def _evaluate_batches(self, X: np.ndarray, y: np.ndarray, batch_size: int):
-        total_loss, correct = 0.0, 0
-        for start in range(0, len(X), batch_size):
-            xb = X[start:start + batch_size]
-            yb = y[start:start + batch_size]
-            probs, _ = self.forward(xb)
-            batch_loss = self.cross_entropy(probs, yb)
-            total_loss += batch_loss * len(xb)
-            correct += np.sum(np.argmax(probs, axis=1) == yb)
-        return total_loss / len(X), correct / len(X)
 
     # ------------------------------------------------------------------
     # Training
@@ -153,102 +217,165 @@ class TestCasePredictor:
         self,
         X: np.ndarray,
         y: np.ndarray,
-        epochs: int = 100,
+        epochs: int = 1000,
         learning_rate: float = 0.03,
-        batch_size: int = 256,
+        batch_size: int = 16,
         validation_fraction: float = 0.2,
-        verbose_every: int = 10,
-        simulated_missing_rate: float = 0.2, # % of features to randomly drop during training
+        verbose_every: int = 100,
+        missing_rate: float = 0.2, # Added parameter to simulate missing data
     ):
-        X = np.asarray(X, dtype=np.float32)
+        X = np.asarray(X, dtype=np.float64)
         y = np.asarray(y, dtype=np.int64)
 
-        # 1. Calculate statistics ignoring existing NaNs
+        if X.ndim != 2:
+            raise ValueError("X must have shape (samples, features)")
+
+        if y.ndim != 1:
+            raise ValueError("y must have shape (samples,)")
+
+        if len(X) != len(y):
+            raise ValueError("X and y must contain the same number of samples")
+
+        if np.min(y) < 0 or np.max(y) >= self.output_dim:
+            raise ValueError("labels are outside the output class range")
+
+        # Ignore NaNs when calculating statistics
         self.mean = np.nanmean(X, axis=0)
         self.std = np.nanstd(X, axis=0)
-        self.std = np.where(self.std < 1e-12, 1.0, self.std).astype(np.float32)
+        self.std = np.where(self.std < 1e-12, 1.0, self.std)
 
-        # 2. Impute NaNs with feature mean, then normalize
+        # Impute NaNs with feature means before normalizing
         X = np.where(np.isnan(X), self.mean, X)
         X = (X - self.mean) / self.std
 
         indices = self.rng.permutation(len(X))
         split = int(len(X) * (1.0 - validation_fraction))
 
-        X_train, y_train = X[indices[:split]], y[indices[:split]]
-        X_valid, y_valid = X[indices[split:]], y[indices[split:]]
+        train_idx = indices[:split]
+        valid_idx = indices[split:]
 
-        history = {"train_loss": [], "train_accuracy": [], "valid_loss": [], "valid_accuracy": []}
+        X_train, y_train = X[train_idx], y[train_idx]
+        X_valid, y_valid = X[valid_idx], y[valid_idx]
+
+        history = {
+            "train_loss": [],
+            "train_accuracy": [],
+            "valid_loss": [],
+            "valid_accuracy": [],
+        }
 
         for epoch in range(1, epochs + 1):
             order = self.rng.permutation(len(X_train))
 
             for start in range(0, len(order), batch_size):
                 batch_indices = order[start:start + batch_size]
+
                 xb = X_train[batch_indices]
                 yb = y_train[batch_indices]
 
-                # Simulate incomplete data by randomly masking inputs to 0.0 (the mean)
-                if simulated_missing_rate > 0.0:
-                    mask = self.rng.binomial(1, 1.0 - simulated_missing_rate, size=xb.shape)
+                # Drop out inputs to teach the model to guess from partial data
+                if missing_rate > 0.0:
+                    mask = self.rng.binomial(1, 1.0 - missing_rate, size=xb.shape)
                     xb = xb * mask
 
                 _, cache = self.forward(xb)
                 gradients = self.backward(cache, yb)
                 self.update(gradients, learning_rate)
 
-            if verbose_every and (epoch == 1 or epoch % verbose_every == 0):
-                train_loss, train_accuracy = self._evaluate_batches(X_train, y_train, batch_size)
-                
-                if len(X_valid):
-                    valid_loss, valid_accuracy = self._evaluate_batches(X_valid, y_valid, batch_size)
-                else:
-                    valid_loss, valid_accuracy = train_loss, train_accuracy
+            train_probs, _ = self.forward(X_train)
+            train_loss = self.cross_entropy(train_probs, y_train)
+            train_accuracy = np.mean(
+                np.argmax(train_probs, axis=1) == y_train
+            )
 
-                history["train_loss"].append(train_loss)
-                history["train_accuracy"].append(train_accuracy)
-                history["valid_loss"].append(valid_loss)
-                history["valid_accuracy"].append(valid_accuracy)
+            if len(X_valid):
+                valid_probs, _ = self.forward(X_valid)
+                valid_loss = self.cross_entropy(valid_probs, y_valid)
+                valid_accuracy = np.mean(
+                    np.argmax(valid_probs, axis=1) == y_valid
+                )
+            else:
+                valid_loss = train_loss
+                valid_accuracy = train_accuracy
 
+            history["train_loss"].append(train_loss)
+            history["train_accuracy"].append(float(train_accuracy))
+            history["valid_loss"].append(valid_loss)
+            history["valid_accuracy"].append(float(valid_accuracy))
+
+            if verbose_every and (
+                epoch == 1 or epoch % verbose_every == 0
+            ):
                 print(
-                    f"epoch {epoch:4d} | "
-                    f"train loss {train_loss:.4f} | train acc {train_accuracy:.3f} | "
-                    f"valid loss {valid_loss:.4f} | valid acc {valid_accuracy:.3f}"
+                    f"epoch {epoch:5d} | "
+                    f"train loss {train_loss:.5f} | "
+                    f"train acc {train_accuracy:.3f} | "
+                    f"valid loss {valid_loss:.5f} | "
+                    f"valid acc {valid_accuracy:.3f}"
                 )
 
         return history
 
     # ------------------------------------------------------------------
-    # Prediction (Handles Incomplete Data)
+    # Prediction
     # ------------------------------------------------------------------
 
     def raw_probabilities(self, X: np.ndarray) -> np.ndarray:
-        X = np.asarray(X, dtype=np.float32)
+        X = np.asarray(X, dtype=np.float64)
         if X.ndim == 1:
             X = X.reshape(1, -1)
 
-        # Impute missing values (NaN) with the historical mean before normalizing
+        # Impute missing values with the historical mean before scaling
         X = np.where(np.isnan(X), self.mean, X)
         X = (X - self.mean) / self.std
         
         probabilities, _ = self.forward(X)
         return probabilities
 
-    def predict_proba(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
-        raw = self.raw_probabilities(X)
-        return self.step(raw, temperature=temperature)
+    def predict_proba(
+        self,
+        X: np.ndarray,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Applies your custom step to each output vector.
 
-    def predict(self, X: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        Training uses normal softmax/cross-entropy.
+        Inference uses the supplied custom transformation.
+        """
+        raw = self.raw_probabilities(X)
+
+        transformed = np.vstack([
+            self.step(row, temperature=temperature)
+            for row in raw
+        ])
+
+        return transformed
+
+    def predict(
+        self,
+        X: np.ndarray,
+        temperature: float = 1.0,
+    ) -> np.ndarray:
         probabilities = self.predict_proba(X, temperature)
         return np.argmax(probabilities, axis=1)
 
-    def predict_one(self, x: np.ndarray, class_names=None, temperature: float = 1.0):
-        probabilities = self.predict_proba(np.asarray(x).reshape(1, -1), temperature=temperature)[0]
+    def predict_one(
+        self,
+        x: np.ndarray,
+        class_names=None,
+        temperature: float = 1.0,
+    ):
+        probabilities = self.predict_proba(
+            np.asarray(x).reshape(1, -1),
+            temperature=temperature,
+        )[0]
+
         predicted_index = int(np.argmax(probabilities))
 
         result = {
             "class_index": predicted_index,
-            "probabilities": probabilities.tolist(), 
+            "probabilities": probabilities.tolist(),
         }
 
         if class_names is not None:
@@ -256,88 +383,174 @@ class TestCasePredictor:
 
         return result
 
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def save(self, path: str, class_names=None):
+        path = Path(path)
+
+        np.savez(
+            path.with_suffix(".npz"),
+            W1=self.W1,
+            b1=self.b1,
+            W2=self.W2,
+            b2=self.b2,
+            mean=self.mean,
+            std=self.std,
+        )
+
+        metadata = {
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "output_dim": self.output_dim,
+            "class_names": class_names,
+        }
+
+        path.write_text(
+            json.dumps(metadata, indent=2),
+            encoding="utf-8",
+        )
+
+    @classmethod
+    def load(cls, path: str):
+        path = Path(path)
+
+        metadata = json.loads(
+            path.read_text(encoding="utf-8")
+        )
+
+        model = cls(
+            input_dim=metadata["input_dim"],
+            hidden_dim=metadata["hidden_dim"],
+            output_dim=metadata["output_dim"],
+        )
+
+        weights = np.load(path.with_suffix(".npz"))
+
+        model.W1 = weights["W1"]
+        model.b1 = weights["b1"]
+        model.W2 = weights["W2"]
+        model.b2 = weights["b2"]
+        model.mean = weights["mean"]
+        model.std = weights["std"]
+
+        return model, metadata.get("class_names")
+
 
 # ----------------------------------------------------------------------
-# Massive Test case with Missing Data Simulation
+# Test case
 # ----------------------------------------------------------------------
 
-def make_massive_demo_dataset(num_classes=2000, samples_per_class=200, num_features=500, seed=42):
-    print(f"Generating dataset with {num_classes} classes, {num_features} features...")
+def make_demo_dataset(seed=7):
+    """
+    Artificial test-case data.
+
+    Features:
+        [input_value, noise_level, signal_strength]
+
+    Classes:
+        0 = low-risk test
+        1 = medium-risk test
+        2 = high-risk test
+    """
+
     rng = np.random.default_rng(seed)
-    centroids = rng.normal(0, 3.0, size=(num_classes, num_features))
 
-    X, y = [], []
-    for class_idx in range(num_classes):
-        samples = rng.normal(centroids[class_idx], 1.5, size=(samples_per_class, num_features))
-        X.append(samples)
-        y.append(np.full(samples_per_class, class_idx, dtype=np.int64))
+    samples_per_class = 150
 
-    X = np.vstack(X)
-    y = np.concatenate(y)
+    low = np.column_stack([
+        rng.normal(0.2, 0.12, samples_per_class),
+        rng.normal(0.2, 0.10, samples_per_class),
+        rng.normal(0.2, 0.12, samples_per_class),
+    ])
+
+    medium = np.column_stack([
+        rng.normal(0.55, 0.12, samples_per_class),
+        rng.normal(0.55, 0.10, samples_per_class),
+        rng.normal(0.55, 0.12, samples_per_class),
+    ])
+
+    high = np.column_stack([
+        rng.normal(0.85, 0.12, samples_per_class),
+        rng.normal(0.80, 0.10, samples_per_class),
+        rng.normal(0.85, 0.12, samples_per_class),
+    ])
+
+    X = np.vstack([low, medium, high])
+    y = np.concatenate([
+        np.zeros(samples_per_class, dtype=np.int64),
+        np.ones(samples_per_class, dtype=np.int64),
+        np.full(samples_per_class, 2, dtype=np.int64),
+    ])
+
     order = rng.permutation(len(X))
     return X[order], y[order]
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--classes", type=int, default=200)
+    parser.add_argument("--model", default="test_case_model.json")
     args = parser.parse_args()
 
-    num_classes = args.classes
-    class_names = [f"case_{i:04d}" for i in range(num_classes)]
+    class_names = [
+        "low-risk test",
+        "medium-risk test",
+        "high-risk test",
+    ]
 
-    X, y = make_massive_demo_dataset(num_classes=num_classes, num_features=20)
-    
+    X, y = make_demo_dataset()
+
     model = TestCasePredictor(
         input_dim=X.shape[1],
-        hidden_dim=1024, 
-        output_dim=num_classes,
+        hidden_dim=16,
+        output_dim=len(class_names),
         seed=42,
     )
 
-    # simulated_missing_rate=0.2 forces the model to learn to guess with 20% of data missing
     model.fit(
-        X, y,
-        epochs=10,
-        learning_rate=0.05,
-        batch_size=256,
+        X,
+        y,
+        epochs=1200,
+        learning_rate=0.03,
+        batch_size=32,
         validation_fraction=0.2,
-        verbose_every=10,
-        simulated_missing_rate=0.2 
+        verbose_every=100,
+        missing_rate=0.2, # Tell the model to learn to guess
     )
 
-    print("\n--- Testing with Incomplete Data ---")
-    
-    rng = np.random.default_rng(99)
-    test_indices = rng.choice(len(X), size=3, replace=False)
-    
-    for i, idx in enumerate(test_indices, start=1):
-        true_label = y[idx]
-        original_features = X[idx].copy()
-        
-        # DELIBERATELY DESTROY DATA: Set 50% of the features to NaN
-        incomplete_features = original_features.copy()
-        missing_mask = rng.choice([True, False], size=len(incomplete_features), p=[0.5, 0.5])
-        incomplete_features[missing_mask] = np.nan
-        
-        missing_count = np.sum(np.isnan(incomplete_features))
-        
+    model.save(args.model, class_names)
+
+    print("\nExample predictions with missing data (np.nan):\n")
+
+    # Added np.nan to simulate missing inputs
+    test_cases = np.array([
+        [0.10, 0.20, 0.15],      # 100% complete data
+        [0.55, np.nan, 0.60],    # Missing the middle feature
+        [np.nan, 0.85, np.nan],  # Missing two features
+    ])
+
+    for i, test_case in enumerate(test_cases, start=1):
         result = model.predict_one(
-            incomplete_features,
+            test_case,
             class_names=class_names,
             temperature=1.0,
         )
 
-        probs = np.array(result["probabilities"])
-        top_3_idx = np.argsort(probs)[-3:][::-1]
-        
-        print(f"\nTest Case {i} (Missing {missing_count}/{len(original_features)} features)")
-        print(f"  Input array: {np.round(incomplete_features, 2)}")
-        print(f"  True label:  {class_names[true_label]}")
-        print(f"  Prediction:  {result['class']} {'(CORRECT)' if result['class'] == class_names[true_label] else '(INCORRECT)'}")
-        print("  Top 3 probabilities:")
-        for top_idx in top_3_idx:
-            print(f"    {class_names[top_idx]}: {probs[top_idx]:.4f}")
+        print(f"test case {i}")
+        print(f"  input:       {test_case}")
+        print(f"  prediction:  {result['class']}")
+        print(
+            "  probabilities:",
+            {
+                name: round(probability, 4)
+                for name, probability in zip(
+                    class_names,
+                    result["probabilities"],
+                )
+            },
+        )
+        print()
 
 
 if __name__ == "__main__":
