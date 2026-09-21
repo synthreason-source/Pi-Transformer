@@ -280,13 +280,13 @@ def make_massive_demo_dataset(num_classes=2000, samples_per_class=200, num_featu
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--classes", type=int, default=2000)
+    parser.add_argument("--classes", type=int, default=200)
     args = parser.parse_args()
 
     num_classes = args.classes
     class_names = [f"case_{i:04d}" for i in range(num_classes)]
 
-    X, y = make_massive_demo_dataset(num_classes=num_classes, num_features=200)
+    X, y = make_massive_demo_dataset(num_classes=num_classes, num_features=20)
     
     model = TestCasePredictor(
         input_dim=X.shape[1],
