@@ -2,7 +2,8 @@
 offline_vision_3d_ergonomic_agent.py
 
 Continuous Webcam + Canny Edge Detector + 3D Cartesian & Euler Pose Estimation 
-+ Object Count Reward & 3D Vessel Steering + Ergonomic Fit Evaluation & Transparent Collage.
++ Object Count Reward & 3D Vessel Steering + Ergonomic Fit Evaluation & Contour-Masked Transparent Collage 
++ Feature-Matched Unique Connectors HUD.
 
 Install:
     pip install opencv-python numpy
@@ -14,7 +15,7 @@ import math
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 
@@ -25,7 +26,7 @@ import numpy as np
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
-DEFAULT_MIN_CONTOUR_AREA = 150
+DEFAULT_MIN_CONTOUR_AREA = 65
 COLLAGE_DIR = Path("3d_ergonomic_collages")
 WINDOW_NAME = "3D Vessel Navigation & Ergonomic Fit HUD Agent"
 
@@ -40,30 +41,24 @@ class ErgonomicFitEvaluator:
     standards (reach zones, comfortable viewing/operation tilt angles, and clearance).
     """
     def __init__(self):
-        # Target ergonomic zones (normalized ideals)
         self.target_optimal_depth = 1.5  # Ideal reach distance
-        self.target_comfort_pitch = 20.0 # Ideal ergonomic tilt angle in degrees
+        self.target_comfort_pitch = 50.0 # Ideal ergonomic tilt angle in degrees
 
     def evaluate_object(self, obj: RecognizedObject3D) -> Tuple[float, Dict[str, float]]:
-        """
-        Computes an ergonomic fit score (0.0 to 1.0) and specific ergonomic adjustments 
-        needed for human comfort (reach clearance and posture angle correction).
-        """
         x, y, z = obj.coord_3d
         roll, pitch, yaw = obj.euler_angles
 
-        # 1. Depth / Reach Ergonomics (penalize if too close or too far for comfortable reach)
+        # 1. Depth / Reach Ergonomics
         depth_diff = abs(z - self.target_optimal_depth)
         reach_score = max(0.0, 1.0 - (depth_diff / 2.0))
 
-        # 2. Angular / Posture Ergonomics (penalize excessive tilt away from comfort angle)
+        # 2. Angular / Posture Ergonomics
         pitch_diff = abs(pitch - self.target_comfort_pitch)
         posture_score = max(0.0, 1.0 - (pitch_diff / 45.0))
 
         # Combined Ergonomic Fit Score
         ergonomic_score = round((reach_score * 0.5) + (posture_score * 0.5), 2)
 
-        # Recommended ergonomic adjustments to fit human reach/posture
         reach_adjustment = round(self.target_optimal_depth - z, 2)
         posture_adjustment = round(self.target_comfort_pitch - pitch, 2)
 
@@ -145,6 +140,7 @@ class RecognizedObject3D:
     euler_angles: tuple[float, float, float]
     ergonomic_score: float = 0.0
     track_id: int = 1
+    contour_mask: Optional[np.ndarray] = field(default=None, repr=False)
 
 
 class Cartesian3DCoordLearner:
@@ -227,13 +223,18 @@ class EdgeDetectorRecognizer3D:
                         else:
                             shape_name = "lever_tall"
 
+                        # Build precise local binary mask for matched feature contour
+                        local_cnt = cnt - np.array([x, y], dtype=np.int32)
+                        local_mask = np.zeros((bh, bw), dtype=np.uint8)
+                        cv2.drawContours(local_mask, [local_cnt], -1, 255, thickness=cv2.FILLED)
+
                         unique_key = f"{shape_name}_id{idx}"
                         coord_3d, euler = self.coord_learner.update(unique_key, cnt, (x, y, x+bw, y+bh), w, h)
 
-                        # Temporary object to evaluate ergonomics
                         temp_obj = RecognizedObject3D(
                             label=shape_name, confidence=1.0, bbox=(x, y, x+bw, y+bh),
-                            coord_3d=coord_3d, euler_angles=euler, track_id=idx
+                            coord_3d=coord_3d, euler_angles=euler, track_id=idx,
+                            contour_mask=local_mask
                         )
                         ergo_score, _ = self.ergonomic_evaluator.evaluate_object(temp_obj)
                         temp_obj.ergonomic_score = ergo_score
@@ -260,8 +261,8 @@ class EdgeDetectorRecognizer3D:
 
 class VesselErgonomicHUDController:
     """
-    Steers the simulated vessel using object count reward, generates transparent 
-    ergonomically-fitted collages, and provides HUD telemetry for human-machine fitting.
+    Steers the simulated vessel using object count reward, generates precise contour-masked 
+    transparent collages, connects matched features, and provides HUD telemetry.
     """
     def __init__(self):
         COLLAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -294,7 +295,7 @@ class VesselErgonomicHUDController:
             }
 
         if len(objects) >= 2:
-            status = f"CLUSTER REACHED [Reward: {self.reward_score}] -> ERGONOMICALLY FITTED COLLAGE"
+            status = f"CLUSTER REACHED [Reward: {self.reward_score}] -> FEATURE-MATCHED COLLAGE"
             collage = self._generate_ergonomic_transparent_collage(frame, objects)
             return status, collage
         else:
@@ -313,26 +314,29 @@ class VesselErgonomicHUDController:
             if x2 > x1 and y2 > y1:
                 crop = frame[y1:y2, x1:x2]
                 crop_resized = cv2.resize(crop, (300, 200))
-                
-                # Apply ergonomic angle adjustment (pitch/roll alignment)
+
+                if obj.contour_mask is not None and obj.contour_mask.size > 0:
+                    mask_resized = cv2.resize(obj.contour_mask, (300, 200), interpolation=cv2.INTER_NEAREST)
+                else:
+                    mask_resized = np.ones((200, 300), dtype=np.uint8) * 255
+
                 center = (150, 100)
                 ergonomic_angle = obj.euler_angles[0]
                 M = cv2.getRotationMatrix2D(center, ergonomic_angle, 1.0)
-                aligned_crop = cv2.warpAffine(crop_resized, M, (300, 200), borderMode=cv2.BORDER_TRANSPARENT)
+                
+                aligned_crop = cv2.warpAffine(crop_resized, M, (300, 200), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
+                aligned_mask = cv2.warpAffine(mask_resized, M, (300, 200), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
 
                 ch, cw, _ = aligned_crop.shape
                 if y1 + ch <= h and x1 + cw <= w:
                     roi = base_canvas[y1:y1+ch, x1:x1+cw]
-                    gray_crop = cv2.cvtColor(aligned_crop, cv2.COLOR_BGR2GRAY)
-                    _, mask = cv2.threshold(gray_crop, 15, 255, cv2.THRESH_BINARY)
-                    mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) / 255.0
+                    mask_3ch = cv2.cvtColor(aligned_mask, cv2.COLOR_GRAY2BGR) / 255.0
 
-                    # Transparent blending without opaque bounding box artifacts
                     blended_region = (roi * (1.0 - (mask_3ch * overlay_alpha))) + (aligned_crop * (mask_3ch * overlay_alpha))
                     base_canvas[y1:y1+ch, x1:x1+cw] = blended_region.astype(np.uint8)
 
         timestamp = time.strftime("%H%M%S")
-        collage_path = COLLAGE_DIR / f"ergonomic_fitted_collage_{timestamp}.jpg"
+        collage_path = COLLAGE_DIR / f"feature_matched_collage_{timestamp}.jpg"
         cv2.imwrite(str(collage_path), base_canvas)
         return base_canvas
 
@@ -373,10 +377,47 @@ def main():
             objects = recognizer.get_latest_objects()
             status_text, collage = controller.evaluate_and_steer(frame, objects)
             
+            # Find and connect genuinely matching feature pairs (based on label affinity and spatial proximity)
+            matched_pairs = set()
+            if len(objects) >= 2:
+                for i, obj_a in enumerate(objects):
+                    best_match_idx = -1
+                    min_cost = float('inf')
+                    for j, obj_b in enumerate(objects):
+                        if i == j:
+                            continue
+                        
+                        # Calculate matching cost: prioritize same label type, then spatial distance
+                        label_penalty = 0.0 if obj_a.label == obj_b.label else 500.0
+                        
+                        pt_a = np.array([(obj_a.bbox[0] + obj_a.bbox[2]) / 2, (obj_a.bbox[1] + obj_a.bbox[3]) / 2])
+                        pt_b = np.array([(obj_b.bbox[0] + obj_b.bbox[2]) / 2, (obj_b.bbox[1] + obj_b.bbox[3]) / 2])
+                        spatial_dist = np.linalg.norm(pt_a - pt_b)
+                        
+                        cost = label_penalty + spatial_dist
+                        if cost < min_cost:
+                            min_cost = cost
+                            best_match_idx = j
+
+                    if best_match_idx != -1:
+                        pair = tuple(sorted([i, best_match_idx]))
+                        matched_pairs.add(pair)
+
+                # Draw unique feature-matched connector lines
+                for idx_a, idx_b in matched_pairs:
+                    obj_a = objects[idx_a]
+                    obj_b = objects[idx_b]
+                    pt_a = int((obj_a.bbox[0] + obj_a.bbox[2]) / 2), int((obj_a.bbox[1] + obj_a.bbox[3]) / 2)
+                    pt_b = int((obj_b.bbox[0] + obj_b.bbox[2]) / 2), int((obj_b.bbox[1] + obj_b.bbox[3]) / 2)
+
+                    match_color = (0, 255, 255) if obj_a.label == obj_b.label else (255, 165, 0)
+                    cv2.line(frame, pt_a, pt_b, match_color, 2, cv2.LINE_AA)
+                    cv2.circle(frame, pt_a, 4, (255, 255, 255), -1)
+                    cv2.circle(frame, pt_b, 4, (255, 255, 255), -1)
+
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                # Color code bounding box green if ergonomic score is high, red if poor fit
-                box_color = (0, 255, 0) if obj.ergonomic_score >= 0.6 else (0, 140, 255)
+                box_color = (0, 255, 0) if obj.ergonomic_score >= 0.6 else (0, 0, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
                 tag = f"{obj.label} | ErgoScore: {obj.ergonomic_score}"
                 cv2.putText(frame, tag, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 2)
@@ -384,7 +425,6 @@ def main():
             cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(frame, f"3D Vessel Steering Vector (X,Y,Z): {controller.vessel_heading_3d}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
 
-            # Draw Ergonomic Fit HUD Panel
             hud_y = 105
             cv2.putText(frame, "--- ERGONOMIC FIT HUD: REACH & POSTURE TELEMETRY ---", (20, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 255), 2, cv2.LINE_AA)
             for obj_key, data in controller.ergonomic_telemetry.items():
@@ -395,7 +435,7 @@ def main():
             cv2.imshow(WINDOW_NAME, frame)
 
             if collage is not None:
-                cv2.imshow("Ergonomically Fitted Collage", collage)
+                cv2.imshow("Feature-Matched Connector Collage", collage)
 
             if cv2.waitKey(30) & 0xFF in (ord('q'), ord('Q'), 27):
                 break
