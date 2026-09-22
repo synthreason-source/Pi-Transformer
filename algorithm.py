@@ -24,10 +24,10 @@ MODEL_PATH='model_cuda.json';BINDINGS_PATH='bindings_cuda.json';DEFAULT_CORPUS='
 ALPHA=.05;TEMP=.8;TOP_K=20;MAX_NEW=800;MAX_SUBSET=5;BEAM=24
 Vec=Dict[str,float]
 
-def tokenize(text):return re.findall(r"[a-zA-ZÀ-ÿ0-9_]+|[.!?,;:{}()[\]<>+=*/%^_-]",text.lower())
+def tokenize(text):return text.lower().split()
 def sentences(text):
     out=[]
-    for x in re.split(r'(?<=[.!?])\s+|\n+',text.replace('\r\n','\n')):
+    for x in text.split("."):
         x=x.strip()
         if x:out.append(x if x[-1] in '.!?' else x+'.')
     return out
