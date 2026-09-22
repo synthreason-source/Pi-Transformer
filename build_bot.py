@@ -1,8 +1,8 @@
 """
-offline_vision_3d_vessel_agent.py
+offline_vision_3d_ergonomic_agent.py
 
-Continuous Webcam + Canny Edge Detector + 3D Cartesian & Euler Orientation Estimation 
-+ Object Count Reward & 3D Vessel Steering + Multi-Axis 3D Rotation HUD.
+Continuous Webcam + Canny Edge Detector + 3D Cartesian & Euler Pose Estimation 
++ Object Count Reward & 3D Vessel Steering + Ergonomic Fit Evaluation & Transparent Collage.
 
 Install:
     pip install opencv-python numpy
@@ -26,8 +26,53 @@ import numpy as np
 # ============================================================
 
 DEFAULT_MIN_CONTOUR_AREA = 150
-COLLAGE_DIR = Path("3d_geometry_collages")
-WINDOW_NAME = "3D Vessel Navigation & Multi-Axis Rotation HUD Agent"
+COLLAGE_DIR = Path("3d_ergonomic_collages")
+WINDOW_NAME = "3D Vessel Navigation & Ergonomic Fit HUD Agent"
+
+
+# ============================================================
+# ERGONOMIC FIT ENGINE
+# ============================================================
+
+class ErgonomicFitEvaluator:
+    """
+    Evaluates 3D spatial coordinates and rotational poses against human ergonomic 
+    standards (reach zones, comfortable viewing/operation tilt angles, and clearance).
+    """
+    def __init__(self):
+        # Target ergonomic zones (normalized ideals)
+        self.target_optimal_depth = 1.5  # Ideal reach distance
+        self.target_comfort_pitch = 20.0 # Ideal ergonomic tilt angle in degrees
+
+    def evaluate_object(self, obj: RecognizedObject3D) -> Tuple[float, Dict[str, float]]:
+        """
+        Computes an ergonomic fit score (0.0 to 1.0) and specific ergonomic adjustments 
+        needed for human comfort (reach clearance and posture angle correction).
+        """
+        x, y, z = obj.coord_3d
+        roll, pitch, yaw = obj.euler_angles
+
+        # 1. Depth / Reach Ergonomics (penalize if too close or too far for comfortable reach)
+        depth_diff = abs(z - self.target_optimal_depth)
+        reach_score = max(0.0, 1.0 - (depth_diff / 2.0))
+
+        # 2. Angular / Posture Ergonomics (penalize excessive tilt away from comfort angle)
+        pitch_diff = abs(pitch - self.target_comfort_pitch)
+        posture_score = max(0.0, 1.0 - (pitch_diff / 45.0))
+
+        # Combined Ergonomic Fit Score
+        ergonomic_score = round((reach_score * 0.5) + (posture_score * 0.5), 2)
+
+        # Recommended ergonomic adjustments to fit human reach/posture
+        reach_adjustment = round(self.target_optimal_depth - z, 2)
+        posture_adjustment = round(self.target_comfort_pitch - pitch, 2)
+
+        adjustments = {
+            "reach_adj_z": reach_adjustment,
+            "posture_adj_pitch": posture_adjustment,
+            "score": ergonomic_score
+        }
+        return ergonomic_score, adjustments
 
 
 # ============================================================
@@ -78,7 +123,7 @@ class ContinuousCamera:
             x1 = int(w * (0.2 + 0.2 * i) + offset_x)
             y1 = int(h * 0.4 + 50 * math.cos(t * 0.5 + i))
             cv2.rectangle(frame, (x1 - 50, y1 - 40), (x1 + 50, y1 + 40), (150 + i * 35, 100, 200), 3)
-        cv2.putText(frame, "SYNTHETIC 3D MULTI-OBJECT FEED", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2, cv2.LINE_AA)
+        cv2.putText(frame, "SYNTHETIC ERGONOMIC FEED", (25, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (240, 240, 240), 2, cv2.LINE_AA)
         return frame
 
     def latest(self):
@@ -96,13 +141,13 @@ class RecognizedObject3D:
     label: str
     confidence: float
     bbox: tuple[int, int, int, int]
-    coord_3d: tuple[float, float, float]  # (X, Y, Z) in 3D space
-    euler_angles: tuple[float, float, float]  # (Roll, Pitch, Yaw) in degrees
+    coord_3d: tuple[float, float, float]
+    euler_angles: tuple[float, float, float]
+    ergonomic_score: float = 0.0
     track_id: int = 1
 
 
 class Cartesian3DCoordLearner:
-    """Estimates 3D spatial coordinates $(X, Y, Z)$ and 3D rotational Euler angles $(\text{Roll}, \text{Pitch}, \text{Yaw})$."""
     def __init__(self):
         self.spatial_memory: Dict[str, Tuple[Tuple[float, float, float], Tuple[float, float, float]]] = {}
 
@@ -110,7 +155,6 @@ class Cartesian3DCoordLearner:
         x1, y1, x2, y2 = bbox
         cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
         
-        # Normalized 3D Cartesian coordinates
         norm_x = (cx - (frame_w / 2.0)) / (frame_w / 2.0)
         norm_y = ((frame_h / 2.0) - cy) / (frame_h / 2.0)
         
@@ -120,21 +164,17 @@ class Cartesian3DCoordLearner:
         
         coord_3d = (round(norm_x, 2), round(norm_y, 2), round(depth_z, 2))
 
-        # 3D Rotational Pose Estimation via Min Area Rect & Contour Moments
         rect = cv2.minAreaRect(contour)
         box_angle = rect[2]
         
-        # Estimate 3D Euler angles: Roll, Pitch, Yaw (in degrees)
-        # Using aspect ratio and contour elongation to simulate 3D tilt
         w_box, h_box = rect[1]
         aspect = w_box / h_box if h_box > 0 else 1.0
         pitch = round((aspect - 1.0) * 45.0, 1)
         roll = round(box_angle if box_angle <= 90 else box_angle - 90, 1)
-        yaw = round(norm_x * 30.0, 1)  # View angle offset relative to camera center
+        yaw = round(norm_x * 30.0, 1)
         
         euler_angles = (roll, pitch, yaw)
 
-        # Temporal smoothing
         if key in self.spatial_memory:
             prev_coord, prev_euler = self.spatial_memory[key]
             alpha = 0.6
@@ -152,6 +192,7 @@ class EdgeDetectorRecognizer3D:
         self.camera = camera
         self.min_area = min_area
         self.coord_learner = Cartesian3DCoordLearner()
+        self.ergonomic_evaluator = ErgonomicFitEvaluator()
         self.lock = threading.Lock()
         self._objects = []
         self.stop_event = threading.Event()
@@ -180,24 +221,24 @@ class EdgeDetectorRecognizer3D:
                         x, y, bw, bh = cv2.boundingRect(cnt)
                         aspect_ratio = float(bw) / bh if bh > 0 else 1.0
                         if 0.8 <= aspect_ratio <= 1.2:
-                            shape_name = "cube_square"
+                            shape_name = "module_square"
                         elif aspect_ratio > 1.2:
-                            shape_name = "prism_wide"
+                            shape_name = "panel_wide"
                         else:
-                            shape_name = "cylinder_tall"
+                            shape_name = "lever_tall"
 
                         unique_key = f"{shape_name}_id{idx}"
                         coord_3d, euler = self.coord_learner.update(unique_key, cnt, (x, y, x+bw, y+bh), w, h)
 
-                        confidence = min(1.0, area / 10000.0)
-                        detections.append(RecognizedObject3D(
-                            label=shape_name,
-                            confidence=confidence,
-                            bbox=(x, y, x + bw, y + bh),
-                            coord_3d=coord_3d,
-                            euler_angles=euler,
-                            track_id=idx
-                        ))
+                        # Temporary object to evaluate ergonomics
+                        temp_obj = RecognizedObject3D(
+                            label=shape_name, confidence=1.0, bbox=(x, y, x+bw, y+bh),
+                            coord_3d=coord_3d, euler_angles=euler, track_id=idx
+                        )
+                        ergo_score, _ = self.ergonomic_evaluator.evaluate_object(temp_obj)
+                        temp_obj.ergonomic_score = ergo_score
+
+                        detections.append(temp_obj)
                         idx += 1
 
                 with self.lock:
@@ -214,56 +255,57 @@ class EdgeDetectorRecognizer3D:
 
 
 # ============================================================
-# 3D VESSEL NAVIGATION & MULTI-AXIS ROTATION HUD CONTROLLER
+# VESSEL NAVIGATION & ERGONOMIC HUD CONTROLLER
 # ============================================================
 
-class Vessel3DHUDController:
+class VesselErgonomicHUDController:
     """
-    Steers a 3D simulated robot vessel using object count reward, generates 3D-aligned 
-    collages, and computes multi-axis rotation HUD telemetry ($\Delta \text{Roll}, \Delta \text{Pitch}, \Delta \text{Yaw}$).
+    Steers the simulated vessel using object count reward, generates transparent 
+    ergonomically-fitted collages, and provides HUD telemetry for human-machine fitting.
     """
     def __init__(self):
         COLLAGE_DIR.mkdir(parents=True, exist_ok=True)
-        self.vessel_heading_3d = (0.0, 0.0, 0.0)  # (dX, dY, dZ)
+        self.vessel_heading_3d = (0.0, 0.0, 0.0)
         self.reward_score = 0.0
-        self.rotation_telemetry_3d: Dict[str, Tuple[float, float, float]] = {}
+        self.ergonomic_telemetry: Dict[str, Dict[str, float]] = {}
+        self.ergo_evaluator = ErgonomicFitEvaluator()
 
     def evaluate_and_steer(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> Tuple[str, Optional[np.ndarray]]:
         if frame is None or not objects:
-            self.rotation_telemetry_3d.clear()
-            return "SEARCHING FOR 3D CLUSTERS (REWARD: 0.0)", None
+            self.ergonomic_telemetry.clear()
+            return "SEARCHING FOR ERGONOMIC CLUSTERS (REWARD: 0.0)", None
 
         h, w, _ = frame.shape
         self.reward_score = float(len(objects))
 
-        # Compute 3D center of mass for vessel heading telemetry
         mean_x = sum(obj.coord_3d[0] for obj in objects) / len(objects)
         mean_y = sum(obj.coord_3d[1] for obj in objects) / len(objects)
         mean_z = sum(obj.coord_3d[2] for obj in objects) / len(objects)
         self.vessel_heading_3d = (round(mean_x, 2), round(mean_y, 2), round(mean_z, 2))
 
-        # Calculate multi-axis rotational adjustments needed to normalize subgeometries to target frame axes ($0^\circ, 0^\circ, 0^\circ$)
-        self.rotation_telemetry_3d.clear()
+        self.ergonomic_telemetry.clear()
         for idx, obj in enumerate(objects):
-            roll_adj = -obj.euler_angles[0]
-            pitch_adj = -obj.euler_angles[1]
-            yaw_adj = -obj.euler_angles[2]
+            _, adj = self.ergo_evaluator.evaluate_object(obj)
             key = f"Obj#{idx+1} ({obj.label})"
-            self.rotation_telemetry_3d[key] = (round(roll_adj, 1), round(pitch_adj, 1), round(yaw_adj, 1))
+            self.ergonomic_telemetry[key] = {
+                "score": obj.ergonomic_score,
+                "reach_z": adj["reach_adj_z"],
+                "pitch_deg": adj["posture_adj_pitch"]
+            }
 
         if len(objects) >= 2:
-            status = f"3D CLUSTER REACHED [Reward: {self.reward_score}] -> 3D ROTATION HUD & COLLAGE ACTIVE"
-            collage = self._generate_3d_geometric_collage(frame, objects)
+            status = f"CLUSTER REACHED [Reward: {self.reward_score}] -> ERGONOMICALLY FITTED COLLAGE"
+            collage = self._generate_ergonomic_transparent_collage(frame, objects)
             return status, collage
         else:
-            status = f"STEERING 3D VESSEL (Heading X,Y,Z: {self.vessel_heading_3d})"
+            status = f"STEERING TO ERGONOMIC CLUSTER (Heading X,Y,Z: {self.vessel_heading_3d})"
             return status, None
 
-    def _generate_3d_geometric_collage(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> np.ndarray:
+    def _generate_ergonomic_transparent_collage(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> np.ndarray:
         h, w, _ = frame.shape
         base_canvas = frame.copy()
-        alpha = 0.6
-        
+        overlay_alpha = 0.45
+
         for obj in objects:
             x1, y1, x2, y2 = obj.bbox
             x1, y1 = max(0, x1), max(0, y1)
@@ -272,20 +314,25 @@ class Vessel3DHUDController:
                 crop = frame[y1:y2, x1:x2]
                 crop_resized = cv2.resize(crop, (300, 200))
                 
-                # Apply 3D affine transformation matrix using Roll angle for multi-axis alignment
+                # Apply ergonomic angle adjustment (pitch/roll alignment)
                 center = (150, 100)
-                roll_angle = obj.euler_angles[0]
-                M = cv2.getRotationMatrix2D(center, roll_angle, 1.0)
-                aligned_crop = cv2.warpAffine(crop_resized, M, (300, 200))
+                ergonomic_angle = obj.euler_angles[0]
+                M = cv2.getRotationMatrix2D(center, ergonomic_angle, 1.0)
+                aligned_crop = cv2.warpAffine(crop_resized, M, (300, 200), borderMode=cv2.BORDER_TRANSPARENT)
 
                 ch, cw, _ = aligned_crop.shape
                 if y1 + ch <= h and x1 + cw <= w:
                     roi = base_canvas[y1:y1+ch, x1:x1+cw]
-                    blended = cv2.addWeighted(roi, 1.0 - alpha, aligned_crop, alpha, 0)
-                    base_canvas[y1:y1+ch, x1:x1+cw] = blended
+                    gray_crop = cv2.cvtColor(aligned_crop, cv2.COLOR_BGR2GRAY)
+                    _, mask = cv2.threshold(gray_crop, 15, 255, cv2.THRESH_BINARY)
+                    mask_3ch = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) / 255.0
+
+                    # Transparent blending without opaque bounding box artifacts
+                    blended_region = (roi * (1.0 - (mask_3ch * overlay_alpha))) + (aligned_crop * (mask_3ch * overlay_alpha))
+                    base_canvas[y1:y1+ch, x1:x1+cw] = blended_region.astype(np.uint8)
 
         timestamp = time.strftime("%H%M%S")
-        collage_path = COLLAGE_DIR / f"3d_aligned_collage_{timestamp}.jpg"
+        collage_path = COLLAGE_DIR / f"ergonomic_fitted_collage_{timestamp}.jpg"
         cv2.imwrite(str(collage_path), base_canvas)
         return base_canvas
 
@@ -301,20 +348,20 @@ def main():
     args = parser.parse_args()
 
     print("=" * 78)
-    print("3D VESSEL NAVIGATION & MULTI-AXIS ROTATION HUD AGENT")
+    print("3D VESSEL NAVIGATION & ERGONOMIC FIT HUD AGENT")
     print("=" * 78)
 
     camera = ContinuousCamera(index=args.camera)
     recognizer = EdgeDetectorRecognizer3D(camera, min_area=args.min_area)
     recognizer.start()
 
-    controller = Vessel3DHUDController()
+    controller = VesselErgonomicHUDController()
 
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
-    print(f"\n3D Collages saving to: ./{COLLAGE_DIR.name}/")
-    print("Running 3D agent. Press ESC or 'q' to exit.\n")
+    print(f"\nErgonomic Collages saving to: ./{COLLAGE_DIR.name}/")
+    print("Running ergonomic agent. Press ESC or 'q' to exit.\n")
 
     try:
         while True:
@@ -326,31 +373,29 @@ def main():
             objects = recognizer.get_latest_objects()
             status_text, collage = controller.evaluate_and_steer(frame, objects)
             
-            # Draw 3D bounding boxes, coordinates, and Euler angles
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                tag = f"{obj.label} | XYZ{obj.coord_3d}"
-                euler_tag = f"R:{obj.euler_angles[0]} P:{obj.euler_angles[1]} Y:{obj.euler_angles[2]}"
-                cv2.putText(frame, tag, (x1, max(20, y1 - 22)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 2)
-                cv2.putText(frame, euler_tag, (x1, max(10, y1 - 6)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                # Color code bounding box green if ergonomic score is high, red if poor fit
+                box_color = (0, 255, 0) if obj.ergonomic_score >= 0.6 else (0, 140, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+                tag = f"{obj.label} | ErgoScore: {obj.ergonomic_score}"
+                cv2.putText(frame, tag, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 2)
 
-            # Display Status & 3D Vessel Telemetry
             cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(frame, f"3D Vessel Steering Vector (X,Y,Z): {controller.vessel_heading_3d}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2, cv2.LINE_AA)
 
-            # Draw Multi-Axis 3D Rotation HUD Panel
+            # Draw Ergonomic Fit HUD Panel
             hud_y = 105
-            cv2.putText(frame, "--- 3D HUD: MULTI-AXIS ROTATION TELEMETRY ($\Delta$Roll, Pitch, Yaw) ---", (20, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 255), 2, cv2.LINE_AA)
-            for obj_key, (r_adj, p_adj, y_adj) in controller.rotation_telemetry_3d.items():
+            cv2.putText(frame, "--- ERGONOMIC FIT HUD: REACH & POSTURE TELEMETRY ---", (20, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (200, 200, 255), 2, cv2.LINE_AA)
+            for obj_key, data in controller.ergonomic_telemetry.items():
                 hud_y += 26
-                hud_txt = f"{obj_key} -> $\Delta$Roll:{r_adj:+.1f}° | $\Delta$Pitch:{p_adj:+.1f}° | $\Delta$Yaw:{y_adj:+.1f}°"
+                hud_txt = f"{obj_key} -> FitScore:{data['score']} | ReachAdjZ:{data['reach_z']:+.2f} | PitchAdj:{data['pitch_deg']:+.1f}°"
                 cv2.putText(frame, hud_txt, (35, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 165, 255), 2, cv2.LINE_AA)
 
             cv2.imshow(WINDOW_NAME, frame)
 
             if collage is not None:
-                cv2.imshow("3D Aligned Subgeometry Collage", collage)
+                cv2.imshow("Ergonomically Fitted Collage", collage)
 
             if cv2.waitKey(30) & 0xFF in (ord('q'), ord('Q'), 27):
                 break
