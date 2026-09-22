@@ -2,8 +2,8 @@
 offline_vision_3d_ergonomic_agent.py
 
 Continuous Webcam + Canny Edge Detector + 3D Cartesian & Euler Pose Estimation 
-+ Object Count Reward & 3D Vessel Steering + Ergonomic Fit Evaluation & Contour-Masked Transparent Collage 
-+ Feature-Matched Unique Connectors HUD.
++ Object Count Reward & 3D Vessel Steering + Ergonomic Fit Evaluation 
++ Feature-Matched Unique Connectors HUD + 2D Russian Doll Containment Hierarchy.
 
 Install:
     pip install opencv-python numpy
@@ -26,8 +26,7 @@ import numpy as np
 # CONFIGURATION & CONSTANTS
 # ============================================================
 
-DEFAULT_MIN_CONTOUR_AREA = 65
-COLLAGE_DIR = Path("3d_ergonomic_collages")
+DEFAULT_MIN_CONTOUR_AREA = 100
 WINDOW_NAME = "3D Vessel Navigation & Ergonomic Fit HUD Agent"
 
 
@@ -141,6 +140,7 @@ class RecognizedObject3D:
     ergonomic_score: float = 0.0
     track_id: int = 1
     contour_mask: Optional[np.ndarray] = field(default=None, repr=False)
+    parent_container_id: Optional[int] = None  # Tracks Russian Doll containment hierarchy
 
 
 class Cartesian3DCoordLearner:
@@ -223,7 +223,6 @@ class EdgeDetectorRecognizer3D:
                         else:
                             shape_name = "lever_tall"
 
-                        # Build precise local binary mask for matched feature contour
                         local_cnt = cnt - np.array([x, y], dtype=np.int32)
                         local_mask = np.zeros((bh, bw), dtype=np.uint8)
                         cv2.drawContours(local_mask, [local_cnt], -1, 255, thickness=cv2.FILLED)
@@ -242,10 +241,33 @@ class EdgeDetectorRecognizer3D:
                         detections.append(temp_obj)
                         idx += 1
 
+                # Evaluate 2D Russian Doll Containment Hierarchies
+                self._evaluate_russian_doll_containment(detections)
+
                 with self.lock:
                     self._objects = detections
             except Exception:
                 time.sleep(0.01)
+
+    def _evaluate_russian_doll_containment(self, objects: List[RecognizedObject3D]):
+        """
+        Determines if an object's bounding box is nested entirely inside another 
+        larger bounding box (2D Russian Doll model).
+        """
+        for i, obj_i in enumerate(objects):
+            xi1, yi1, xi2, yi2 = obj_i.bbox
+            area_i = max(1.0, (xi2 - xi1) * (yi2 - yi1))
+            
+            for j, obj_j in enumerate(objects):
+                if i == j:
+                    continue
+                xj1, yj1, xj2, yj2 = obj_j.bbox
+                area_j = max(1.0, (xj2 - xj1) * (yj2 - yj1))
+
+                if area_j > area_i:
+                    if xi1 >= xj1 and yi1 >= yj1 and xi2 <= xj2 and yi2 <= yj2:
+                        obj_i.parent_container_id = obj_j.track_id
+                        break
 
     def get_latest_objects(self):
         with self.lock:
@@ -261,20 +283,19 @@ class EdgeDetectorRecognizer3D:
 
 class VesselErgonomicHUDController:
     """
-    Steers the simulated vessel using object count reward, generates precise contour-masked 
-    transparent collages, connects matched features, and provides HUD telemetry.
+    Steers the simulated vessel using object count reward, evaluates 2D Russian Doll 
+    containment layouts, and manages HUD telemetry data.
     """
     def __init__(self):
-        COLLAGE_DIR.mkdir(parents=True, exist_ok=True)
         self.vessel_heading_3d = (0.0, 0.0, 0.0)
         self.reward_score = 0.0
         self.ergonomic_telemetry: Dict[str, Dict[str, float]] = {}
         self.ergo_evaluator = ErgonomicFitEvaluator()
 
-    def evaluate_and_steer(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> Tuple[str, Optional[np.ndarray]]:
+    def evaluate_and_steer(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> str:
         if frame is None or not objects:
             self.ergonomic_telemetry.clear()
-            return "SEARCHING FOR ERGONOMIC CLUSTERS (REWARD: 0.0)", None
+            return "SEARCHING FOR ERGONOMIC CLUSTERS (REWARD: 0.0)"
 
         h, w, _ = frame.shape
         self.reward_score = float(len(objects))
@@ -285,60 +306,28 @@ class VesselErgonomicHUDController:
         self.vessel_heading_3d = (round(mean_x, 2), round(mean_y, 2), round(mean_z, 2))
 
         self.ergonomic_telemetry.clear()
+        nested_count = 0
         for idx, obj in enumerate(objects):
             _, adj = self.ergo_evaluator.evaluate_object(obj)
-            key = f"Obj#{idx+1} ({obj.label})"
+            key = f"Obj#{obj.track_id} ({obj.label})"
+            if obj.parent_container_id is not None:
+                key += f" [NESTED IN #{obj.parent_container_id}]"
+                nested_count += 1
+
             self.ergonomic_telemetry[key] = {
                 "score": obj.ergonomic_score,
                 "reach_z": adj["reach_adj_z"],
                 "pitch_deg": adj["posture_adj_pitch"]
             }
 
-        if len(objects) >= 2:
-            status = f"CLUSTER REACHED [Reward: {self.reward_score}] -> FEATURE-MATCHED COLLAGE"
-            collage = self._generate_ergonomic_transparent_collage(frame, objects)
-            return status, collage
+        if nested_count > 0:
+            status = f"RUSSIAN DOLL NESTING DETECTED ({nested_count} contained objects flagged for transfer)"
+        elif len(objects) >= 2:
+            status = f"CLUSTER REACHED [Reward: {self.reward_score}] -> ACTIVE HUD MONITORING"
         else:
             status = f"STEERING TO ERGONOMIC CLUSTER (Heading X,Y,Z: {self.vessel_heading_3d})"
-            return status, None
 
-    def _generate_ergonomic_transparent_collage(self, frame: np.ndarray, objects: List[RecognizedObject3D]) -> np.ndarray:
-        h, w, _ = frame.shape
-        base_canvas = frame.copy()
-        overlay_alpha = 0.45
-
-        for obj in objects:
-            x1, y1, x2, y2 = obj.bbox
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
-            if x2 > x1 and y2 > y1:
-                crop = frame[y1:y2, x1:x2]
-                crop_resized = cv2.resize(crop, (300, 200))
-
-                if obj.contour_mask is not None and obj.contour_mask.size > 0:
-                    mask_resized = cv2.resize(obj.contour_mask, (300, 200), interpolation=cv2.INTER_NEAREST)
-                else:
-                    mask_resized = np.ones((200, 300), dtype=np.uint8) * 255
-
-                center = (150, 100)
-                ergonomic_angle = obj.euler_angles[0]
-                M = cv2.getRotationMatrix2D(center, ergonomic_angle, 1.0)
-                
-                aligned_crop = cv2.warpAffine(crop_resized, M, (300, 200), borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0))
-                aligned_mask = cv2.warpAffine(mask_resized, M, (300, 200), borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-                ch, cw, _ = aligned_crop.shape
-                if y1 + ch <= h and x1 + cw <= w:
-                    roi = base_canvas[y1:y1+ch, x1:x1+cw]
-                    mask_3ch = cv2.cvtColor(aligned_mask, cv2.COLOR_GRAY2BGR) / 255.0
-
-                    blended_region = (roi * (1.0 - (mask_3ch * overlay_alpha))) + (aligned_crop * (mask_3ch * overlay_alpha))
-                    base_canvas[y1:y1+ch, x1:x1+cw] = blended_region.astype(np.uint8)
-
-        timestamp = time.strftime("%H%M%S")
-        collage_path = COLLAGE_DIR / f"feature_matched_collage_{timestamp}.jpg"
-        cv2.imwrite(str(collage_path), base_canvas)
-        return base_canvas
+        return status
 
 
 # ============================================================
@@ -364,8 +353,7 @@ def main():
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
-    print(f"\nErgonomic Collages saving to: ./{COLLAGE_DIR.name}/")
-    print("Running ergonomic agent. Press ESC or 'q' to exit.\n")
+    print("\nRunning ergonomic agent. Press ESC or 'q' to exit.\n")
 
     try:
         while True:
@@ -375,9 +363,8 @@ def main():
                 continue
 
             objects = recognizer.get_latest_objects()
-            status_text, collage = controller.evaluate_and_steer(frame, objects)
+            status_text = controller.evaluate_and_steer(frame, objects)
             
-            # Find and connect genuinely matching feature pairs (based on label affinity and spatial proximity)
             matched_pairs = set()
             if len(objects) >= 2:
                 for i, obj_a in enumerate(objects):
@@ -387,9 +374,7 @@ def main():
                         if i == j:
                             continue
                         
-                        # Calculate matching cost: prioritize same label type, then spatial distance
                         label_penalty = 0.0 if obj_a.label == obj_b.label else 500.0
-                        
                         pt_a = np.array([(obj_a.bbox[0] + obj_a.bbox[2]) / 2, (obj_a.bbox[1] + obj_a.bbox[3]) / 2])
                         pt_b = np.array([(obj_b.bbox[0] + obj_b.bbox[2]) / 2, (obj_b.bbox[1] + obj_b.bbox[3]) / 2])
                         spatial_dist = np.linalg.norm(pt_a - pt_b)
@@ -403,7 +388,6 @@ def main():
                         pair = tuple(sorted([i, best_match_idx]))
                         matched_pairs.add(pair)
 
-                # Draw unique feature-matched connector lines
                 for idx_a, idx_b in matched_pairs:
                     obj_a = objects[idx_a]
                     obj_b = objects[idx_b]
@@ -417,9 +401,16 @@ def main():
 
             for obj in objects:
                 x1, y1, x2, y2 = obj.bbox
-                box_color = (0, 255, 0) if obj.ergonomic_score >= 0.6 else (0, 0, 255)
+                if obj.parent_container_id is not None:
+                    box_color = (255, 0, 255)  # Magenta for Russian Doll nested items
+                else:
+                    box_color = (0, 255, 0) if obj.ergonomic_score >= 0.6 else (0, 0, 255)
+                
                 cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-                tag = f"{obj.label} | ErgoScore: {obj.ergonomic_score}"
+                
+                tag = f"#{obj.track_id} {obj.label} | ErgoScore: {obj.ergonomic_score}"
+                if obj.parent_container_id is not None:
+                    tag += f" (Nested in #{obj.parent_container_id})"
                 cv2.putText(frame, tag, (x1, max(20, y1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 2)
 
             cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
@@ -433,9 +424,6 @@ def main():
                 cv2.putText(frame, hud_txt, (35, hud_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 165, 255), 2, cv2.LINE_AA)
 
             cv2.imshow(WINDOW_NAME, frame)
-
-            if collage is not None:
-                cv2.imshow("Feature-Matched Connector Collage", collage)
 
             if cv2.waitKey(30) & 0xFF in (ord('q'), ord('Q'), 27):
                 break
