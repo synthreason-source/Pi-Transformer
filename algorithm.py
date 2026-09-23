@@ -1,13 +1,19 @@
 """CUDA-first stochastic polymorphic number generator and bijective automorphism filter.
 
 Run:
-  pip install torch gradio plotly
+  pip install torch gradio plotly ultralytics
   python app_cuda_automorphism.py
   python app_cuda_automorphism.py --share
 
 Transforms vector spaces via a bijective, isometric orthogonal automorphism
 (matrix exponential of a skew-symmetric generator) before computing GPU similarity
 and subset-sum routing over compact polymorphic numbers.
+
+Also cross-correlates text-corpus word peaks against a vision-side signal
+pulled directly from a YOLO model's own class_id table (no images, no pixel
+inference -- just the model's built-in data), folding both into one shared
+context-vector space so the connectome, generator, and search all draw on
+text tokens and model class-ids together.
 """
 from __future__ import annotations
 import argparse, json, math, random, re
@@ -25,7 +31,7 @@ MODEL_PATH = 'model_auto.json'
 BINDINGS_PATH = 'bindings_auto.json'
 DEFAULT_CORPUS = 'corpus_auto.txt'
 
-ALPHA = .05; TEMP = .8; TOP_K = 20; MAX_NEW = 800; MAX_SUBSET = 5; BEAM = 24
+ALPHA = .05; TEMP = .8; TOP_K = 20; MAX_NEW = 800; MAX_SUBSET = 5; BEAM = 24; XCORR_WEIGHT = 1.5
 Vec = Dict[str, float]
 
 def tokenize(text):
@@ -426,9 +432,128 @@ def build_connectome(bindings: 'Bindings', vocab_size: int = 45, k: int = 3) -> 
     return fig, summary
 
 
+# ---------------------------------------------------------------------------
+# Model-data vision signal: uses the YOLO model's own built-in class-id table
+# directly -- no images, no inference. The model ships a fixed id->name map
+# (its 'names' attribute); we take that id space itself as the raw numeric
+# 'vision' signal, weighted by inverse rank so the model's foundational
+# low-numbered classes carry more weight. This becomes S.yolo_freq, folded
+# into the shared context-vector space and compared in the cross-correlation,
+# exactly like an image harvest would, but sourced from the model's own data.
+# ---------------------------------------------------------------------------
+
+_YOLO_MODEL = None
+YOLO_WEIGHTS = 'yolov8n.pt'  # swap for a domain-specific checkpoint if you have one
+
+def get_yolo_model(weights: str = YOLO_WEIGHTS):
+    global _YOLO_MODEL
+    if _YOLO_MODEL is None:
+        from ultralytics import YOLO  # deferred import: heavy, optional until used
+        _YOLO_MODEL = YOLO(weights)
+    return _YOLO_MODEL
+
+def model_class_signal(weights: str = YOLO_WEIGHTS) -> Counter:
+    """Raw data straight from the model: its class_id table, nothing else."""
+    model = get_yolo_model(weights)
+    ids = list(model.names)  # class_id keys the model itself defines
+    n = len(ids) or 1
+    return Counter({str(cid): (n - rank) / n for rank, cid in enumerate(sorted(ids))})
+
+def fold_model_signal_into_bindings(bindings: 'Bindings', class_signal: Counter) -> 'Bindings':
+    """Every raw class_id co-occurs with every other, weighted by their model
+    weight product -- the model's own class space treated as one context
+    window, the same way an image's detections would be, but sourced from
+    model data rather than pixels."""
+    ids = list(class_signal)
+    incoming = defaultdict(Counter)
+    for i, a in enumerate(ids):
+        for j, b in enumerate(ids):
+            if i == j:
+                continue
+            incoming[a][b] += class_signal[a] * class_signal[b]
+
+    if bindings.contexts:
+        merged = defaultdict(Counter)
+        for w, v in bindings.contexts.items():
+            merged[w].update(v)
+        for w, v in incoming.items():
+            for k, x in v.items():
+                merged[w][k] = bindings.momentum * merged[w][k] + (1 - bindings.momentum) * x
+        bindings.contexts = dict(merged)
+    else:
+        bindings.contexts = dict(incoming)
+    bindings.rebuild()
+    return bindings
+
+
+# ---------------------------------------------------------------------------
+# Cross-correlation of YOLO detection peaks against text-corpus word peaks.
+#
+# Both frequency signals are laid onto the same combined-vocabulary axis
+# (ranked by combined frequency), so they share one ordering. A GPU 1D
+# cross-correlation (via conv1d) finds the lag at which the two frequency
+# curves align best; local maxima ("peaks") in each signal are then matched
+# near that lag. Words that peak in *both* the text corpus and the YOLO
+# detections become weighted co-peak terms, fed back into generation as an
+# extra bias alongside the prompt-driven bias already in use.
+# ---------------------------------------------------------------------------
+
+def _sequence_peaks(arr: List[float]) -> List[int]:
+    n = len(arr)
+    peaks = []
+    for i in range(n):
+        prev = arr[i - 1] if i > 0 else -1.0
+        nxt = arr[i + 1] if i < n - 1 else -1.0
+        if arr[i] >= prev and arr[i] >= nxt and arr[i] > 0:
+            peaks.append(i)
+    return peaks
+
+def cross_correlate_peaks(text_freq: Counter, yolo_freq: Counter, top_n: int = 60) -> Tuple[Dict[str, float], str]:
+    vocab = set(text_freq) | set(yolo_freq)
+    if not vocab or not text_freq or not yolo_freq:
+        return {}, 'Need both a trained text corpus and at least one YOLO harvest to cross-correlate.'
+
+    ranked = sorted(vocab, key=lambda w: text_freq.get(w, 0) + yolo_freq.get(w, 0.), reverse=True)[:top_n]
+    n = len(ranked)
+    text_arr = [float(text_freq.get(w, 0)) for w in ranked]
+    yolo_arr = [float(yolo_freq.get(w, 0.)) for w in ranked]
+
+    def norm(a):
+        mx = max(a) or 1.0
+        return [v / mx for v in a]
+    tx, ty = norm(text_arr), norm(yolo_arr)
+
+    a = torch.tensor(tx, dtype=torch.float32, device=DEVICE) - sum(tx) / n
+    b = torch.tensor(ty, dtype=torch.float32, device=DEVICE) - sum(ty) / n
+    full = torch.nn.functional.conv1d(
+        a.view(1, 1, -1), b.flip(0).view(1, 1, -1), padding=n - 1
+    ).flatten()
+    lags = list(range(-(n - 1), n))
+    best_i = int(torch.argmax(full).item())
+    best_lag = lags[best_i]
+    denom = (torch.linalg.vector_norm(a) * torch.linalg.vector_norm(b)).clamp_min(1e-12)
+    corr_coef = float(full[best_i] / denom)
+
+    text_peaks = set(_sequence_peaks(tx))
+    yolo_peaks = set(_sequence_peaks(ty))
+    shifted_yolo_peaks = {p + best_lag for p in yolo_peaks}  # align yolo peaks onto the text axis
+    co_peak_idx = {i for i in text_peaks if any(abs(i - p) <= 1 for p in shifted_yolo_peaks)}
+
+    bias = {ranked[i]: (tx[i] + ty[i]) * XCORR_WEIGHT for i in co_peak_idx}
+    top_words = sorted(bias, key=bias.get, reverse=True)[:10]
+    summary = (
+        f'Cross-correlated {len(text_freq)} text words x {len(yolo_freq)} YOLO labels '
+        f'over {n} ranked terms - best lag={best_lag} - corr={corr_coef:.3f} - '
+        f'{len(co_peak_idx)} co-peak words: {", ".join(top_words) if top_words else "none"}'
+    )
+    return bias, summary
+
+
 class State:
     def __init__(self):
         self.model = None; self.corpus = None; self.bindings = Bindings()
+        self.text_freq = Counter()   # word -> frequency, from the trained text corpus
+        self.yolo_freq = Counter()   # label -> confidence-weighted count, from harvested images
 
     def train(self, text):
         self.model = NGram().ingest(text)
@@ -437,6 +562,7 @@ class State:
         self.bindings.update(text)
         self.bindings.save()
         self.corpus = Corpus(text, self.bindings)
+        self.text_freq = Counter(w for w in tokenize(text) if w not in SPECIAL)
 
 S = State()
 
@@ -448,15 +574,35 @@ def train(file):
 
 def generate(prompt, vocab_size=45, k=3):
     if not S.model:
-        return 'Train filter first', '', '', go.Figure(), 'Train the filter first (need a trained corpus).'
+        return 'Train filter first', '', '', go.Figure(), '', ''
+
+    # Pull the vision-side signal straight from the YOLO model's own data
+    # (its class_id table) -- computed once and cached, no images involved.
+    if not S.yolo_freq:
+        S.yolo_freq = model_class_signal()
+        fold_model_signal_into_bindings(S.bindings, S.yolo_freq)
+        visual_text = ' '.join(f"{cid}." for cid in S.yolo_freq)
+        S.model.ingest(visual_text)
+        S.model.save()
+        ss = sentences(visual_text)
+        freq = Counter(s.lower() for s in ss)
+        start = len(S.corpus.refs)
+        for i, s in enumerate(ss):
+            t = tokenize(s)
+            f = S.corpus.bindings.expand({k2: float(v) for k2, v in bow(t).items()})
+            S.corpus.refs.append(Ref(start + i, s, t, freq[s.lower()], f))
+
     target = S.corpus.bindings.expand({k2: float(v) for k2, v in bow(tokenize(prompt)).items()})
+    peak_bias, xcorr_summary = cross_correlate_peaks(S.text_freq, S.yolo_freq)
     state = dict(target)
+    for w, sc in peak_bias.items():
+        state[w] = state.get(w, 0.) + sc
     def bias(history):
         seeds = sorted(state, key=lambda x: state[x] * S.corpus.bindings.threshold, reverse=True)[:12]
         return S.model_bias(seeds) if hasattr(S, 'model_bias') else {}
     text = S.model.generate(prompt, bias)
     fig, conn_summary = build_connectome(S.bindings, int(vocab_size), int(k))
-    return 'CUDA device: ' + str(DEVICE), format_matches(S.corpus.search(prompt)), text, fig, conn_summary
+    return 'CUDA device: ' + str(DEVICE), format_matches(S.corpus.search(prompt)), text, fig, conn_summary, xcorr_summary
 
 def format_matches(rows):
     return '\n'.join(f'{x.rank}. {x.ref.s} score={x.score:.3f} vector={x.vector:.3f}' + (' [subset]' if x.selected else ' [endpoint]') for x in rows) or 'No matches.'
@@ -470,7 +616,7 @@ def main():
     import gradio as gr
     with gr.Blocks(title="CUDA Bijective Automorphism Filter") as ui:
         gr.Markdown(f"# CUDA-first Bijective Automorphism Filter\nDevice: `{DEVICE}`")
-        gr.Markdown("## 1. Corpus Ingestion")
+        gr.Markdown("## Corpus Ingestion")
         corpus_file = gr.File(label="Corpus File (.txt)", file_types=["file"])
         train_button = gr.Button("Train Automorphism Filter", variant="primary")
         training_status = gr.Textbox(label="Status", lines=2)
@@ -478,12 +624,13 @@ def main():
         binding_summary = gr.Textbox(label="GPU Automorphism Summary", lines=5)
         train_button.click(fn=train, inputs=[corpus_file], outputs=[training_status, corpus_preview, binding_summary])
 
-        gr.Markdown("## 2. CUDA Stochastic Generation & Filtering")
+        gr.Markdown("## Generate")
         gr.Markdown(
-            "One pass builds the generated series *and* the sparse Manhattan distance connectome "
-            "over the same trained token vectors: x = frequency, y = mean neighbour distance "
-            "(complementary to x), z = `log(sorted(exp(d)))` of each node's distance vector "
-            "(algebraically == sorted(d)). Peak envelopes trace local maxima on the x/y marginals."
+            "One button does everything: generates the series, builds the sparse Manhattan "
+            "distance connectome, and cross-correlates text-word peaks against a vision signal "
+            "pulled straight from the YOLO model's own class_id table (no images, no inference "
+            "on pixels -- just the model's built-in data). Co-peak words feed back into the "
+            "generator as an extra bias alongside the usual prompt-driven bias."
         )
         prompt_input = gr.Textbox(label="Filter Seed Prompt", placeholder="Enter a seed phrase...", lines=2)
         with gr.Row():
@@ -495,10 +642,11 @@ def main():
         generated_text = gr.Textbox(label="Automorphically Filtered Series Output", lines=8)
         connectome_plot = gr.Plot(label="Sparse Manhattan Connectome")
         connectome_summary = gr.Textbox(label="Connectome Summary", lines=2)
+        xcorr_summary = gr.Textbox(label="Model-Data <-> Corpus Peak Cross-Correlation", lines=2)
         generate_button.click(
             fn=generate,
             inputs=[prompt_input, vocab_slider, k_slider],
-            outputs=[generation_status, corpus_matches, generated_text, connectome_plot, connectome_summary],
+            outputs=[generation_status, corpus_matches, generated_text, connectome_plot, connectome_summary, xcorr_summary],
         )
 
         ui.launch(server_name=a.server_name, server_port=a.server_port, share=a.share)
