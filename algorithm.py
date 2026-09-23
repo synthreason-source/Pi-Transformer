@@ -1,12 +1,12 @@
 """CUDA-first stochastic polymorphic number generator and bijective automorphism filter.
 
 Run:
-  pip install torch gradio
+  pip install torch gradio plotly
   python app_cuda_automorphism.py
   python app_cuda_automorphism.py --share
 
-Transforms vector spaces via a bijective, isometric orthogonal automorphism 
-(matrix exponential of a skew-symmetric generator) before computing GPU similarity 
+Transforms vector spaces via a bijective, isometric orthogonal automorphism
+(matrix exponential of a skew-symmetric generator) before computing GPU similarity
 and subset-sum routing over compact polymorphic numbers.
 """
 from __future__ import annotations
@@ -15,6 +15,7 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import torch
+import plotly.graph_objects as go
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 CUDA = DEVICE.type == 'cuda'
@@ -60,30 +61,30 @@ def gpu_gain(target: Vec, vectors: List[Vec]):
 
 def gpu_automorphism_matrix(vectors, theta=0.5):
     """
-    Transforms the vector space via a bijective, isometric automorphism 
+    Transforms the vector space via a bijective, isometric automorphism
     before computing the similarity matrix.
-    
+
     Constructs an orthogonal rotation matrix Q via matrix exponential:
     Q = exp(theta * (A - A^T)), where A is a random seed matrix.
     Since Q^T Q = I, the mapping x -> xQ is strictly bijective and invertible.
     """
-    if not vectors: 
+    if not vectors:
         return torch.empty((0, 0), device=DEVICE)
-    
+
     keys = sorted(set().union(*(v.keys() for v in vectors)))
     x = matrix(vectors, keys)
     num_vectors, num_keys = x.shape
-    
+
     if num_keys > 1:
         torch.manual_seed(42)
         A = torch.randn(num_keys, num_keys, device=DEVICE) * 0.01
         A = A - A.T  # Skew-symmetric generator
-        
+
         try:
             Q = torch.linalg.matrix_exp(theta * A)
         except AttributeError:
             Q = torch.eye(num_keys, device=DEVICE) + theta * A + (theta**2 / 2.0) * (A @ A)
-            
+
         x_transformed = x @ Q
     else:
         x_transformed = x
@@ -262,6 +263,169 @@ class NGram:
 
 NGram.model_bias = lambda self, seeds: self.bias_from(seeds) if hasattr(self, 'bias_from') else {}
 
+
+# ---------------------------------------------------------------------------
+# Sparse Manhattan-distance connectome
+#
+# Reuses the same context vectors already built by Bindings (token -> Counter
+# of co-occurring tokens). Computes a dense pairwise L1 (Manhattan) distance
+# matrix on GPU, then sparsifies each node down to its k-nearest neighbours
+# (a "connectome" rather than a dense similarity matrix).
+#
+# Axes:
+#   x = log1p(token frequency), normalized 0..1  (dataset frequency)
+#   y = mean L1 distance to a node's kept neighbours, normalized 0..1
+#       (complementary to x: hub words cluster low, isolated words sit high)
+#   z = log(sorted(exp(d))) of each node's own kept-neighbour distance vector.
+#       Note: log and exp are exact inverses, so this is algebraically
+#       identical to sorted(d) -- implemented literally rather than swapped
+#       out, with the median of the sorted vector taken as the node's z value.
+#
+# Marginal peak envelopes: histogram x and y separately, find each bin that
+# is a local maximum, and connect those peaks with straight (piecewise
+# linear) segments -- drawn as extra traces projected onto the z=0 floor.
+# ---------------------------------------------------------------------------
+
+def _local_peaks(values: List[float], bins: int = 16):
+    if not values:
+        return [], 0.0, 1.0
+    mn, mx = min(values), max(values)
+    span = (mx - mn) or 1.0
+    hist = [0] * bins
+    for v in values:
+        b = min(bins - 1, int((v - mn) / span * bins))
+        hist[b] += 1
+    peaks = []
+    for i in range(bins):
+        prev = hist[i - 1] if i > 0 else -1
+        nxt = hist[i + 1] if i < bins - 1 else -1
+        if hist[i] >= prev and hist[i] >= nxt and hist[i] > 0:
+            peaks.append((mn + (i + 0.5) / bins * span, hist[i]))
+    return peaks, mn, mx
+
+def build_connectome(bindings: 'Bindings', vocab_size: int = 45, k: int = 3) -> Tuple[go.Figure, str]:
+    if not bindings.contexts:
+        return go.Figure(), 'Train the filter first (no contexts to build a connectome from).'
+
+    words_all = list(bindings.contexts)
+    freq_all = {w: sum(bindings.contexts[w].values()) for w in words_all}
+    words = sorted(words_all, key=lambda w: freq_all[w], reverse=True)[:vocab_size]
+    wset = set(words)
+
+    # context vectors restricted to the chosen vocabulary, on GPU
+    keys = words
+    vecs = torch.tensor(
+        [[float(bindings.contexts[w].get(k2, 0.)) for k2 in keys] for w in words],
+        dtype=torch.float32, device=DEVICE,
+    )
+
+    # dense pairwise Manhattan distance, computed on GPU
+    dist = torch.cdist(vecs, vecs, p=1.0)
+    n = len(words)
+    kk = min(k, max(1, n - 1))
+
+    dist_filled = dist.clone()
+    dist_filled.fill_diagonal_(float('inf'))
+    nn_vals, nn_idx = torch.topk(dist_filled, k=kk, largest=False, dim=1)
+
+    edges = set()
+    for i in range(n):
+        for j in nn_idx[i].tolist():
+            key = (i, j) if i < j else (j, i)
+            edges.add(key)
+
+    freq = [freq_all[w] for w in words]
+    mean_nn = nn_vals.mean(dim=1)  # y: mean distance to kept neighbours
+
+    # z = log(sorted(exp(d))) per node's kept-neighbour distances == sorted(d);
+    # take the median of that sorted vector as the node's scalar z.
+    sorted_nn, _ = torch.sort(nn_vals, dim=1)
+    z_literal = torch.log(torch.exp(sorted_nn))  # identity, kept explicit per spec
+    z_med = z_literal[:, kk // 2]
+
+    def norm(t: torch.Tensor) -> torch.Tensor:
+        mn, mx = t.min(), t.max()
+        return (t - mn) / (mx - mn) if (mx - mn).item() > 1e-9 else torch.full_like(t, 0.5)
+
+    x_raw = torch.log1p(torch.tensor(freq, dtype=torch.float32, device=DEVICE))
+    xN = norm(x_raw).tolist()
+    yN = norm(mean_nn).tolist()
+    zN = norm(z_med).tolist()
+
+    fig = go.Figure()
+
+    # sparse edges
+    ex, ey, ez = [], [], []
+    for i, j in edges:
+        ex += [xN[i], xN[j], None]
+        ey += [yN[i], yN[j], None]
+        ez += [zN[i], zN[j], None]
+    fig.add_trace(go.Scatter3d(
+        x=ex, y=ey, z=ez, mode='lines',
+        line=dict(color='rgba(120,140,160,.55)', width=2),
+        name=f'sparse Manhattan edges (k={kk})', hoverinfo='skip',
+    ))
+
+    # nodes
+    fig.add_trace(go.Scatter3d(
+        x=xN, y=yN, z=zN, mode='markers+text',
+        marker=dict(
+            size=[6 + 10 * (f / max(freq)) for f in freq],
+            color=zN, colorscale='Tealrose', showscale=True,
+            colorbar=dict(title='z (sorted dist.)'),
+            line=dict(color='black', width=0.5),
+        ),
+        text=words, textposition='top center', textfont=dict(size=9),
+        hovertemplate='%{text}<br>freq=%{customdata[0]}<br>x=%{x:.2f} y=%{y:.2f} z=%{z:.2f}<extra></extra>',
+        customdata=[[freq_all[w]] for w in words],
+        name='tokens',
+    ))
+
+    # piecewise-linear peak envelope on the x marginal, projected onto the z=0 floor
+    xpeaks, _, _ = _local_peaks(xN)
+    if len(xpeaks) > 1:
+        xpeaks.sort(key=lambda p: p[0])
+        fig.add_trace(go.Scatter3d(
+            x=[p[0] for p in xpeaks],
+            y=[0.0] * len(xpeaks),
+            z=[0.0] * len(xpeaks),
+            mode='lines+markers', line=dict(color='#e7a45c', width=5),
+            marker=dict(size=4, color='#e7a45c'),
+            name='x-axis peak envelope',
+        ))
+
+    # piecewise-linear peak envelope on the y marginal, projected onto the z=0 floor
+    ypeaks, _, _ = _local_peaks(yN)
+    if len(ypeaks) > 1:
+        ypeaks.sort(key=lambda p: p[0])
+        fig.add_trace(go.Scatter3d(
+            x=[0.0] * len(ypeaks),
+            y=[p[0] for p in ypeaks],
+            z=[0.0] * len(ypeaks),
+            mode='lines+markers', line=dict(color='#c77dd2', width=5),
+            marker=dict(size=4, color='#c77dd2'),
+            name='y-axis peak envelope',
+        ))
+
+    fig.update_layout(
+        template='plotly_dark',
+        scene=dict(
+            xaxis_title='x: frequency (log, normalized)',
+            yaxis_title='y: mean neighbour distance (normalized)',
+            zaxis_title='z: sorted per-node distance (log(sorted(exp(d))) == sorted(d))',
+        ),
+        margin=dict(l=0, r=0, t=30, b=0),
+        legend=dict(orientation='h', y=-0.05),
+        height=650,
+    )
+
+    summary = (
+        f'Nodes: {n} · sparse edges: {len(edges)} (k={kk}) · '
+        f'x-peaks: {len(xpeaks)} · y-peaks: {len(ypeaks)} · device: {DEVICE}'
+    )
+    return fig, summary
+
+
 class State:
     def __init__(self):
         self.model = None; self.corpus = None; self.bindings = Bindings()
@@ -282,15 +446,17 @@ def train(file):
     S.train(text)
     return 'Automorphism Filter Trained', text[:1000], S.bindings.summary()
 
-def generate(prompt):
-    if not S.model: return 'Train filter first', '', ''
-    target = S.corpus.bindings.expand({k: float(v) for k, v in bow(tokenize(prompt)).items()})
+def generate(prompt, vocab_size=45, k=3):
+    if not S.model:
+        return 'Train filter first', '', '', go.Figure(), 'Train the filter first (need a trained corpus).'
+    target = S.corpus.bindings.expand({k2: float(v) for k2, v in bow(tokenize(prompt)).items()})
     state = dict(target)
     def bias(history):
         seeds = sorted(state, key=lambda x: state[x] * S.corpus.bindings.threshold, reverse=True)[:12]
         return S.model_bias(seeds) if hasattr(S, 'model_bias') else {}
     text = S.model.generate(prompt, bias)
-    return 'CUDA device: ' + str(DEVICE), format_matches(S.corpus.search(prompt)), text
+    fig, conn_summary = build_connectome(S.bindings, int(vocab_size), int(k))
+    return 'CUDA device: ' + str(DEVICE), format_matches(S.corpus.search(prompt)), text, fig, conn_summary
 
 def format_matches(rows):
     return '\n'.join(f'{x.rank}. {x.ref.s} score={x.score:.3f} vector={x.vector:.3f}' + (' [subset]' if x.selected else ' [endpoint]') for x in rows) or 'No matches.'
@@ -305,7 +471,7 @@ def main():
     with gr.Blocks(title="CUDA Bijective Automorphism Filter") as ui:
         gr.Markdown(f"# CUDA-first Bijective Automorphism Filter\nDevice: `{DEVICE}`")
         gr.Markdown("## 1. Corpus Ingestion")
-        corpus_file = gr.File(label="Corpus File (.txt containing numbers/hex)", file_types=["file"])
+        corpus_file = gr.File(label="Corpus File (.txt)", file_types=["file"])
         train_button = gr.Button("Train Automorphism Filter", variant="primary")
         training_status = gr.Textbox(label="Status", lines=2)
         corpus_preview = gr.Textbox(label="Preview", lines=6)
@@ -313,12 +479,28 @@ def main():
         train_button.click(fn=train, inputs=[corpus_file], outputs=[training_status, corpus_preview, binding_summary])
 
         gr.Markdown("## 2. CUDA Stochastic Generation & Filtering")
-        prompt_input = gr.Textbox(label="Filter Seed Prompt", placeholder="Enter numeric sequence or hex mask...", lines=2)
+        gr.Markdown(
+            "One pass builds the generated series *and* the sparse Manhattan distance connectome "
+            "over the same trained token vectors: x = frequency, y = mean neighbour distance "
+            "(complementary to x), z = `log(sorted(exp(d)))` of each node's distance vector "
+            "(algebraically == sorted(d)). Peak envelopes trace local maxima on the x/y marginals."
+        )
+        prompt_input = gr.Textbox(label="Filter Seed Prompt", placeholder="Enter a seed phrase...", lines=2)
+        with gr.Row():
+            vocab_slider = gr.Slider(10, 100, value=45, step=1, label="Connectome vocab size (top-N tokens)")
+            k_slider = gr.Slider(1, 8, value=3, step=1, label="Connectome k-nearest neighbours")
         generate_button = gr.Button("Execute Automorphic Stream", variant="primary")
         generation_status = gr.Textbox(label="CUDA Execution Status", lines=2)
         corpus_matches = gr.Textbox(label="Subset-sum Filter Matches", lines=8)
         generated_text = gr.Textbox(label="Automorphically Filtered Series Output", lines=8)
-        generate_button.click(fn=generate, inputs=[prompt_input], outputs=[generation_status, corpus_matches, generated_text])
+        connectome_plot = gr.Plot(label="Sparse Manhattan Connectome")
+        connectome_summary = gr.Textbox(label="Connectome Summary", lines=2)
+        generate_button.click(
+            fn=generate,
+            inputs=[prompt_input, vocab_slider, k_slider],
+            outputs=[generation_status, corpus_matches, generated_text, connectome_plot, connectome_summary],
+        )
+
         ui.launch(server_name=a.server_name, server_port=a.server_port, share=a.share)
 
 if __name__ == '__main__':
