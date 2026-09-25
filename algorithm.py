@@ -1,1937 +1,443 @@
+#!/usr/bin/env python3
+"""
+HECM Toy Language Model (n-gram, default: trigram)
+====================================================
 
-import os
-import json
+A word-level model inspired by the "Harmonic-Exponential Cartesian Mapping"
+(HECM) sketch, generalized to arbitrary n-gram order (default: order=3,
+i.e. trigrams). See README.md for the full mapping between the original
+sketch and what's implemented here.
+
+Key idea for going beyond bigrams (order > 2)
+----------------------------------------------
+A trigram's natural table is CONTEXT (two words) -> NEXT WORD, which is
+rectangular (num_contexts x vocab_size), not square. The matrix-exponential
+step needs a SQUARE matrix to mean anything (it's a propagator: it has to
+map the state space back onto itself). The standard fix for higher-order
+Markov chains is to treat each context -- e.g. the pair (w1, w2) -- as a
+single STATE, and build a square STATE -> STATE transition matrix: moving
+from context (w1, w2) to context (w2, w3) whenever the trigram (w1, w2, w3)
+was observed. This is square by construction, so log-sorting, matrix-
+exponential diffusion, and sinusoidal-temperature sampling all carry over
+completely unchanged from the bigram case. order=2 (context length 1)
+reduces exactly to the original bigram model.
+
+Pipeline:
+  1. Dataset loader -> tokenize text, build a vocabulary.
+  2. Cartesian product of CONTEXTS x CONTEXTS -> a square count matrix over
+     (order-1)-word context states. This generalizes the original A x B
+     word-pair matrix.
+  3. Log-sorting -> contexts reordered by descending log-frequency.
+  4. Matrix-exponential weighting -> expm() on the row-normalized context
+     transition matrix (a real diffusion/propagation technique), blended
+     with the raw n-gram probabilities.
+  5. Sinusoidal modulation -> a sine wave over generation step index biases
+     sampling temperature (replaces the ill-defined "curve intersection").
+  6. Text prompting -> CLI / function interface, prompt in, continuation out.
+
+Still fundamentally an n-gram frequency model, not a neural network.
+"""
+
 import argparse
-import random
+import glob
 import math
-from typing import List, Dict, Tuple, Any
-from collections import defaultdict, Counter
+import re
+import sys
+from collections import Counter
+
+import numpy as np
+from scipy.linalg import expm
+
+UNK = "<unk>"
+BOS = "<bos>"
 
 
-# ============================================================
-# DATASET
-# ============================================================
+# ---------------------------------------------------------------------------
+# 1. Dataset loading
+# ---------------------------------------------------------------------------
 
-DATASET_FILE = input("Filename: ")
+def load_corpus(paths=None, raw_text=None, lowercase=True, strip_punct=False):
+    """Load one or more text files (glob patterns supported) and/or a raw
+    string, and tokenize into a flat list of word tokens."""
+    text_chunks = []
 
-if not os.path.exists(DATASET_FILE):
-    raise FileNotFoundError(
-        f"Dataset file not found: {DATASET_FILE}"
-    )
+    if paths:
+        found_any = False
+        for pattern in paths:
+            for fp in sorted(glob.glob(pattern)):
+                found_any = True
+                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
+                    text_chunks.append(f.read())
+        if not found_any:
+            print(f"[warn] no files matched {paths}", file=sys.stderr)
 
-with open(
-    DATASET_FILE,
-    "r",
-    encoding="utf-8",
-    errors="replace",
-) as file:
-    DEFAULT_DATASET = file.read()
+    if raw_text:
+        text_chunks.append(raw_text)
 
+    if not text_chunks:
+        text_chunks.append(_DEMO_CORPUS)
 
-# ============================================================
-# TOKENIZATION
-# ============================================================
+    full_text = "\n".join(text_chunks)
+    if lowercase:
+        full_text = full_text.lower()
 
-def tokenize(
-    text: str,
-    unit: str = "word",
-) -> List[str]:
+    tokens = re.findall(r"[a-z0-9']+|[.,!?;:]", full_text)
 
-    if unit == "char":
-        return list(text)
+    if strip_punct:
+        tokens = [t for t in tokens if re.match(r"[a-z0-9']+", t)]
 
-    return text.strip().split()
+    return tokens
 
-
-def detokenize(
-    tokens: List[str],
-    unit: str = "word",
-) -> str:
-
-    if unit == "char":
-        return "".join(tokens)
-
-    return " ".join(tokens)
+with open(input("Filename: "), "r", encoding="utf-8") as file:
+    _DEMO_CORPUS = file.read()
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+# ---------------------------------------------------------------------------
+# 2. Vocabulary and n-gram context-state construction
+# ---------------------------------------------------------------------------
 
-def clamp(
-    value: float,
-    minimum: float,
-    maximum: float,
-) -> float:
-
-    return max(
-        minimum,
-        min(
-            maximum,
-            value,
-        ),
-    )
+def build_vocab(tokens, min_count=1):
+    counts = Counter(tokens)
+    kept = sorted([w for w, c in counts.items() if c >= min_count])
+    vocab = [UNK, BOS] + kept
+    word_to_idx = {w: i for i, w in enumerate(vocab)}
+    return vocab, word_to_idx, counts
 
 
-# ============================================================
-# AUTOMATIC SCALING
-# ============================================================
+def build_ngram_contexts(tokens, word_to_idx, order=3):
+    """Build the square CONTEXT -> CONTEXT transition count matrix for an
+    n-gram model of the given order (order=3 -> trigram, context length 2).
 
-def calculate_trigram_scaling(
-    total_tokens: int,
-    vocabulary_size: int,
-    unique_trigrams: int,
-) -> Dict[str, Any]:
-
+    Returns:
+        contexts: list of context tuples (word indices), index-aligned with M.
+        context_to_idx: dict mapping context tuple -> row/col index.
+        M: (num_contexts x num_contexts) count matrix.
+        context_counts: Counter of how often each context tuple occurred.
     """
-    Automatic scaling based on:
+    ctx_len = order - 1
+    if ctx_len < 1:
+        raise ValueError("order must be >= 2")
 
-        N = dataset token count
-        V = vocabulary size
-        T = unique trigram contexts
+    bos_idx = word_to_idx[BOS]
+    unk_idx = word_to_idx[UNK]
+    ids = [word_to_idx.get(t, unk_idx) for t in tokens]
+    padded = [bos_idx] * ctx_len + ids
 
-    This scaling never introduces bigram or unigram
-    generation.
+    context_to_idx = {}
+    contexts = []
+    context_counts = Counter()
+    edges = Counter()  # (context_idx, next_context_idx) -> count
 
-    The actual model remains:
+    def get_ctx_idx(ctx_tuple):
+        if ctx_tuple not in context_to_idx:
+            context_to_idx[ctx_tuple] = len(contexts)
+            contexts.append(ctx_tuple)
+        return context_to_idx[ctx_tuple]
 
-        P(c | a,b)
+    n = len(padded)
+    for i in range(n - ctx_len):
+        ctx = tuple(padded[i:i + ctx_len])
+        next_ctx = tuple(padded[i + 1:i + 1 + ctx_len])
+        ci = get_ctx_idx(ctx)
+        cj = get_ctx_idx(next_ctx)
+        context_counts[ctx] += 1
+        edges[(ci, cj)] += 1.0
 
-        (a,b) -> c
+    m = len(contexts)
+    M = np.zeros((m, m), dtype=np.float64)
+    for (ci, cj), c in edges.items():
+        M[ci, cj] = c
+
+    return contexts, context_to_idx, M, context_counts
+
+
+def log_sort_contexts(contexts, context_counts):
+    """Reorder contexts by descending log-frequency. Returns new order
+    (list of old indices) to be applied to both `contexts` and the matrix."""
+    def key(ctx):
+        c = context_counts.get(ctx, 0)
+        return -math.log(c + 1.0)
+
+    order = sorted(range(len(contexts)), key=lambda i: key(contexts[i]))
+    return order
+
+
+def permute_matrix(M, order):
+    return M[np.ix_(order, order)]
+
+
+# ---------------------------------------------------------------------------
+# 3 & 4. Normalization and matrix-exponential diffusion weighting
+# ---------------------------------------------------------------------------
+
+def row_normalize(M, eps=1e-9):
+    row_sums = M.sum(axis=1, keepdims=True)
+    row_sums[row_sums == 0] = 1.0
+    return M / (row_sums + eps)
+
+
+def diffusion_weighting(P, beta=0.15, remove_self_loops=True):
+    """expm(beta * (P - I)) -- continuous-time Markov propagator, blended
+    later with the raw n-gram probabilities.
+
+    Caveat (important): expm(beta*(P - I)) == exp(-beta) * expm(beta*P).
+    The exp(-beta) factor is the continuous-time "probability no jump has
+    happened yet," which lands almost entirely on the diagonal (self-loops)
+    for small beta. That's a sensible reading of "elapsed time beta" in a
+    continuous-time chain, but it's meaningless for discrete, one-word-per-
+    step text generation -- every generation step must move to a *different*
+    context. Left unchecked, it makes the generator repeat the same word/
+    context over and over (e.g. "the the the the").
+
+    remove_self_loops=True (default) strips that diagonal out after the
+    exponential is computed and renormalizes each row over its remaining
+    (genuinely different) target states, which is what you want for
+    generation. Set it False only if you specifically want to inspect the
+    raw continuous-time kernel.
     """
+    m = P.shape[0]
+    L = P - np.eye(m)
+    D = expm(beta * L)
+    D = np.clip(D, 0, None)
 
-    N = max(
-        1,
-        int(total_tokens),
-    )
+    if remove_self_loops:
+        np.fill_diagonal(D, 0.0)
+        row_sums = D.sum(axis=1)
+        # Rows that lost all their mass (rare: a state whose only diffused
+        # probability was the self-loop) fall back to the raw row's
+        # off-diagonal distribution, so generation never gets stuck.
+        dead_rows = row_sums <= 1e-12
+        if np.any(dead_rows):
+            fallback = P.copy()
+            np.fill_diagonal(fallback, 0.0)
+            fb_sums = fallback.sum(axis=1, keepdims=True)
+            fb_sums[fb_sums == 0] = 1.0
+            fallback = fallback / fb_sums
+            D[dead_rows] = fallback[dead_rows]
 
-    V = max(
-        1,
-        int(vocabulary_size),
-    )
+    D = row_normalize(D)
+    return D
 
-    T = max(
-        1,
-        int(unique_trigrams),
-    )
 
-    # --------------------------------------------------------
-    # TOP-K
-    #
-    #     top_k = clamp(
-    #         round(4 * sqrt(V)),
-    #         8,
-    #         256
-    #     )
-    # --------------------------------------------------------
+def blend(P_raw, P_diffused, alpha=0.5, remove_self_loops=True):
+    P = (1 - alpha) * P_raw + alpha * P_diffused
+    if remove_self_loops:
+        np.fill_diagonal(P, 0.0)
+        P = row_normalize(P)
+    return P
 
-    top_k = int(
-        round(
-            clamp(
-                4.0 * math.sqrt(V),
-                8,
-                min(256, V),
+
+# ---------------------------------------------------------------------------
+# 5. Sinusoidal temperature modulation
+# ---------------------------------------------------------------------------
+
+def sinusoidal_temperature(step, base_temp=0.8, amplitude=0.4, omega=0.5, phase=0.0, floor=0.05):
+    t = base_temp + amplitude * math.sin(omega * step + phase)
+    return max(floor, t)
+
+
+# ---------------------------------------------------------------------------
+# 6. Sampling and generation
+# ---------------------------------------------------------------------------
+
+def sample_next(probs, temperature=1.0, top_k=10, rng=None):
+    rng = rng or np.random.default_rng()
+    probs = np.asarray(probs, dtype=np.float64)
+
+    if top_k is not None and 0 < top_k < len(probs):
+        top_idx = np.argpartition(probs, -top_k)[-top_k:]
+    else:
+        top_idx = np.arange(len(probs))
+
+    top_probs = probs[top_idx]
+    if top_probs.sum() <= 0:
+        top_probs = np.ones_like(top_probs)
+
+    logits = np.log(top_probs + 1e-12) / max(temperature, 1e-6)
+    logits -= logits.max()
+    weights = np.exp(logits)
+    weights /= weights.sum()
+
+    choice = rng.choice(len(top_idx), p=weights)
+    return top_idx[choice]
+
+
+class HECMModel:
+    def __init__(self, tokens, order=3, min_count=1, beta=0.15, alpha=0.5,
+                 max_diffusion_states=1500):
+        self.order = order
+        vocab, word_to_idx, counts = build_vocab(tokens, min_count=min_count)
+        self.vocab = vocab
+        self.word_to_idx = word_to_idx
+
+        contexts, context_to_idx, M, context_counts = build_ngram_contexts(
+            tokens, word_to_idx, order=order
+        )
+
+        perm = log_sort_contexts(contexts, context_counts)
+        contexts = [contexts[i] for i in perm]
+        M = permute_matrix(M, perm)
+        context_to_idx = {ctx: i for i, ctx in enumerate(contexts)}
+
+        self.contexts = contexts
+        self.context_to_idx = context_to_idx
+        self.context_counts = context_counts
+
+        self.P_raw = row_normalize(M)
+
+        num_states = len(contexts)
+        if num_states > max_diffusion_states:
+            print(
+                f"[warn] {num_states} context-states exceeds "
+                f"max_diffusion_states={max_diffusion_states}; skipping "
+                f"matrix-exponential diffusion (O(n^3) cost) and using raw "
+                f"n-gram probabilities only. Raise --max-diffusion-states "
+                f"to override.",
+                file=sys.stderr,
             )
-        )
-    )
-
-    top_k = max(
-        1,
-        min(
-            V,
-            top_k,
-        ),
-    )
-
-    # --------------------------------------------------------
-    # PIECES
-    #
-    #     pieces =
-    #         clamp(
-    #             round(2*log2(V+1)),
-    #             4,
-    #             32
-    #         )
-    # --------------------------------------------------------
-
-    base_pieces = int(
-        round(
-            clamp(
-                2.0 * math.log2(V + 1),
-                4,
-                32,
-            )
-        )
-    )
-
-    base_pieces = max(
-        1,
-        min(
-            base_pieces,
-            V,
-        ),
-    )
-
-    # --------------------------------------------------------
-    # DATASET DENSITY
-    #
-    #     density = N / V
-    # --------------------------------------------------------
-
-    density = (
-        N / float(V)
-    )
-
-    # --------------------------------------------------------
-    # SMOOTHING
-    #
-    #     smoothing =
-    #         clamp(
-    #             0.20 / sqrt(N/V),
-    #             0.005,
-    #             0.20
-    #         )
-    #
-    # IMPORTANT:
-    # This is only applied to already observed third-token
-    # candidates of the current trigram.
-    # --------------------------------------------------------
-
-    smoothing = clamp(
-        0.20
-        / math.sqrt(
-            max(
-                density,
-                1.0,
-            )
-        ),
-        0.005,
-        0.20,
-    )
-
-    # --------------------------------------------------------
-    # REPETITION PENALTY
-    #
-    #     penalty =
-    #         1 + 0.35/log2(V+1)
-    # --------------------------------------------------------
-
-    repetition_penalty = (
-        1.0
-        +
-        0.35
-        /
-        max(
-            1.0,
-            math.log2(V + 1),
-        )
-    )
-
-    # --------------------------------------------------------
-    # REPETITION WINDOW
-    # --------------------------------------------------------
-
-    repetition_window = int(
-        round(
-            clamp(
-                4.0 * math.log2(V + 1),
-                8,
-                64,
-            )
-        )
-    )
-
-    # --------------------------------------------------------
-    # TRIGRAM COVERAGE
-    # --------------------------------------------------------
-
-    possible_positions = max(
-        1,
-        N - 2,
-    )
-
-    coverage = clamp(
-        T / float(
-            possible_positions
-        ),
-        0.0,
-        1.0,
-    )
-
-    return {
-        "total_tokens": N,
-        "vocabulary_size": V,
-        "unique_trigram_contexts": T,
-
-        "density_N_over_V": density,
-
-        "trigram_coverage": coverage,
-
-        "top_k_formula":
-            "clamp(round(4 * sqrt(V)), 8, 256)",
-
-        "top_k": top_k,
-
-        "base_pieces_formula":
-            "clamp(round(2 * log2(V + 1)), 4, 32)",
-
-        "base_pieces": base_pieces,
-
-        "smoothing_formula":
-            "clamp(0.20 / sqrt(max(N/V, 1)), 0.005, 0.20)",
-
-        "smoothing": smoothing,
-
-        "repetition_penalty_formula":
-            "1 + 0.35 / log2(V + 1)",
-
-        "repetition_penalty":
-            repetition_penalty,
-
-        "repetition_window":
-            repetition_window,
-
-        "generation_distribution":
-            "P(token[t] | token[t-2], token[t-1])",
-
-        "generation_transition":
-            "(token[t-2], token[t-1]) -> token[t]",
-
-        "backoff": "NONE",
-
-        "bigram_model": False,
-
-        "unigram_model": False,
-
-        "interpolation": False,
-    }
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-class Config:
-
-    def __init__(
-        self,
-        unit: str = "word",
-        seed: int = 42,
-        output_dir: str = "output",
-
-        temperature: float = 0.85,
-
-        # ----------------------------------------------------
-        # These were missing from the previous Config.
-        # ----------------------------------------------------
-
-        sine_amplitude: float = 0.20,
-        sine_frequency: float = 1.0,
-        sine_phase: float = 0.0,
-
-        plasticity_rate: float = 0.005,
-        plasticity_strength: float = 0.02,
-
-        piece_strength: float = 0.025,
-
-        punctuation_penalty: float = 0.50,
-
-        prevent_immediate_repeat: bool = True,
-
-    ):
-
-        self.unit = unit
-        self.seed = seed
-        self.output_dir = output_dir
-
-        self.temperature = temperature
-
-        # ----------------------------------------------------
-        # Curve parameters
-        # ----------------------------------------------------
-
-        self.sine_amplitude = (
-            sine_amplitude
-        )
-
-        self.sine_frequency = (
-            sine_frequency
-        )
-
-        self.sine_phase = (
-            sine_phase
-        )
-
-        # ----------------------------------------------------
-        # Plasticity
-        # ----------------------------------------------------
-
-        self.plasticity_rate = (
-            plasticity_rate
-        )
-
-        self.plasticity_strength = (
-            plasticity_strength
-        )
-
-        # ----------------------------------------------------
-        # Piecewise modulation
-        # ----------------------------------------------------
-
-        self.piece_strength = (
-            piece_strength
-        )
-
-        # ----------------------------------------------------
-        # Repetition
-        # ----------------------------------------------------
-
-        self.punctuation_penalty = (
-            punctuation_penalty
-        )
-
-        self.prevent_immediate_repeat = (
-            prevent_immediate_repeat
-        )
-
-
-# ============================================================
-# TRUE TRIGRAM MARKOV GENERATOR
-# ============================================================
-
-class TrueTrigramMarkovGenerator:
-
-    """
-    PURE TRUE-TRIGRAM MODEL.
-
-    The only probability relationship used for generation is:
-
-        P(c | a,b)
-
-    where:
-
-        a = token[t-2]
-        b = token[t-1]
-        c = token[t]
-
-    Therefore every generated transition is:
-
-        (a,b) -> c
-
-    There is NO:
-
-        bigram fallback
-        unigram fallback
-        vocabulary-wide random fallback
-        n-gram interpolation
-    """
-
-    def __init__(
-        self,
-        dataset_text: str,
-        config: Config,
-    ):
-
-        self.config = config
-
-        random.seed(
-            config.seed
-        )
-
-        self.tokens = tokenize(
-            dataset_text,
-            config.unit,
-        )
-
-        if len(
-            self.tokens
-        ) < 3:
-
-            raise ValueError(
-                "A true trigram model requires "
-                "at least three dataset tokens."
-            )
-
-        # ----------------------------------------------------
-        # VOCABULARY
-        # ----------------------------------------------------
-
-        self.vocab = sorted(
-            set(self.tokens)
-        )
-
-        self.token_to_id = {
-            token: index
-            for index, token
-            in enumerate(self.vocab)
-        }
-
-        self.id_to_token = {
-            index: token
-            for index, token
-            in enumerate(self.vocab)
-        }
-
-        self.vocab_size = len(
-            self.vocab
-        )
-
-        self.ids = [
-            self.token_to_id[token]
-            for token in self.tokens
-        ]
-
-        # ----------------------------------------------------
-        # TRUE TRIGRAM COUNTS
-        #
-        #     (a,b) -> {c: count}
-        # ----------------------------------------------------
-
-        self.trigram_counts = (
-            defaultdict(Counter)
-        )
-
-        for i in range(
-            len(self.ids) - 2
-        ):
-
-            a = self.ids[i]
-            b = self.ids[i + 1]
-            c = self.ids[i + 2]
-
-            self.trigram_counts[
-                (a, b)
-            ][c] += 1
-
-        if not self.trigram_counts:
-
-            raise ValueError(
-                "No true trigram contexts "
-                "were constructed."
-            )
-
-        # ----------------------------------------------------
-        # AUTOMATIC PARAMETERS
-        # ----------------------------------------------------
-
-        self.scaled = (
-            calculate_trigram_scaling(
-                total_tokens=len(
-                    self.tokens
-                ),
-                vocabulary_size=(
-                    self.vocab_size
-                ),
-                unique_trigrams=len(
-                    self.trigram_counts
-                ),
-            )
-        )
-
-        self.top_k = (
-            self.scaled["top_k"]
-        )
-
-        self.base_pieces = (
-            self.scaled["base_pieces"]
-        )
-
-        self.smoothing = (
-            self.scaled["smoothing"]
-        )
-
-        self.repetition_penalty = (
-            self.scaled[
-                "repetition_penalty"
+            self.P_diffused = self.P_raw
+            self.P_final = self.P_raw
+        else:
+            self.P_diffused = diffusion_weighting(self.P_raw, beta=beta)
+            self.P_final = blend(self.P_raw, self.P_diffused, alpha=alpha)
+
+    def vocab_size(self):
+        return len(self.vocab)
+
+    def num_states(self):
+        return len(self.contexts)
+
+    def _tokenize_prompt(self, prompt):
+        toks = re.findall(r"[a-z0-9']+|[.,!?;:]", prompt.lower())
+        unk = self.word_to_idx[UNK]
+        return [self.word_to_idx.get(t, unk) for t in toks]
+
+    def _initial_context(self, prompt_ids, rng):
+        ctx_len = self.order - 1
+        bos = self.word_to_idx[BOS]
+        padded = [bos] * ctx_len + prompt_ids
+        desired = tuple(padded[-ctx_len:])
+
+        if desired in self.context_to_idx:
+            return self.context_to_idx[desired]
+
+        # Fallback 1: find any registered context sharing the longest
+        # possible suffix with `desired`.
+        for k in range(ctx_len - 1, 0, -1):
+            suffix = desired[-k:]
+            candidates = [
+                i for i, ctx in enumerate(self.contexts) if ctx[-k:] == suffix
             ]
-        )
+            if candidates:
+                return rng.choice(candidates)
 
-        self.repetition_window = (
-            self.scaled[
-                "repetition_window"
-            ]
-        )
+        # Fallback 2: pick the single most frequent context.
+        best = max(range(len(self.contexts)),
+                    key=lambda i: self.context_counts.get(self.contexts[i], 0))
+        return best
 
-        self.history = []
+    def generate(self, prompt, max_new_tokens=40, top_k=10, base_temp=0.8,
+                 amplitude=0.4, omega=0.5, phase=0.0, seed=None):
+        rng = np.random.default_rng(seed)
+        prompt_ids = self._tokenize_prompt(prompt)
 
-    # ========================================================
-    # TRUE TRIGRAM CONTEXT
-    # ========================================================
+        ctx_idx = self._initial_context(prompt_ids, rng)
+        out_ids = list(prompt_ids)
 
-    def find_initial_context(
-        self,
-        prompt_tokens: List[str],
-    ) -> Tuple[
-        List[int],
-        bool,
-    ]:
-
-        """
-        Find an observed two-token trigram context.
-
-        The prompt itself is preserved separately.
-
-        If the final two known prompt tokens form an observed
-        trigram context, that pair is used.
-
-        Otherwise an observed dataset trigram context is used.
-
-        No lower-order model is created.
-        """
-
-        prompt_ids = [
-            self.token_to_id.get(
-                token,
-                -1,
+        for step in range(max_new_tokens):
+            temp = sinusoidal_temperature(
+                step, base_temp=base_temp, amplitude=amplitude,
+                omega=omega, phase=phase,
             )
-            for token in prompt_tokens
-        ]
-
-        # ----------------------------------------------------
-        # Prefer the latest observed pair in the prompt.
-        # ----------------------------------------------------
-
-        for i in range(
-            len(prompt_ids) - 2,
-            -1,
-            -1,
-        ):
-
-            a = prompt_ids[i]
-            b = prompt_ids[i + 1]
-
-            if a < 0 or b < 0:
-                continue
-
-            if (
-                a,
-                b
-            ) in self.trigram_counts:
-
-                return (
-                    [
-                        a,
-                        b,
-                    ],
-                    True,
-                )
-
-        # ----------------------------------------------------
-        # Prompt does not contain a usable trigram context.
-        #
-        # Select an actual observed trigram context.
-        # ----------------------------------------------------
-
-        initial = next(
-            iter(
-                self.trigram_counts
-            )
-        )
-
-        return (
-            list(initial),
-            False,
-        )
-
-    # ========================================================
-    # TRUE TRIGRAM DISTRIBUTION
-    # ========================================================
-
-    def trigram_distribution(
-        self,
-        context_ids: List[int],
-    ) -> Tuple[
-        List[int],
-        List[float],
-    ]:
-
-        """
-        Construct only:
-
-            P(c | a,b)
-
-        No other probability model exists here.
-        """
-
-        if len(
-            context_ids
-        ) != 2:
-
-            raise RuntimeError(
-                "True trigram generation requires "
-                "exactly two context IDs."
-            )
-
-        a = context_ids[0]
-        b = context_ids[1]
-
-        counts = (
-            self.trigram_counts.get(
-                (a, b)
-            )
-        )
-
-        
-        
-        candidate_ids = list(
-            counts.keys()
-        )
-
-        raw_counts = [
-            float(
-                counts[token_id]
-            )
-            for token_id
-            in candidate_ids
-        ]
-
-        total = sum(
-            raw_counts
-        )
-
-        if total <= 0:
-
-            raise RuntimeError(
-                "Invalid trigram counts."
-            )
-
-        probabilities = [
-            count / total
-            for count
-            in raw_counts
-        ]
-
-        # ----------------------------------------------------
-        # Smoothing remains strictly inside the active
-        # trigram continuation set.
-        #
-        # If the trigram has:
-        #
-        #     (a,b) -> c1
-        #     (a,b) -> c2
-        #
-        # smoothing only affects c1 and c2.
-        #
-        # It cannot introduce a token never observed after
-        # this exact (a,b) context.
-        # ----------------------------------------------------
-
-        if len(
-            probabilities
-        ) > 1:
-
-            candidate_count = (
-                len(probabilities)
-            )
-
-            probabilities = [
-                (
-                    (1.0 - self.smoothing)
-                    * probability
-                    +
-                    (
-                        self.smoothing
-                        /
-                        candidate_count
-                    )
-                )
-                for probability
-                in probabilities
-            ]
-
-        total = sum(
-            probabilities
-        )
-
-        probabilities = [
-            probability / total
-            for probability
-            in probabilities
-        ]
-
-        return (
-            candidate_ids,
-            probabilities,
-        )
-
-    # ========================================================
-    # SINE MODULATION
-    # ========================================================
-
-    def sine_factor(
-        self,
-        step_index: int,
-    ) -> float:
-
-        return (
-            1.0
-            +
-            self.config.sine_amplitude
-            *
-            math.sin(
-                self.config.sine_frequency
-                *
-                step_index
-                +
-                self.config.sine_phase
-            )
-        )
-
-    # ========================================================
-    # PIECEWISE MODULATION
-    # ========================================================
-
-    def piecewise_modulate(
-        self,
-        probabilities: List[float],
-        step_index: int,
-    ) -> List[float]:
-
-        """
-        Piecewise modulation is applied to the candidates of
-        the active true trigram only.
-        """
-
-        if len(
-            probabilities
-        ) <= 1:
-
-            return probabilities
-
-        result = list(
-            probabilities
-        )
-
-        ranking = sorted(
-            range(
-                len(result)
-            ),
-            key=lambda index:
-                result[index],
-        )
-
-        pieces = min(
-            self.base_pieces,
-            len(ranking),
-        )
-
-        # ----------------------------------------------------
-        # Dataset-scaled sine factor.
-        # ----------------------------------------------------
-
-        sine = self.sine_factor(
-            step_index
-        )
-
-        # Convert sine value to a bounded modulation strength.
-        sine_offset = (
-            sine - 1.0
-        )
-
-        for piece_index in range(
-            pieces
-        ):
-
-            start = (
-                piece_index
-                *
-                len(ranking)
-                //
-                pieces
-            )
-
-            end = (
-                (piece_index + 1)
-                *
-                len(ranking)
-                //
-                pieces
-            )
-
-            if end <= start:
-                continue
-
-            if pieces == 1:
-
-                position = 0.5
-
-            else:
-
-                position = (
-                    piece_index
-                    /
-                    float(
-                        pieces - 1
-                    )
-                )
-
-            rank_center = (
-                position - 0.5
-            )
-
-            scale = (
-                1.0
-                +
-                self.config.piece_strength
-                *
-                rank_center
-                *
-                2.0
-                *
-                sine
-            )
-
-            # Small global sine contribution while preserving
-            # token-specific rank differences.
-            scale += (
-                0.05
-                *
-                sine_offset
-                *
-                rank_center
-            )
-
-            scale = max(
-                0.001,
-                scale,
-            )
-
-            for index in ranking[
-                start:end
-            ]:
-
-                result[index] *= (
-                    scale
-                )
-
-        total = sum(
-            result
-        )
-
-        if total <= 0:
-
-            return probabilities
-
-        return [
-            probability / total
-            for probability
-            in result
-        ]
-
-    # ========================================================
-    # PLASTICITY
-    # ========================================================
-
-    def apply_plasticity(
-        self,
-        probabilities: List[float],
-        step_index: int,
-    ) -> List[float]:
-
-        """
-        Apply a small rank-dependent plasticity term.
-
-        Still only modifies probabilities belonging to the
-        active true-trigram continuation set.
-        """
-
-        if len(
-            probabilities
-        ) <= 1:
-
-            return probabilities
-
-        result = list(
-            probabilities
-        )
-
-        phase = (
-            step_index
-            *
-            self.config.plasticity_rate
-        )
-
-        plasticity = math.sin(
-            phase
-        )
-
-        ranking = sorted(
-            range(
-                len(result)
-            ),
-            key=lambda index:
-                result[index],
-            reverse=True,
-        )
-
-        size = len(
-            ranking
-        )
-
-        for rank, index in enumerate(
-            ranking
-        ):
-
-            normalized_rank = (
-                rank
-                /
-                max(
-                    1,
-                    size - 1,
-                )
-            )
-
-            centered = (
-                0.5
-                -
-                normalized_rank
-            )
-
-            multiplier = (
-                1.0
-                +
-                self.config.plasticity_strength
-                *
-                plasticity
-                *
-                centered
-            )
-
-            result[index] *= (
-                max(
-                    0.001,
-                    multiplier,
-                )
-            )
-
-        total = sum(
-            result
-        )
-
-        if total <= 0:
-
-            return probabilities
-
-        return [
-            probability / total
-            for probability
-            in result
-        ]
-
-    # ========================================================
-    # REPETITION
-    # ========================================================
-
-    def repetition_control(
-        self,
-        candidate_ids: List[int],
-        probabilities: List[float],
-        generated_ids: List[int],
-    ) -> List[float]:
-
-        if not generated_ids:
-
-            return probabilities
-
-        result = list(
-            probabilities
-        )
-
-        recent = (
-            generated_ids[
-                -self.repetition_window:
-            ]
-        )
-
-        recent_counts = Counter(
-            recent
-        )
-
-        for index, token_id in enumerate(
-            candidate_ids
-        ):
-
-            count = (
-                recent_counts.get(
-                    token_id,
-                    0,
-                )
-            )
-
-            if count:
-
-                result[index] /= (
-                    self.repetition_penalty
-                    **
-                    count
-                )
-
-        # ----------------------------------------------------
-        # Immediate repetition reduction.
-        #
-        # Only applied if the trigram has another valid
-        # continuation.
-        # ----------------------------------------------------
-
-        if (
-            len(candidate_ids) > 1
-            and generated_ids
-            and self.config.prevent_immediate_repeat
-        ):
-
-            previous = (
-                generated_ids[-1]
-            )
-
-            for index, token_id in enumerate(
-                candidate_ids
-            ):
-
-                if token_id == previous:
-
-                    result[index] *= 0.05
-
-        total = sum(
-            result
-        )
-
-        if total <= 0:
-
-            return probabilities
-
-        return [
-            probability / total
-            for probability
-            in result
-        ]
-
-    # ========================================================
-    # TEMPERATURE
-    # ========================================================
-
-    def apply_temperature(
-        self,
-        probabilities: List[float],
-    ) -> List[float]:
-
-        temperature = max(
-            self.config.temperature,
-            1e-12,
-        )
-
-        logits = [
-            math.log(
-                max(
-                    probability,
-                    1e-12,
-                )
-            )
-            /
-            temperature
-            for probability
-            in probabilities
-        ]
-
-        maximum = max(
-            logits
-        )
-
-        values = [
-            math.exp(
-                value - maximum
-            )
-            for value in logits
-        ]
-
-        total = sum(
-            values
-        )
-
-        return [
-            value / total
-            for value in values
-        ]
-
-    # ========================================================
-    # TOP-K
-    # ========================================================
-
-    def apply_top_k(
-        self,
-        candidate_ids: List[int],
-        probabilities: List[float],
-    ) -> Tuple[
-        List[int],
-        List[float],
-    ]:
-
-        k = min(
-            self.top_k,
-            len(candidate_ids),
-        )
-
-        if k >= len(
-            candidate_ids
-        ):
-
-            return (
-                candidate_ids,
-                probabilities,
-            )
-
-        ranking = sorted(
-            range(
-                len(candidate_ids)
-            ),
-            key=lambda index:
-                probabilities[index],
-            reverse=True,
-        )
-
-        selected = ranking[:k]
-
-        ids = [
-            candidate_ids[index]
-            for index in selected
-        ]
-
-        values = [
-            probabilities[index]
-            for index in selected
-        ]
-
-        total = sum(
-            values
-        )
-
-        values = [
-            value / total
-            for value in values
-        ]
-
-        return (
-            ids,
-            values,
-        )
-
-    # ========================================================
-    # SINGLE TRUE-TRIGRAM STEP
-    # ========================================================
-
-    def step(
-        self,
-        context_ids: List[int],
-        generated_ids: List[int],
-        step_index: int,
-    ) -> Tuple[
-        int,
-        Dict[str, Any],
-    ]:
-        try:
-            # ----------------------------------------------------
-            # HARD GUARANTEE
-            # ----------------------------------------------------
-
-            if len(
-                context_ids
-            ) != 2:
-
-                raise RuntimeError(
-                    "Pure true-trigram generation "
-                    "requires exactly two context tokens."
-                )
-
-            a = context_ids[0]
-            b = context_ids[1]
-
-            # ----------------------------------------------------
-            # THE ONLY MODEL LOOKUP
-            #
-            #         (a,b) -> c
-            # ----------------------------------------------------
-
-            candidate_ids, probabilities = (
-                self.trigram_distribution(
-                    context_ids
-                )
-            )
-
-            # ----------------------------------------------------
-            # Modulation
-            # ----------------------------------------------------
-
-            probabilities = (
-                self.piecewise_modulate(
-                    probabilities,
-                    step_index,
-                )
-            )
-
-            probabilities = (
-                self.apply_plasticity(
-                    probabilities,
-                    step_index,
-                )
-            )
-
-            probabilities = (
-                self.repetition_control(
-                    candidate_ids,
-                    probabilities,
-                    generated_ids,
-                )
-            )
-
-            probabilities = (
-                self.apply_temperature(
-                    probabilities
-                )
-            )
-
-            candidate_ids, probabilities = (
-                self.apply_top_k(
-                    candidate_ids,
-                    probabilities,
-                )
-            )
-
-            # ----------------------------------------------------
-            # SAMPLE THIRD TOKEN
-            # ----------------------------------------------------
-
-            target_id = random.choices(
-                candidate_ids,
-                weights=probabilities,
-                k=1,
-            )[0]
-
-            target_token = (
-                self.id_to_token[
-                    target_id
-                ]
-            )
-
-            token_a = (
-                self.id_to_token[a]
-            )
-
-            token_b = (
-                self.id_to_token[b]
-            )
-
-            # ----------------------------------------------------
-            # Explicit trigram metadata.
-            # ----------------------------------------------------
-
-            info = {
-                "type": (
-                    "generated_trigram"
-                ),
-
-                "model": (
-                    "PURE_TRUE_TRIGRAM"
-                ),
-
-                "step_index": (
-                    step_index
-                ),
-
-                "equation": (
-                    "P(c | a,b)"
-                ),
-
-                "context_ids": [
-                    int(a),
-                    int(b),
-                ],
-
-                "context": [
-                    token_a,
-                    token_b,
-                ],
-
-                "selected_id": (
-                    int(target_id)
-                ),
-
-                "selected_token": (
-                    target_token
-                ),
-
-                "trigram": [
-                    token_a,
-                    token_b,
-                    target_token,
-                ],
-
-                "transition": (
-                    f"({token_a}, "
-                    f"{token_b}) -> "
-                    f"{target_token}"
-                ),
-
-                "candidate_count": (
-                    len(candidate_ids)
-                ),
-
-                "top_k": (
-                    self.top_k
-                ),
-
-                "mode": "trigram",
-
-                "backoff": None,
-
-                "bigram_used": False,
-
-                "unigram_used": False,
-            }
-
-            return (
-                target_id,
-                info,
-            )
-        except:
-            return (
-                0,
-                "",
-            )
-    # ========================================================
-    # GENERATE
-    # ========================================================
-
-    def generate(
-        self,
-        prompt: str,
-        max_new_tokens: int = 40,
-    ) -> str:
-
-        prompt_tokens = tokenize(
-            prompt,
-            self.config.unit,
-        )
-
-        # ----------------------------------------------------
-        # Establish an actual observed trigram context.
-        # ----------------------------------------------------
-
-        context_ids, prompt_context_used = (
-            self.find_initial_context(
-                prompt_tokens
-            )
-        )
-
-        if len(
-            context_ids
-        ) != 2:
-
-            raise RuntimeError(
-                "Could not establish a valid "
-                "true-trigram context."
-            )
-
-        generated_ids: List[int] = []
-
-        generated_tokens: List[str] = []
-
-        self.history = []
-
-        # ----------------------------------------------------
-        # Record prompt.
-        # ----------------------------------------------------
-
-        for position, token in enumerate(
-            prompt_tokens
-        ):
-
-            self.history.append(
-                {
-                    "type": "prompt",
-                    "position": position,
-                    "token": token,
-                    "known_to_dataset": (
-                        token
-                        in self.token_to_id
-                    ),
-                }
-            )
-
-        # ----------------------------------------------------
-        # Record initialization.
-        # ----------------------------------------------------
-
-        self.history.append(
-            {
-                "type": (
-                    "trigram_initialization"
-                ),
-
-                "prompt_context_used": (
-                    prompt_context_used
-                ),
-
-                "context_ids": [
-                    int(x)
-                    for x in context_ids
-                ],
-
-                "context": [
-                    self.id_to_token[x]
-                    for x in context_ids
-                ],
-
-                "equation": (
-                    "P(c | a,b)"
-                ),
-            }
-        )
-
-        # ----------------------------------------------------
-        # GENERATION
-        # ----------------------------------------------------
-
-        for step_index in range(
-            max(
-                0,
-                int(max_new_tokens),
-            )
-        ):
-
-            # ------------------------------------------------
-            # Hard invariant:
-            #
-            # exactly two tokens enter the model.
-            # ------------------------------------------------
-
-            if len(
-                context_ids
-            ) != 2:
-
-                raise RuntimeError(
-                    "Internal trigram context "
-                    "invariant violated."
-                )
-
-            target_id, info = (
-                self.step(
-                    context_ids,
-                    generated_ids,
-                    step_index,
-                )
-            )
-
-            self.history.append(
-                info
-            )
-
-            generated_ids.append(
-                target_id
-            )
-
-            target_token = (
-                self.id_to_token[
-                    target_id
-                ]
-            )
-
-            generated_tokens.append(
-                target_token
-            )
-
-            # ------------------------------------------------
-            # TRIGRAM SHIFT
-            #
-            # Previous:
-            #
-            #     (a,b) -> c
-            #
-            # Next:
-            #
-            #     (b,c) -> d
-            # ------------------------------------------------
-
-            context_ids = [
-                context_ids[1],
-                target_id,
-            ]
-
-        # ----------------------------------------------------
-        # Continuation.
-        # ----------------------------------------------------
-
-        continuation = detokenize(
-            generated_tokens,
-            self.config.unit,
-        )
-
-        # ----------------------------------------------------
-        # Preserve the prompt.
-        # ----------------------------------------------------
-
-        if not prompt:
-
-            return continuation
-
-        if not continuation:
-
-            return prompt
-
-        if self.config.unit == "char":
-
-            return (
-                prompt
-                +
-                continuation
-            )
-
-        return (
-            prompt
-            +
-            " "
-            +
-            continuation
-        )
-
-    # ========================================================
-    # SAVE HISTORY
-    # ========================================================
-
-    def save_history(
-        self,
-        filepath: str,
-    ):
-
-        directory = os.path.dirname(
-            filepath
-        )
-
-        if directory:
-
-            os.makedirs(
-                directory,
-                exist_ok=True,
-            )
-
-        with open(
-            filepath,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                self.history,
-                f,
-                indent=2,
-                ensure_ascii=False,
-            )
-
-    # ========================================================
-    # SAVE SCALING
-    # ========================================================
-
-    def save_scaling(
-        self,
-        filepath: str,
-    ):
-
-        directory = os.path.dirname(
-            filepath
-        )
-
-        if directory:
-
-            os.makedirs(
-                directory,
-                exist_ok=True,
-            )
-
-        with open(
-            filepath,
-            "w",
-            encoding="utf-8",
-        ) as f:
-
-            json.dump(
-                self.scaled,
-                f,
-                indent=2,
-            )
-
-
-# ============================================================
+            probs = self.P_final[ctx_idx]
+            next_ctx_idx = sample_next(probs, temperature=temp, top_k=top_k, rng=rng)
+            next_word_id = self.contexts[next_ctx_idx][-1]  # newly introduced word
+            out_ids.append(next_word_id)
+            ctx_idx = next_ctx_idx
+
+        words = [self.vocab[i] for i in out_ids]
+        return _detokenize(words)
+
+
+def _detokenize(tokens):
+    out = []
+    for tok in tokens:
+        if tok in (BOS,):
+            continue
+        if out and re.match(r"[.,!?;:]", tok):
+            out[-1] = out[-1] + tok
+        else:
+            out.append(tok)
+    text = " ".join(out)
+    if text:
+        text = text[0].upper() + text[1:]
+    return text
+
+
+# ---------------------------------------------------------------------------
 # CLI
-# ============================================================
+# ---------------------------------------------------------------------------
 
-def parse_args():
+def main():
+    ap = argparse.ArgumentParser(description="HECM toy n-gram language model")
+    ap.add_argument("--data", nargs="*", default=None,
+                     help="Text file path(s) or glob pattern(s). Omit for a "
+                          "built-in demo corpus.")
+    ap.add_argument("--order", type=int, default=3,
+                     help="n-gram order: 2=bigram, 3=trigram (default), "
+                          "4=4-gram, etc. Context length = order - 1.")
+    ap.add_argument("--min-count", type=int, default=1)
+    ap.add_argument("--beta", type=float, default=0.15,
+                     help="Matrix-exponential diffusion strength.")
+    ap.add_argument("--alpha", type=float, default=0.5,
+                     help="Blend factor: 0=raw n-gram probs, 1=diffused probs.")
+    ap.add_argument("--max-diffusion-states", type=int, default=1500,
+                     help="Skip the O(n^3) diffusion step above this many "
+                          "context-states (trigrams+ can have many contexts).")
+    ap.add_argument("--length", type=int, default=400)
+    ap.add_argument("--top-k", type=int, default=10)
+    ap.add_argument("--base-temp", type=float, default=0.8)
+    ap.add_argument("--amplitude", type=float, default=0.4)
+    ap.add_argument("--omega", type=float, default=0.5)
+    ap.add_argument("--phase", type=float, default=0.0)
+    ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--interactive", action="store_true")
+    args = ap.parse_args()
 
-    parser = argparse.ArgumentParser(
-        description=(
-            "Pure True-Trigram Markov "
-            "Generator"
+    tokens = load_corpus(paths=args.data)
+    print(f"[info] loaded {len(tokens)} tokens", file=sys.stderr)
+
+    model = HECMModel(
+        tokens, order=args.order, min_count=args.min_count,
+        beta=args.beta, alpha=args.alpha,
+        max_diffusion_states=args.max_diffusion_states,
+    )
+    print(f"[info] order={args.order} (context length {args.order-1}) | "
+          f"vocab size: {model.vocab_size()} | context-states: {model.num_states()}",
+          file=sys.stderr)
+
+    def run_once(prompt):
+        result = model.generate(
+            prompt,
+            max_new_tokens=args.length,
+            top_k=args.top_k,
+            base_temp=args.base_temp,
+            amplitude=args.amplitude,
+            omega=args.omega,
+            phase=args.phase,
+            seed=args.seed,
         )
-    )
+        print(result)
 
-   
-    parser.add_argument(
-        "--tokens",
-        type=int,
-        default=800,
-        help=(
-            "Number of new tokens."
-        ),
-    )
-
-    parser.add_argument(
-        "--unit",
-        type=str,
-        default="word",
-        choices=[
-            "word",
-            "char",
-        ],
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=42,
-    )
-
-    parser.add_argument(
-        "--temperature",
-        type=float,
-        default=0.85,
-    )
-
-    parser.add_argument(
-        "--sine-amplitude",
-        type=float,
-        default=0.20,
-    )
-
-    parser.add_argument(
-        "--sine-frequency",
-        type=float,
-        default=1.0,
-    )
-
-    parser.add_argument(
-        "--sine-phase",
-        type=float,
-        default=0.0,
-    )
-
-    parser.add_argument(
-        "--plasticity-rate",
-        type=float,
-        default=0.005,
-    )
-
-    parser.add_argument(
-        "--plasticity-strength",
-        type=float,
-        default=0.02,
-    )
-
-    parser.add_argument(
-        "--piece-strength",
-        type=float,
-        default=0.025,
-    )
-
-    parser.add_argument(
-        "--seed-output",
-        type=str,
-        default="output",
-    )
-
-    return parser.parse_args()
-
-
-# ============================================================
-# MAIN
-# ============================================================
-
-if __name__ == "__main__":
-
-    args = parse_args()
-
-    config = Config(
-        unit=args.unit,
-        seed=args.seed,
-        output_dir=args.seed_output,
-
-        temperature=args.temperature,
-
-        # ----------------------------------------------------
-        # These are now explicitly present in Config.
-        # ----------------------------------------------------
-
-        sine_amplitude=(
-            args.sine_amplitude
-        ),
-
-        sine_frequency=(
-            args.sine_frequency
-        ),
-
-        sine_phase=(
-            args.sine_phase
-        ),
-
-        plasticity_rate=(
-            args.plasticity_rate
-        ),
-
-        plasticity_strength=(
-            args.plasticity_strength
-        ),
-
-        piece_strength=(
-            args.piece_strength
-        ),
-    )
-
-    print(
-        "Initializing "
-        "PURE TRUE-TRIGRAM generator..."
-    )
-
-    generator = (
-        TrueTrigramMarkovGenerator(
-            dataset_text=(
-                DEFAULT_DATASET
-            ),
-            config=config,
-        )
-    )
-
-    # ========================================================
-    # PARAMETERS
-    # ========================================================
-
-    print()
-    print(
-        "=" * 76
-    )
-    print(
-        "TRUE TRIGRAM MODEL"
-    )
-    print(
-        "=" * 76
-    )
-
-    print(
-        f"Dataset tokens:          "
-        f"{len(generator.tokens):,}"
-    )
-
-    print(
-        f"Vocabulary:              "
-        f"{generator.vocab_size:,}"
-    )
-
-    print(
-        f"Unique trigram contexts: "
-        f"{len(generator.trigram_counts):,}"
-    )
-
-    print()
-    print(
-        "=" * 76
-    )
-    print(
-        "AUTOMATIC SCALING"
-    )
-    print(
-        "=" * 76
-    )
-
-    print(
-        f"top_k:                   "
-        f"{generator.top_k}"
-    )
-
-    print(
-        f"base_pieces:             "
-        f"{generator.base_pieces}"
-    )
-
-    print(
-        f"smoothing:               "
-        f"{generator.smoothing:.8f}"
-    )
-
-    print(
-        f"repetition_penalty:      "
-        f"{generator.repetition_penalty:.8f}"
-    )
-
-    print(
-        f"repetition_window:       "
-        f"{generator.repetition_window}"
-    )
-
-    print()
-    print(
-        "=" * 76
-    )
-    print(
-        "MODEL STRUCTURE"
-    )
-    print(
-        "=" * 76
-    )
-
-    print(
-        "Probability model:"
-    )
-
-    print(
-        "  P(token[t] | "
-        "token[t-2], token[t-1])"
-    )
-
-    print(
-        "Transition:"
-    )
-
-    print(
-        "  (token[t-2], token[t-1]) "
-        "-> token[t]"
-    )
-
-    print(
-        "Bigram fallback:         NO"
-    )
-
-    print(
-        "Unigram fallback:        NO"
-    )
-
-    print(
-        "Vocabulary fallback:     NO"
-    )
-
-    print(
-        "N-gram interpolation:     NO"
-    )
-
-    print()
-    print(
-        "=" * 76
-    )
-
+    print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
     while True:
-        output = generator.generate(
-            prompt=input("USER: "),
-            max_new_tokens=args.tokens,
-        )
-
-        print()
-        print(
-            "Generated Output:"
-        )
-        print(
-            output
-        )
+        try:
+            prompt = input("prompt> ")
+        except EOFError:
+            break
+        if prompt.strip().lower() in ("quit", "exit"):
+            break
+        run_once(prompt)
+   
+if __name__ == "__main__":
+    main()
