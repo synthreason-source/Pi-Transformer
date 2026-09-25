@@ -34,8 +34,44 @@ Pipeline:
   5. Sinusoidal modulation -> a sine wave over generation step index biases
      sampling temperature (replaces the ill-defined "curve intersection").
   6. Text prompting -> CLI / function interface, prompt in, continuation out.
+  7. Payload customizer -> an optional user-supplied word:weight "payload"
+     vector. At each step, every candidate trigram is scored by the dot
+     product of the payload against that trigram's word composition, and
+     this score reranks (never expands) the set of verbatim candidates --
+     so generation can be steered toward chosen themes/words without ever
+     breaking the "every trigram is real" guarantee.
 
 Still fundamentally an n-gram frequency model, not a neural network.
+
+Narrative framing (descriptive only -- nothing below is executed)
+-------------------------------------------------------------------
+Two pieces of the original HECM sketch never got turned into code, because
+there was no real mechanism to attach them to (see the README's mapping
+table for the parts that *did* get an honest reinterpretation). They're
+described here in the same narrative register the sketch used, purely to
+preserve the intent -- not to imply the code performs them:
+
+  "Harmonic resonance field" / sinusoidal curve intersection -- the sketch
+  pictures each chunk of the transition surface as a string with its own
+  natural frequency, and generation as a receiver tuning in to the chunks
+  that ring together, letting noisy transitions fall silent while the
+  strongly-linked phrases carry through. It's an evocative way to talk
+  about surfacing stable patterns in a sequence. Nothing in this file tunes
+  into anything, though -- the closest real mechanism is the sinusoidal
+  *temperature* schedule in Phase 5, and what it actually does is far
+  plainer: it nudges sampling between more cautious and more adventurous
+  on a fixed clock, with no sense of which words "belong together."
+
+  "Phase-locked, rhythmically stable feature space" -- the sketch describes
+  generation settling into reinforced pathways the way a pendulum settles
+  into a stable orbit, so that only "mathematically reinforced harmonic
+  nodes" get visited. That's a nice image for "the output gets more
+  predictable the longer it runs," but there's no dynamical system here
+  with fixed points or phase-locking to settle into. If what you actually
+  want is generation that leans toward safer, more repeated phrasing over a
+  long run, `--base-temp` and a small `--amplitude` get you there for real
+  -- that's an honest, working knob, just not the mechanism the sketch
+  describes.
 """
 
 import argparse
@@ -87,6 +123,7 @@ def load_corpus(paths=None, raw_text=None, lowercase=True, strip_punct=False):
         tokens = [t for t in tokens if re.match(r"[a-z0-9']+", t)]
 
     return tokens
+
 
 with open(input("Filename: "), "r", encoding="utf-8") as file:
     _DEMO_CORPUS = file.read()
@@ -240,20 +277,38 @@ def sinusoidal_temperature(step, base_temp=0.8, amplitude=0.4, omega=0.5, phase=
 # 6. Sampling and generation
 # ---------------------------------------------------------------------------
 
-def sample_next(probs, temperature=1.0, top_k=10, rng=None):
+def sample_next(probs, temperature=1.0, top_k=10, rng=None, bias=None, bias_strength=0.0):
+    """Sample strictly among states with nonzero probability -- i.e. only
+    transitions that were genuinely observed in training data. Zero-
+    probability entries are never eligible, however small temperature or
+    top_k padding might otherwise make them. Returns None if there is no
+    eligible (nonzero-probability) state at all (a true dead end).
+
+    `bias` (optional): a full-length array of per-state scores (e.g. a
+    payload dot-product score). When given, it RERANKS the already-eligible
+    (nonzero-probability) candidates via bias_strength * bias[state] added
+    to their log-probability -- it can never make a zero-probability state
+    eligible, so the verbatim guarantee is preserved regardless of
+    bias_strength.
+    """
     rng = rng or np.random.default_rng()
     probs = np.asarray(probs, dtype=np.float64)
 
-    if top_k is not None and 0 < top_k < len(probs):
-        top_idx = np.argpartition(probs, -top_k)[-top_k:]
+    nonzero_idx = np.nonzero(probs > 0)[0]
+    if len(nonzero_idx) == 0:
+        return None
+
+    if top_k is not None and 0 < top_k < len(nonzero_idx):
+        sub = np.argpartition(probs[nonzero_idx], -top_k)[-top_k:]
+        top_idx = nonzero_idx[sub]
     else:
-        top_idx = np.arange(len(probs))
+        top_idx = nonzero_idx
 
     top_probs = probs[top_idx]
-    if top_probs.sum() <= 0:
-        top_probs = np.ones_like(top_probs)
 
-    logits = np.log(top_probs + 1e-12) / max(temperature, 1e-6)
+    logits = np.log(top_probs) / max(temperature, 1e-6)
+    if bias is not None and bias_strength != 0.0:
+        logits = logits + bias_strength * np.asarray(bias)[top_idx]
     logits -= logits.max()
     weights = np.exp(logits)
     weights /= weights.sum()
@@ -262,9 +317,44 @@ def sample_next(probs, temperature=1.0, top_k=10, rng=None):
     return top_idx[choice]
 
 
+def parse_payload(payload_str, word_to_idx):
+    """Parse a "word:weight,word:weight,..." string into a dense payload
+    vector over the vocabulary (unknown words are dropped with a warning).
+    Weights can be negative to *penalize* a word instead of boosting it."""
+    vocab_size = len(word_to_idx)
+    payload_vector = np.zeros(vocab_size, dtype=np.float64)
+    if not payload_str:
+        return payload_vector
+
+    for item in payload_str.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" in item:
+            word, weight_str = item.rsplit(":", 1)
+            try:
+                weight = float(weight_str)
+            except ValueError:
+                print(f"[warn] payload entry '{item}' has a non-numeric "
+                      f"weight; skipping", file=sys.stderr)
+                continue
+        else:
+            word, weight = item, 1.0
+
+        word = word.strip().lower()
+        idx = word_to_idx.get(word)
+        if idx is None:
+            print(f"[warn] payload word '{word}' is not in the vocabulary; "
+                  f"skipping", file=sys.stderr)
+            continue
+        payload_vector[idx] = weight
+
+    return payload_vector
+
+
 class HECMModel:
-    def __init__(self, tokens, order=3, min_count=1, beta=0.15, alpha=0.5,
-                 max_diffusion_states=1500):
+    def __init__(self, tokens, order=3, min_count=1, beta=0.0, alpha=0.0,
+                 max_diffusion_states=1500, payload=None):
         self.order = order
         vocab, word_to_idx, counts = build_vocab(tokens, min_count=min_count)
         self.vocab = vocab
@@ -286,7 +376,13 @@ class HECMModel:
         self.P_raw = row_normalize(M)
 
         num_states = len(contexts)
-        if num_states > max_diffusion_states:
+        if alpha <= 0.0 or beta <= 0.0:
+            # Verbatim mode: skip the (expensive, and by default unused)
+            # diffusion step entirely and sample straight from the raw,
+            # actually-observed n-gram probabilities.
+            self.P_diffused = self.P_raw
+            self.P_final = self.P_raw
+        elif num_states > max_diffusion_states:
             print(
                 f"[warn] {num_states} context-states exceeds "
                 f"max_diffusion_states={max_diffusion_states}; skipping "
@@ -301,6 +397,33 @@ class HECMModel:
             self.P_diffused = diffusion_weighting(self.P_raw, beta=beta)
             self.P_final = blend(self.P_raw, self.P_diffused, alpha=alpha)
 
+        # --- Payload customizer -------------------------------------------
+        # payload: dense vocab-length vector of user weights (from
+        # parse_payload). We precompute, per context-state j:
+        #   context_word_score[j]  = sum of payload weights over j's own
+        #                            (order-1) words -- the "sub-trigram"
+        #                            (context-only) part of the dot product.
+        #   introduced_word_score[j] = payload weight of j's last word --
+        #                            the word that gets newly emitted when
+        #                            transitioning INTO state j.
+        # The full "trigram payload dot product" for a transition
+        # ctx_idx -> j is context_word_score[ctx_idx] + introduced_word_score[j].
+        # The first term is constant across all candidates j reachable from
+        # a given ctx_idx, so it cancels out of *that* step's softmax -- it
+        # only matters when comparing candidates that have DIFFERENT
+        # preceding context (i.e. when picking among fallback/restart
+        # states), where it correctly favors thematically-relevant contexts.
+        if payload is None:
+            payload = np.zeros(len(vocab), dtype=np.float64)
+        self.payload = payload
+        self.context_word_score = np.array(
+            [sum(payload[w] for w in ctx) for ctx in contexts], dtype=np.float64
+        )
+        self.introduced_word_score = np.array(
+            [payload[ctx[-1]] for ctx in contexts], dtype=np.float64
+        )
+        self.context_total_score = self.context_word_score + 0.0  # alias for clarity
+
     def vocab_size(self):
         return len(self.vocab)
 
@@ -312,7 +435,19 @@ class HECMModel:
         unk = self.word_to_idx[UNK]
         return [self.word_to_idx.get(t, unk) for t in toks]
 
-    def _initial_context(self, prompt_ids, rng):
+    def _weighted_pick(self, candidates, boost_strength, rng):
+        """Pick among a list of candidate state indices, softmax-weighted
+        by boost_strength * (their own context-word payload score), falling
+        back to uniform when boost_strength is 0 or all scores tie."""
+        if boost_strength == 0.0 or len(candidates) == 1:
+            return candidates[rng.integers(len(candidates))] if len(candidates) > 1 else candidates[0]
+        scores = boost_strength * self.context_total_score[candidates]
+        scores = scores - scores.max()
+        weights = np.exp(scores)
+        weights /= weights.sum()
+        return candidates[rng.choice(len(candidates), p=weights)]
+
+    def _initial_context(self, prompt_ids, rng, boost_strength=0.0):
         ctx_len = self.order - 1
         bos = self.word_to_idx[BOS]
         padded = [bos] * ctx_len + prompt_ids
@@ -322,26 +457,29 @@ class HECMModel:
             return self.context_to_idx[desired]
 
         # Fallback 1: find any registered context sharing the longest
-        # possible suffix with `desired`.
+        # possible suffix with `desired`, ranked by payload score.
         for k in range(ctx_len - 1, 0, -1):
             suffix = desired[-k:]
             candidates = [
                 i for i, ctx in enumerate(self.contexts) if ctx[-k:] == suffix
             ]
             if candidates:
-                return rng.choice(candidates)
+                return self._weighted_pick(candidates, boost_strength, rng)
 
-        # Fallback 2: pick the single most frequent context.
-        best = max(range(len(self.contexts)),
-                    key=lambda i: self.context_counts.get(self.contexts[i], 0))
-        return best
+        # Fallback 2: pick among the most frequent contexts, weighted by payload.
+        counts_arr = np.array(
+            [self.context_counts.get(ctx, 0) for ctx in self.contexts]
+        )
+        top_candidates = list(np.argsort(counts_arr)[-10:])
+        return self._weighted_pick(top_candidates, boost_strength, rng)
 
     def generate(self, prompt, max_new_tokens=40, top_k=10, base_temp=0.8,
-                 amplitude=0.4, omega=0.5, phase=0.0, seed=None):
+                 amplitude=0.4, omega=0.5, phase=0.0, seed=None,
+                 boost_strength=0.0):
         rng = np.random.default_rng(seed)
         prompt_ids = self._tokenize_prompt(prompt)
 
-        ctx_idx = self._initial_context(prompt_ids, rng)
+        ctx_idx = self._initial_context(prompt_ids, rng, boost_strength=boost_strength)
         out_ids = list(prompt_ids)
 
         for step in range(max_new_tokens):
@@ -350,7 +488,18 @@ class HECMModel:
                 omega=omega, phase=phase,
             )
             probs = self.P_final[ctx_idx]
-            next_ctx_idx = sample_next(probs, temperature=temp, top_k=top_k, rng=rng)
+            next_ctx_idx = sample_next(
+                probs, temperature=temp, top_k=top_k, rng=rng,
+                bias=self.introduced_word_score, bias_strength=boost_strength,
+            )
+
+            if next_ctx_idx is None:
+                # True dead end: this exact context never had any observed
+                # continuation in training data. Restart from a fresh real
+                # context (payload-weighted) rather than fabricate one.
+                ctx_idx = self._initial_context(out_ids, rng, boost_strength=boost_strength)
+                continue
+
             next_word_id = self.contexts[next_ctx_idx][-1]  # newly introduced word
             out_ids.append(next_word_id)
             ctx_idx = next_ctx_idx
@@ -387,13 +536,17 @@ def main():
                      help="n-gram order: 2=bigram, 3=trigram (default), "
                           "4=4-gram, etc. Context length = order - 1.")
     ap.add_argument("--min-count", type=int, default=1)
-    ap.add_argument("--beta", type=float, default=0.15,
-                     help="Matrix-exponential diffusion strength.")
-    ap.add_argument("--alpha", type=float, default=0.5,
-                     help="Blend factor: 0=raw n-gram probs, 1=diffused probs.")
+    ap.add_argument("--beta", type=float, default=0.0,
+                     help="Matrix-exponential diffusion strength. 0 (default) "
+                          "= verbatim mode: sample strictly from actually-"
+                          "observed n-gram transitions, no synthesis.")
+    ap.add_argument("--alpha", type=float, default=0.0,
+                     help="Blend factor: 0 (default)=raw/verbatim n-gram "
+                          "probs only, 1=fully diffused probs.")
     ap.add_argument("--max-diffusion-states", type=int, default=1500,
                      help="Skip the O(n^3) diffusion step above this many "
                           "context-states (trigrams+ can have many contexts).")
+    ap.add_argument("--prompt", type=str, default="the fox and")
     ap.add_argument("--length", type=int, default=400)
     ap.add_argument("--top-k", type=int, default=10)
     ap.add_argument("--base-temp", type=float, default=0.8)
@@ -402,6 +555,19 @@ def main():
     ap.add_argument("--phase", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--interactive", action="store_true")
+    ap.add_argument("--boost", type=str, default=None,
+                     help="Payload customizer: comma-separated 'word:weight' "
+                          "pairs (weight optional, defaults to 1.0; use "
+                          "negative weights to penalize a word), e.g. "
+                          "'forest:2.0,dog:1.0,fire:-1.5'. At each step, "
+                          "candidate trigrams are reranked by the dot "
+                          "product of this payload against the trigram's "
+                          "words -- never adds a transition that wasn't "
+                          "already observed, so verbatim mode still holds.")
+    ap.add_argument("--boost-strength", type=float, default=1.0,
+                     help="Scales the payload dot-product bias before it's "
+                          "added to sampling log-probabilities. 0 disables "
+                          "the customizer even if --boost is set.")
     args = ap.parse_args()
 
     tokens = load_corpus(paths=args.data)
@@ -416,6 +582,25 @@ def main():
           f"vocab size: {model.vocab_size()} | context-states: {model.num_states()}",
           file=sys.stderr)
 
+    # Build the payload after the model exists, so we can validate words
+    # against its vocabulary and populate the model's payload-derived scores.
+    if args.boost:
+        payload = parse_payload(args.boost, model.word_to_idx)
+        model.payload = payload
+        model.context_word_score = np.array(
+            [sum(payload[w] for w in ctx) for ctx in model.contexts], dtype=np.float64
+        )
+        model.introduced_word_score = np.array(
+            [payload[ctx[-1]] for ctx in model.contexts], dtype=np.float64
+        )
+        model.context_total_score = model.context_word_score
+        nonzero = np.count_nonzero(payload)
+        print(f"[info] payload customizer active: {nonzero} word(s) weighted, "
+              f"boost-strength={args.boost_strength}", file=sys.stderr)
+        boost_strength = args.boost_strength
+    else:
+        boost_strength = 0.0
+
     def run_once(prompt):
         result = model.generate(
             prompt,
@@ -426,18 +611,23 @@ def main():
             omega=args.omega,
             phase=args.phase,
             seed=args.seed,
+            boost_strength=boost_strength,
         )
         print(result)
 
-    print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
-    while True:
-        try:
-            prompt = input("prompt> ")
-        except EOFError:
-            break
-        if prompt.strip().lower() in ("quit", "exit"):
-            break
-        run_once(prompt)
-   
+    if args.interactive:
+        print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
+        while True:
+            try:
+                prompt = input("prompt> ")
+            except EOFError:
+                break
+            if prompt.strip().lower() in ("quit", "exit"):
+                break
+            run_once(prompt)
+    else:
+        run_once(args.prompt)
+
+
 if __name__ == "__main__":
     main()
