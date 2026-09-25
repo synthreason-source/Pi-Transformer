@@ -569,7 +569,7 @@ def main():
     ap.add_argument("--data", nargs="*", default=None,
                      help="Text file path(s) or glob pattern(s). Omit for a "
                           "built-in demo corpus.")
-    ap.add_argument("--order", type=int, default=3,
+    ap.add_argument("--order", type=int, default=5,
                      help="n-gram order: 2=bigram, 3=trigram (default), "
                           "4=4-gram, etc. Context length = order - 1.")
     ap.add_argument("--min-count", type=int, default=1)
