@@ -1,26 +1,3 @@
-"""
-HECM Toy Language Model — vocabulary exchange with the Temporal Index /
-Topological Energy Membrane paper
-====================================================================
-
-    paper construct                          |  code mechanism (unchanged)
-    ------------------------------------------|--------------------------------
-    temporal index (tau)                      |  fraction of decision compute
-                                               |  spent on lookahead-rerank
-                                               |  (payload) vs. context lookup
-                                               |  (raw n-gram retrieval)
-    mass-density coupling (rho_eff, lambda)   |  context-state count -> memory
-                                               |  footprint -> O(n^2)/O(n^3)
-                                               |  cost of the diffusion step
-    topological energy membrane (d-Omega)     |  context -> next-context
-                                               |  transition, i.e. one step
-                                               |  of the Markov chain
-    membrane quanta (N)                       |  one emitted token per step
-    decision precedes rule (D then R)         |  payload/top_k narrow the
-                                               |  candidate set; P_final (the
-                                               |  observed n-gram law) is
-                                               |  never edited
-"""
 
 import argparse
 import glob
