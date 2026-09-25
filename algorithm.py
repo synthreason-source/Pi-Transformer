@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 """
 HECM Toy Language Model (n-gram, default: trigram)
 ====================================================
@@ -82,6 +82,7 @@ import sys
 from collections import Counter
 
 import numpy as np
+import scipy.sparse as sp
 from scipy.linalg import expm
 
 UNK = "<unk>"
@@ -145,10 +146,22 @@ def build_ngram_contexts(tokens, word_to_idx, order=3):
     """Build the square CONTEXT -> CONTEXT transition count matrix for an
     n-gram model of the given order (order=3 -> trigram, context length 2).
 
+    The matrix is built SPARSE (scipy.sparse.csr_matrix), not dense. A
+    dense (num_contexts x num_contexts) matrix is only viable for tiny toy
+    corpora -- a real dataset routinely has 10,000-100,000+ unique
+    contexts, and a dense float64 matrix at that size is gigabytes to
+    hundreds of gigabytes (e.g. 137,702 contexts -> a dense matrix would
+    need ~141 GiB, which is exactly the kind of allocation that used to
+    crash here). The transition graph is naturally very sparse -- each
+    context only ever transitions to the handful of contexts that actually
+    followed it in the corpus -- so sparse storage costs are proportional
+    to the number of *observed* transitions, not the square of the
+    vocabulary of contexts.
+
     Returns:
         contexts: list of context tuples (word indices), index-aligned with M.
         context_to_idx: dict mapping context tuple -> row/col index.
-        M: (num_contexts x num_contexts) count matrix.
+        M: (num_contexts x num_contexts) sparse CSR count matrix.
         context_counts: Counter of how often each context tuple occurred.
     """
     ctx_len = order - 1
@@ -181,9 +194,11 @@ def build_ngram_contexts(tokens, word_to_idx, order=3):
         edges[(ci, cj)] += 1.0
 
     m = len(contexts)
-    M = np.zeros((m, m), dtype=np.float64)
-    for (ci, cj), c in edges.items():
-        M[ci, cj] = c
+    if edges:
+        rows, cols, data = zip(*[(r, c, v) for (r, c), v in edges.items()])
+    else:
+        rows, cols, data = (), (), ()
+    M = sp.csr_matrix((data, (rows, cols)), shape=(m, m), dtype=np.float64)
 
     return contexts, context_to_idx, M, context_counts
 
@@ -200,6 +215,10 @@ def log_sort_contexts(contexts, context_counts):
 
 
 def permute_matrix(M, order):
+    """Reorder both rows and columns of a square matrix, sparse or dense."""
+    order = np.asarray(order)
+    if sp.issparse(M):
+        return M[order, :][:, order].tocsr()
     return M[np.ix_(order, order)]
 
 
@@ -208,6 +227,13 @@ def permute_matrix(M, order):
 # ---------------------------------------------------------------------------
 
 def row_normalize(M, eps=1e-9):
+    """Row-normalize a transition matrix, sparse or dense, into a
+    row-stochastic matrix (rows with no outgoing mass stay all-zero)."""
+    if sp.issparse(M):
+        row_sums = np.asarray(M.sum(axis=1)).ravel()
+        row_sums[row_sums == 0] = 1.0
+        inv = sp.diags(1.0 / row_sums)
+        return (inv @ M).tocsr()
     row_sums = M.sum(axis=1, keepdims=True)
     row_sums[row_sums == 0] = 1.0
     return M / (row_sums + eps)
@@ -394,8 +420,9 @@ class HECMModel:
             self.P_diffused = self.P_raw
             self.P_final = self.P_raw
         else:
-            self.P_diffused = diffusion_weighting(self.P_raw, beta=beta)
-            self.P_final = blend(self.P_raw, self.P_diffused, alpha=alpha)
+            P_raw_dense = self.P_raw.toarray()
+            self.P_diffused = diffusion_weighting(P_raw_dense, beta=beta)
+            self.P_final = blend(P_raw_dense, self.P_diffused, alpha=alpha)
 
         # --- Payload customizer -------------------------------------------
         # payload: dense vocab-length vector of user weights (from
@@ -429,6 +456,16 @@ class HECMModel:
 
     def num_states(self):
         return len(self.contexts)
+
+    def _get_row(self, ctx_idx):
+        """Return a dense 1D probability row for ctx_idx, whether P_final
+        is currently sparse (verbatim/no-diffusion mode) or dense (small
+        diffusion-enabled state space). A single sparse row is cheap to
+        densify (its length, not its length squared)."""
+        row = self.P_final[ctx_idx]
+        if sp.issparse(self.P_final):
+            return np.asarray(row.todense()).ravel()
+        return np.asarray(row)
 
     def _tokenize_prompt(self, prompt):
         toks = re.findall(r"[a-z0-9']+|[.,!?;:]", prompt.lower())
@@ -487,7 +524,7 @@ class HECMModel:
                 step, base_temp=base_temp, amplitude=amplitude,
                 omega=omega, phase=phase,
             )
-            probs = self.P_final[ctx_idx]
+            probs = self._get_row(ctx_idx)
             next_ctx_idx = sample_next(
                 probs, temperature=temp, top_k=top_k, rng=rng,
                 bias=self.introduced_word_score, bias_strength=boost_strength,
@@ -615,19 +652,16 @@ def main():
         )
         print(result)
 
-    if args.interactive:
-        print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
-        while True:
-            try:
-                prompt = input("prompt> ")
-            except EOFError:
-                break
-            if prompt.strip().lower() in ("quit", "exit"):
-                break
-            run_once(prompt)
-    else:
-        run_once(args.prompt)
-
+    print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
+    while True:
+        try:
+            prompt = input("prompt> ")
+        except EOFError:
+            break
+        if prompt.strip().lower() in ("quit", "exit"):
+            break
+        run_once(prompt)
+    
 
 if __name__ == "__main__":
     main()
