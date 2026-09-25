@@ -3,35 +3,6 @@ HECM Toy Language Model — vocabulary exchange with the Temporal Index /
 Topological Energy Membrane paper
 ====================================================================
 
-WHAT THIS FILE IS AND ISN'T
-----------------------------
-This is Reading A of "exchange the mechanisms": the underlying math and
-behavior are IDENTICAL to the original hecm.py. Every function has been
-renamed and re-documented so that the paper's constructs (temporal index,
-mass-density coupling, topological energy membrane, decision-precedes-rule)
-are the explicit names of things the code was already doing honestly.
-Nothing new was invented to make room for these names.
-
-This file deliberately does NOT implement two pieces of the original
-sketch's vocabulary, and says so here instead of hiding it in a comment
-three screens down:
-
-  - "harmonic resonance field" / tuning into chunks that "ring together"
-  - "phase-locked, rhythmically stable feature space"
-
-These aren't omitted because they're hard to code. They're omitted because
-there's no discrete-Markov-chain referent to attach them to — no
-oscillator, no natural frequency, nothing that locks phase. Renaming
-`sample_next`'s temperature schedule to `resonance_tuner` would produce
-code that runs and does something, but the something it does (nudge
-softmax temperature on a sine wave) is not what "tuning into resonance"
-describes, and calling it that would misrepresent what the function does
-to anyone reading the code later. So `sinusoidal_temperature` keeps its
-plain name below — the one piece of the exchange this file won't make.
-
-Everything else DOES get exchanged, because everything else already had a
-one-to-one real referent:
-
     paper construct                          |  code mechanism (unchanged)
     ------------------------------------------|--------------------------------
     temporal index (tau)                      |  fraction of decision compute
