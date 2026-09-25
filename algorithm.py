@@ -672,7 +672,7 @@ class TrueTrigramMarkovGenerator:
         )
 
         
-
+        
         candidate_ids = list(
             counts.keys()
         )
@@ -1227,171 +1227,175 @@ class TrueTrigramMarkovGenerator:
         int,
         Dict[str, Any],
     ]:
+        try:
+            # ----------------------------------------------------
+            # HARD GUARANTEE
+            # ----------------------------------------------------
 
-        # ----------------------------------------------------
-        # HARD GUARANTEE
-        # ----------------------------------------------------
-
-        if len(
-            context_ids
-        ) != 2:
-
-            raise RuntimeError(
-                "Pure true-trigram generation "
-                "requires exactly two context tokens."
-            )
-
-        a = context_ids[0]
-        b = context_ids[1]
-
-        # ----------------------------------------------------
-        # THE ONLY MODEL LOOKUP
-        #
-        #         (a,b) -> c
-        # ----------------------------------------------------
-
-        candidate_ids, probabilities = (
-            self.trigram_distribution(
+            if len(
                 context_ids
+            ) != 2:
+
+                raise RuntimeError(
+                    "Pure true-trigram generation "
+                    "requires exactly two context tokens."
+                )
+
+            a = context_ids[0]
+            b = context_ids[1]
+
+            # ----------------------------------------------------
+            # THE ONLY MODEL LOOKUP
+            #
+            #         (a,b) -> c
+            # ----------------------------------------------------
+
+            candidate_ids, probabilities = (
+                self.trigram_distribution(
+                    context_ids
+                )
             )
-        )
 
-        # ----------------------------------------------------
-        # Modulation
-        # ----------------------------------------------------
+            # ----------------------------------------------------
+            # Modulation
+            # ----------------------------------------------------
 
-        probabilities = (
-            self.piecewise_modulate(
-                probabilities,
-                step_index,
+            probabilities = (
+                self.piecewise_modulate(
+                    probabilities,
+                    step_index,
+                )
             )
-        )
 
-        probabilities = (
-            self.apply_plasticity(
-                probabilities,
-                step_index,
+            probabilities = (
+                self.apply_plasticity(
+                    probabilities,
+                    step_index,
+                )
             )
-        )
 
-        probabilities = (
-            self.repetition_control(
+            probabilities = (
+                self.repetition_control(
+                    candidate_ids,
+                    probabilities,
+                    generated_ids,
+                )
+            )
+
+            probabilities = (
+                self.apply_temperature(
+                    probabilities
+                )
+            )
+
+            candidate_ids, probabilities = (
+                self.apply_top_k(
+                    candidate_ids,
+                    probabilities,
+                )
+            )
+
+            # ----------------------------------------------------
+            # SAMPLE THIRD TOKEN
+            # ----------------------------------------------------
+
+            target_id = random.choices(
                 candidate_ids,
-                probabilities,
-                generated_ids,
+                weights=probabilities,
+                k=1,
+            )[0]
+
+            target_token = (
+                self.id_to_token[
+                    target_id
+                ]
             )
-        )
 
-        probabilities = (
-            self.apply_temperature(
-                probabilities
+            token_a = (
+                self.id_to_token[a]
             )
-        )
 
-        candidate_ids, probabilities = (
-            self.apply_top_k(
-                candidate_ids,
-                probabilities,
+            token_b = (
+                self.id_to_token[b]
             )
-        )
 
-        # ----------------------------------------------------
-        # SAMPLE THIRD TOKEN
-        # ----------------------------------------------------
+            # ----------------------------------------------------
+            # Explicit trigram metadata.
+            # ----------------------------------------------------
 
-        target_id = random.choices(
-            candidate_ids,
-            weights=probabilities,
-            k=1,
-        )[0]
+            info = {
+                "type": (
+                    "generated_trigram"
+                ),
 
-        target_token = (
-            self.id_to_token[
-                target_id
-            ]
-        )
+                "model": (
+                    "PURE_TRUE_TRIGRAM"
+                ),
 
-        token_a = (
-            self.id_to_token[a]
-        )
+                "step_index": (
+                    step_index
+                ),
 
-        token_b = (
-            self.id_to_token[b]
-        )
+                "equation": (
+                    "P(c | a,b)"
+                ),
 
-        # ----------------------------------------------------
-        # Explicit trigram metadata.
-        # ----------------------------------------------------
+                "context_ids": [
+                    int(a),
+                    int(b),
+                ],
 
-        info = {
-            "type": (
-                "generated_trigram"
-            ),
+                "context": [
+                    token_a,
+                    token_b,
+                ],
 
-            "model": (
-                "PURE_TRUE_TRIGRAM"
-            ),
+                "selected_id": (
+                    int(target_id)
+                ),
 
-            "step_index": (
-                step_index
-            ),
+                "selected_token": (
+                    target_token
+                ),
 
-            "equation": (
-                "P(c | a,b)"
-            ),
+                "trigram": [
+                    token_a,
+                    token_b,
+                    target_token,
+                ],
 
-            "context_ids": [
-                int(a),
-                int(b),
-            ],
+                "transition": (
+                    f"({token_a}, "
+                    f"{token_b}) -> "
+                    f"{target_token}"
+                ),
 
-            "context": [
-                token_a,
-                token_b,
-            ],
+                "candidate_count": (
+                    len(candidate_ids)
+                ),
 
-            "selected_id": (
-                int(target_id)
-            ),
+                "top_k": (
+                    self.top_k
+                ),
 
-            "selected_token": (
-                target_token
-            ),
+                "mode": "trigram",
 
-            "trigram": [
-                token_a,
-                token_b,
-                target_token,
-            ],
+                "backoff": None,
 
-            "transition": (
-                f"({token_a}, "
-                f"{token_b}) -> "
-                f"{target_token}"
-            ),
+                "bigram_used": False,
 
-            "candidate_count": (
-                len(candidate_ids)
-            ),
+                "unigram_used": False,
+            }
 
-            "top_k": (
-                self.top_k
-            ),
-
-            "mode": "trigram",
-
-            "backoff": None,
-
-            "bigram_used": False,
-
-            "unigram_used": False,
-        }
-
-        return (
-            target_id,
-            info,
-        )
-
+            return (
+                target_id,
+                info,
+            )
+        except:
+            return (
+                0,
+                "",
+            )
     # ========================================================
     # GENERATE
     # ========================================================
