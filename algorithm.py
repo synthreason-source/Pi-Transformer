@@ -12,7 +12,7 @@ from collections import defaultdict, Counter
 # DATASET
 # ============================================================
 
-DATASET_FILE = "singlekb.txt"
+DATASET_FILE = input("Filename: ")
 
 if not os.path.exists(DATASET_FILE):
     raise FileNotFoundError(
