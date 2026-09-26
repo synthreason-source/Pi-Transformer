@@ -505,7 +505,7 @@ def _detokenize(tokens):
 def main():
     ap = argparse.ArgumentParser(description="HECM model, relabeled to the temporal-index paper's vocabulary")
     ap.add_argument("--data", nargs="*", default=None)
-    ap.add_argument("--order", type=int, default=5)
+    ap.add_argument("--order", type=int, default=3)
     ap.add_argument("--min-count", type=int, default=1)
     ap.add_argument("--beta", type=float, default=0.3, help="mass-density diffusion strength")
     ap.add_argument("--alpha", type=float, default=0.1, help="temporal-orientation blend factor")
