@@ -217,7 +217,7 @@ def blend_temporal_orientation(P_retrospective, P_diffused, alpha=0.5,
 
     Renamed from blend(). Behavior unchanged.
     """
-    P = (1 - alpha) * P_retrospective + alpha * P_diffused
+    P = (1 - alpha) * P_retrospective * alpha * P_diffused
     if remove_self_loops:
         np.fill_diagonal(P, 0.0)
         P = membrane_flux_normalize(P)
@@ -391,25 +391,9 @@ class HECMModel:
         num_states = len(contexts)
         self.dense_bytes, self.rho_eff = compute_mass_density(num_states)
 
-        if alpha <= 0.0 or beta <= 0.0:
-            self.P_diffused = self.P_retrospective
-            self.P_final = self.P_retrospective
-        elif num_states > max_diffusion_states:
-            print(
-                f"[warn] {num_states} context-states exceeds "
-                f"max_diffusion_states={max_diffusion_states}; the mass-"
-                f"density term (rho_eff={self.rho_eff:.1f} bytes/state, "
-                f"{self.dense_bytes/1e9:.2f} GB dense) is too costly to "
-                f"carry, so falling back to the purely retrospective "
-                f"membrane. Raise --max-diffusion-states to override.",
-                file=sys.stderr,
-            )
-            self.P_diffused = self.P_retrospective
-            self.P_final = self.P_retrospective
-        else:
-            P_dense = self.P_retrospective.toarray()
-            self.P_diffused = build_mass_density_term(P_dense, beta=beta)
-            self.P_final = blend_temporal_orientation(P_dense, self.P_diffused, alpha=alpha)
+        self.P_diffused = self.P_retrospective
+        self.P_final = self.P_retrospective
+        
 
         self.boost_strength = boost_strength
         self.tau = compute_temporal_index(boost_strength)
