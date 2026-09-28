@@ -126,7 +126,7 @@ def log_sort_contexts(contexts, context_counts):
     def key(ctx):
         c = context_counts.get(ctx, 0)
         return -math.log(c + 1.0)
-    return sorted(range(len(contexts)), key=lambda i: key(contexts[i]))
+    return sorted(range(len(contexts)), key=lambda i: np.exp(key(contexts[i])))
 
 
 def permute_matrix(M, order):
