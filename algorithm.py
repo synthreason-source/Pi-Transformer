@@ -1,4 +1,3 @@
-
 import argparse
 import glob
 import math
@@ -9,6 +8,7 @@ from collections import Counter
 import numpy as np
 import scipy.sparse as sp
 from scipy.linalg import expm
+from scipy.sparse.linalg import svds
 
 UNK = "<unk>"
 BOS = "<bos>"
@@ -122,11 +122,20 @@ def build_membrane_transition_graph(tokens, word_to_idx, order=3):
     return contexts, context_to_idx, membrane, context_counts
 
 
-def log_sort_contexts(contexts, context_counts):
+def log_sort_contexts(contexts, context_counts, mode="sine"):
+    """Return context indices ordered by a key on each context's count.
+
+    mode="log":  original ordering, key = -log(c + 1)
+    mode="sine": key = exp(log(x) * sin(x)) with x = c + 1
+                 (mathematically x ** sin(x); not monotonic in x)
+    """
     def key(ctx):
-        c = context_counts.get(ctx, 0)
-        return -math.log(c + 1.0)
-    return sorted(range(len(contexts)), key=lambda i: np.exp(key(contexts[i])))
+        x = context_counts.get(ctx, 0) + 1.0
+        if mode == "sine":
+            return math.exp(math.log(x) * math.sin(x))
+        return -math.log(x)
+
+    return sorted(range(len(contexts)), key=lambda i: key(contexts[i]))
 
 
 def permute_matrix(M, order):
@@ -299,14 +308,121 @@ def sinusoidal_temperature(step, base_temp=0.8, amplitude=0.4, omega=0.5, phase=
 #    decisions rewrite physics.
 # ---------------------------------------------------------------------------
 
+def dry_local_minimum(probs, idx, min_keep=2, gap_ratio=4.0):
+    """Prune the tail below the steepest drop in the sorted candidate probs.
+
+    probs: the full probability row; idx: candidate indices (nonzero, after top_k).
+    Returns the subset of idx to keep. The cut only happens when the biggest
+    drop is at least `gap_ratio`x, so flat distributions are left untouched.
+    """
+    if len(idx) <= min_keep:
+        return idx
+    order = np.argsort(probs[idx])[::-1]          # descending by prob
+    sorted_p = probs[idx][order]
+    drops = sorted_p[:-1] / sorted_p[1:]           # p_i / p_{i+1}
+    # only consider cut points that keep at least min_keep candidates
+    drops[: min_keep - 1] = 0.0
+    cut = int(np.argmax(drops))
+    if drops[cut] < gap_ratio:
+        return idx
+    return idx[order[: cut + 1]]
+
+
+def build_mirror_coords(P, seed=0):
+    """Place every context-state on a 2D plane. Uses the 2nd and 3rd singular
+    vectors of the transition matrix (the 1st is the trivial stationary mode),
+    so states that transition to similar places sit near each other. Falls
+    back to random positions for tiny or degenerate matrices."""
+    m = P.shape[0]
+    rng = np.random.default_rng(seed)
+    coords = None
+    if m > 4:
+        try:
+            u, s, _ = svds(P.astype(np.float64), k=3, v0=rng.standard_normal(m))
+            order = np.argsort(-s)[1:3]
+            coords = u[:, order] * s[order]
+        except Exception as e:
+            print(f"[warn] svds embedding failed ({e}); using random 2D layout", file=sys.stderr)
+    if coords is None or not np.all(np.isfinite(coords)) or np.ptp(coords) < 1e-12:
+        coords = rng.standard_normal((m, 2))
+    coords = coords - coords.mean(axis=0)
+    coords = coords / max(np.abs(coords).max(), 1e-12)
+    return coords
+
+
+class ShatterMirrors:
+    """A pane of broken glass laid over the candidate plane.
+
+    The plane is split into Voronoi shards. Each shard has its own mirror
+    line. A candidate's probability mass is not spent on the candidate
+    itself: it is emitted from the candidate's REFLECTED position (reflected
+    in its shard's mirror), as a Gaussian bump of width `sigma`, and lands
+    on whichever candidates sit near that reflected image. Shard borders
+    are discontinuities, so neighbouring candidates in different shards get
+    thrown in unrelated directions -- that is the shattering. `drift`
+    slowly rotates the mirrors each step so the fracture pattern evolves.
+
+    The distortion only re-weights candidates that already survived
+    top-k/drying, and it is blended with the original distribution via
+    `strength`, so it can never make a zero-probability transition eligible.
+    """
+
+    def __init__(self, coords, n_shards=7, strength=0.6, sigma=0.35,
+                 drift=0.05, seed=0):
+        rng = np.random.default_rng(seed)
+        self.coords = coords
+        self.strength = strength
+        self.sigma = max(sigma, 1e-3)
+        self.drift = drift
+        self.seeds = rng.uniform(-1, 1, (n_shards, 2))
+        self.angles = rng.uniform(0, math.pi, n_shards)
+        self.offsets = rng.uniform(-0.3, 0.3, (n_shards, 2))
+
+    def distort(self, idx, p, step=0):
+        if self.strength <= 0 or len(idx) < 2:
+            return p
+        p = p / p.sum()
+        pts = self.coords[idx]                                   # (n, 2)
+
+        # which shard each candidate lives in
+        d2 = ((pts[:, None, :] - self.seeds[None, :, :]) ** 2).sum(-1)
+        shard = d2.argmin(axis=1)
+
+        # reflect each candidate across its shard's mirror line
+        ang = self.angles[shard] + self.drift * step
+        dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
+        a = self.seeds[shard] + self.offsets[shard]
+        rel = pts - a
+        proj = (rel * dirs).sum(axis=1, keepdims=True) * dirs
+        refl = a + 2.0 * proj - rel
+
+        # mass emitted from reflected images lands on nearby candidates
+        d2 = ((pts[:, None, :] - refl[None, :, :]) ** 2).sum(-1)  # [target, source]
+        kernel = np.exp(-d2 / (2.0 * self.sigma ** 2))
+        landed = kernel @ p
+        total = landed.sum()
+        if total <= 1e-300:
+            return p
+        landed = landed / total
+
+        mixed = (1.0 - self.strength) * p + self.strength * landed
+        return mixed / mixed.sum()
+
+
 def sample_at_boundary(probs, temperature=1.0, top_k=10, rng=None,
-                        lookahead_bias=None, boost_strength=0.0):
+                        lookahead_bias=None, boost_strength=0.0,
+                        dry=True, dry_gap=4.0, dry_min_keep=2,
+                        mirror=None, step=0):
     """Cross d-Omega once: pick the next context-state (i.e. emit one
     quantum). `lookahead_bias` is the decision operator D's input;
     `probs` (P_final's row) is the rule R. D can only rerank within
     nonzero_idx — the domain R already permits — never expand it.
 
-    Renamed from sample_next(). Behavior unchanged.
+    Drying: after top-k, the tail below the steepest drop in the sorted
+    candidate probabilities is pruned, before temperature and the
+    lookahead boost, so the boost cannot revive a pruned candidate.
+
+    Renamed from sample_next(). Behavior unchanged apart from drying.
     """
     rng = rng or np.random.default_rng()
     probs = np.asarray(probs, dtype=np.float64)
@@ -321,7 +437,13 @@ def sample_at_boundary(probs, temperature=1.0, top_k=10, rng=None,
     else:
         top_idx = nonzero_idx
 
+    if dry:
+        top_idx = dry_local_minimum(probs, top_idx,
+                                    min_keep=dry_min_keep, gap_ratio=dry_gap)
+
     top_probs = probs[top_idx]
+    if mirror is not None:
+        top_probs = mirror.distort(top_idx, top_probs, step=step)
     logits = np.log(top_probs) / max(temperature, 1e-6)
     if lookahead_bias is not None and boost_strength != 0.0:
         logits = logits + boost_strength * np.asarray(lookahead_bias)[top_idx]
@@ -367,7 +489,9 @@ class HECMModel:
     inferred from comments."""
 
     def __init__(self, tokens, order=3, min_count=1, beta=0.0, alpha=0.0,
-                 max_diffusion_states=1500, payload=None, boost_strength=0.0):
+                 max_diffusion_states=1500, payload=None, boost_strength=0.0,
+                 sort_mode="sine", shatter=0.0, shards=7, shatter_sigma=0.35,
+                 shatter_drift=0.05, shatter_seed=0):
         self.order = order
         vocab, word_to_idx, counts = build_vocab(tokens, min_count=min_count)
         self.vocab = vocab
@@ -377,7 +501,7 @@ class HECMModel:
             tokens, word_to_idx, order=order
         )
 
-        perm = log_sort_contexts(contexts, context_counts)
+        perm = log_sort_contexts(contexts, context_counts, mode=sort_mode)
         contexts = [contexts[i] for i in perm]
         membrane = permute_matrix(membrane, perm)
         context_to_idx = {ctx: i for i, ctx in enumerate(contexts)}
@@ -393,7 +517,14 @@ class HECMModel:
 
         self.P_diffused = self.P_retrospective
         self.P_final = self.P_retrospective
-        
+
+        self.mirror = None
+        if shatter > 0.0:
+            coords = build_mirror_coords(self.P_final, seed=shatter_seed)
+            self.mirror = ShatterMirrors(
+                coords, n_shards=shards, strength=shatter, sigma=shatter_sigma,
+                drift=shatter_drift, seed=shatter_seed,
+            )
 
         self.boost_strength = boost_strength
         self.tau = compute_temporal_index(boost_strength)
@@ -456,7 +587,7 @@ class HECMModel:
 
     def generate(self, prompt, max_new_tokens=40, top_k=10, base_temp=0.8,
                  amplitude=0.4, omega=0.5, phase=0.0, seed=None,
-                 boost_strength=0.0):
+                 boost_strength=0.0, dry=True, dry_gap=4.0):
         rng = np.random.default_rng(seed)
         prompt_ids = self._tokenize_prompt(prompt)
 
@@ -471,6 +602,8 @@ class HECMModel:
             next_ctx_idx = sample_at_boundary(
                 probs, temperature=temp, top_k=top_k, rng=rng,
                 lookahead_bias=self.introduced_word_score, boost_strength=boost_strength,
+                dry=dry, dry_gap=dry_gap,
+                mirror=self.mirror, step=step,
             )
 
             if next_ctx_idx is None:
@@ -520,6 +653,19 @@ def main():
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--boost", type=str, default=None)
     ap.add_argument("--boost-strength", type=float, default=1.0)
+    ap.add_argument("--sort-mode", choices=["log", "sine"], default="sine",
+                    help="context ordering key: original -log(c+1) or exp(log(x)*sin(x))")
+    ap.add_argument("--no-dry", action="store_true", help="disable tail pruning")
+    ap.add_argument("--dry-gap", type=float, default=4.0,
+                    help="prune tail when the steepest drop between sorted probs is >= this ratio")
+    ap.add_argument("--shatter", type=float, default=0.6,
+                    help="mirror distortion strength 0..1 (0 disables)")
+    ap.add_argument("--shards", type=int, default=7, help="number of glass shards / mirrors")
+    ap.add_argument("--shatter-sigma", type=float, default=0.35,
+                    help="width of each reflected bump on the 2D plane")
+    ap.add_argument("--shatter-drift", type=float, default=0.05,
+                    help="mirror rotation per generation step (radians)")
+    ap.add_argument("--shatter-seed", type=int, default=0)
     args = ap.parse_args()
 
     tokens = load_corpus(paths=args.data)
@@ -532,6 +678,10 @@ def main():
         beta=args.beta, alpha=args.alpha,
         max_diffusion_states=args.max_diffusion_states,
         boost_strength=boost_strength,
+        sort_mode=args.sort_mode,
+        shatter=args.shatter, shards=args.shards,
+        shatter_sigma=args.shatter_sigma, shatter_drift=args.shatter_drift,
+        shatter_seed=args.shatter_seed,
     )
 
     print(
@@ -559,6 +709,7 @@ def main():
             base_temp=args.base_temp, amplitude=args.amplitude,
             omega=args.omega, phase=args.phase, seed=args.seed,
             boost_strength=boost_strength,
+            dry=not args.no_dry, dry_gap=args.dry_gap,
         )
         print(result)
         print(f"[info] quanta crossed this run (N): {model.last_quanta_crossed}", file=sys.stderr)
