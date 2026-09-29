@@ -1,729 +1,264 @@
+#!/usr/bin/env python3
+"""Assign a value to the words of a prompt; it unfolds THROUGH the byte
+encoding, and the text stream continues the prompt.
+
+Two graphs, joined by the spelling of each word:
+
+  word graph   Sn   words compared by the contexts they live in (like-minded
+                    by use): cosine of (left ++ right) bigram signatures,
+                    top-n, symmetrized.
+  byte graph   Sb   byte 3-gram states (with word-boundary marks) linked when
+                    they follow each other inside a word: like-minded by form.
+  interface    B    word <-> the byte states along its spelling.
+
+One unfolding hop from a word-value vector `cur`:
+    via use   = Sn @ cur                       # cross comparison of words
+    via bytes = B @ ( Sb @ (B.T @ cur) )       # deposit on byte states,
+                                               # spread on the byte graph,
+                                               # read back onto words
+    cur       = decay * (mix*via_use + (1-mix)*via_bytes)
+The byte-state field also reads out ANY string, including words that are not
+in the data.
+
+The prompt: every prompt word that appears in the data gets a value, scaled by
+rarity (log(N/count), the rarest prompt word gets --value), so "the" in a
+prompt doesn't swamp "moon". Prompt words not in the data are reported and
+get no value.
+"""
 import argparse
-import glob
 import math
 import re
 import sys
-from collections import Counter
+import time
+from collections import Counter, defaultdict
 
 import numpy as np
 import scipy.sparse as sp
-from scipy.linalg import expm
-from scipy.sparse.linalg import svds
-
-UNK = "<unk>"
-BOS = "<bos>"
-
-
-# ---------------------------------------------------------------------------
-# 1. Dataset loading (unchanged — no construct in the paper maps to this)
-# ---------------------------------------------------------------------------
-
-def load_corpus(paths=None, raw_text=None, lowercase=True, strip_punct=False):
-    text_chunks = []
-    if paths:
-        found_any = False
-        for pattern in paths:
-            for fp in sorted(glob.glob(pattern)):
-                found_any = True
-                with open(fp, "r", encoding="utf-8", errors="ignore") as f:
-                    text_chunks.append(f.read())
-        if not found_any:
-            print(f"[warn] no files matched {paths}", file=sys.stderr)
-
-    if raw_text:
-        text_chunks.append(raw_text)
-    if not text_chunks:
-        text_chunks.append(_DEMO_CORPUS)
-
-    full_text = "\n".join(text_chunks)
-    if lowercase:
-        full_text = full_text.lower()
-
-    tokens = re.findall(r"[a-z0-9']+|[.,!?;:]", full_text)
-    if strip_punct:
-        tokens = [t for t in tokens if re.match(r"[a-z0-9']+", t)]
-    return tokens
-
-
-with open(input("Filename: "), "r", encoding="utf-8") as file:
-    _DEMO_CORPUS = file.read()
-
-
-def build_vocab(tokens, min_count=1):
-    counts = Counter(tokens)
-    kept = sorted([w for w, c in counts.items() if c >= min_count])
-    vocab = [UNK, BOS] + kept
-    word_to_idx = {w: i for i, w in enumerate(vocab)}
-    return vocab, word_to_idx, counts
-
-
-# ---------------------------------------------------------------------------
-# 2. The membrane: context-state construction
-#
-#    Exchange: "topological energy membrane separating internal state space
-#    from environment" -> the boundary crossed when the Markov chain moves
-#    from one context-state to the next. d-Omega is not a spatial surface;
-#    it is the transition itself. Quanta N are tokens: one per crossing,
-#    genuinely indivisible (the tokenizer's vocabulary IS a discrete set),
-#    which is the one place in the whole exercise where "quanta" is not a
-#    metaphor borrowed from QM — it is just an accurate word for "discrete
-#    countable unit," which is what a token already was.
-# ---------------------------------------------------------------------------
-
-def build_membrane_transition_graph(tokens, word_to_idx, order=3):
-    """Build the square context -> context transition count matrix. This
-    IS the membrane: d-Omega = the set of (context_state -> context_state)
-    edges; a single generation step = one crossing of d-Omega; the emitted
-    word at that step = one quantum.
-
-    Renamed from build_ngram_contexts(). Same function, same sparse-matrix
-    justification: a dense (num_contexts x num_contexts) "membrane" at
-    real corpus scale is gigabytes to hundreds of gigabytes, which is
-    exactly the mass-density blowup discussed in build_mass_density_term()
-    below — the membrane and the mass term are two names for adjacent
-    facts about the same object, not two separate mechanisms.
-    """
-    ctx_len = order - 1
-    if ctx_len < 1:
-        raise ValueError("order must be >= 2")
-
-    bos_idx = word_to_idx[BOS]
-    unk_idx = word_to_idx[UNK]
-    ids = [word_to_idx.get(t, unk_idx) for t in tokens]
-    padded = [bos_idx] * ctx_len + ids
-
-    context_to_idx = {}
-    contexts = []
-    context_counts = Counter()
-    edges = Counter()
-
-    def get_ctx_idx(ctx_tuple):
-        if ctx_tuple not in context_to_idx:
-            context_to_idx[ctx_tuple] = len(contexts)
-            contexts.append(ctx_tuple)
-        return context_to_idx[ctx_tuple]
-
-    n = len(padded)
-    for i in range(n - ctx_len):
-        ctx = tuple(padded[i:i + ctx_len])
-        next_ctx = tuple(padded[i + 1:i + 1 + ctx_len])
-        ci = get_ctx_idx(ctx)
-        cj = get_ctx_idx(next_ctx)
-        context_counts[ctx] += 1
-        edges[(ci, cj)] += 1.0
-
-    m = len(contexts)
-    if edges:
-        rows, cols, data = zip(*[(r, c, v) for (r, c), v in edges.items()])
-    else:
-        rows, cols, data = (), (), ()
-    membrane = sp.csr_matrix((data, (rows, cols)), shape=(m, m), dtype=np.float64)
-
-    return contexts, context_to_idx, membrane, context_counts
-
-
-def log_sort_contexts(contexts, context_counts, mode="sine"):
-    """Return context indices ordered by a key on each context's count.
-
-    mode="log":  original ordering, key = -log(c + 1)
-    mode="sine": key = exp(log(x) * sin(x)) with x = c + 1
-                 (mathematically x ** sin(x); not monotonic in x)
-    """
-    def key(ctx):
-        x = context_counts.get(ctx, 0) + 1.0
-        if mode == "sine":
-            return math.exp(math.log(x) * math.sin(x))
-        return -math.log(x)
-
-    return sorted(range(len(contexts)), key=lambda i: key(contexts[i]))
-
-
-def permute_matrix(M, order):
-    order = np.asarray(order)
-    if sp.issparse(M):
-        return M[order, :][:, order].tocsr()
-    return M[np.ix_(order, order)]
-
-
-def membrane_flux_normalize(M, eps=1e-9):
-    """Row-normalize the membrane's transition weights into a proper
-    conservation law: total probability flux leaving any context-state
-    across d-Omega sums to 1. This is the literal, enforced version of the
-    paper's heuristic surface integral N = oint_dOmega sigma(x) dx — not
-    an analogy to it, an instance of it, since a row-stochastic matrix row
-    IS a discrete measure over the boundary that sums to a fixed quantum
-    budget per step.
-
-    Renamed from row_normalize(). Behavior unchanged.
-    """
-    if sp.issparse(M):
-        row_sums = np.asarray(M.sum(axis=1)).ravel()
-        row_sums[row_sums == 0] = 1.0
-        inv = sp.diags(1.0 / row_sums)
-        return (inv @ M).tocsr()
-    row_sums = M.sum(axis=1, keepdims=True)
-    row_sums[row_sums == 0] = 1.0
-    return M / (row_sums + eps)
-
-
-# ---------------------------------------------------------------------------
-# 3. Mass-density coupling term
-#
-#    Exchange: rho_eff (effective mass-density, coupled to retrospective
-#    orientation) -> the memory footprint and O(n^2)-to-O(n^3) compute cost
-#    of diffusing probability mass across the membrane. This is the ONE
-#    construct in the original paper that upgrades from metaphor to fact
-#    when ported to code: "retrospection carries more computational mass"
-#    stops being poetic and becomes a literal, measurable claim about
-#    bytes and FLOPs, which is exactly what the original file's own
-#    docstring already said before any relabeling ("137,702 contexts ->
-#    ~141 GiB").
-# ---------------------------------------------------------------------------
-
-def build_mass_density_term(P, beta=0.15, remove_self_loops=True):
-    """expm(beta * (P - I)): the diffusion/propagation step. In the paper's
-    vocabulary this is where mass-density is "felt" — it is the most
-    expensive operation in the pipeline (O(n^3) for a state space of size
-    n), and its cost is precisely what rho_eff = M(t)/|Omega_active(t)|
-    measures. A system leaning harder on this term (more diffusion, less
-    raw/verbatim retrospective lookup) really does carry more
-    computational mass: more memory, more latency, more bandwidth.
-
-    Renamed from diffusion_weighting(). Behavior unchanged, including the
-    self-loop caveat: exp(-beta) concentrates on the diagonal for small
-    beta, which would make generation stick to one context-state forever
-    (i.e., infinite effective mass, zero motion) unless removed.
-    """
-    m = P.shape[0]
-    L = P - np.eye(m)
-    D = expm(beta * L)
-    D = np.clip(D, 0, None)
-
-    if remove_self_loops:
-        np.fill_diagonal(D, 0.0)
-        row_sums = D.sum(axis=1)
-        dead_rows = row_sums <= 1e-12
-        if np.any(dead_rows):
-            fallback = P.copy()
-            np.fill_diagonal(fallback, 0.0)
-            fb_sums = fallback.sum(axis=1, keepdims=True)
-            fb_sums[fb_sums == 0] = 1.0
-            fallback = fallback / fb_sums
-            D[dead_rows] = fallback[dead_rows]
-
-    D = membrane_flux_normalize(D)
-    return D
-
-
-def blend_temporal_orientation(P_retrospective, P_diffused, alpha=0.5,
-                                remove_self_loops=True):
-    """Blend the purely retrospective (raw n-gram, tau = -1) distribution
-    with the mass-density-diffused one, controlled by alpha. alpha is the
-    closest thing in this codebase to a dial on tau: alpha=0 is maximally
-    retrospective (pure lookup), alpha=1 is maximally diffused (mass-heavy,
-    still not "anticipatory" in any real sense — see the note in
-    compute_temporal_index() below about why diffusion isn't lookahead).
-
-    Renamed from blend(). Behavior unchanged.
-    """
-    P = (1 - alpha) * P_retrospective * alpha * P_diffused
-    if remove_self_loops:
-        np.fill_diagonal(P, 0.0)
-        P = membrane_flux_normalize(P)
-    return P
-
-
-def compute_mass_density(num_states, dtype_bytes=8):
-    """rho_eff = M(t) / |Omega_active(t)|, made concrete: bytes required
-    for a DENSE membrane of this many context-states, divided by the
-    number of active states. This is the real, computable version of the
-    coupling constant lambda from the original speculative paper — no
-    free parameter, just arithmetic.
-    """
-    dense_bytes = (num_states ** 2) * dtype_bytes
-    rho_eff = dense_bytes / max(num_states, 1)
-    return dense_bytes, rho_eff
-
-
-# ---------------------------------------------------------------------------
-# 4. Temporal index computation
-#
-#    Exchange: tau (subjective temporal orientation) -> fraction of
-#    per-step decision compute spent on the payload lookahead-rerank
-#    (prospective: scoring a word BEFORE it's committed) versus the raw
-#    context lookup (retrospective: reading what was already observed).
-# ---------------------------------------------------------------------------
-
-def compute_temporal_index(boost_strength, lookahead_ops=1, retrospective_ops=1):
-    """tau = (C_lookahead - C_retrospective) / (C_lookahead + C_retrospective),
-    gated by whether the payload customizer is active at all.
-
-    With boost_strength == 0, the payload rerank never executes (see
-    sample_at_boundary below), so tau = -1 exactly: this generator is
-    purely retrospective, same as any causal-masked autoregressive model.
-
-    With boost_strength > 0, the payload dot-product IS a one-step
-    lookahead — it scores the word that would be newly introduced by a
-    candidate transition before that transition is taken — so tau ticks
-    positive by an amount proportional to how much compute that rerank
-    consumes relative to the base lookup. This is a real, bounded,
-    non-metaphorical number, not a stand-in for felt anticipation.
-
-    Note on the diffusion term: build_mass_density_term() does NOT count
-    as lookahead, even though it's a "future-looking" propagator in the
-    continuous-time-Markov sense. It diffuses probability mass over
-    ALREADY-OBSERVED transitions; it doesn't evaluate not-yet-taken
-    candidate words the way the payload rerank does. Mass-density and
-    temporal index are independent axes here, exactly as the original
-    paper treated rho_eff and tau as coupled-but-distinct variables.
-    """
-    if boost_strength == 0.0:
-        return -1.0
-    total = lookahead_ops + retrospective_ops
-    return (boost_strength * lookahead_ops - retrospective_ops) / (
-        boost_strength * lookahead_ops + retrospective_ops
-    )
-
-
-# ---------------------------------------------------------------------------
-# 5. Sinusoidal temperature — kept under its plain name
-#
-#    This is the one function this file will NOT rename into the paper's
-#    "harmonic resonance" vocabulary. See module docstring.
-# ---------------------------------------------------------------------------
-
-def sinusoidal_temperature(step, base_temp=0.8, amplitude=0.4, omega=0.5, phase=0.0, floor=0.05):
-    t = base_temp + amplitude * math.sin(omega * step + phase)
-    return max(floor, t)
-
-
-# ---------------------------------------------------------------------------
-# 6. Sampling: where the decision operator D acts on the rule R
-#
-#    Exchange: "decisions precede the rule-set" -> D narrows/reranks the
-#    ALREADY-LAWFUL candidate set (nonzero-probability transitions); it
-#    can never make a zero-probability transition eligible. R (the
-#    observed n-gram law, P_final) is never edited by D. This is the
-#    weak, defensible reading of the inversion, not the strong claim that
-#    decisions rewrite physics.
-# ---------------------------------------------------------------------------
-
-def dry_local_minimum(probs, idx, min_keep=2, gap_ratio=4.0):
-    """Prune the tail below the steepest drop in the sorted candidate probs.
-
-    probs: the full probability row; idx: candidate indices (nonzero, after top_k).
-    Returns the subset of idx to keep. The cut only happens when the biggest
-    drop is at least `gap_ratio`x, so flat distributions are left untouched.
-    """
-    if len(idx) <= min_keep:
-        return idx
-    order = np.argsort(probs[idx])[::-1]          # descending by prob
-    sorted_p = probs[idx][order]
-    drops = sorted_p[:-1] / sorted_p[1:]           # p_i / p_{i+1}
-    # only consider cut points that keep at least min_keep candidates
-    drops[: min_keep - 1] = 0.0
-    cut = int(np.argmax(drops))
-    if drops[cut] < gap_ratio:
-        return idx
-    return idx[order[: cut + 1]]
-
-
-def build_mirror_coords(P, seed=0):
-    """Place every context-state on a 2D plane. Uses the 2nd and 3rd singular
-    vectors of the transition matrix (the 1st is the trivial stationary mode),
-    so states that transition to similar places sit near each other. Falls
-    back to random positions for tiny or degenerate matrices."""
-    m = P.shape[0]
-    rng = np.random.default_rng(seed)
-    coords = None
-    if m > 4:
-        try:
-            u, s, _ = svds(P.astype(np.float64), k=3, v0=rng.standard_normal(m))
-            order = np.argsort(-s)[1:3]
-            coords = u[:, order] * s[order]
-        except Exception as e:
-            print(f"[warn] svds embedding failed ({e}); using random 2D layout", file=sys.stderr)
-    if coords is None or not np.all(np.isfinite(coords)) or np.ptp(coords) < 1e-12:
-        coords = rng.standard_normal((m, 2))
-    coords = coords - coords.mean(axis=0)
-    coords = coords / max(np.abs(coords).max(), 1e-12)
-    return coords
-
-
-class ShatterMirrors:
-    """A pane of broken glass laid over the candidate plane.
-
-    The plane is split into Voronoi shards. Each shard has its own mirror
-    line. A candidate's probability mass is not spent on the candidate
-    itself: it is emitted from the candidate's REFLECTED position (reflected
-    in its shard's mirror), as a Gaussian bump of width `sigma`, and lands
-    on whichever candidates sit near that reflected image. Shard borders
-    are discontinuities, so neighbouring candidates in different shards get
-    thrown in unrelated directions -- that is the shattering. `drift`
-    slowly rotates the mirrors each step so the fracture pattern evolves.
-
-    The distortion only re-weights candidates that already survived
-    top-k/drying, and it is blended with the original distribution via
-    `strength`, so it can never make a zero-probability transition eligible.
-    """
-
-    def __init__(self, coords, n_shards=7, strength=0.6, sigma=0.35,
-                 drift=0.05, seed=0):
-        rng = np.random.default_rng(seed)
-        self.coords = coords
-        self.strength = strength
-        self.sigma = max(sigma, 1e-3)
-        self.drift = drift
-        self.seeds = rng.uniform(-1, 1, (n_shards, 2))
-        self.angles = rng.uniform(0, math.pi, n_shards)
-        self.offsets = rng.uniform(-0.3, 0.3, (n_shards, 2))
-
-    def distort(self, idx, p, step=0):
-        if self.strength <= 0 or len(idx) < 2:
-            return p
-        p = p / p.sum()
-        pts = self.coords[idx]                                   # (n, 2)
-
-        # which shard each candidate lives in
-        d2 = ((pts[:, None, :] - self.seeds[None, :, :]) ** 2).sum(-1)
-        shard = d2.argmin(axis=1)
-
-        # reflect each candidate across its shard's mirror line
-        ang = self.angles[shard] + self.drift * step
-        dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
-        a = self.seeds[shard] + self.offsets[shard]
-        rel = pts * a
-        proj = (rel * dirs).sum(axis=1, keepdims=True) * dirs
-        refl = a + 2.0 * proj - rel
-
-        # mass emitted from reflected images lands on nearby candidates
-        d2 = ((pts[:, None, :] - refl[None, :, :]) ** 2).sum(-1)  # [target, source]
-        kernel = np.exp(-d2 / (2.0 * self.sigma ** 2))
-        landed = kernel @ p
-        total = landed.sum()
-        if total <= 1e-300:
-            return p
-        landed = landed / total
-
-        mixed = (1.0 - self.strength) * p + self.strength * landed
-        return mixed / mixed.sum()
-
-
-def sample_at_boundary(probs, temperature=1.0, top_k=10, rng=None,
-                        lookahead_bias=None, boost_strength=0.0,
-                        dry=True, dry_gap=4.0, dry_min_keep=2,
-                        mirror=None, step=0):
-    """Cross d-Omega once: pick the next context-state (i.e. emit one
-    quantum). `lookahead_bias` is the decision operator D's input;
-    `probs` (P_final's row) is the rule R. D can only rerank within
-    nonzero_idx — the domain R already permits — never expand it.
-
-    Drying: after top-k, the tail below the steepest drop in the sorted
-    candidate probabilities is pruned, before temperature and the
-    lookahead boost, so the boost cannot revive a pruned candidate.
-
-    Renamed from sample_next(). Behavior unchanged apart from drying.
-    """
+
+SEP = 256                                   # word-boundary symbol
+SENTENCE_END = {".", "!", "?"}
+
+
+def normalize_rows(M):
+    s = np.asarray(M.sum(axis=1)).ravel()
+    s[s == 0] = 1.0
+    return sp.diags(1.0 / s) @ M if sp.issparse(M) else M / s[:, None]
+
+
+def word_states(word, k=3):
+    seq = (SEP,) + tuple(word.encode("utf-8")) + (SEP,)
+    seq = seq + (SEP,) * max(0, k - len(seq))
+    return [seq[i:i + k] for i in range(len(seq) - k + 1)]
+
+
+def show_state(st):
+    out, buf = [], []
+    for b in st:
+        if b == SEP:
+            if buf:
+                out.append(bytes(buf).decode("utf-8", "replace"))
+                buf = []
+            out.append("|")
+        else:
+            buf.append(b)
+    if buf:
+        out.append(bytes(buf).decode("utf-8", "replace"))
+    return "".join(out)
+
+
+class ValueField:
+    def __init__(self, tokens, values, top=5, hops=3, decay=0.5, mix=0.5, k=3):
+        self.k = k
+        self.vocab = sorted(set(tokens))
+        self.idx = {w: i for i, w in enumerate(self.vocab)}
+        n = len(self.vocab)
+
+        # word graph: cross comparison by context
+        C = np.zeros((n, n))
+        for a, b in zip(tokens, tokens[1:]):
+            C[self.idx[a], self.idx[b]] += 1.0
+        X = np.hstack([normalize_rows(C), normalize_rows(C.T)])
+        X /= np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
+        S = X @ X.T
+        np.fill_diagonal(S, 0.0)
+        K = np.zeros_like(S)
+        for i in range(n):
+            j = np.argsort(S[i])[-top:]
+            K[i, j] = S[i, j]
+        K = np.maximum(K, K.T)
+        d = np.sqrt(np.maximum(K.sum(axis=1), 1e-12))
+        Sn = K / np.outer(d, d)
+
+        # byte graph + word/byte interface
+        self.states = {}
+        rows, cols, er, ec = [], [], [], []
+        for wi, w in enumerate(self.vocab):
+            path = [self.states.setdefault(st, len(self.states)) for st in word_states(w, k)]
+            rows += [wi] * len(path)
+            cols += path
+            for a, b in zip(path, path[1:]):
+                if a != b:
+                    er += [a, b]
+                    ec += [b, a]
+        ns = len(self.states)
+        B = normalize_rows(sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, ns)))
+        A = sp.csr_matrix((np.ones(len(er)), (er, ec)), shape=(ns, ns))
+        A.data[:] = 1.0
+        dd = 1.0 / np.sqrt(np.maximum(np.asarray(A.sum(axis=1)).ravel(), 1e-12))
+        Sb = sp.diags(dd) @ A @ sp.diags(dd)
+        self.state_list = list(self.states)
+
+        # unfolding: every hop crosses the interface
+        v0 = np.zeros(n)
+        for w, x in values.items():
+            v0[self.idx[w]] = x
+        cur, self.field = v0, v0.copy()
+        self.tiers = [v0]
+        self.state_field = B.T @ v0
+        for _ in range(hops):
+            via_use = Sn @ cur
+            st = Sb @ (B.T @ cur)
+            via_bytes = B @ st
+            cur = decay * (mix * via_use + (1 - mix) * via_bytes)
+            self.state_field = self.state_field + (1 - mix) * decay * st
+            self.field = self.field + cur
+            self.tiers.append(cur)
+
+    def read(self, word):
+        """Value of ANY string from the byte-state field (works out of vocabulary)."""
+        ids = [self.states[s] for s in word_states(word, self.k) if s in self.states]
+        return float(np.mean(self.state_field[ids])) if ids else 0.0
+
+
+class Trigrams:
+    """Word trigram rule R: (w1, w2) -> next word, backing off to the bigram
+    (w2 -> next word). The value field only reranks what R allows."""
+
+    def __init__(self, tokens):
+        self.tri, self.bi = defaultdict(Counter), defaultdict(Counter)
+        self.starts = Counter(tokens[:1])                    # words that open a sentence
+        for a, b in zip(tokens, tokens[1:]):
+            if a in SENTENCE_END:
+                self.starts[b] += 1
+        for a, b, c in zip(tokens, tokens[1:], tokens[2:]):
+            self.tri[(a, b)][c] += 1
+        for a, b in zip(tokens, tokens[1:]):
+            self.bi[a][b] += 1
+
+    def table(self, out):
+        if len(out) >= 2 and (out[-2], out[-1]) in self.tri:
+            return self.tri[(out[-2], out[-1])]
+        return self.bi.get(out[-1])
+
+
+def generate(vf, tg, start, n=40, beta=3.0, rng=None):
+    """logit(next) = log P_trigram(next | prev two words) + beta * value(next)."""
     rng = rng or np.random.default_rng()
-    probs = np.asarray(probs, dtype=np.float64)
-
-    nonzero_idx = np.nonzero(probs > 0)[0]
-    if len(nonzero_idx) == 0:
-        return None
-
-    if top_k is not None and 0 < top_k < len(nonzero_idx):
-        sub = np.argpartition(probs[nonzero_idx], -top_k)[-top_k:]
-        top_idx = nonzero_idx[sub]
-    else:
-        top_idx = nonzero_idx
-
-    if dry:
-        top_idx = dry_local_minimum(probs, top_idx,
-                                    min_keep=dry_min_keep, gap_ratio=dry_gap)
-
-    top_probs = probs[top_idx]
-    if mirror is not None:
-        top_probs = mirror.distort(top_idx, top_probs, step=step)
-    logits = np.log(top_probs) / max(temperature, 1e-6)
-    if lookahead_bias is not None and boost_strength != 0.0:
-        logits = logits + boost_strength * np.asarray(lookahead_bias)[top_idx]
-    logits -= logits.max()
-    weights = np.exp(logits)
-    weights /= weights.sum()
-
-    choice = rng.choice(len(top_idx), p=weights)
-    return top_idx[choice]
-
-
-def parse_payload(payload_str, word_to_idx):
-    vocab_size = len(word_to_idx)
-    payload_vector = np.zeros(vocab_size, dtype=np.float64)
-    if not payload_str:
-        return payload_vector
-    for item in payload_str.split(","):
-        item = item.strip()
-        if not item:
+    out = [start]
+    while len(out) < n:
+        table = tg.table(out)
+        if not table:                       # dead end: restart from the start word
+            out.append(start)
             continue
-        if ":" in item:
-            word, weight_str = item.rsplit(":", 1)
-            try:
-                weight = float(weight_str)
-            except ValueError:
-                print(f"[warn] payload entry '{item}' has a non-numeric weight; skipping", file=sys.stderr)
-                continue
-        else:
-            word, weight = item, 1.0
-        word = word.strip().lower()
-        idx = word_to_idx.get(word)
-        if idx is None:
-            print(f"[warn] payload word '{word}' is not in the vocabulary; skipping", file=sys.stderr)
-            continue
-        payload_vector[idx] = weight
-    return payload_vector
+        words = list(table)
+        p = np.array([table[w] for w in words], dtype=np.float64)
+        logits = np.log(p / p.sum()) + beta * vf.field[[vf.idx[w] for w in words]]
+        w = np.exp(logits - logits.max())
+        out.append(words[rng.choice(len(words), p=w / w.sum())])
+    return out
 
 
-class HECMModel:
-    """Same model as before. Internally, the membrane, mass-density term,
-    and temporal index are now named as such and exposed as attributes
-    (self.rho_eff, self.tau) so they can be inspected directly rather than
-    inferred from comments."""
-
-    def __init__(self, tokens, order=3, min_count=1, beta=0.0, alpha=0.0,
-                 max_diffusion_states=1500, payload=None, boost_strength=0.0,
-                 sort_mode="sine", shatter=0.0, shards=7, shatter_sigma=0.35,
-                 shatter_drift=0.05, shatter_seed=0):
-        self.order = order
-        vocab, word_to_idx, counts = build_vocab(tokens, min_count=min_count)
-        self.vocab = vocab
-        self.word_to_idx = word_to_idx
-
-        contexts, context_to_idx, membrane, context_counts = build_membrane_transition_graph(
-            tokens, word_to_idx, order=order
-        )
-
-        perm = log_sort_contexts(contexts, context_counts, mode=sort_mode)
-        contexts = [contexts[i] for i in perm]
-        membrane = permute_matrix(membrane, perm)
-        context_to_idx = {ctx: i for i, ctx in enumerate(contexts)}
-
-        self.contexts = contexts
-        self.context_to_idx = context_to_idx
-        self.context_counts = context_counts
-
-        self.P_retrospective = membrane_flux_normalize(membrane)
-
-        num_states = len(contexts)
-        self.dense_bytes, self.rho_eff = compute_mass_density(num_states)
-
-        self.P_diffused = self.P_retrospective
-        self.P_final = self.P_retrospective
-
-        self.mirror = None
-        if shatter > 0.0:
-            coords = build_mirror_coords(self.P_final, seed=shatter_seed)
-            self.mirror = ShatterMirrors(
-                coords, n_shards=shards, strength=shatter, sigma=shatter_sigma,
-                drift=shatter_drift, seed=shatter_seed,
-            )
-
-        self.boost_strength = boost_strength
-        self.tau = compute_temporal_index(boost_strength)
-
-        if payload is None:
-            payload = np.zeros(len(vocab), dtype=np.float64)
-        self.payload = payload
-        self.context_word_score = np.array(
-            [sum(payload[w] for w in ctx) for ctx in contexts], dtype=np.float64
-        )
-        self.introduced_word_score = np.array(
-            [payload[ctx[-1]] for ctx in contexts], dtype=np.float64
-        )
-        self.context_total_score = self.context_word_score + 0.0
-
-    def vocab_size(self):
-        return len(self.vocab)
-
-    def num_states(self):
-        return len(self.contexts)
-
-    def _get_row(self, ctx_idx):
-        row = self.P_final[ctx_idx]
-        if sp.issparse(self.P_final):
-            return np.asarray(row.todense()).ravel()
-        return np.asarray(row)
-
-    def _tokenize_prompt(self, prompt):
-        toks = re.findall(r"[a-z0-9']+|[.,!?;:]", prompt.lower())
-        unk = self.word_to_idx[UNK]
-        return [self.word_to_idx.get(t, unk) for t in toks]
-
-    def _weighted_pick(self, candidates, boost_strength, rng):
-        if boost_strength == 0.0 or len(candidates) == 1:
-            return candidates[rng.integers(len(candidates))] if len(candidates) > 1 else candidates[0]
-        scores = boost_strength * self.context_total_score[candidates]
-        scores = scores - scores.max()
-        weights = np.exp(scores)
-        weights /= weights.sum()
-        return candidates[rng.choice(len(candidates), p=weights)]
-
-    def _initial_context(self, prompt_ids, rng, boost_strength=0.0):
-        ctx_len = self.order - 1
-        bos = self.word_to_idx[BOS]
-        padded = [bos] * ctx_len + prompt_ids
-        desired = tuple(padded[-ctx_len:])
-
-        if desired in self.context_to_idx:
-            return self.context_to_idx[desired]
-
-        for k in range(ctx_len - 1, 0, -1):
-            suffix = desired[-k:]
-            candidates = [i for i, ctx in enumerate(self.contexts) if ctx[-k:] == suffix]
-            if candidates:
-                return self._weighted_pick(candidates, boost_strength, rng)
-
-        counts_arr = np.array([self.context_counts.get(ctx, 0) for ctx in self.contexts])
-        top_candidates = list(np.argsort(counts_arr)[-10:])
-        return self._weighted_pick(top_candidates, boost_strength, rng)
-
-    def generate(self, prompt, max_new_tokens=40, top_k=10, base_temp=0.8,
-                 amplitude=0.4, omega=0.5, phase=0.0, seed=None,
-                 boost_strength=0.0, dry=True, dry_gap=4.0):
-        rng = np.random.default_rng(seed)
-        prompt_ids = self._tokenize_prompt(prompt)
-
-        ctx_idx = self._initial_context(prompt_ids, rng, boost_strength=boost_strength)
-        out_ids = list(prompt_ids)
-        quanta_crossed = 0  # N: count of boundary crossings this run
-
-        for step in range(max_new_tokens):
-            temp = sinusoidal_temperature(step, base_temp=base_temp, amplitude=amplitude,
-                                           omega=omega, phase=phase)
-            probs = self._get_row(ctx_idx)
-            next_ctx_idx = sample_at_boundary(
-                probs, temperature=temp, top_k=top_k, rng=rng,
-                lookahead_bias=self.introduced_word_score, boost_strength=boost_strength,
-                dry=dry, dry_gap=dry_gap,
-                mirror=self.mirror, step=step,
-            )
-
-            if next_ctx_idx is None:
-                ctx_idx = self._initial_context(out_ids, rng, boost_strength=boost_strength)
-                continue
-
-            next_word_id = self.contexts[next_ctx_idx][-1]
-            out_ids.append(next_word_id)
-            ctx_idx = next_ctx_idx
-            quanta_crossed += 1
-
-        self.last_quanta_crossed = quanta_crossed
-        words = [self.vocab[i] for i in out_ids]
-        return _detokenize(words)
+def _pick(vf, table, beta, rng):
+    words = list(table)
+    p = np.array([table[w] for w in words], dtype=np.float64)
+    logits = np.log(p / p.sum()) + beta * vf.field[[vf.idx[w] for w in words]]
+    w = np.exp(logits - logits.max())
+    return words[rng.choice(len(words), p=w / w.sum())]
 
 
-def _detokenize(tokens):
-    out = []
-    for tok in tokens:
-        if tok in (BOS,):
-            continue
-        if out and re.match(r"[.,!?;:]", tok):
-            out[-1] = out[-1] + tok
-        else:
-            out.append(tok)
-    text = " ".join(out)
-    if text:
-        text = text[0].upper() + text[1:]
-    return text
-
-
-def main():
-    ap = argparse.ArgumentParser(description="HECM model, relabeled to the temporal-index paper's vocabulary")
-    ap.add_argument("--data", nargs="*", default=None)
-    ap.add_argument("--order", type=int, default=3)
-    ap.add_argument("--min-count", type=int, default=1)
-    ap.add_argument("--beta", type=float, default=0.3, help="mass-density diffusion strength")
-    ap.add_argument("--alpha", type=float, default=0.1, help="temporal-orientation blend factor")
-    ap.add_argument("--max-diffusion-states", type=int, default=5)
-    ap.add_argument("--prompt", type=str, default="the fox and")
-    ap.add_argument("--length", type=int, default=400)
-    ap.add_argument("--top-k", type=int, default=10)
-    ap.add_argument("--base-temp", type=float, default=0.8)
-    ap.add_argument("--amplitude", type=float, default=0.4)
-    ap.add_argument("--omega", type=float, default=0.5)
-    ap.add_argument("--phase", type=float, default=0.0)
-    ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--boost", type=str, default=None)
-    ap.add_argument("--boost-strength", type=float, default=1.0)
-    ap.add_argument("--sort-mode", choices=["log", "sine"], default="sine",
-                    help="context ordering key: original -log(c+1) or exp(log(x)*sin(x))")
-    ap.add_argument("--no-dry", action="store_true", help="disable tail pruning")
-    ap.add_argument("--dry-gap", type=float, default=4.0,
-                    help="prune tail when the steepest drop between sorted probs is >= this ratio")
-    ap.add_argument("--shatter", type=float, default=0.6,
-                    help="mirror distortion strength 0..1 (0 disables)")
-    ap.add_argument("--shards", type=int, default=7, help="number of glass shards / mirrors")
-    ap.add_argument("--shatter-sigma", type=float, default=0.35,
-                    help="width of each reflected bump on the 2D plane")
-    ap.add_argument("--shatter-drift", type=float, default=0.05,
-                    help="mirror rotation per generation step (radians)")
-    ap.add_argument("--shatter-seed", type=int, default=0)
-    args = ap.parse_args()
-
-    tokens = load_corpus(paths=args.data)
-    print(f"[info] loaded {len(tokens)} tokens", file=sys.stderr)
-
-    boost_strength = args.boost_strength if args.boost else 0.0
-
-    model = HECMModel(
-        tokens, order=args.order, min_count=args.min_count,
-        beta=args.beta, alpha=args.alpha,
-        max_diffusion_states=args.max_diffusion_states,
-        boost_strength=boost_strength,
-        sort_mode=args.sort_mode,
-        shatter=args.shatter, shards=args.shards,
-        shatter_sigma=args.shatter_sigma, shatter_drift=args.shatter_drift,
-        shatter_seed=args.shatter_seed,
-    )
-
-    print(
-        f"[info] order={args.order} | vocab={model.vocab_size()} | "
-        f"membrane states={model.num_states()} | "
-        f"rho_eff={model.rho_eff:.1f} bytes/state | "
-        f"tau={model.tau:.3f}",
-        file=sys.stderr,
-    )
-
-    if args.boost:
-        payload = parse_payload(args.boost, model.word_to_idx)
-        model.payload = payload
-        model.context_word_score = np.array(
-            [sum(payload[w] for w in ctx) for ctx in model.contexts], dtype=np.float64
-        )
-        model.introduced_word_score = np.array(
-            [payload[ctx[-1]] for ctx in model.contexts], dtype=np.float64
-        )
-        model.context_total_score = model.context_word_score
-
-    def run_once(prompt):
-        result = model.generate(
-            prompt, max_new_tokens=args.length, top_k=args.top_k,
-            base_temp=args.base_temp, amplitude=args.amplitude,
-            omega=args.omega, phase=args.phase, seed=args.seed,
-            boost_strength=boost_strength,
-            dry=not args.no_dry, dry_gap=args.dry_gap,
-        )
-        print(result)
-        print(f"[info] quanta crossed this run (N): {model.last_quanta_crossed}", file=sys.stderr)
-
-    print("[info] interactive mode -- type a prompt, or 'quit' to exit", file=sys.stderr)
+def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None):
+    """Endless token stream. Inside a sentence: trigram rule + value bias.
+    After a sentence end the context resets and the next sentence opens from
+    the corpus's sentence-openers, again biased by value, so the stream keeps
+    returning to what was valued instead of drifting or looping on a dead end.
+    `ctx` seeds the first context (the last two words of the prompt)."""
+    rng = rng or np.random.default_rng()
+    ctx = list(ctx or [])
     while True:
-        try:
-            prompt = input("prompt> ")
-        except EOFError:
-            break
-        if prompt.strip().lower() in ("quit", "exit"):
-            break
-        run_once(prompt)
+        table = tg.table(ctx) if ctx else tg.starts
+        if not table:
+            ctx = []
+            continue
+        w = _pick(vf, table, beta, rng)
+        yield w
+        ctx = [] if w in SENTENCE_END else (ctx + [w])[-2:]
+
+
+def stream_text(tokens, first=True, cap=True):
+    """Token stream -> text chunks: spacing, punctuation, sentence case.
+    first=False continues after text that is already on screen."""
+    for t in tokens:
+        if re.match(r"[.,!?;:]", t):
+            chunk = t
+        else:
+            chunk = ("" if first else " ") + (t[:1].upper() + t[1:] if cap else t)
+        cap, first = t in SENTENCE_END, False
+        yield chunk
+
+
+def detokenize(tokens):
+    text = ""
+    for t in tokens:
+        text += t if (not text or re.match(r"[.,!?;:]", t)) else " " + t
+    return text[:1].upper() + text[1:]
 
 
 if __name__ == "__main__":
-    main()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data", required=True)
+    ap.add_argument("--prompt", default="the moon",
+                    help="text to continue; its words are valued (rarer words count more)")
+    ap.add_argument("--value", type=float, default=3.0, help="value of the rarest prompt word")
+    ap.add_argument("--mix", type=float, default=0.5, help="1 = by use only, 0 = by bytes only")
+    ap.add_argument("--k", type=int, default=3, help="byte n-gram length of a state")
+    ap.add_argument("--show", type=int, default=10)
+    ap.add_argument("--beta", type=float, default=3.0, help="weight of the unfolded value")
+    gen_seed = int(np.random.SeedSequence().entropy % 2**32)
+
+    ap.add_argument("--words", type=int, default=600, help="stop the stream after N words (0 = endless)")
+    ap.add_argument("--delay", type=float, default=0.03, help="seconds between words")
+    args = ap.parse_args()
+
+    text = open(args.data, encoding="utf-8", errors="ignore").read().lower()
+    tokens = re.findall(r"[\w']+|[.,!?;:]", text)
+
+    # prompt -> values
+    counts = Counter(tokens)
+    ptoks = re.findall(r"[\w']+|[.,!?;:]", input("USER: ").lower())
+    is_word = lambda t: re.match(r"[\w']+", t)
+    known = [w for w in dict.fromkeys(ptoks) if is_word(w) and w in counts]
+    unknown = [w for w in dict.fromkeys(ptoks) if is_word(w) and w not in counts]
+    if unknown:
+        print(f"[warn] not in the data, no value assigned: {unknown}", file=sys.stderr)
+    if not known:
+        raise SystemExit("no prompt word appears in the data")
+    rarity = {w: max(math.log(len(tokens) / counts[w]), 1e-9) for w in known}
+    values = {w: args.value * rarity[w] / max(rarity.values()) for w in known}
+
+    vf = ValueField(tokens, values, mix=args.mix, k=args.k)
+    order = np.argsort(-vf.field)
+
+
+    # stream: print the prompt, then continue it
+    tg = Trigrams(tokens)
+    ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
+    ctx0 = [] if (not ptoks or ended) else ptoks[-2:]
+    toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0)
+
+    for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
+        sys.stdout.write(chunk)
+        sys.stdout.flush()
+        if n >= args.words:
+            break
+        
+    print()
