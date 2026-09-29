@@ -392,7 +392,7 @@ class ShatterMirrors:
         ang = self.angles[shard] + self.drift * step
         dirs = np.stack([np.cos(ang), np.sin(ang)], axis=1)
         a = self.seeds[shard] + self.offsets[shard]
-        rel = pts - a
+        rel = pts * a
         proj = (rel * dirs).sum(axis=1, keepdims=True) * dirs
         refl = a + 2.0 * proj - rel
 
