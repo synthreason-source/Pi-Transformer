@@ -35,8 +35,20 @@ NEW  logic mask  (after all the math, before the sampler)
   Each rule contributes a log-bias; the sampler uses
       logit = log P_trigram + beta * value + gamma * mask_bias
   and the mask never dead-ends (penalties are large but finite).
+
+NEW  duplicated vocabulary, partitioned linkwise   (--copies N, default 2)
+  Every word exists as N identities: "moon", "moon#1", ... (a copy mark that
+  the tokenizer can never produce). The dataset is partitioned LINKWISE: each
+  distinct link (word-pair transition, e.g. the -> moon) is assigned a class
+  by a stable hash, and crossing a link of class c moves the running copy
+  forward by c (mod N). Class-0 links stay inside a copy; other classes
+  cross between copies. So the trigram table, the word graph, the roles and
+  the mask all see the N copies as separate words, while everything that has
+  to do with the surface (spelling/bytes, punctuation, printing, rules R2-R4,
+  the prompt) uses the surface word. --copies 1 is the program without this.
 """
 import argparse
+import hashlib
 import math
 import re
 import sys
@@ -50,7 +62,96 @@ SEP = 256                                   # word-boundary symbol
 SENTENCE_END = {".", "!", "?"}
 SOFT_PUNCT = {",", ";", ":"}
 HARD = -30.0                                # "forbidden" that never yields NaN
+COPY_MARK = "#"                             # never produced by the tokenizer
 
+
+# ---------------------------------------------------------------------------
+# duplicated vocabulary + linkwise partition
+# ---------------------------------------------------------------------------
+
+def surf(token):
+    """Surface word of a (possibly copy-tagged) token."""
+    return token.partition(COPY_MARK)[0]
+
+
+def copy_of(token):
+    _, _, c = token.partition(COPY_MARK)
+    return int(c) if c else 0
+
+
+def tag(word, copy):
+    return word if copy == 0 else f"{word}{COPY_MARK}{copy}"
+
+
+def shift_token(token, offset, copies):
+    return tag(surf(token), (copy_of(token) + offset) % copies)
+
+
+def link_class(first, second, copies, salt=""):
+    """Partition the LINKS into `copies` classes with a stable hash: the
+    same word-pair transition always lands in the same class."""
+    digest = hashlib.blake2b(
+        f"{salt}\x00{first}\x00{second}".encode("utf-8"), digest_size=8
+    ).digest()
+    return int.from_bytes(digest, "big") % copies
+
+
+def lift_tokens(tokens, copies, salt=""):
+    """Surface tokens -> copy-tagged tokens. Crossing a link of class c moves
+    the copy forward by c (mod copies). Projecting with surf() returns the
+    original dataset exactly."""
+    out, copy, previous = [], 0, None
+    for t in tokens:
+        if previous is not None:
+            copy = (copy + link_class(previous, t, copies, salt)) % copies
+        out.append(tag(t, copy))
+        previous = t
+    return out
+
+
+def lift_prompt(ptoks, tg, copies, salt, rng):
+    """A prompt's links fix its copy DIFFERENCES; the corpus supplies the
+    absolute copy. Try every offset and pick among those the trigram table
+    knows, weighted by how much data supports them."""
+    rel = lift_tokens(ptoks, copies, salt)
+    if copies == 1 or not rel:
+        return rel
+    weights = []
+    for o in range(copies):
+        shifted = [shift_token(t, o, copies) for t in rel]
+        w = 0.0
+        if len(shifted) >= 2 and (shifted[-2], shifted[-1]) in tg.tri:
+            w = float(sum(tg.tri[(shifted[-2], shifted[-1])].values()))
+        elif shifted[-1] in tg.bi:
+            w = 0.01 * float(sum(tg.bi[shifted[-1]].values()))
+        weights.append(w)
+    weights = np.array(weights)
+    o = 0 if weights.sum() == 0 else int(rng.choice(copies, p=weights / weights.sum()))
+    return [shift_token(t, o, copies) for t in rel]
+
+
+def partition_report(tokens, lifted, copies, salt):
+    seen, distinct, occ = set(), Counter(), Counter()
+    for a, b in zip(tokens, tokens[1:]):
+        c = link_class(a, b, copies, salt)
+        occ[c] += 1
+        if (a, b) not in seen:
+            seen.add((a, b))
+            distinct[c] += 1
+    return {
+        "copies": copies,
+        "vocab": len(set(lifted)),
+        "distinct_links_per_class": dict(sorted(distinct.items())),
+        "occurrences_per_class": dict(sorted(occ.items())),
+        "projects_back_to_dataset": [surf(t) for t in lifted] == tokens,
+        "copy_moves_follow_link_class": all(
+            copy_of(y) == (copy_of(x) + link_class(a, b, copies, salt)) % copies
+            for x, y, a, b in zip(lifted, lifted[1:], tokens, tokens[1:])
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 
 def normalize_rows(M):
     s = np.asarray(M.sum(axis=1)).ravel()
@@ -103,11 +204,12 @@ class ValueField:
         d = np.sqrt(np.maximum(K.sum(axis=1), 1e-12))
         Sn = K / np.outer(d, d)
 
-        # byte graph + word/byte interface
+        # byte graph + word/byte interface (all copies of a word share the
+        # byte states of its surface spelling)
         self.states = {}
         rows, cols, edges = [], [], set()
         for wi, w in enumerate(self.vocab):
-            path = [self.states.setdefault(st, len(self.states)) for st in word_states(w, k)]
+            path = [self.states.setdefault(st, len(self.states)) for st in word_states(surf(w), k)]
             rows += [wi] * len(path)
             cols += path
             for a, b in zip(path, path[1:]):
@@ -140,7 +242,7 @@ class ValueField:
 
     def read(self, word):
         """Value of ANY string from the byte-state field (works out of vocabulary)."""
-        ids = [self.states[s] for s in word_states(word, self.k) if s in self.states]
+        ids = [self.states[s] for s in word_states(surf(word), self.k) if s in self.states]
         return float(np.mean(self.state_field[ids])) if ids else 0.0
 
 
@@ -174,9 +276,9 @@ class LogicMask:
         self.R = k + 2                                   # emit-able roles
         self.role = lab.copy()
         for w, i in vf.idx.items():
-            if w in SENTENCE_END:
+            if surf(w) in SENTENCE_END:
                 self.role[i] = self.END
-            elif w in SOFT_PUNCT:
+            elif surf(w) in SOFT_PUNCT:
                 self.role[i] = self.PUNCT
 
         # 2. template: role bigram / trigram over sentences (BOS resets)
@@ -188,7 +290,7 @@ class LogicMask:
             self.bi[prev[-1], r] += 1
             if len(prev) >= 2:
                 self.tri[(prev[-2], prev[-1])][r] += 1
-            prev = [self.BOS] if t in SENTENCE_END else (prev + [r])[-2:]
+            prev = [self.BOS] if surf(t) in SENTENCE_END else (prev + [r])[-2:]
         rs = self.bi.sum(axis=1, keepdims=True)
         self.p_end = np.where(rs[:, 0] > 0, self.bi[:, self.END] / np.maximum(rs[:, 0], 1), 0.0)
 
@@ -204,8 +306,8 @@ class LogicMask:
         if dist is None or dist.sum() == 0:
             dist = self.bi[last]
         dist = dist / max(dist.sum(), 1e-12)
-        recent = set(sent_words[-self.window:])
-        n_words = sum(1 for w in sent_words if w not in SOFT_PUNCT)
+        recent = {surf(x) for x in sent_words[-self.window:]}            # surface: any copy counts
+        n_words = sum(1 for w in sent_words if surf(w) not in SOFT_PUNCT)
         out = np.zeros(len(cand_words))
         for i, w in enumerate(cand_words):
             r = self.role[vf.idx[w]]
@@ -216,7 +318,7 @@ class LogicMask:
                     b += HARD
             if r in (self.END, self.PUNCT) and last in (self.BOS, self.END, self.PUNCT):
                 b += HARD                                                # R3 no stutter
-            if r < self.END and w in recent:                             # R4 no loop
+            if r < self.END and surf(w) in recent:                       # R4 no loop
                 b += HARD / 3
             out[i] = b
         return out
@@ -224,13 +326,15 @@ class LogicMask:
 
 class Trigrams:
     """Word trigram rule R: (w1, w2) -> next word, backing off to the bigram
-    (w2 -> next word). The value field only reranks what R allows."""
+    (w2 -> next word). The value field only reranks what R allows. Words are
+    copy-tagged tokens, so the same surface word in another copy is another
+    context."""
 
     def __init__(self, tokens):
         self.tri, self.bi = defaultdict(Counter), defaultdict(Counter)
         self.starts = Counter(tokens[:1])
         for a, b in zip(tokens, tokens[1:]):
-            if a in SENTENCE_END:
+            if surf(a) in SENTENCE_END:
                 self.starts[b] += 1
         for a, b, c in zip(tokens, tokens[1:], tokens[2:]):
             self.tri[(a, b)][c] += 1
@@ -268,7 +372,7 @@ def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None, mask=None, gamma=1.0, tr
         if trace and mask is not None:
             print(f"[mask] {w!r} role={mask.role[vf.idx[w]]}", file=sys.stderr)
         yield w
-        if w in SENTENCE_END:
+        if surf(w) in SENTENCE_END:
             ctx, sent = [], []
         else:
             ctx = (ctx + [w])[-2:]
@@ -277,17 +381,19 @@ def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None, mask=None, gamma=1.0, tr
 
 def stream_text(tokens, first=True, cap=True):
     for t in tokens:
-        if re.match(r"[.,!?;:]", t):
-            chunk = t
+        s = surf(t)
+        if re.match(r"[.,!?;:]", s):
+            chunk = s
         else:
-            chunk = ("" if first else " ") + (t[:1].upper() + t[1:] if cap else t)
-        cap, first = t in SENTENCE_END, False
+            chunk = ("" if first else " ") + (s[:1].upper() + s[1:] if cap else s)
+        cap, first = s in SENTENCE_END, False
         yield chunk
 
 
 def detokenize(tokens):
     text = ""
     for t in tokens:
+        t = surf(t)
         text += t if (not text or re.match(r"[.,!?;:]", t)) else " " + t
     return text[:1].upper() + text[1:]
 
@@ -307,6 +413,9 @@ if __name__ == "__main__":
     ap.add_argument("--min-len", type=int, default=4, help="min words before a sentence may end")
     ap.add_argument("--no-mask", action="store_true", help="disable the logic mask")
     ap.add_argument("--trace", action="store_true", help="print mask role decisions to stderr")
+    ap.add_argument("--copies", type=int, default=2,
+                    help="how many times the vocabulary is duplicated (1 = off)")
+    ap.add_argument("--link-seed", type=int, default=0, help="salt for the link -> class partition")
     gen_seed = int(np.random.SeedSequence().entropy % 2**32)
 
     ap.add_argument("--words", type=int, default=600, help="stop the stream after N words (0 = endless)")
@@ -316,8 +425,14 @@ if __name__ == "__main__":
     text = open(args.data, encoding="utf-8", errors="ignore").read().lower()
     tokens = re.findall(r"[\w']+|[.,!?;:]", text)
 
+    # duplicate the vocabulary, partition the dataset linkwise
+    copies, salt = max(1, args.copies), str(args.link_seed)
+    lifted = lift_tokens(tokens, copies, salt)
+    lifted_set = set(lifted)
+    print(f"[partition] {partition_report(tokens, lifted, copies, salt)}", file=sys.stderr)
+
     # prompt -> values
-    counts = Counter(tokens)
+    counts = Counter(tokens)                                   # surface counts
     while True:
         ptoks = re.findall(r"[\w']+|[.,!?;:]", input("USER: ").lower())
         is_word = lambda t: re.match(r"[\w']+", t)
@@ -329,18 +444,23 @@ if __name__ == "__main__":
             raise SystemExit("no prompt word appears in the data")
         rarity = {w: max(math.log(len(tokens) / counts[w]), 1e-9) for w in known}
         values = {w: args.value * rarity[w] / max(rarity.values()) for w in known}
+        # a value on a word applies to every copy of it
+        values = {tag(w, c): x for w, x in values.items() for c in range(copies)
+                  if tag(w, c) in lifted_set}
 
-        vf = ValueField(tokens, values, mix=args.mix, k=args.k)
+        vf = ValueField(lifted, values, mix=args.mix, k=args.k)
 
         # logic mask: learned after all the math, gates the sampler
-        mask = None if args.no_mask else LogicMask(vf, tokens, n_classes=args.classes,
+        mask = None if args.no_mask else LogicMask(vf, lifted, n_classes=args.classes,
                                                    min_len=args.min_len)
 
-        # stream: print the prompt, then continue it
-        tg = Trigrams(tokens)
+        # stream: continue the prompt
+        tg = Trigrams(lifted)
+        rng = np.random.default_rng(gen_seed)
         ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
-        ctx0 = [] if (not ptoks or ended) else ptoks[-2:]
-        toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0,
+        lp = lift_prompt(ptoks, tg, copies, salt, rng)
+        ctx0 = [] if (not ptoks or ended) else lp[-2:]
+        toks = stream_tokens(vf, tg, args.beta, rng, ctx=ctx0,
                              mask=mask, gamma=args.gamma, trace=args.trace)
 
         for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
