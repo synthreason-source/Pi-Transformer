@@ -12,18 +12,29 @@ Two graphs, joined by the spelling of each word:
   interface    B    word <-> the byte states along its spelling.
 
 One unfolding hop from a word-value vector `cur`:
-    via use   = Sn @ cur                       # cross comparison of words
-    via bytes = B @ ( Sb @ (B.T @ cur) )       # deposit on byte states,
-                                               # spread on the byte graph,
-                                               # read back onto words
+    via use   = Sn @ cur
+    via bytes = B @ ( Sb @ (B.T @ cur) )
     cur       = decay * (mix*via_use + (1-mix)*via_bytes)
-The byte-state field also reads out ANY string, including words that are not
-in the data.
 
-The prompt: every prompt word that appears in the data gets a value, scaled by
-rarity (log(N/count), the rarest prompt word gets --value), so "the" in a
-prompt doesn't swamp "moon". Prompt words not in the data are reported and
-get no value.
+NEW  logic mask  (after all the math, before the sampler)
+  The value field says WHAT is worth saying; the mask says whether it may be
+  said HERE. It is learned from the same data, no external grammar:
+    1. roles      words are clustered by their context signature (the same
+                  X used for the word graph) into R roles, plus END (. ! ?),
+                  PUNCT (, ; :) and BOS (start of sentence).
+    2. template   role trigram / bigram tables: which role may follow the
+                  last two roles (a learned sentence frame).
+    3. rules      explicit logical constraints, checked at every step:
+                    R1 role-legality     next role must be licensed by the frame
+                    R2 no dangling end   END only after a role that has ended
+                                         sentences before, and only after
+                                         `min_len` words
+                    R3 no stutter        no punctuation right after punctuation,
+                                         none opening a sentence
+                    R4 no loop           a word may not recur inside `window`
+  Each rule contributes a log-bias; the sampler uses
+      logit = log P_trigram + beta * value + gamma * mask_bias
+  and the mask never dead-ends (penalties are large but finite).
 """
 import argparse
 import math
@@ -37,6 +48,8 @@ import scipy.sparse as sp
 
 SEP = 256                                   # word-boundary symbol
 SENTENCE_END = {".", "!", "?"}
+SOFT_PUNCT = {",", ";", ":"}
+HARD = -30.0                                # "forbidden" that never yields NaN
 
 
 def normalize_rows(M):
@@ -79,6 +92,7 @@ class ValueField:
             C[self.idx[a], self.idx[b]] += 1.0
         X = np.hstack([normalize_rows(C), normalize_rows(C.T)])
         X /= np.maximum(np.linalg.norm(X, axis=1, keepdims=True), 1e-12)
+        self.X = X                                   # kept: the mask reuses it
         S = X @ X.T
         np.fill_diagonal(S, 0.0)
         K = np.zeros_like(S)
@@ -91,17 +105,17 @@ class ValueField:
 
         # byte graph + word/byte interface
         self.states = {}
-        rows, cols, er, ec = [], [], [], []
+        rows, cols, edges = [], [], set()
         for wi, w in enumerate(self.vocab):
             path = [self.states.setdefault(st, len(self.states)) for st in word_states(w, k)]
             rows += [wi] * len(path)
             cols += path
             for a, b in zip(path, path[1:]):
-                if a not in rows:
-                    er += [a, b]
-                    ec += [b, a]
+                edges.add((a, b))
+                edges.add((b, a))
         ns = len(self.states)
         B = normalize_rows(sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, ns)))
+        er, ec = zip(*edges) if edges else ([], [])
         A = sp.csr_matrix((np.ones(len(er)), (er, ec)), shape=(ns, ns))
         A.data[:] = 1.0
         dd = 1.0 / np.sqrt(np.maximum(np.asarray(A.sum(axis=1)).ravel(), 1e-12))
@@ -118,8 +132,8 @@ class ValueField:
         for _ in range(hops):
             via_use = Sn @ cur
             st = Sb @ (B.T @ cur)
-            via_bytes = B/-1 * st.T
-            cur = decay * -(mix * via_use + (1 - mix) * via_bytes)
+            via_bytes = B @ st
+            cur = decay * (mix * via_use + (1 - mix) * via_bytes)
             self.state_field = self.state_field + (1 - mix) * decay * st
             self.field = self.field + cur
             self.tiers.append(cur)
@@ -130,13 +144,91 @@ class ValueField:
         return float(np.mean(self.state_field[ids])) if ids else 0.0
 
 
+class LogicMask:
+    """Learned logical template + explicit rules that gate every next word.
+
+    Roles 0..k-1 : clusters of words by context signature
+    role END     : . ! ?        role PUNCT : , ; :        role BOS : sentence start
+    """
+
+    def __init__(self, vf, tokens, n_classes=12, min_len=4, window=6,
+                 floor=1e-3, seed=0, iters=15):
+        self.vf, self.min_len, self.window, self.floor = vf, min_len, window, floor
+        rng = np.random.default_rng(seed)
+        n = len(vf.vocab)
+
+        # 1. roles: spherical k-means on a random projection of X
+        Z = vf.X @ rng.standard_normal((vf.X.shape[1], min(32, vf.X.shape[1])))
+        Z /= np.maximum(np.linalg.norm(Z, axis=1, keepdims=True), 1e-12)
+        k = max(1, min(n_classes, n))
+        cent = Z[rng.choice(n, k, replace=False)].copy()
+        lab = np.zeros(n, dtype=int)
+        for _ in range(iters):
+            lab = np.argmax(Z @ cent.T, axis=1)
+            for c in range(k):
+                m = lab == c
+                if m.any():
+                    v = Z[m].mean(axis=0)
+                    cent[c] = v / max(np.linalg.norm(v), 1e-12)
+        self.END, self.PUNCT, self.BOS = k, k + 1, k + 2
+        self.R = k + 2                                   # emit-able roles
+        self.role = lab.copy()
+        for w, i in vf.idx.items():
+            if w in SENTENCE_END:
+                self.role[i] = self.END
+            elif w in SOFT_PUNCT:
+                self.role[i] = self.PUNCT
+
+        # 2. template: role bigram / trigram over sentences (BOS resets)
+        self.bi = np.zeros((self.BOS + 1, self.R))
+        self.tri = defaultdict(lambda: np.zeros(self.R))
+        prev = [self.BOS]
+        for t in tokens:
+            r = self.role[vf.idx[t]]
+            self.bi[prev[-1], r] += 1
+            if len(prev) >= 2:
+                self.tri[(prev[-2], prev[-1])][r] += 1
+            prev = [self.BOS] if t in SENTENCE_END else (prev + [r])[-2:]
+        rs = self.bi.sum(axis=1, keepdims=True)
+        self.p_end = np.where(rs[:, 0] > 0, self.bi[:, self.END] / np.maximum(rs[:, 0], 1), 0.0)
+
+    def roles_of(self, words):
+        return [self.role[self.vf.idx[w]] for w in words if w in self.vf.idx]
+
+    def bias(self, sent_words, cand_words):
+        """Log-bias per candidate given the words of the current sentence."""
+        vf, fl = self.vf, self.floor
+        roles = [self.BOS] + self.roles_of(sent_words)
+        last = roles[-1]
+        dist = self.tri.get((roles[-2], roles[-1])) if len(roles) >= 2 else None
+        if dist is None or dist.sum() == 0:
+            dist = self.bi[last]
+        dist = dist / max(dist.sum(), 1e-12)
+        recent = set(sent_words[-self.window:])
+        n_words = sum(1 for w in sent_words if w not in SOFT_PUNCT)
+        out = np.zeros(len(cand_words))
+        for i, w in enumerate(cand_words):
+            r = self.role[vf.idx[w]]
+            b = math.log(dist[r] + fl)                                   # R1 legality
+            if r == self.END:                                            # R2 no dangling end
+                b += math.log(self.p_end[last] + fl)
+                if n_words < self.min_len or last in (self.BOS, self.PUNCT):
+                    b += HARD
+            if r in (self.END, self.PUNCT) and last in (self.BOS, self.END, self.PUNCT):
+                b += HARD                                                # R3 no stutter
+            if r < self.END and w in recent:                             # R4 no loop
+                b += HARD / 3
+            out[i] = b
+        return out
+
+
 class Trigrams:
     """Word trigram rule R: (w1, w2) -> next word, backing off to the bigram
     (w2 -> next word). The value field only reranks what R allows."""
 
     def __init__(self, tokens):
         self.tri, self.bi = defaultdict(Counter), defaultdict(Counter)
-        self.starts = Counter(tokens[:1])                    # words that open a sentence
+        self.starts = Counter(tokens[:1])
         for a, b in zip(tokens, tokens[1:]):
             if a in SENTENCE_END:
                 self.starts[b] += 1
@@ -151,52 +243,39 @@ class Trigrams:
         return self.bi.get(out[-1])
 
 
-def generate(vf, tg, start, n=40, beta=3.0, rng=None):
-    """logit(next) = log P_trigram(next | prev two words) + beta * value(next)."""
-    rng = rng or np.random.default_rng()
-    out = [start]
-    while len(out) < n:
-        table = tg.table(out)
-        if not table:                       # dead end: restart from the start word
-            out.append(start)
-            continue
-        words = list(table)
-        p = np.array([table[w] for w in words], dtype=np.float64)
-        logits = np.log(p / p.sum()) + beta * vf.field[[vf.idx[w] for w in words]]
-        w = np.exp(logits - logits.max())
-        out.append(words[rng.choice(len(words), p=w / w.sum())])
-    return sorted(out)
-
-
-def _pick(vf, table, beta, rng):
+def _pick(vf, table, beta, rng, mask=None, sent=(), gamma=1.0):
     words = list(table)
     p = np.array([table[w] for w in words], dtype=np.float64)
     logits = np.log(p / p.sum()) + beta * np.exp(vf.field[[vf.idx[w] for w in words]])
+    if mask is not None:
+        logits = logits + gamma * mask.bias(list(sent), words)
     w = np.exp(logits - logits.max())
     return words[rng.choice(len(words), p=w / w.sum())]
 
 
-def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None):
-    """Endless token stream. Inside a sentence: trigram rule + value bias.
-    After a sentence end the context resets and the next sentence opens from
-    the corpus's sentence-openers, again biased by value, so the stream keeps
-    returning to what was valued instead of drifting or looping on a dead end.
-    `ctx` seeds the first context (the last two words of the prompt)."""
+def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None, mask=None, gamma=1.0, trace=False):
+    """Endless token stream. Inside a sentence: trigram rule + value bias +
+    logic mask. After a sentence end the context resets."""
     rng = rng or np.random.default_rng()
     ctx = list(ctx or [])
+    sent = list(ctx)                         # words of the current sentence
     while True:
         table = tg.table(ctx) if ctx else tg.starts
         if not table:
-            ctx = []
+            ctx, sent = [], []
             continue
-        w = _pick(vf, table, beta, rng)
+        w = _pick(vf, table, beta, rng, mask, sent, gamma)
+        if trace and mask is not None:
+            print(f"[mask] {w!r} role={mask.role[vf.idx[w]]}", file=sys.stderr)
         yield w
-        ctx = [] if w in SENTENCE_END else (ctx + [w])[-2:]
+        if w in SENTENCE_END:
+            ctx, sent = [], []
+        else:
+            ctx = (ctx + [w])[-2:]
+            sent.append(w)
 
 
 def stream_text(tokens, first=True, cap=True):
-    """Token stream -> text chunks: spacing, punctuation, sentence case.
-    first=False continues after text that is already on screen."""
     for t in tokens:
         if re.match(r"[.,!?;:]", t):
             chunk = t
@@ -223,6 +302,11 @@ if __name__ == "__main__":
     ap.add_argument("--k", type=int, default=3, help="byte n-gram length of a state")
     ap.add_argument("--show", type=int, default=10)
     ap.add_argument("--beta", type=float, default=3.0, help="weight of the unfolded value")
+    ap.add_argument("--gamma", type=float, default=1.0, help="weight of the logic mask")
+    ap.add_argument("--classes", type=int, default=12, help="number of learned roles")
+    ap.add_argument("--min-len", type=int, default=4, help="min words before a sentence may end")
+    ap.add_argument("--no-mask", action="store_true", help="disable the logic mask")
+    ap.add_argument("--trace", action="store_true", help="print mask role decisions to stderr")
     gen_seed = int(np.random.SeedSequence().entropy % 2**32)
 
     ap.add_argument("--words", type=int, default=600, help="stop the stream after N words (0 = endless)")
@@ -246,19 +330,24 @@ if __name__ == "__main__":
     values = {w: args.value * rarity[w] / max(rarity.values()) for w in known}
 
     vf = ValueField(tokens, values, mix=args.mix, k=args.k)
-    order = np.argsort(-vf.field)
 
+    # logic mask: learned after all the math, gates the sampler
+    mask = None if args.no_mask else LogicMask(vf, tokens, n_classes=args.classes,
+                                               min_len=args.min_len)
 
     # stream: print the prompt, then continue it
     tg = Trigrams(tokens)
     ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
     ctx0 = [] if (not ptoks or ended) else ptoks[-2:]
-    toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0)
+    toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0,
+                         mask=mask, gamma=args.gamma, trace=args.trace)
 
     for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
         sys.stdout.write(chunk)
         sys.stdout.flush()
-        if n >= args.words:
+        if args.delay:
+            time.sleep(args.delay)
+        if args.words and n >= args.words:
             break
-        
+
     print()
