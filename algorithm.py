@@ -318,36 +318,37 @@ if __name__ == "__main__":
 
     # prompt -> values
     counts = Counter(tokens)
-    ptoks = re.findall(r"[\w']+|[.,!?;:]", input("USER: ").lower())
-    is_word = lambda t: re.match(r"[\w']+", t)
-    known = [w for w in dict.fromkeys(ptoks) if is_word(w) and w in counts]
-    unknown = [w for w in dict.fromkeys(ptoks) if is_word(w) and w not in counts]
-    if unknown:
-        print(f"[warn] not in the data, no value assigned: {unknown}", file=sys.stderr)
-    if not known:
-        raise SystemExit("no prompt word appears in the data")
-    rarity = {w: max(math.log(len(tokens) / counts[w]), 1e-9) for w in known}
-    values = {w: args.value * rarity[w] / max(rarity.values()) for w in known}
+    while True:
+        ptoks = re.findall(r"[\w']+|[.,!?;:]", input("USER: ").lower())
+        is_word = lambda t: re.match(r"[\w']+", t)
+        known = [w for w in dict.fromkeys(ptoks) if is_word(w) and w in counts]
+        unknown = [w for w in dict.fromkeys(ptoks) if is_word(w) and w not in counts]
+        if unknown:
+            print(f"[warn] not in the data, no value assigned: {unknown}", file=sys.stderr)
+        if not known:
+            raise SystemExit("no prompt word appears in the data")
+        rarity = {w: max(math.log(len(tokens) / counts[w]), 1e-9) for w in known}
+        values = {w: args.value * rarity[w] / max(rarity.values()) for w in known}
 
-    vf = ValueField(tokens, values, mix=args.mix, k=args.k)
+        vf = ValueField(tokens, values, mix=args.mix, k=args.k)
 
-    # logic mask: learned after all the math, gates the sampler
-    mask = None if args.no_mask else LogicMask(vf, tokens, n_classes=args.classes,
-                                               min_len=args.min_len)
+        # logic mask: learned after all the math, gates the sampler
+        mask = None if args.no_mask else LogicMask(vf, tokens, n_classes=args.classes,
+                                                   min_len=args.min_len)
 
-    # stream: print the prompt, then continue it
-    tg = Trigrams(tokens)
-    ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
-    ctx0 = [] if (not ptoks or ended) else ptoks[-2:]
-    toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0,
-                         mask=mask, gamma=args.gamma, trace=args.trace)
+        # stream: print the prompt, then continue it
+        tg = Trigrams(tokens)
+        ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
+        ctx0 = [] if (not ptoks or ended) else ptoks[-2:]
+        toks = stream_tokens(vf, tg, args.beta, np.random.default_rng(gen_seed), ctx=ctx0,
+                             mask=mask, gamma=args.gamma, trace=args.trace)
 
-    for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
-        if args.delay:
-            time.sleep(args.delay)
-        if args.words and n >= args.words:
-            break
+        for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
+            sys.stdout.write(chunk)
+            sys.stdout.flush()
+            if args.delay:
+                time.sleep(args.delay)
+            if args.words and n >= args.words:
+                break
 
-    print()
+        print()
