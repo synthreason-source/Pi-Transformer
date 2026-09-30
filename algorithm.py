@@ -118,7 +118,7 @@ class ValueField:
         for _ in range(hops):
             via_use = Sn @ cur
             st = Sb @ (B.T @ cur)
-            via_bytes = B @ st
+            via_bytes = B @ st.T
             cur = decay * (mix * via_use + (1 - mix) * via_bytes)
             self.state_field = self.state_field + (1 - mix) * decay * st
             self.field = self.field + cur
@@ -165,13 +165,13 @@ def generate(vf, tg, start, n=40, beta=3.0, rng=None):
         logits = np.log(p / p.sum()) + beta * vf.field[[vf.idx[w] for w in words]]
         w = np.exp(logits - logits.max())
         out.append(words[rng.choice(len(words), p=w / w.sum())])
-    return out
+    return sorted(out)
 
 
 def _pick(vf, table, beta, rng):
     words = list(table)
     p = np.array([table[w] for w in words], dtype=np.float64)
-    logits = np.log(p / p.sum()) + beta * vf.field[[vf.idx[w] for w in words]]
+    logits = np.log(p / p.sum()) + beta * np.exp(vf.field[[vf.idx[w] for w in words]])
     w = np.exp(logits - logits.max())
     return words[rng.choice(len(words), p=w / w.sum())]
 
