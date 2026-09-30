@@ -46,6 +46,35 @@ NEW  duplicated vocabulary, partitioned linkwise   (--copies N, default 2)
   the mask all see the N copies as separate words, while everything that has
   to do with the surface (spelling/bytes, punctuation, printing, rules R2-R4,
   the prompt) uses the surface word. --copies 1 is the program without this.
+
+NEW  the copies solve an NP-hard problem on each other   (agenda)
+  Problem: 0/1 KNAPSACK. From the most valuable words, choose the set with the
+  largest total value whose spelling fits a character budget (one sentence).
+  Brute force is 2^n subsets. Meet in the middle (Horowitz-Sahni) makes it
+  2 * 2^(n/2):
+      half A  = candidate words that live in the even copies   (sorted ascending)
+      half B  = candidate words that live in the odd copies    (sorted REVERSED,
+                descending), so that one two-pointer sweep pairs every subset
+                of A with the best subset of B that still fits.
+  A word lives in the copy where the linkwise partition put most of its
+  occurrences. The winning set is the sentence AGENDA: words the stream gets a
+  bonus for saying (once each per sentence). --check-solver proves the answer
+  against brute force.
+
+NEW  curved context push until the context is pinned to the dataset   (--context curved)
+  The dataset is indexed by position at several context lengths ("dimensions").
+  At every step the context is pushed up a CURVED schedule of lengths
+      k_j = 1 + round(j ** curve)      e.g. 1, 2, 4, 7, 10     (--curve 1.6)
+  and each length asks: where in the dataset does this exact context occur?
+      - no position         stop: the previous length is the deepest match
+      - <= --pin positions  PINNED: the context matches the dataset
+                            positionally; the next word is what the dataset
+                            itself says at that position
+      - several positions   keep pushing
+  Whatever length it stops at gives the candidate next words (the positions'
+  successors); value, mask and agenda still rerank them. The context is the
+  running history, so it carries across sentence ends and can follow the
+  dataset from one sentence into the next. --context trigram is the old rule.
 """
 import argparse
 import hashlib
@@ -149,6 +178,96 @@ def partition_report(tokens, lifted, copies, salt):
             for x, y, a, b in zip(lifted, lifted[1:], tokens, tokens[1:])
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# NP-hard problem between the copies: knapsack by meet in the middle
+# ---------------------------------------------------------------------------
+
+def subset_table(items):
+    """All 2^n subsets of [(weight, value), ...] as arrays (W, V, bitmask)."""
+    W = np.zeros(1, dtype=np.int64)
+    V = np.zeros(1)
+    M = np.zeros(1, dtype=np.int64)
+    for i, (w, v) in enumerate(items):
+        W = np.concatenate([W, W + w])
+        V = np.concatenate([V, V + v])
+        M = np.concatenate([M, M | (1 << i)])
+    return W, V, M
+
+
+def knapsack_mitm(set_a, set_b, budget):
+    """Best total value with total weight <= budget, choosing from both sets.
+    A is scanned ascending, B REVERSED (descending): as A's weight grows the
+    room left for B only shrinks, so one pointer into B moves forward once and
+    a suffix maximum answers "best B-subset that still fits"."""
+    WA, VA, MA = subset_table(set_a)
+    WB, VB, MB = subset_table(set_b)
+    oa = np.argsort(WA, kind="stable")                   # A ascending
+    ob = np.argsort(-WB, kind="stable")                  # B reversed
+    WA, VA, MA = WA[oa], VA[oa], MA[oa]
+    WB, VB, MB = WB[ob], VB[ob], MB[ob]
+
+    nb = len(WB)
+    sufv = np.empty(nb)
+    sufi = np.empty(nb, dtype=np.int64)
+    best_v, best_i = -1.0, -1
+    for j in range(nb - 1, -1, -1):
+        if VB[j] > best_v:
+            best_v, best_i = VB[j], j
+        sufv[j], sufi[j] = best_v, best_i
+
+    best = (-1.0, 0, 0)
+    j = 0
+    for a in range(len(WA)):
+        room = budget - WA[a]
+        if room < 0:
+            break                                        # nothing later in A fits either
+        while j < nb and WB[j] > room:
+            j += 1                                       # pointer only moves forward
+        if j == nb:
+            break
+        total = VA[a] + sufv[j]
+        if total > best[0]:
+            best = (total, int(MA[a]), int(MB[sufi[j]]))
+    return best[0], best[1], best[2], len(WA) + len(WB)
+
+
+def knapsack_brute(items, budget):
+    W, V, _ = subset_table(items)
+    return float(V[W <= budget].max())
+
+
+def solve_agenda(vf, lcounts, copies, pool=18, budget=30, check=False):
+    """Candidates = the `pool` most valuable surface words (value taken at the
+    word's home copy). Even-copy words form half A, odd-copy words half B
+    (with one copy, halves alternate by rank)."""
+    by_surface = defaultdict(list)
+    for t in vf.vocab:
+        if re.fullmatch(r"[\w']+", surf(t)):
+            by_surface[surf(t)].append(t)
+    cand = []
+    for word, toks in by_surface.items():
+        home = max(toks, key=lambda t: (lcounts[t], -copy_of(t)))
+        cand.append((word, home, float(vf.field[vf.idx[home]])))
+    cand = [c for c in sorted(cand, key=lambda c: -c[2])[:pool] if c[2] > 1e-6]
+
+    halves = ([], [])
+    for rank, (word, home, val) in enumerate(cand):
+        h = copy_of(home) % 2 if copies >= 2 else rank % 2
+        halves[h].append((word, len(word) + 1, val))
+    value, ma, mb, ops = knapsack_mitm([(w, v) for _, w, v in halves[0]],
+                                       [(w, v) for _, w, v in halves[1]], budget)
+    words = [halves[0][i][0] for i in range(len(halves[0])) if ma >> i & 1] + \
+            [halves[1][i][0] for i in range(len(halves[1])) if mb >> i & 1]
+    chars = sum(len(w) + 1 for w in words)
+    report = {"candidates": len(cand), "half_A": len(halves[0]), "half_B": len(halves[1]),
+              "agenda": words, "chars": chars, "budget": budget, "value": round(value, 3),
+              "subsets_examined": ops, "brute_force_would_examine": 2 ** len(cand)}
+    if check and len(cand) <= 22:
+        brute = knapsack_brute([(len(w) + 1, v) for w, _, v in cand], budget)
+        report["matches_brute_force"] = bool(abs(brute - max(value, 0.0)) < 1e-9)
+    return words, report
 
 
 # ---------------------------------------------------------------------------
@@ -347,33 +466,99 @@ class Trigrams:
         return self.bi.get(out[-1])
 
 
-def _pick(vf, table, beta, rng, mask=None, sent=(), gamma=1.0):
+def curved_schedule(max_order, power):
+    """Context lengths 1 + round(j**power): dense at first, then ever wider."""
+    ks, j = [], 0
+    while True:
+        k = 1 + int(round(j ** power))
+        if k > max_order:
+            break
+        if not ks or k > ks[-1]:
+            ks.append(k)
+        j += 1
+    return ks
+
+
+class CurvedContext(Trigrams):
+    """Variable-order context. Keeps Trigrams' tables (tri/bi/starts) for the
+    prompt lift and as the fallback, and adds a positional index per length."""
+
+    curved = True
+
+    def __init__(self, tokens, max_order=10, power=1.6, pin=1):
+        super().__init__(tokens)
+        self.tokens, self.pin = tokens, pin
+        self.schedule = curved_schedule(max_order, power)
+        self.index = {k: defaultdict(list) for k in self.schedule}
+        for k in self.schedule:
+            for i in range(k - 1, len(tokens) - 1):      # a next word must exist
+                self.index[k][tuple(tokens[i - k + 1:i + 1])].append(i)
+        self.last = {"order": 0, "positions": 0, "pinned": False}
+
+    def table(self, history):
+        best = None
+        for k in self.schedule:
+            if k > len(history):
+                break
+            positions = self.index[k].get(tuple(history[-k:]))
+            if not positions:
+                break
+            best = (k, positions)
+            if len(positions) <= self.pin:
+                break                                     # pinned to the dataset
+        if best is None:
+            self.last = {"order": 0, "positions": 0, "pinned": False}
+            return Trigrams.table(self, history)
+        k, positions = best
+        self.last = {"order": k, "positions": len(positions),
+                     "pinned": len(positions) <= self.pin}
+        return Counter(self.tokens[p + 1] for p in positions)
+
+
+def _pick(vf, table, beta, rng, mask=None, sent=(), gamma=1.0, favor=(), bonus=0.0):
     words = list(table)
     p = np.array([table[w] for w in words], dtype=np.float64)
     logits = np.log(p / p.sum()) + beta * np.exp(vf.field[[vf.idx[w] for w in words]])
     if mask is not None:
         logits = logits + gamma * mask.bias(list(sent), words)
+    if bonus and favor:                                   # the knapsack agenda
+        # scaled by the spread of the candidates' logits, so `bonus` means
+        # "this fraction of the gap between best and worst candidate"
+        spread = max(float(logits.max() - logits.min()), 1.0)
+        logits = logits + bonus * spread * np.array([surf(w) in favor for w in words], dtype=np.float64)
     w = np.exp(logits - logits.max())
     return words[rng.choice(len(words), p=w / w.sum())]
 
 
-def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None, mask=None, gamma=1.0, trace=False):
+def stream_tokens(vf, tg, beta=3.0, rng=None, ctx=None, mask=None, gamma=1.0, trace=False,
+                  agenda=(), bonus=0.0, history=None):
     """Endless token stream. Inside a sentence: trigram rule + value bias +
     logic mask. After a sentence end the context resets."""
     rng = rng or np.random.default_rng()
     ctx = list(ctx or [])
     sent = list(ctx)                         # words of the current sentence
+    pending = set(agenda) - {surf(x) for x in sent}      # agenda words still to say
+    history = list(history or [])                        # every word so far (curved context)
+    curved = getattr(tg, "curved", False)
     while True:
-        table = tg.table(ctx) if ctx else tg.starts
+        if curved:
+            table = tg.table(history) if history else tg.starts
+        else:
+            table = tg.table(ctx) if ctx else tg.starts
         if not table:
-            ctx, sent = [], []
+            ctx, sent, history = [], [], []
             continue
-        w = _pick(vf, table, beta, rng, mask, sent, gamma)
+        w = _pick(vf, table, beta, rng, mask, sent, gamma, pending, bonus)
         if trace and mask is not None:
             print(f"[mask] {w!r} role={mask.role[vf.idx[w]]}", file=sys.stderr)
+        if trace and curved:
+            print(f"[context] {w!r} {tg.last}", file=sys.stderr)
         yield w
+        history = (history + [w])[-64:]
+        pending.discard(surf(w))
         if surf(w) in SENTENCE_END:
             ctx, sent = [], []
+            pending = set(agenda)                         # a new sentence, a fresh agenda
         else:
             ctx = (ctx + [w])[-2:]
             sent.append(w)
@@ -416,6 +601,17 @@ if __name__ == "__main__":
     ap.add_argument("--copies", type=int, default=2,
                     help="how many times the vocabulary is duplicated (1 = off)")
     ap.add_argument("--link-seed", type=int, default=0, help="salt for the link -> class partition")
+    ap.add_argument("--context", choices=("curved", "trigram"), default="curved",
+                    help="curved = push the context up a curved schedule until it is pinned to the dataset")
+    ap.add_argument("--max-order", type=int, default=10, help="longest context the curve may reach")
+    ap.add_argument("--curve", type=float, default=10.6, help="exponent of the context-length curve")
+    ap.add_argument("--pin", type=int, default=3, help="a context with <= this many positions is pinned")
+    ap.add_argument("--agenda-pool", type=int, default=32, help="candidate words for the knapsack")
+    ap.add_argument("--agenda-chars", type=int, default=64, help="character budget per sentence")
+    ap.add_argument("--agenda-bonus", type=float, default=0.9,
+                    help="bonus for agenda words, as a fraction of the candidates' logit spread")
+    ap.add_argument("--no-agenda", action="store_true", help="skip the knapsack")
+    ap.add_argument("--check-solver", action="store_true", help="verify the solver against brute force")
     gen_seed = int(np.random.SeedSequence().entropy % 2**32)
 
     ap.add_argument("--words", type=int, default=600, help="stop the stream after N words (0 = endless)")
@@ -429,6 +625,7 @@ if __name__ == "__main__":
     copies, salt = max(1, args.copies), str(args.link_seed)
     lifted = lift_tokens(tokens, copies, salt)
     lifted_set = set(lifted)
+    lcounts = Counter(lifted)
     print(f"[partition] {partition_report(tokens, lifted, copies, salt)}", file=sys.stderr)
 
     # prompt -> values
@@ -450,18 +647,27 @@ if __name__ == "__main__":
 
         vf = ValueField(lifted, values, mix=args.mix, k=args.k)
 
+        # the copies solve knapsack on each other -> sentence agenda
+        agenda = []
+        if not args.no_agenda:
+            agenda, rep_ = solve_agenda(vf, lcounts, copies, args.agenda_pool,
+                                        args.agenda_chars, args.check_solver)
+            print(f"[agenda] {rep_}", file=sys.stderr)
+
         # logic mask: learned after all the math, gates the sampler
         mask = None if args.no_mask else LogicMask(vf, lifted, n_classes=args.classes,
                                                    min_len=args.min_len)
 
         # stream: continue the prompt
-        tg = Trigrams(lifted)
+        tg = (CurvedContext(lifted, args.max_order, args.curve, args.pin)
+              if args.context == "curved" else Trigrams(lifted))
         rng = np.random.default_rng(gen_seed)
         ended = bool(ptoks) and ptoks[-1] in SENTENCE_END
         lp = lift_prompt(ptoks, tg, copies, salt, rng)
         ctx0 = [] if (not ptoks or ended) else lp[-2:]
         toks = stream_tokens(vf, tg, args.beta, rng, ctx=ctx0,
-                             mask=mask, gamma=args.gamma, trace=args.trace)
+                             mask=mask, gamma=args.gamma, trace=args.trace,
+                             agenda=agenda, bonus=args.agenda_bonus, history=lp)
 
         for n, chunk in enumerate(stream_text(toks, first=False, cap=ended), 1):
             sys.stdout.write(chunk)
