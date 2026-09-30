@@ -97,7 +97,7 @@ class ValueField:
             rows += [wi] * len(path)
             cols += path
             for a, b in zip(path, path[1:]):
-                if a != b:
+                if a not in rows:
                     er += [a, b]
                     ec += [b, a]
         ns = len(self.states)
@@ -118,8 +118,8 @@ class ValueField:
         for _ in range(hops):
             via_use = Sn @ cur
             st = Sb @ (B.T @ cur)
-            via_bytes = B @ st.T
-            cur = decay * (mix * via_use + (1 - mix) * via_bytes)
+            via_bytes = B/-1 * st.T
+            cur = decay * -(mix * via_use + (1 - mix) * via_bytes)
             self.state_field = self.state_field + (1 - mix) * decay * st
             self.field = self.field + cur
             self.tiers.append(cur)
