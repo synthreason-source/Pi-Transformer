@@ -1,128 +1,185 @@
-"""
-Noetic LM (Standard Transformer version without Multi-View Memory).
-Word-level tokenization with full file corpus loading.
-
-Run: python noetic_lm.py
-"""
 import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from collections import Counter, defaultdict
+import random
+import re
+from collections import Counter
 
+# --- ORIGINAL SOLVER KEEPT EXACTLY THE SAME ---
+class PCMMaxCut:
+    def __init__(self, graph, noise=0.02, drift_nu=0.08):
+        self.graph = graph
+        self.n = len(graph)
+        self.noise = noise
+        self.drift_nu = drift_nu
+        self.spins = [random.choice([-1, 1]) for _ in range(self.n)]
+        self.age = 1
 
-# --------------------------------------------------------------------------- #
-# Transformer Block
-# --------------------------------------------------------------------------- #
-class Block(nn.Module):
-    def __init__(self, d, heads):
-        super().__init__()
-        self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
-        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
-        self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(), nn.Linear(4 * d, d))
+    def local_field(self, i):
+        return sum(
+            weight * self.spins[j]
+            for j, weight in self.graph[i].items()
+        )
 
-    def forward(self, x, mask):
-        h = self.ln1(x)
-        x = x + self.attn(h, h, h, attn_mask=mask, need_weights=False)[0]
-        return x + self.mlp(self.ln2(x))
+    def delta_energy(self, i):
+        return -2 * self.spins[i] * self.local_field(i)
 
+    def energy(self):
+        value = 0.0
+        for i in range(self.n):
+            for j, weight in self.graph[i].items():
+                if j > i:
+                    value += weight * self.spins[i] * self.spins[j]
+        return value
 
-class NoeticLM(nn.Module):
-    def __init__(self, vocab, d=128, heads=4, layers=3, ctx=64, ground_dim=0):
-        super().__init__()
-        self.ctx = ctx
-        self.tok, self.pos = nn.Embedding(vocab, d), nn.Embedding(ctx, d)
-        self.ground = nn.Linear(ground_dim, d) if ground_dim else None   # grounding channel
-        self.blocks = nn.ModuleList(Block(d, heads) for _ in range(layers))
-        self.ln_f, self.head = nn.LayerNorm(d), nn.Linear(d, vocab)
+    def cut_size(self):
+        total = 0
+        for i in range(self.n):
+            for j, weight in self.graph[i].items():
+                if j > i and self.spins[i] != self.spins[j]:
+                    total += weight
+        return total
 
-    def forward(self, idx, ground=None, targets=None):
-        B, T = idx.shape
-        x = self.tok(idx) + self.pos(torch.arange(T, device=idx.device))
-        if self.ground is not None and ground is not None:
-            x = x + self.ground(ground).unsqueeze(1)
-        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=idx.device), 1)
-        for blk in self.blocks:
-            x = blk(x, mask)
-        logits = self.head(self.ln_f(x))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) if targets is not None else None
-        return logits, loss
+    def pcm_flip_attempt(self, temperature):
+        i = random.randrange(self.n)
+        delta = self.delta_energy(i)
 
-    @torch.no_grad()
-    def generate(self, idx, n, ground=None, temperature=0.8):
-        self.eval()
-        for _ in range(n):
-            logits, _ = self(idx[:, -self.ctx:], ground)
-            p = F.softmax(logits[:, -1] / temperature, dim=-1)
-            idx = torch.cat([idx, torch.multinomial(p, 1)], dim=1)
-        return idx
+        drift = self.age ** (-self.drift_nu)
+        thermal_noise = random.gauss(0.0, self.noise) * max(1.0, abs(self.local_field(i)))
+        effective_delta = delta + thermal_noise * drift
 
+        if effective_delta <= 0:
+            accept = True
+        else:
+            accept = random.random() < math.exp(-effective_delta / max(temperature, 1e-9))
 
-# --------------------------------------------------------------------------- #
-# Demo: corpus loading & vocabulary building
-# --------------------------------------------------------------------------- #
-with open(input("Filename: "), "r", encoding="utf8") as f:
-    _CORPORA = f.read()
-    CORPORA = [_CORPORA] * 40
+        if accept:
+            self.spins[i] *= -1
+            return i, True, delta
 
+        return i, False, delta
 
-def main(steps=600, seed=0):
-    torch.manual_seed(seed)
-    text = "".join(CORPORA)
+    def run(self, iterations=1000, temperature=1.0, cooling=0.995):
+        history = []
+        for _ in range(iterations):
+            _, accepted, _ = self.pcm_flip_attempt(temperature)
+            temperature *= cooling
+            self.age += 1
+            history.append({
+                "energy": self.energy(),
+                "cut": self.cut_size(),
+                "accepted": accepted,
+                "temperature": temperature,
+                "spins": self.spins[:],
+            })
+        return history
+# ----------------------------------------------
+
+def process_text_to_trigram_graph(filepath, max_nodes=200):
+    """Builds a graph where nodes are Bigrams and edges represent Trigrams."""
+    try:
+        with open(filepath, 'r', encoding='utf-8') as f:
+            text = f.read().lower()
+    except FileNotFoundError:
+        print(f"File {filepath} not found. Using a fallback dataset.")
+        text = "the quick brown fox jumps over the lazy dog. the lazy dog barks at the brown fox. the quick brown fox runs away quickly into the deep brown forest."
+
+    words = text.split()
     
-    # Tokenize corpus into words using simple whitespace splitting
-    all_words = text.split()
-    vocab_words = sorted(set(all_words))
+    # 1. Extract all sequential bigrams from the text
+    all_bigrams = [(words[i], words[i+1]) for i in range(len(words)-1)]
     
-    stoi = {w: i for i, w in enumerate(vocab_words)}
-    itos = {i: w for w, i in stoi.items()}
+    # 2. Keep only the most frequent bigrams to control graph size
+    top_bigrams = [b for b, _ in Counter(all_bigrams).most_common(max_nodes)]
+    bigram_set = set(top_bigrams)
     
-    # Encoder safely maps known words, ignoring out-of-vocab entries
-    enc = lambda s: torch.tensor([stoi[w] for w in s.split() if w in stoi])
+    node_to_id = {b: i for i, b in enumerate(top_bigrams)}
+    id_to_node = {i: b for i, b in enumerate(top_bigrams)}
     
-    data = [enc(c) for c in CORPORA]
-    data = [d for d in data if len(d) > 65]  # Ensure sequences exceed context window
-    if len(data) == 0:
-        data = [enc(c) for c in CORPORA]
-
-    model = NoeticLM(len(vocab_words), ground_dim=len(CORPORA), ctx=32)
-    opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
-    ctx, bs = model.ctx, min(16, len(data))
-    print(f"params: {sum(p.numel() for p in model.parameters()):,}")
-
-    for step in range(1, steps + 1):
-        model.train()
-        which = torch.randint(0, len(CORPORA), (bs,))
-        xs, ys = [], []
-        for w in which:
-            if len(data[w]) <= ctx + 1:
-                padded = F.pad(data[w], (0, ctx + 2 - len(data[w])))
-                xs.append(padded[:ctx])
-                ys.append(padded[1:ctx + 1])
-            else:
-                i = torch.randint(0, len(data[w]) - ctx - 1, (1,)).item()
-                xs.append(data[w][i:i + ctx])
-                ys.append(data[w][i + 1:i + ctx + 1])
+    n = len(top_bigrams)
+    graph = {i: {} for i in range(n)}
+    
+    # 3. Build Trigram Edges
+    # If Bigram A (w1, w2) is followed immediately by Bigram B (w2, w3), they form an edge.
+    for i in range(len(words) - 2):
+        b1 = (words[i], words[i+1])
+        b2 = (words[i+1], words[i+2])
+        
+        if b1 in bigram_set and b2 in bigram_set:
+            id1, id2 = node_to_id[b1], node_to_id[b2]
+            if id1 != id2:
+                # Undirected graph for Max-Cut
+                graph[id1][id2] = graph[id1].get(id2, 0) + 1
+                graph[id2][id1] = graph[id2].get(id1, 0) + 1
                 
-        g = F.one_hot(which, len(CORPORA)).float()
-        _, loss = model(torch.stack(xs), g, torch.stack(ys))
-        opt.zero_grad(); loss.backward(); opt.step()
+    return graph, node_to_id, id_to_node
 
-        if step % 100 == 0:
-            print(f"step {step:4d} loss {loss.item():.3f}")
+def generate_trigram_text(graph, id_to_node, spins, length=30):
+    """Walks the trigram graph, bouncing across the Max-Cut partition."""
+    n = len(graph)
+    
+    # Start with a random valid bigram
+    current_node = random.choice(range(n))
+    # Output stores single words. We start by adding both words of the initial bigram.
+    output = list(id_to_node[current_node]) 
+    
+    for _ in range(length - 2):
+        current_spin = spins[current_node]
+        neighbors = graph[current_node]
+        
+        # We only want to cross the cut AND maintain the Markov overlap 
+        # (the next bigram's first word MUST match our current bigram's second word)
+        current_word_2 = id_to_node[current_node][1]
+        
+        valid_neighbors = {}
+        for neighbor, weight in neighbors.items():
+            neighbor_bigram = id_to_node[neighbor]
+            # Cross-cut check AND directional overlap check
+            if spins[neighbor] != current_spin and neighbor_bigram[0] == current_word_2:
+                valid_neighbors[neighbor] = weight
+        
+        if not valid_neighbors:
+            # Fallback: If trapped, jump to a random bigram in the opposite spin 
+            # that starts with our last word to maintain grammatical flow.
+            opposite_nodes = [i for i, s in enumerate(spins) if s != current_spin and id_to_node[i][0] == current_word_2]
+            if opposite_nodes:
+                next_node = random.choice(opposite_nodes)
+            else:
+                # Hard fallback if completely stuck (breaks grammar slightly, keeps algorithm moving)
+                next_node = random.choice([i for i, s in enumerate(spins) if s != current_spin])
+        else:
+            # Probabilistically pick the next bigram based on trigram frequency
+            population = list(valid_neighbors.keys())
+            weights = list(valid_neighbors.values())
+            next_node = random.choices(population, weights=weights, k=1)[0]
             
-    while True:
-        user_prompt = input("\nUSER: ")
-        prompt = enc(user_prompt).unsqueeze(0)
-        if prompt.size(1) == 0:
-            print("Prompt words out of vocabulary. Try again.")
-            continue
-        # Use first grounding index for generation testing
-        w = 0
-        g = F.one_hot(torch.tensor([w]), len(CORPORA)).float()
-        out = model.generate(prompt, 600, g)[0].tolist()
-        print(" ".join(itos[i] for i in out))
-
+        # Append only the SECOND word of the new bigram, since the first word overlaps
+        output.append(id_to_node[next_node][1])
+        current_node = next_node
+        
+    return " ".join(output)
 
 if __name__ == "__main__":
-    main()
+    dataset_file = "singlekb.txt" 
+    
+    print("Building trigram graph from text...")
+    # 150 nodes = Top 150 most common word PAIRS. 
+    graph, node_to_id, id_to_node = process_text_to_trigram_graph(dataset_file, max_nodes=1500)
+    
+    if len(graph) == 0:
+        print("Graph is empty. Check your dataset text.")
+        exit()
+
+    print(f"Graph built with {len(graph)} unique nodes (bigrams).")
+    print("Running PCMMaxCut Solver...")
+    
+    solver = PCMMaxCut(graph, noise=0.05, drift_nu=0.08)
+    # Trigram graphs are often sparser, so we might need more iterations
+    history = solver.run(iterations=8000, temperature=2.5, cooling=0.999)
+    
+    best = max(history, key=lambda item: item["cut"])
+    
+    print(f"Max Cut Size: {best['cut']}")
+    print(f"Final Energy: {history[-1]['energy']}\n")
+    
+    print("--- GENERATED TEXT (Trigram Max-Cut Walk) ---")
+    generated = generate_trigram_text(graph, id_to_node, best["spins"], length=500)
+    print(generated.capitalize() + ".")
