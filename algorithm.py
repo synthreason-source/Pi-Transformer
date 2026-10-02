@@ -11,7 +11,7 @@ from collections import Counter, defaultdict
 
 import numpy as np
 
-PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", "<eos>"
+PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
 TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 
@@ -92,8 +92,7 @@ def complete(model, vocab, prompt, max_len=40, temp=0.9, top_k=40):
     ctx, out = [vocab.bos] + ids, []
     for _ in range(max_len):
         nxt = model.sample_next(ctx, temp, top_k)
-        if nxt == vocab.eos:
-            break
+
         out.append(vocab.itos[nxt])
         ctx.append(nxt)
     return detok(toks + out), oov
@@ -107,7 +106,7 @@ def main():
     ap.add_argument("--n", type=int, default=1, help="completions per prompt")
     ap.add_argument("--temp", type=float, default=0.9)
     ap.add_argument("--top-k", type=int, default=40)
-    ap.add_argument("--max-len", type=int, default=40)
+    ap.add_argument("--max-len", type=int, default=400)
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--interactive", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
