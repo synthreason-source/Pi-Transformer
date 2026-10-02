@@ -3,7 +3,7 @@ import random
 import re
 from collections import Counter
 
-# --- ORIGINAL SOLVER KEEPT EXACTLY THE SAME ---
+# --- ORIGINAL SOLVER KEPT EXACTLY THE SAME ---
 class PCMMaxCut:
     def __init__(self, graph, noise=0.02, drift_nu=0.08):
         self.graph = graph
@@ -80,14 +80,10 @@ def process_text_to_trigram_graph(filepath, max_nodes=200):
             text = f.read().lower()
     except FileNotFoundError:
         print(f"File {filepath} not found. Using a fallback dataset.")
-        text = "the quick brown fox jumps over the lazy dog. the lazy dog barks at the brown fox. the quick brown fox runs away quickly into the deep brown forest."
+        text = "the quick brown fox jumps over the lazy dog. the lazy dog barks at the brown fox. the quick brown fox runs away quickly into the deep dark brown forest. the dark forest is full of mystery. a dog barks loudly in the dark."
 
     words = text.split()
-    
-    # 1. Extract all sequential bigrams from the text
     all_bigrams = [(words[i], words[i+1]) for i in range(len(words)-1)]
-    
-    # 2. Keep only the most frequent bigrams to control graph size
     top_bigrams = [b for b, _ in Counter(all_bigrams).most_common(max_nodes)]
     bigram_set = set(top_bigrams)
     
@@ -97,8 +93,6 @@ def process_text_to_trigram_graph(filepath, max_nodes=200):
     n = len(top_bigrams)
     graph = {i: {} for i in range(n)}
     
-    # 3. Build Trigram Edges
-    # If Bigram A (w1, w2) is followed immediately by Bigram B (w2, w3), they form an edge.
     for i in range(len(words) - 2):
         b1 = (words[i], words[i+1])
         b2 = (words[i+1], words[i+2])
@@ -106,80 +100,95 @@ def process_text_to_trigram_graph(filepath, max_nodes=200):
         if b1 in bigram_set and b2 in bigram_set:
             id1, id2 = node_to_id[b1], node_to_id[b2]
             if id1 != id2:
-                # Undirected graph for Max-Cut
                 graph[id1][id2] = graph[id1].get(id2, 0) + 1
                 graph[id2][id1] = graph[id2].get(id1, 0) + 1
                 
     return graph, node_to_id, id_to_node
 
-def generate_trigram_text(graph, id_to_node, spins, length=30):
-    """Walks the trigram graph, bouncing across the Max-Cut partition."""
+def generate_markovian_prompt_text(graph, id_to_node, spins, prompt_vocab, length=30):
+    """
+    Populates an intermediate probability array dynamically based on Markov edge weights, 
+    Max-Cut alignment, and Prompt vocabulary matching.
+    """
     n = len(graph)
     
-    # Start with a random valid bigram
-    current_node = random.choice(range(n))
-    # Output stores single words. We start by adding both words of the initial bigram.
+    # Try to start on a node that contains a prompt word, otherwise random
+    valid_starts = [i for i in range(n) if any(w in prompt_vocab for w in id_to_node[i])]
+    current_node = random.choice(valid_starts) if valid_starts else random.choice(range(n))
+    
     output = list(id_to_node[current_node]) 
     
     for _ in range(length - 2):
         current_spin = spins[current_node]
         neighbors = graph[current_node]
-        
-        # We only want to cross the cut AND maintain the Markov overlap 
-        # (the next bigram's first word MUST match our current bigram's second word)
         current_word_2 = id_to_node[current_node][1]
         
-        valid_neighbors = {}
-        for neighbor, weight in neighbors.items():
-            neighbor_bigram = id_to_node[neighbor]
-            # Cross-cut check AND directional overlap check
-            if spins[neighbor] != current_spin and neighbor_bigram[0] == current_word_2:
-                valid_neighbors[neighbor] = weight
+        # 1. Find all grammatically valid overlapping next bigrams
+        valid_neighbors = [
+            neighbor for neighbor in neighbors.keys() 
+            if id_to_node[neighbor][0] == current_word_2
+        ]
         
         if not valid_neighbors:
-            # Fallback: If trapped, jump to a random bigram in the opposite spin 
-            # that starts with our last word to maintain grammatical flow.
-            opposite_nodes = [i for i, s in enumerate(spins) if s != current_spin and id_to_node[i][0] == current_word_2]
-            if opposite_nodes:
-                next_node = random.choice(opposite_nodes)
-            else:
-                # Hard fallback if completely stuck (breaks grammar slightly, keeps algorithm moving)
-                next_node = random.choice([i for i, s in enumerate(spins) if s != current_spin])
+            # Fallback if trapped
+            fallback_nodes = [i for i, s in enumerate(spins) if s != current_spin and id_to_node[i][0] == current_word_2]
+            next_node = random.choice(fallback_nodes) if fallback_nodes else random.choice(range(n))
         else:
-            # Probabilistically pick the next bigram based on trigram frequency
-            population = list(valid_neighbors.keys())
-            weights = list(valid_neighbors.values())
-            next_node = random.choices(population, weights=weights, k=1)[0]
+            # 2. Populate the intermediate probabilities array
+            probabilities = []
             
-        # Append only the SECOND word of the new bigram, since the first word overlaps
+            for neighbor in valid_neighbors:
+                base_weight = graph[current_node][neighbor]
+                
+                # Max-Cut influence: 5x more likely to pick a path that crosses the Cut
+                cut_multiplier = 5.0 if spins[neighbor] != current_spin else 1.0
+                
+                # Prompt influence: 50x more likely to pick a path leading to a prompt word
+                neighbor_words = id_to_node[neighbor]
+                prompt_multiplier = 50.0 if any(w in prompt_vocab for w in neighbor_words) else 1.0
+                
+                # Calculate intermediate probability score
+                score = base_weight * cut_multiplier * prompt_multiplier
+                probabilities.append(score)
+            
+            # Pick the next node proportionally based on our constructed probability array
+            next_node = random.choices(valid_neighbors, weights=probabilities, k=1)[0]
+            
         output.append(id_to_node[next_node][1])
         current_node = next_node
         
     return " ".join(output)
 
 if __name__ == "__main__":
-    dataset_file = "singlekb.txt" 
+    dataset_file = input("Filename: ")
     
     print("Building trigram graph from text...")
-    # 150 nodes = Top 150 most common word PAIRS. 
-    graph, node_to_id, id_to_node = process_text_to_trigram_graph(dataset_file, max_nodes=1500)
+    graph, node_to_id, id_to_node = process_text_to_trigram_graph(dataset_file, max_nodes=15000)
     
     if len(graph) == 0:
         print("Graph is empty. Check your dataset text.")
         exit()
+    print(f"Graph built with {len(graph)} unique nodes (bigrams).\n")
+    
+    # Run Max Cut once to establish the structural partitions (Spins)
+    print("Running PCMMaxCut Solver once for structural baseline...")
+    solver = PCMMaxCut(graph, noise=0.01, drift_nu=0.00001)
+    history = solver.run(iterations=5000, temperature=0.0005, cooling=0.0000199)
+    best_cut = max(history, key=lambda item: item["cut"])
+    best_spins = best_cut["spins"]
+    print(f"Base partition created. Max Cut Size: {best_cut['cut']}\n")
 
-    print(f"Graph built with {len(graph)} unique nodes (bigrams).")
-    print("Running PCMMaxCut Solver...")
+    # Dynamic Prompt Testing Using Intermediate Probabilities
     
-    solver = PCMMaxCut(graph, noise=0.05, drift_nu=0.08)
-    # Trigram graphs are often sparser, so we might need more iterations
-    history = solver.run(iterations=8000, temperature=2.5, cooling=0.999)
-    
-    best = max(history, key=lambda item: item["cut"])
-    
-    print(f"Max Cut Size: {best['cut']}")
-    print(f"Final Energy: {history[-1]['energy']}\n")
-    
-    print("--- GENERATED TEXT (Trigram Max-Cut Walk) ---")
-    generated = generate_trigram_text(graph, id_to_node, best["spins"], length=500)
-    print(generated.capitalize() + ".")
+    while True:  
+        # Generation is now instantly Markovian based on the prompt array
+        final_text = generate_markovian_prompt_text(
+            graph, 
+            id_to_node, 
+            best_spins, 
+            input("USER: ").split(), 
+            length=400
+       )
+            
+        print("Generated Output:")
+        print(f"> {final_text.capitalize()}.\n")
