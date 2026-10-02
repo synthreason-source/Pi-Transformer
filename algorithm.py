@@ -1,764 +1,270 @@
+#!/usr/bin/env python3
+"""
+Markov text model from a .txt file.
+
+  - vocab: frequency-sorted ids, stable tie-break, special tokens
+  - forward chain (static order) + backward chain (reversed view)
+  - interpolated n-gram probabilities (proper distributions, add-k base)
+  - order-invariant sum encoding vs position-aware encoding
+  - held-out perplexity vs the unigram baseline / entropy
+  - generation: forward, backward, "around a seed word", and prompt completion
+
+Usage:
+  python markov_gen.py data.txt --order 2 --n 5 --seed-word "the"
+  python markov_gen.py data.txt --prompt "once upon a" --n 3
+  python markov_gen.py data.txt --interactive
+"""
+import argparse
 import math
 import random
 import re
-import textwrap
-from collections import Counter
-from itertools import zip_longest
+from collections import Counter, defaultdict
 
 import numpy as np
-from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
 
-# gensim provides the GloVe vectors. If it is missing, the program falls
-# back to plain prompt-word biasing on the full graph.
-try:
-    from gensim.models import KeyedVectors
-    import gensim.downloader as gensim_api
-    GENSIM_AVAILABLE = True
-except ImportError:
-    GENSIM_AVAILABLE = False
+PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
+SPECIALS = [PAD, UNK, BOS, EOS]
+TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
+SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 
 
-# ----------------------------------------------------------------------
-# ORIGINAL SOLVER KEPT EXACTLY THE SAME
-# ----------------------------------------------------------------------
-
-class PCMMaxCut:
-    def __init__(self, graph, noise=0.02, drift_nu=0.08):
-        self.graph = graph
-        self.n = len(graph)
-        self.noise = noise
-        self.drift_nu = drift_nu
-        self.spins = [random.choice([-1, 1]) for _ in range(self.n)]
-        self.age = 1
-
-    def local_field(self, i):
-        return sum(
-            weight * self.spins[j]
-            for j, weight in self.graph[i].items()
-        )
-
-    def delta_energy(self, i):
-        return -2 * self.spins[i] * self.local_field(i)
-
-    def energy(self):
-        value = 0.0
-        for i in range(self.n):
-            for j, weight in self.graph[i].items():
-                if j > i:
-                    value += weight * self.spins[i] * self.spins[j]
-        return value
-
-    def cut_size(self):
-        total = 0
-        for i in range(self.n):
-            for j, weight in self.graph[i].items():
-                if j > i and self.spins[i] != self.spins[j]:
-                    total += weight
-        return total
-
-    def pcm_flip_attempt(self, temperature):
-        i = random.randrange(self.n)
-        delta = self.delta_energy(i)
-
-        drift = self.age ** (-self.drift_nu)
-        thermal_noise = random.gauss(
-            0.0,
-            self.noise
-        ) * max(1.0, abs(self.local_field(i)))
-
-        effective_delta = delta + thermal_noise * drift
-
-        if effective_delta <= 0:
-            accept = True
-        else:
-            accept = random.random() < math.exp(
-                -effective_delta / max(temperature, 1e-9)
-            )
-
-        if accept:
-            self.spins[i] *= -1
-            return i, True, delta
-
-        return i, False, delta
-
-    def run(self, iterations=1000, temperature=1.0, cooling=0.995):
-        history = []
-
-        for _ in range(iterations):
-            _, accepted, _ = self.pcm_flip_attempt(temperature)
-
-            temperature *= cooling
-            self.age += 1
-
-            history.append({
-                "energy": self.energy(),
-                "cut": self.cut_size(),
-                "accepted": accepted,
-                "temperature": temperature,
-                "spins": self.spins[:],
-            })
-
-        return history
+def detok(tokens):
+    return re.sub(r"\s+([.,!?;:])", r"\1", " ".join(tokens))
 
 
-# ----------------------------------------------------------------------
-# TEXT HELPERS
-# ----------------------------------------------------------------------
-
-TOKEN_RE = re.compile(r"[a-z']+")
-
-
-def clean_text(text):
-    text = text.replace("\x00", " ")
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def tokenize(text):
-    return TOKEN_RE.findall(text.lower())
+# --------------------------------------------------------------------- data
+def load_sentences(path):
+    with open(path, encoding="utf-8") as f:
+        text = f.read().lower()
+    sents = []
+    for chunk in SENT_SPLIT.split(text):
+        toks = TOKEN_RE.findall(chunk)
+        if len(toks) >= 2:
+            sents.append(toks)
+    return sents
 
 
-def clean_word(word):
-    return re.sub(r"[^a-z']", "", word.lower())
+class Vocab:
+    """token -> id built once; never re-sorted or reversed afterwards."""
+
+    def __init__(self, sentences, min_count=1):
+        counts = Counter(t for s in sentences for t in s)
+        kept = [t for t, c in counts.items() if c >= min_count]
+        kept.sort(key=lambda t: (-counts[t], t))  # frequency, then alphabetical
+        self.itos = SPECIALS + kept
+        self.stoi = {t: i for i, t in enumerate(self.itos)}
+        self.V = len(self.itos)
+        self.pad, self.unk, self.bos, self.eos = (self.stoi[s] for s in SPECIALS)
+        # unigram counts over ids (specials get 0 here; handled in the model)
+        self.counts = np.zeros(self.V)
+        for t in kept:
+            self.counts[self.stoi[t]] = counts[t]
+
+    def encode(self, sent):
+        return [self.stoi.get(t, self.unk) for t in sent]
+
+    def decode(self, ids):
+        out = [self.itos[i] for i in ids if i not in (self.pad, self.bos, self.eos)]
+        return detok(out)
+
+    def unigram_entropy(self):
+        p = self.counts[self.counts > 0]
+        p = p / p.sum()
+        return float(-(p * np.log(p)).sum())
 
 
-def content_tokens(words):
-    """Cleaned, non-stopword tokens."""
-    cleaned = (clean_word(w) for w in words)
-    return [w for w in cleaned if w and w not in ENGLISH_STOP_WORDS]
-
-
-# ----------------------------------------------------------------------
-# MODAL SQUEEZER
-# ----------------------------------------------------------------------
-
-class ModalSqueezer:
+# -------------------------------------------------------------------- model
+class NGram:
     """
-    Anchors (nearest GloVe words to a slice) get made-up Zipf frequencies.
-    Every graph node is scored by its similarity to the anchors, weighted
-    by those frequencies, then squeezed toward the mode with w**gamma.
+    Interpolated n-gram. `order` = number of previous tokens used.
+    order=1 is a classic Markov chain (bigram), order=2 is trigram, etc.
+
+    `start` / `stop` are the boundary tokens of the sequences this model is
+    trained on: forward = (<bos>, <eos>), backward = (<eos>, <bos>).
+    The start token is never predicted; the stop token is.
     """
 
-    def __init__(self, zipf_s=1.0, gamma=2.5, boost=50.0):
-        self.zipf_s = zipf_s    # higher = first anchor dominates more
-        self.gamma = gamma      # >1 sharpens toward the mode, <1 flattens
-        self.boost = boost      # max multiplier, same role as the old 50.0
+    def __init__(self, vocab, order=2, lam=0.7, k=0.01, start=None, stop=None):
+        self.v, self.order, self.lam, self.k = vocab, order, lam, k
+        self.start = vocab.bos if start is None else start
+        self.stop = vocab.eos if stop is None else stop
+        # tables[n][ctx_tuple_of_len_n] -> Counter(next_id)
+        self.tables = [defaultdict(Counter) for _ in range(order + 1)]
+        self.base = None
+
+    def fit(self, id_seqs):
+        for seq in id_seqs:
+            for t in range(1, len(seq)):
+                for n in range(0, self.order + 1):
+                    if t - n < 0:
+                        break
+                    self.tables[n][tuple(seq[t - n:t])][seq[t]] += 1
+        # base: add-k smoothed unigram. Mass on real tokens, <unk>, and the
+        # stop token; none on <pad> or the start token (never predicted).
+        base = self.v.counts.copy()
+        base[self.stop] = len(id_seqs)
+        base = base + self.k
+        base[[self.v.pad, self.start]] = 0.0
+        self.base = base / base.sum()
+        return self
+
+    def dist(self, ctx):
+        """Full probability vector over the vocab given a context list."""
+        p = self.base
+        ctx = tuple(ctx[-self.order:]) if self.order else ()
+        for n in range(0, len(ctx) + 1):          # shortest -> longest context
+            c = self.tables[n].get(ctx[len(ctx) - n:] if n else ())
+            if not c:
+                continue
+            vec = np.zeros(self.v.V)
+            for tok, cnt in c.items():
+                vec[tok] = cnt
+            vec /= vec.sum()
+            p = self.lam * vec + (1 - self.lam) * p
+        return p
+
+    def logprob(self, seq):
+        lp = 0.0
+        for t in range(1, len(seq)):
+            lp += math.log(self.dist(seq[:t])[seq[t]] + 1e-12)
+        return lp
+
+    def sample_next(self, ctx, temp=1.0, top_k=40, banned=()):
+        p = self.dist(ctx).copy()
+        for b in banned:
+            p[b] = 0.0
+        if top_k and top_k < len(p):
+            cut = np.partition(p, -top_k)[-top_k]
+            p[p < cut] = 0.0
+        p = p ** (1.0 / max(temp, 1e-3))
+        s = p.sum()
+        if s == 0:
+            return self.stop
+        return int(np.random.choice(len(p), p=p / s))
+
+
+def generate(model, start_ctx, stop_id, max_len=40, temp=0.9, top_k=40):
+    ctx, out = list(start_ctx), []
+    banned = tuple(b for b in (model.v.pad, model.v.bos, model.v.unk, model.v.eos)
+                   if b != stop_id)
+    for _ in range(max_len):
+        nxt = model.sample_next(ctx, temp, top_k, banned)
+
+        out.append(nxt)
+        ctx.append(nxt)
+    return out
+
+def complete(model, vocab, prompt, max_len=40, temp=0.9, top_k=40):
+    """Continue a free-text prompt. Returns (full_text, oov_words)."""
+    toks = TOKEN_RE.findall(prompt.lower())
+    if not toks:
+        raise ValueError("prompt has no usable tokens")
+    ids = vocab.encode(toks)
+    oov = [t for t, i in zip(toks, ids) if i == vocab.unk]
+    # condition on <bos> + prompt, so the model treats it as a sentence start
+    cont = generate(model, [vocab.bos] + ids, vocab.eos,
+                    max_len=max_len, temp=temp, top_k=top_k)
+    return detok(toks + [vocab.itos[i] for i in cont]), oov
+
+
+# --------------------------------------------------------------- evaluation
+def perplexity(model, seqs):
+    lp, n = 0.0, 0
+    for s in seqs:
+        lp += model.logprob(s)
+        n += len(s) - 1
+    return math.exp(-lp / n) if n else float("nan")
+
+# ---------------------------------------------------------------- encodings
+class Encoder:
+    """Sum encoding (order-invariant) vs positional-weighted (order-aware)."""
+
+    def __init__(self, V, dim=16, decay=0.9, seed=0):
+        rng = np.random.default_rng(seed)
+        self.E = rng.normal(0, 1, (V, dim))
+        self.decay = decay
+
+    def bag_sum(self, ids):
+        return self.E[ids].sum(0)
 
-    def synthetic_freqs(self, k):
-        ranks = np.arange(1, k + 1, dtype=np.float32)
-        f = 1.0 / ranks ** self.zipf_s
-        return f / f.sum()
+    def positional(self, ids):
+        w = self.decay ** np.arange(len(ids))
+        return (self.E[ids] * w[:, None]).sum(0)
 
-    def node_weights(self, node_matrix, node_valid, anchor_vecs):
-        n = node_matrix.shape[0]
-        if len(anchor_vecs) == 0:
-            return np.zeros(n, dtype=np.float32)
 
-        freqs = self.synthetic_freqs(len(anchor_vecs))
-        # cosine similarity (all vectors are unit length)
-        sims = np.clip(node_matrix @ anchor_vecs.T, 0.0, None)
-        sem = sims @ freqs                      # freq-weighted semantics
-        sem[~node_valid] = 0.0
-
-        peak = sem.max()
-        if peak <= 0:
-            return np.zeros(n, dtype=np.float32)
-
-        w = sem / peak
-        return (w ** self.gamma).astype(np.float32)   # the modal squeeze
-
-
-# ----------------------------------------------------------------------
-# GLOVE PROMPT SLICER (probes the graph directly, no corpus segments)
-# ----------------------------------------------------------------------
-
-class GloveSlicer:
-    """
-    Slices a prompt into word windows, embeds each slice with GloVe, and
-    measures the Manhattan (L1) distance from the slice to every bigram
-    node of the dataset graph. The nearest nodes are the peaks, which seed
-    generation. Each slice also yields an ordered anchor list (slice words
-    plus GloVe neighbours that exist in the dataset).
-    """
-
-    def __init__(self, glove_name="glove-wiki-gigaword-100", glove_path=None):
-        if glove_path:
-            print(f"Loading GloVe from {glove_path}")
-            self.kv = KeyedVectors.load_word2vec_format(
-                glove_path, binary=False, no_header=True
-            )
-        else:
-            print(f"Loading GloVe: {glove_name} (cached after first download)")
-            self.kv = gensim_api.load(glove_name)
-
-        self.dim = self.kv.vector_size
-        self.node_matrix = None
-        self.node_valid = None
-
-    # -- embedding -----------------------------------------------------
-
-    def embed(self, tokens):
-        vecs = [self.kv[t] for t in tokens if t in self.kv]
-        if not vecs:
-            return None
-        v = np.mean(vecs, axis=0)
-        norm = np.linalg.norm(v)
-        return (v / norm).astype(np.float32) if norm > 0 else None
-
-    def index_nodes(self, id_to_node):
-        """Embed every bigram node (content words only)."""
-        n = len(id_to_node)
-        self.node_matrix = np.zeros((n, self.dim), dtype=np.float32)
-        self.node_valid = np.zeros(n, dtype=bool)
-
-        for index, pair in id_to_node.items():
-            vec = self.embed(content_tokens(pair))
-            if vec is not None:
-                self.node_matrix[index] = vec
-                self.node_valid[index] = True
-
-        print(
-            f"Embedded {int(self.node_valid.sum())}/{n} graph nodes with GloVe."
-        )
-
-    # -- slicing -------------------------------------------------------
-
-    def slice_prompt(self, prompt, width=2, stride=1):
-        tokens = [t for t in tokenize(prompt) if t not in ENGLISH_STOP_WORDS]
-        if not tokens:
-            tokens = tokenize(prompt)
-
-        if len(tokens) <= width:
-            windows = [tokens]
-        else:
-            windows = [
-                tokens[i:i + width]
-                for i in range(0, len(tokens) - width + 1, stride)
-            ]
-
-        slices = []
-        for window in windows:
-            vec = self.embed(window)
-            if vec is not None:
-                slices.append((window, vec))
-        return slices
-
-    # -- Manhattan distance and peaks ----------------------------------
-
-    @staticmethod
-    def manhattan(a, b):
-        return float(np.abs(a - b).sum())
-
-    def node_distances(self, slice_vec):
-        """Manhattan distance from one slice to every node (inf if invalid)."""
-        if self.node_matrix is None:
-            raise RuntimeError("Call index_nodes() first.")
-
-        distances = np.abs(self.node_matrix - slice_vec).sum(axis=1)
-        distances[~self.node_valid] = np.inf
-        return distances
-
-    @staticmethod
-    def find_peaks(distances, top_k=5, prominence=1.0):
-        """
-        Peaks = the nodes whose distance sits at least `prominence`
-        standard deviations below the mean, capped at top_k. Always
-        returns at least the single nearest node.
-        """
-        finite = np.isfinite(distances)
-        if not finite.any():
-            return []
-
-        mean = distances[finite].mean()
-        std = distances[finite].std()
-
-        k = min(top_k, int(finite.sum()))
-        nearest = np.argpartition(np.where(finite, distances, np.inf), k - 1)[:k]
-        nearest = nearest[np.argsort(distances[nearest])]
-
-        if std == 0:
-            return [int(nearest[0])]
-
-        peaks = [
-            int(i) for i in nearest
-            if (mean - distances[i]) / std >= prominence
-        ]
-
-        return peaks or [int(nearest[0])]
-
-    # -- ordered anchors for the squeezer ------------------------------
-
-    def anchors(self, slice_tokens, slice_vec, dataset_vocab, topn=80, keep=8):
-        """Ordered anchors: slice words first, then nearest dataset neighbours."""
-        ordered = [t for t in slice_tokens if t in self.kv]
-        limit = keep + len(ordered)
-
-        for word, _ in self.kv.similar_by_vector(slice_vec, topn=topn):
-            if (
-                word in dataset_vocab
-                and word not in ENGLISH_STOP_WORDS
-                and word not in ordered
-            ):
-                ordered.append(word)
-            if len(ordered) >= limit:
-                break
-
-        vecs = np.array(
-            [self.kv.get_vector(w, norm=True) for w in ordered],
-            dtype=np.float32,
-        )
-        return ordered, vecs
-
-
-def dataset_vocab_from_nodes(id_to_node):
-    """
-    Graph nodes keep raw whitespace tokens ("dog.", "fox,"), so map each
-    cleaned word to every raw form present in the graph.
-    """
-    clean_to_raw = {}
-    for pair in id_to_node.values():
-        for raw in pair:
-            clean_to_raw.setdefault(clean_word(raw), set()).add(raw.lower())
-    return clean_to_raw
-
-
-def to_raw_vocab(clean_vocab, clean_to_raw):
-    raw = set()
-    for word in clean_vocab:
-        raw.update(clean_to_raw.get(word, {word}))
-    return raw
-
-
-def print_peak_table(slices, per_slice_distances, per_slice_peaks, id_to_node, max_rows=12):
-    """Peak nodes down the side, one distance column per slice."""
-    best = {}
-    for peaks, distances in zip(per_slice_peaks, per_slice_distances):
-        for node in peaks:
-            best[node] = min(best.get(node, np.inf), distances[node])
-
-    rows = sorted(best, key=lambda node: best[node])[:max_rows]
-
-    labels = [" ".join(tokens)[:14] for tokens, _ in slices]
-    col = 16
-    print("\nManhattan distance (peak node x slice)   * = peak for that slice")
-    print("node".ljust(24) + "".join(label.ljust(col) for label in labels))
-
-    for node in rows:
-        name = " ".join(id_to_node[node])[:22]
-        line = name.ljust(24)
-        for peaks, distances in zip(per_slice_peaks, per_slice_distances):
-            cell = f"{distances[node]:.3f}"
-            if node in peaks:
-                cell += " *"
-            line += cell.ljust(col)
-        print(line)
-
-
-def render_side_by_side(columns, total_width=118, gap=3):
-    """columns: list of (header, text). Prints them as parallel columns."""
-    n = len(columns)
-    width = max(18, (total_width - gap * (n - 1)) // n)
-    wrapped = [textwrap.wrap(text, width) for _, text in columns]
-    sep = " " * gap
-
-    lines = [sep.join(header[:width].ljust(width) for header, _ in columns)]
-    lines.append(sep.join("-" * width for _ in columns))
-    for parts in zip_longest(*wrapped, fillvalue=""):
-        lines.append(sep.join(part.ljust(width) for part in parts))
-    return "\n".join(lines)
-
-
-# ----------------------------------------------------------------------
-# GRAPH CREATION
-# ----------------------------------------------------------------------
-
-def process_text_to_trigram_graph(text, max_nodes=200):
-    """
-    Builds a graph where nodes are bigrams and edges represent trigrams.
-    """
-    text = text.lower()
-    words = text.split()
-
-    if len(words) < 3:
-        return {}, {}, {}
-
-    all_bigrams = [
-        (words[i], words[i + 1])
-        for i in range(len(words) - 1)
-    ]
-
-    top_bigrams = [
-        bigram
-        for bigram, _ in Counter(all_bigrams).most_common(max_nodes)
-    ]
-
-    bigram_set = set(top_bigrams)
-
-    node_to_id = {
-        bigram: index
-        for index, bigram in enumerate(top_bigrams)
-    }
-
-    id_to_node = {
-        index: bigram
-        for index, bigram in enumerate(top_bigrams)
-    }
-
-    graph = {
-        index: {}
-        for index in range(len(top_bigrams))
-    }
-
-    for i in range(len(words) - 2):
-        b1 = (words[i], words[i + 1])
-        b2 = (words[i + 1], words[i + 2])
-
-        if b1 in bigram_set and b2 in bigram_set:
-            id1 = node_to_id[b1]
-            id2 = node_to_id[b2]
-
-            if id1 != id2:
-                graph[id1][id2] = graph[id1].get(id2, 0) + 1
-                graph[id2][id1] = graph[id2].get(id1, 0) + 1
-
-    return graph, node_to_id, id_to_node
-
-
-# ----------------------------------------------------------------------
-# PROMPT-AWARE MARKOV GENERATOR
-# ----------------------------------------------------------------------
-
-def generate_markovian_prompt_text(
-    graph,
-    id_to_node,
-    spins,
-    prompt_vocab,
-    length=100,
-    node_weights=None,
-    boost=50.0,
-):
-    n = len(graph)
-
-    if n == 0:
-        return ""
-
-    prompt_vocab = {
-        word.lower()
-        for word in prompt_vocab
-        if word.strip()
-    }
-
-    use_semantic = node_weights is not None and node_weights.sum() > 0
-
-    # Start node: sample by semantic weight instead of a hard word match.
-    if use_semantic:
-        current_node = random.choices(
-            range(n),
-            weights=node_weights + 1e-6,
-            k=1,
-        )[0]
-    else:
-        valid_starts = [
-            i
-            for i in range(n)
-            if any(word in prompt_vocab for word in id_to_node[i])
-        ]
-        current_node = (
-            random.choice(valid_starts)
-            if valid_starts
-            else random.randrange(n)
-        )
-
-    output = list(id_to_node[current_node])
-
-    for _ in range(max(0, length - 2)):
-        current_spin = spins[current_node]
-        neighbors = graph[current_node]
-        current_word_2 = id_to_node[current_node][1]
-
-        valid_neighbors = [
-            neighbor
-            for neighbor in neighbors
-            if id_to_node[neighbor][0] == current_word_2
-        ]
-
-        if not valid_neighbors:
-            fallback_nodes = [
-                i
-                for i, spin in enumerate(spins)
-                if (
-                    spin != current_spin
-                    and id_to_node[i][0] == current_word_2
-                )
-            ]
-
-            if fallback_nodes:
-                next_node = random.choice(fallback_nodes)
-            else:
-                next_node = random.randrange(n)
-        else:
-            probabilities = []
-
-            for neighbor in valid_neighbors:
-                base_weight = graph[current_node][neighbor]
-
-                cut_multiplier = (
-                    5.0
-                    if spins[neighbor] != current_spin
-                    else 1.0
-                )
-
-                if use_semantic:
-                    prompt_multiplier = 1.0 + boost * float(node_weights[neighbor])
-                else:
-                    neighbor_words = id_to_node[neighbor]
-                    prompt_multiplier = (
-                        50.0
-                        if any(word in prompt_vocab for word in neighbor_words)
-                        else 1.0
-                    )
-
-                score = (
-                    base_weight
-                    * cut_multiplier
-                    * prompt_multiplier
-                )
-
-                probabilities.append(score)
-
-            next_node = random.choices(
-                valid_neighbors,
-                weights=probabilities,
-                k=1,
-            )[0]
-
-        output.append(id_to_node[next_node][1])
-        current_node = next_node
-
-    return " ".join(output)
-
-
-# ----------------------------------------------------------------------
-# GLOVE PROBE + SIDE-BY-SIDE GENERATION
-# ----------------------------------------------------------------------
-
-def glove_probe_and_generate(
-    prompt,
-    slicer,
-    graph,
-    id_to_node,
-    spins,
-    clean_to_raw,
-    squeezer,
-    width=22,
-    top_k=5,
-    length=60,
-    max_columns=42,
-):
-    slices = slicer.slice_prompt(prompt, width=width)
-
-    if not slices:
-        print("GloVe knows none of the prompt words; no slices to probe.")
-        return False
-
-    # Keep the output readable: cap the number of side-by-side columns.
-    if len(slices) > max_columns:
-        step = len(slices) / max_columns
-        slices = [slices[int(i * step)] for i in range(max_columns)]
-
-    per_slice_distances = [slicer.node_distances(vec) for _, vec in slices]
-    per_slice_peaks = [
-        slicer.find_peaks(d, top_k=top_k) for d in per_slice_distances
-    ]
-
-    if not any(per_slice_peaks):
-        print("No usable peaks found.")
-        return False
-
-    print_peak_table(
-        slices, per_slice_distances, per_slice_peaks, id_to_node
-    )
-
-    dataset_vocab = set(clean_to_raw)
-
-    columns = []
-    for (tokens, slice_vec), peaks in zip(slices, per_slice_peaks):
-        anchor_words, anchor_vecs = slicer.anchors(
-            tokens, slice_vec, dataset_vocab
-        )
-
-        weights = squeezer.node_weights(
-            slicer.node_matrix, slicer.node_valid, anchor_vecs
-        )
-
-        # Peak nodes are the strongest anchors: pin them to full weight.
-        for node in peaks:
-            weights[node] = 1.0
-
-        raw_vocab = to_raw_vocab(set(anchor_words), clean_to_raw)
-        for node in peaks:
-            raw_vocab.update(id_to_node[node])
-
-        text = generate_markovian_prompt_text(
-            graph,
-            id_to_node,
-            spins,
-            raw_vocab,
-            length=length,
-            node_weights=weights,
-            boost=squeezer.boost,
-        )
-
-        header = (
-            f"[{' '.join(tokens)}] "
-            f"{len(anchor_words)} anchors g={squeezer.gamma}"
-        )
-        columns.append((header, text.capitalize() + "."))
-
-    print("\nGenerated Output (one column per prompt slice):\n")
-    print(render_side_by_side(columns))
-    print()
-    return True
-
-
-# ----------------------------------------------------------------------
-# PLAIN FALLBACK (no GloVe)
-# ----------------------------------------------------------------------
-
-def plain_generate(prompt, graph, id_to_node, spins):
-    final_text = generate_markovian_prompt_text(
-        graph,
-        id_to_node,
-        spins,
-        prompt.split(),
-        length=400,
-    )
-
-    print("\nGenerated Output:")
-    print(f"> {final_text.capitalize()}.\n")
-
-
-# ----------------------------------------------------------------------
-# MAIN PROGRAM
-# ----------------------------------------------------------------------
-
-def load_text_file(filepath):
-    try:
-        with open(filepath, "r", encoding="utf-8") as file:
-            return file.read()
-    except FileNotFoundError:
-        print(f"File {filepath} not found. Using fallback text.")
-
-        return (
-            "The quick brown fox jumps over the lazy dog. "
-            "The lazy dog barks at the brown fox. "
-            "The quick brown fox runs away quickly into the deep "
-            "dark brown forest. The dark forest is full of mystery. "
-            "A dog barks loudly in the dark."
-        )
-
-
-def load_slicer(id_to_node):
-    if not GENSIM_AVAILABLE:
-        print("gensim not installed (pip install gensim). Using plain generation.")
-        return None
-
-    glove_path = input(
-        "Local GloVe .txt path (blank = download glove-wiki-gigaword-100): "
-    ).strip()
-
-    try:
-        slicer = GloveSlicer(glove_path=glove_path or None)
-        slicer.index_nodes(id_to_node)
-        return slicer
-    except Exception as error:
-        print(f"Could not load GloVe ({error}). Using plain generation.")
-        return None
-
-
+# --------------------------------------------------------------------- main
 def main():
-    dataset_file = input("Dataset filename: ").strip()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("path")
+    ap.add_argument("--order", type=int, default=3)
+    ap.add_argument("--min-count", type=int, default=1)
+    ap.add_argument("--n", type=int, default=1, help="sentences to generate")
+    ap.add_argument("--temp", type=float, default=0.9)
+    ap.add_argument("--top-k", type=int, default=40)
+    ap.add_argument("--max-len", type=int, default=400)
+    ap.add_argument("--lam", type=float, default=0.7, help="interpolation weight")
+    ap.add_argument("--k", type=float, default=0.01, help="add-k for the base")
+    ap.add_argument("--seed-word", default=None)
+    ap.add_argument("--prompt", default=None, help="text to continue")
+    ap.add_argument("--interactive", default=True, action="store_true", help="prompt loop")
+    ap.add_argument("--seed", type=int, default=42)
+    args = ap.parse_args()
 
-    dataset_text = clean_text(load_text_file(dataset_file))
+    random.seed(args.seed)
+    np.random.seed(args.seed)
 
-    print("Building graph from the complete dataset...")
-    graph, node_to_id, id_to_node = process_text_to_trigram_graph(
-        dataset_text,
-        max_nodes=150000,
-    )
+    sents = load_sentences(args.path)
+    if not sents:
+        raise SystemExit("no usable sentences found in input file")
+    random.shuffle(sents)
+    split = max(1, int(0.9 * len(sents)))
+    train, test = sents[:split], sents[split:]
 
-    if not graph:
-        print("Graph is empty. Check the dataset.")
-        return
+    vocab = Vocab(train, args.min_count)
+    print(f"sentences: {len(train)} train / {len(test)} test | vocab: {vocab.V}")
 
-    print(f"Graph built with {len(graph)} unique nodes.")
+    def wrap(s):
+        return [vocab.bos] + vocab.encode(s) + [vocab.eos]
 
-    print("Running PCMMaxCut solver for structural baseline...")
+    fwd_seqs = [wrap(s) for s in train]              # static order
+    bwd_seqs = [s[::-1] for s in fwd_seqs]           # reversed view, same ids
 
-    solver = PCMMaxCut(
-        graph,
-        noise=0.00001,
-        drift_nu=0.00000001,
-    )
+    gen_kw = dict(max_len=args.max_len, temp=args.temp, top_k=args.top_k)
+    model_kw = dict(order=args.order, lam=args.lam, k=args.k)
 
-    history = solver.run(
-        iterations=5000,
-        temperature=0.0000005,
-        cooling=0.0000000199,
-    )
+    fwd = NGram(vocab, **model_kw).fit(fwd_seqs)
+    bwd = NGram(vocab, start=vocab.eos, stop=vocab.bos, **model_kw).fit(bwd_seqs)
 
-    best_cut = max(
-        history,
-        key=lambda item: item["cut"],
-    )
+    # ---- prompt completion
+    def run(prompt):
+        oov_all = set()
+        for _ in range(args.n):
+            text, oov = complete(fwd, vocab, prompt, **gen_kw)
+            oov_all.update(oov)
+            print(" ", text)
+        if oov_all:
+            print(f"  (not in vocab, treated as <unk>: {sorted(oov_all)})")
 
-    print(
-        f"Base partition created. "
-        f"Max Cut Size: {best_cut['cut']}\n"
-    )
-
-    spins = best_cut["spins"]
-    clean_to_raw = dataset_vocab_from_nodes(id_to_node)
-    slicer = load_slicer(id_to_node)
-
-    # gamma: squeeze strength (>1 sharper, <1 flatter)
-    # zipf_s: how top-heavy the made-up anchor frequencies are
-    squeezer = ModalSqueezer(zipf_s=1.0, gamma=2.5, boost=50.0)
-
-    while True:
+    if args.prompt:
+        print(f"\n--- continuing: {args.prompt!r} ---")
         try:
-            user_prompt = input("USER: ").strip()
-        except (KeyboardInterrupt, EOFError):
-            print("\nExiting.")
-            break
+            run(args.prompt)
+        except ValueError as e:
+            print(" ", e)
 
-        if not user_prompt:
-            continue
-
-        if user_prompt.lower() in {"exit", "quit"}:
-            break
-
-        done = False
-
-        if slicer is not None:
-            done = glove_probe_and_generate(
-                user_prompt,
-                slicer,
-                graph,
-                id_to_node,
-                spins,
-                clean_to_raw,
-                squeezer,
-                width=24,
-                top_k=5,
-                length=60,
-                max_columns=4,
-            )
-
-        # Fall back to plain prompt-word biasing if GloVe is unavailable
-        # or knows none of the prompt words.
-        if not done:
-            plain_generate(user_prompt, graph, id_to_node, spins)
+    if args.interactive:
+        print("\nType a prompt (empty line to quit).")
+        while True:
+            try:
+                p = input("> ").strip()
+            except EOFError:
+                break
+            if not p:
+                break
+            try:
+                run(p)
+            except ValueError as e:
+                print(" ", e)
 
 
 if __name__ == "__main__":
