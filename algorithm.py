@@ -129,6 +129,46 @@ def content_tokens(words):
 
 
 # ----------------------------------------------------------------------
+# MODAL SQUEEZER
+# ----------------------------------------------------------------------
+
+class ModalSqueezer:
+    """
+    Anchors (nearest GloVe words to a slice) get made-up Zipf frequencies.
+    Every graph node is scored by its similarity to the anchors, weighted
+    by those frequencies, then squeezed toward the mode with w**gamma.
+    """
+
+    def __init__(self, zipf_s=1.0, gamma=2.5, boost=50.0):
+        self.zipf_s = zipf_s    # higher = first anchor dominates more
+        self.gamma = gamma      # >1 sharpens toward the mode, <1 flattens
+        self.boost = boost      # max multiplier, same role as the old 50.0
+
+    def synthetic_freqs(self, k):
+        ranks = np.arange(1, k + 1, dtype=np.float32)
+        f = 1.0 / ranks ** self.zipf_s
+        return f / f.sum()
+
+    def node_weights(self, node_matrix, node_valid, anchor_vecs):
+        n = node_matrix.shape[0]
+        if len(anchor_vecs) == 0:
+            return np.zeros(n, dtype=np.float32)
+
+        freqs = self.synthetic_freqs(len(anchor_vecs))
+        # cosine similarity (all vectors are unit length)
+        sims = np.clip(node_matrix @ anchor_vecs.T, 0.0, None)
+        sem = sims @ freqs                      # freq-weighted semantics
+        sem[~node_valid] = 0.0
+
+        peak = sem.max()
+        if peak <= 0:
+            return np.zeros(n, dtype=np.float32)
+
+        w = sem / peak
+        return (w ** self.gamma).astype(np.float32)   # the modal squeeze
+
+
+# ----------------------------------------------------------------------
 # GLOVE PROMPT SLICER (probes the graph directly, no corpus segments)
 # ----------------------------------------------------------------------
 
@@ -137,8 +177,8 @@ class GloveSlicer:
     Slices a prompt into word windows, embeds each slice with GloVe, and
     measures the Manhattan (L1) distance from the slice to every bigram
     node of the dataset graph. The nearest nodes are the peaks, which seed
-    generation. Each slice's vocabulary is expanded with GloVe neighbours
-    that exist in the dataset.
+    generation. Each slice also yields an ordered anchor list (slice words
+    plus GloVe neighbours that exist in the dataset).
     """
 
     def __init__(self, glove_name="glove-wiki-gigaword-100", glove_path=None):
@@ -246,22 +286,28 @@ class GloveSlicer:
 
         return peaks or [int(nearest[0])]
 
-    # -- accommodating vocabulary --------------------------------------
+    # -- ordered anchors for the squeezer ------------------------------
 
-    def expand_vocab(self, slice_tokens, slice_vec, dataset_vocab, topn=80, keep=8):
-        """
-        Slice words plus nearest GloVe neighbours that also occur in the
-        dataset graph, so the Markov walk can actually reach them.
-        """
-        vocab = set(slice_tokens)
-        added = 0
+    def anchors(self, slice_tokens, slice_vec, dataset_vocab, topn=80, keep=8):
+        """Ordered anchors: slice words first, then nearest dataset neighbours."""
+        ordered = [t for t in slice_tokens if t in self.kv]
+        limit = keep + len(ordered)
+
         for word, _ in self.kv.similar_by_vector(slice_vec, topn=topn):
-            if word in dataset_vocab and word not in ENGLISH_STOP_WORDS:
-                vocab.add(word)
-                added += 1
-                if added >= keep:
-                    break
-        return vocab
+            if (
+                word in dataset_vocab
+                and word not in ENGLISH_STOP_WORDS
+                and word not in ordered
+            ):
+                ordered.append(word)
+            if len(ordered) >= limit:
+                break
+
+        vecs = np.array(
+            [self.kv.get_vector(w, norm=True) for w in ordered],
+            dtype=np.float32,
+        )
+        return ordered, vecs
 
 
 def dataset_vocab_from_nodes(id_to_node):
@@ -388,6 +434,8 @@ def generate_markovian_prompt_text(
     spins,
     prompt_vocab,
     length=100,
+    node_weights=None,
+    boost=50.0,
 ):
     n = len(graph)
 
@@ -400,17 +448,26 @@ def generate_markovian_prompt_text(
         if word.strip()
     }
 
-    valid_starts = [
-        i
-        for i in range(n)
-        if any(word in prompt_vocab for word in id_to_node[i])
-    ]
+    use_semantic = node_weights is not None and node_weights.sum() > 0
 
-    current_node = (
-        random.choice(valid_starts)
-        if valid_starts
-        else random.randrange(n)
-    )
+    # Start node: sample by semantic weight instead of a hard word match.
+    if use_semantic:
+        current_node = random.choices(
+            range(n),
+            weights=node_weights + 1e-6,
+            k=1,
+        )[0]
+    else:
+        valid_starts = [
+            i
+            for i in range(n)
+            if any(word in prompt_vocab for word in id_to_node[i])
+        ]
+        current_node = (
+            random.choice(valid_starts)
+            if valid_starts
+            else random.randrange(n)
+        )
 
     output = list(id_to_node[current_node])
 
@@ -451,13 +508,15 @@ def generate_markovian_prompt_text(
                     else 1.0
                 )
 
-                neighbor_words = id_to_node[neighbor]
-
-                prompt_multiplier = (
-                    50.0
-                    if any(word in prompt_vocab for word in neighbor_words)
-                    else 1.0
-                )
+                if use_semantic:
+                    prompt_multiplier = 1.0 + boost * float(node_weights[neighbor])
+                else:
+                    neighbor_words = id_to_node[neighbor]
+                    prompt_multiplier = (
+                        50.0
+                        if any(word in prompt_vocab for word in neighbor_words)
+                        else 1.0
+                    )
 
                 score = (
                     base_weight
@@ -490,10 +549,11 @@ def glove_probe_and_generate(
     id_to_node,
     spins,
     clean_to_raw,
-    width=2,
+    squeezer,
+    width=22,
     top_k=5,
     length=60,
-    max_columns=4,
+    max_columns=42,
 ):
     slices = slicer.slice_prompt(prompt, width=width)
 
@@ -523,10 +583,19 @@ def glove_probe_and_generate(
 
     columns = []
     for (tokens, slice_vec), peaks in zip(slices, per_slice_peaks):
-        clean_vocab = slicer.expand_vocab(tokens, slice_vec, dataset_vocab)
-        raw_vocab = to_raw_vocab(clean_vocab, clean_to_raw)
+        anchor_words, anchor_vecs = slicer.anchors(
+            tokens, slice_vec, dataset_vocab
+        )
 
-        # The peak nodes' own words also seed the walk.
+        weights = squeezer.node_weights(
+            slicer.node_matrix, slicer.node_valid, anchor_vecs
+        )
+
+        # Peak nodes are the strongest anchors: pin them to full weight.
+        for node in peaks:
+            weights[node] = 1.0
+
+        raw_vocab = to_raw_vocab(set(anchor_words), clean_to_raw)
         for node in peaks:
             raw_vocab.update(id_to_node[node])
 
@@ -536,10 +605,14 @@ def glove_probe_and_generate(
             spins,
             raw_vocab,
             length=length,
+            node_weights=weights,
+            boost=squeezer.boost,
         )
 
-        added = len(clean_vocab) - len(tokens)
-        header = f"[{' '.join(tokens)}] +{max(added, 0)} words"
+        header = (
+            f"[{' '.join(tokens)}] "
+            f"{len(anchor_words)} anchors g={squeezer.gamma}"
+        )
         columns.append((header, text.capitalize() + "."))
 
     print("\nGenerated Output (one column per prompt slice):\n")
@@ -648,6 +721,10 @@ def main():
     clean_to_raw = dataset_vocab_from_nodes(id_to_node)
     slicer = load_slicer(id_to_node)
 
+    # gamma: squeeze strength (>1 sharper, <1 flatter)
+    # zipf_s: how top-heavy the made-up anchor frequencies are
+    squeezer = ModalSqueezer(zipf_s=1.0, gamma=2.5, boost=50.0)
+
     while True:
         try:
             user_prompt = input("USER: ").strip()
@@ -671,7 +748,8 @@ def main():
                 id_to_node,
                 spins,
                 clean_to_raw,
-                width=2,
+                squeezer,
+                width=24,
                 top_k=5,
                 length=60,
                 max_columns=4,
