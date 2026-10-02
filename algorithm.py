@@ -163,7 +163,7 @@ if __name__ == "__main__":
     dataset_file = input("Filename: ")
     
     print("Building trigram graph from text...")
-    graph, node_to_id, id_to_node = process_text_to_trigram_graph(dataset_file, max_nodes=15000)
+    graph, node_to_id, id_to_node = process_text_to_trigram_graph(dataset_file, max_nodes=150000)
     
     if len(graph) == 0:
         print("Graph is empty. Check your dataset text.")
