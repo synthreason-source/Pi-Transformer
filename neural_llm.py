@@ -28,13 +28,6 @@ Pipeline
      age (`--curves exp` swaps in a plain exponential decay), so the context
      evolves word by word instead of being fixed by the prompt.
 
-Word recognition
-  * Up to --circuit-vocab content words get their own brain vector.
-  * Inflections of those words (rivers/river, flowing/flow) are aliased onto
-    their sibling's vector via a crude suffix stemmer.
-  * Unseen prompt words are matched to a known word by shared stem, then by
-    close spelling (difflib), before falling back to <unk>.
-
 Other generation controls: entropy-targeted temperature, direct leaky anchor,
 beam search (heapq + linked-list paths + exact state dedup), min-len,
 feasibility-based length floor, beam calibration, and an ablation `--diagnose`
@@ -48,7 +41,6 @@ that compares: no bias / direct anchor / PPMI dots (no brain) / circuit dots.
   python neural_llm.py data.txt --interactive --dots circuit --target-entropy 1.5
 """
 import argparse
-import difflib
 import heapq
 import json
 import os
@@ -67,19 +59,6 @@ PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
 TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 WORD_RE = re.compile(r"[a-z0-9']")
-
-_SUFFIXES = ("ing", "ed", "es", "s", "ly")
-
-
-def stem(w):
-    """Crude suffix stripper: enough to link rivers/river, flowing/flow."""
-    for suf in _SUFFIXES:
-        if suf == "s" and w.endswith("ss"):      # glass != glas
-            continue
-        if w.endswith(suf) and len(w) - len(suf) >= 3:
-            return w[:-len(suf)]
-    return w
-
 
 def explain_words(values):
     """Expand one or more command-line values into individual explainable words."""
@@ -213,25 +192,9 @@ class Vocab:
         self.counts = np.zeros(self.V)
         for t in kept:
             self.counts[self.stoi[t]] = counts[t]
-        self.by_stem = {}
-        for i in range(4, self.V):                # itos is frequency-sorted
-            self.by_stem.setdefault(stem(self.itos[i]), i)
 
     def encode(self, toks):
         return [self.stoi.get(t, self.unk) for t in toks]
-
-    def resolve(self, tok):
-        """Known word -> itself. Otherwise try a shared stem, then a close spelling.
-        Returns a vocabulary token or None."""
-        if tok in self.stoi:
-            return tok
-        if not WORD_RE.match(tok) or len(tok) < 4:
-            return None
-        i = self.by_stem.get(stem(tok))
-        if i is not None:
-            return self.itos[i]
-        m = difflib.get_close_matches(tok, self.itos[4:], n=1, cutoff=0.85)
-        return m[0] if m else None
 
 
 class NGram:
@@ -279,8 +242,8 @@ class NGram:
 # ===========================================================================
 @dataclass
 class Circuit:
-    ids: np.ndarray        # vocab ids that have their own circuit vector
-    row_of: np.ndarray     # vocab id -> row in G (or -1); inflections alias a sibling's row
+    ids: np.ndarray        # vocab ids that have a circuit vector
+    row_of: np.ndarray     # vocab id -> row in G (or -1)
     G: np.ndarray          # circuit dot products  r_i . r_j   (diag = 0)
     Gp: np.ndarray         # ablation: PPMI-cosine dots, no brain (diag = 0)
     ppmi: np.ndarray       # raw PPMI (used only by the diagnostic metric)
@@ -385,8 +348,7 @@ def word_context_table(R, seeds, coords_all, vals, keep_cc, codes):
 
 
 def word_context(circ, vocab, word, top=5):
-    """Everything the MRI says about one word, or None if it has no circuit vector.
-    Inflections share their sibling's vector, so they report the sibling's context."""
+    """Everything the MRI says about one word, or None if it has no circuit vector."""
     i = vocab.stoi.get(word, -1)
     r = circ.row_of[i] if i >= 0 else -1
     if r < 0 or not circ.info:
@@ -419,44 +381,27 @@ def build_circuit(sents, vocab, a):
     row_of = np.full(vocab.V, -1, np.int64)
     row_of[ids] = np.arange(Vc)
 
-    # --- PPMI over sentence co-occurrence (float32 to keep the dense Vc x Vc matrices small)
+    # --- PPMI over sentence co-occurrence
     r, c = [], []
     for si, s in enumerate(sents):
         for t in set(vocab.encode(s)):
             if row_of[t] >= 0:
                 r.append(si); c.append(row_of[t])
     X = sp.csr_matrix((np.ones(len(r), np.float32), (r, c)), shape=(len(sents), Vc))
-    C = (X.T @ X).toarray().astype(np.float32)
+    C = (X.T @ X).toarray().astype(np.float64)
     np.fill_diagonal(C, 0)
     rs = C.sum(1, keepdims=True)
-    tot = np.float32(C.sum(dtype=np.float64))
     with np.errstate(divide="ignore", invalid="ignore"):
-        pmi = np.log(C * tot / (rs * rs.T))
-    del C
+        pmi = np.log(C * C.sum() / (rs * rs.T))
     P = np.where(np.isfinite(pmi) & (pmi > 0), pmi, 0).astype(np.float32)
-    del pmi
     Pn = P / (np.linalg.norm(P, axis=1, keepdims=True) + 1e-8)
     Gp = (Pn @ Pn.T).astype(np.float32)
     np.fill_diagonal(Gp, 0)
-    del Pn
-
-    # --- alias inflections of circuit words onto their sibling's row (done after PPMI so
-    #     co-occurrence counts aren't merged; function words in `skip` are never aliased)
-    by_stem = {}
-    for i in ids:
-        by_stem.setdefault(stem(vocab.itos[i]), row_of[i])
-    for i in range(4, vocab.V):
-        if row_of[i] < 0 and i not in skip and WORD_RE.match(vocab.itos[i]):
-            rr = by_stem.get(stem(vocab.itos[i]))
-            if rr is not None:
-                row_of[i] = rr
-    print(f"[circuit] {int((row_of >= 0).sum())} vocab words resolve to a circuit vector "
-          f"({Vc} direct, rest via stems)")
 
     # cache keyed by every parameter that affects G
     nd = dict(L=getattr(a, "noodle_steps", 24), K=getattr(a, "noodle_count", 16),
               ang=getattr(a, "noodle_angle", 70.0), pct=getattr(a, "noodle_tube_pct", 25.0))
-    sig = json.dumps(dict(v=4, nd=nd, mri=a.mri, ds=a.downsample, vt=a.voxel_threshold, steps=a.steps,
+    sig = json.dumps(dict(v=3, nd=nd, mri=a.mri, ds=a.downsample, vt=a.voxel_threshold, steps=a.steps,
                           decay=a.decay, gain=a.gain, fire=a.fire_threshold,
                           toks=[vocab.itos[i] for i in ids]), sort_keys=True)
     if a.dots_cache and os.path.exists(a.dots_cache):
@@ -480,8 +425,7 @@ def build_circuit(sents, vocab, a):
           f"gain {gain:.2f} (spreads only if gain*w > threshold {a.fire_threshold})")
 
     # --- place tokens on the brain: PPMI -> 3 SVD dims -> uniform [0,1] -> bbox -> nearest node
-    Ps = sp.csr_matrix(P).astype(np.float64)       # PPMI is sparse; avoids a dense float64 copy
-    U, S, _ = svds(Ps, k=3, v0=np.random.default_rng(0).normal(size=Vc))  # seeded: reproducible placement
+    U, S, _ = svds(P.astype(np.float64), k=3, v0=np.random.default_rng(0).normal(size=Vc))  # seeded: reproducible placement
     pos = np.stack([rank01(v) for v in (U * S).T], axis=1)
     cc = coords[keep].astype(np.float64)
     target = cc.min(0) + pos * (cc.max(0) - cc.min(0))
@@ -510,19 +454,6 @@ def build_circuit(sents, vocab, a):
     return Circuit(ids, row_of, G, Gp, P, stats, info)
 
 
-def expand_bias(circ, vocab, s):
-    """Row scores -> full-vocab bias, robustly normalised to [0, 1].
-    Aliased inflections share their sibling's score."""
-    pos = s[s > 0]
-    if not pos.size:
-        return None
-    x = np.clip(s / np.percentile(pos, 99), 0, 1)
-    full = np.zeros(vocab.V, np.float32)
-    has = circ.row_of >= 0
-    full[has] = x[circ.row_of[has]]
-    return full
-
-
 def prompt_bias(circ, vocab, toks, source):
     """Dot products between the prompt's content tokens and every token,
     robustly normalised to [0, 1] and expanded to the full vocabulary."""
@@ -533,7 +464,13 @@ def prompt_bias(circ, vocab, toks, source):
             if t in vocab.stoi and circ.row_of[vocab.stoi[t]] >= 0]
     if not rows:
         return None
-    return expand_bias(circ, vocab, M[:, rows].sum(axis=1))
+    s = M[:, rows].sum(axis=1)
+    pos = s[s > 0]
+    if not pos.size:
+        return None
+    full = np.zeros(vocab.V, np.float32)
+    full[circ.ids] = np.clip(s / np.percentile(pos, 99), 0, 1)
+    return full
 
 
 def context_bias(circ, M, vocab, gen_ids, decay, curves=False, stride=3):
@@ -548,7 +485,13 @@ def context_bias(circ, M, vocab, gen_ids, decay, curves=False, stride=3):
             u[r] += C[r, min(age * stride, C.shape[1] - 1)] if curves else decay ** age
     if not u.any():
         return None
-    return expand_bias(circ, vocab, M @ u)
+    s = M @ u
+    pos = s[s > 0]
+    if not pos.size:
+        return None
+    full = np.zeros(vocab.V, np.float32)
+    full[circ.ids] = np.clip(s / np.percentile(pos, 99), 0, 1)
+    return full
 
 
 # ===========================================================================
@@ -748,24 +691,11 @@ def generate(model, vocab, toks, gen, circ=None, trace=None):
     return out, temps
 
 
-def resolve_prompt(vocab, toks):
-    """Map each prompt token to a known word where possible.
-    Returns (resolved tokens, list of 'typed→matched' strings)."""
-    resolved, mapped = [], []
-    for t in toks:
-        r = vocab.resolve(t)
-        if r is not None and r != t:
-            mapped.append(f"{t}→{r}")
-        resolved.append(r if r is not None else t)
-    return resolved, mapped
-
-
 def complete(model, vocab, prompt, gen, circ=None, trace=None):
     toks = TOKEN_RE.findall(prompt.lower())
     if not toks:
         raise ValueError("prompt has no usable tokens")
-    resolved, mapped = resolve_prompt(vocab, toks)
-    ids = vocab.encode(resolved)
+    ids = vocab.encode(toks)
     oov = [t for t, i in zip(toks, ids) if i == vocab.unk]
     d = min_steps_to_eos(model, vocab, ids[-1])
     note = None
@@ -773,9 +703,7 @@ def complete(model, vocab, prompt, gen, circ=None, trace=None):
         note = "no observed path to end-of-text from the last prompt token"
     else:
         gen = replace(gen, max_len=max(gen.max_len, d + gen.slack))
-    out, _ = generate(model, vocab, resolved, gen, circ, trace)
-    if mapped:
-        note = (note + "; " if note else "") + "matched unseen words: " + ", ".join(mapped)
+    out, _ = generate(model, vocab, toks, gen, circ, trace)
     return detok(toks + [vocab.itos[i] for i in out]), oov, note
 
 
@@ -797,7 +725,7 @@ def diagnose(model, vocab, prompt, gen, circ, n=30):
     content words (a direct corpus statistic). Caveat: PPMI also builds both dot-product
     sources, so the 'ppmi' arm is favoured by construction; use a labelled-topic corpus
     for an independent check."""
-    toks, _ = resolve_prompt(vocab, TOKEN_RE.findall(prompt.lower()))
+    toks = TOKEN_RE.findall(prompt.lower())
     prompt_rows = [circ.row_of[vocab.stoi[t]] for t in toks
                    if t in vocab.stoi and circ.row_of[vocab.stoi[t]] >= 0] if circ else []
     anchors = set(anchor_ids(vocab, toks))
@@ -883,8 +811,7 @@ def main():
     g.add_argument("--decay", type=float, default=0.6)
     g.add_argument("--gain", type=float, default=0.0, help="0 = auto (1.5 x threshold / mean weight)")
     g.add_argument("--fire-threshold", type=float, default=0.55)
-    g.add_argument("--circuit-vocab", type=int, default=8000,
-                   help="max content words with their own brain vector (dense Vc x Vc matrices: memory ~ Vc^2)")
+    g.add_argument("--circuit-vocab", type=int, default=2000)
     g.add_argument("--circuit-min-count", type=int, default=2)
     g.add_argument("--skip-top", type=int, default=20)
     g.add_argument("--dots-cache", default=None)
@@ -981,7 +908,7 @@ def main():
             explain_tokens
             if explain_tokens
             else [
-                t for t in resolve_prompt(vocab, TOKEN_RE.findall((a.prompt or "").lower()))[0]
+                t for t in TOKEN_RE.findall((a.prompt or "").lower())
                 if t in vocab.stoi
             ][:6]
         )
@@ -1013,21 +940,7 @@ def main():
         if a.diagnose:
             diagnose(model, vocab, prompt, gen, circ)
 
-    if a.prompt:
-        run(a.prompt)
-    if a.interactive:
-        print("interactive mode: type a prompt, empty line to quit")
-        while True:
-            try:
-                line = input("> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not line:
-                break
-            try:
-                run(line)
-            except ValueError as e:
-                print(f"  ({e})")
+  
 
 
 if __name__ == "__main__":
