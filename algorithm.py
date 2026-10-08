@@ -302,6 +302,7 @@ def complete(engine, model, vocab, prompt, gen):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("path")
     ap.add_argument("--order", type=int, default=2)
     ap.add_argument("--min-count", type=int, default=1)
     ap.add_argument("--n", type=int, default=1)
