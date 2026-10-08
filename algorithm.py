@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
-"""Markov text model with PyTorch neural constructors and dynamic tensor execution."""
+"""Markov text model with prompt completion, using the generation
+techniques distilled from the neural-circuit simulation.
 
+  python markov_gen.py data.txt --prompt "once upon a" --n 3
+  python markov_gen.py data.txt --prompt "once upon a" --target-entropy 2.0 --anchor 2.0
+  python markov_gen.py data.txt --prompt "once upon a" --beam 8
+  python markov_gen.py data.txt --calibrate --diagnose --prompt "once upon a"
+  python markov_gen.py data.txt --interactive
+
+Techniques (each is off by default, so the plain sampler still works):
+  --target-entropy H   hold per-step entropy near H by solving for temperature
+                       (avoids die-out/repetition vs runaway incoherence)
+  --anchor A           leaky logit bias on the prompt's content words, decaying
+                       every step and re-pulsed every --anchor-interval steps
+  --beam W             beam search: heapq pruning, linked-list paths, exact
+                       Markov-state dedup, length-normalised final ranking
+  --calibrate          find the smallest beam width matching a wide-beam reference
+  --diagnose           measure whether the anchor really raises prompt-word recurrence
+  --base-clip P        clip the unigram backoff at the P-th percentile of counts
+Always on: generation stops at end-of-text, and max_len is raised to at least
+the shortest observed path to end-of-text (+ --slack).
+"""
 import argparse
 import heapq
 import random
@@ -9,9 +29,6 @@ from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, replace
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
 PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
 TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
@@ -47,6 +64,8 @@ class Vocab:
 
 
 class NGram:
+    """Interpolated n-gram; order = number of previous tokens used."""
+
     def __init__(self, vocab, order=2, lam=0.7, k=0.01, base_clip=100.0):
         self.v, self.order, self.lam, self.k = vocab, order, lam, k
         self.base_clip = base_clip
@@ -59,7 +78,7 @@ class NGram:
                     self.tables[n][tuple(seq[t - n:t])][seq[t]] += 1
         base = self.v.counts.copy()
         base[self.v.eos] = len(seqs)
-        if self.base_clip < 100:
+        if self.base_clip < 100:  # robust normalisation: stop a few giant counts dominating
             pos = base[base > 0]
             base = np.minimum(base, np.percentile(pos, self.base_clip))
         base += self.k
@@ -69,7 +88,7 @@ class NGram:
     def dist(self, ctx):
         p = self.base
         ctx = tuple(ctx[-self.order:]) if self.order else ()
-        for n in range(len(ctx) + 1):
+        for n in range(len(ctx) + 1):  # shortest -> longest context
             c = self.tables[n].get(ctx[len(ctx) - n:] if n else ())
             if c:
                 vec = np.zeros(self.v.V)
@@ -79,110 +98,95 @@ class NGram:
         return p
 
     def logits(self, ctx):
+        """Log-probabilities as logits, specials masked. Fresh array: safe to edit."""
         lg = np.log(np.maximum(self.dist(ctx), 1e-300))
         lg[[self.v.pad, self.v.bos, self.v.unk]] = -np.inf
-        return torch.tensor(lg, dtype=torch.float32)
+        return lg
 
 
-class EntropyController(nn.Module):
-    def __init__(self, vocab_size, hidden_dim=64):
-        super().__init__()
-        self.fc1 = nn.Linear(vocab_size, hidden_dim)
-        self.act = nn.SiLU()
-        self.fc2 = nn.Linear(hidden_dim, 1)
-
-    def forward(self, logits, min_temp=0.05, max_temp=3.0):
-        safe_logits = torch.where(torch.isinf(logits), torch.full_like(logits, -100.0), logits)
-        h = self.act(self.fc1(safe_logits))
-        temp = torch.sigmoid(self.fc2(h)) * (max_temp - min_temp) + min_temp
-        return temp.squeeze(-1)
-
-
-class LeakyAnchorBias(nn.Module):
-    def __init__(self, vocab_size, decay=0.9, interval=16):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.decay = decay
-        self.interval = interval
-        self.register_buffer("bias_state", torch.zeros(vocab_size))
-
-    def reset(self):
-        self.bias_state.zero_()
-
-    def step(self, step_idx, anchor_ids, amp):
-        if len(anchor_ids) == 0 or amp <= 0.0:
-            return torch.zeros(self.vocab_size)
-        self.bias_state.mul_(self.decay)
-        if step_idx % self.interval == 0:
-            self.bias_state[anchor_ids] += amp
-        return self.bias_state.clone()
-
-
-class NeuralMarkovEngine(nn.Module):
-    def __init__(self, vocab_size, embed_dim=32):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.ctx_embed = nn.EmbeddingBag(vocab_size, embed_dim, mode="mean")
-        self.entropy_ctrl = EntropyController(vocab_size)
-        self.anchor_layer = LeakyAnchorBias(vocab_size)
-
-    def forward(self, ngram_logits, seq_tensor, step_idx, anchor_ids, gen_settings):
-        logits = ngram_logits.clone()
-        if seq_tensor.numel() > 0:
-            offsets = torch.tensor([0], device=seq_tensor.device)
-            ctx_vec = self.ctx_embed(seq_tensor.unsqueeze(0), offsets)
-            ctx_logits = torch.matmul(ctx_vec, self.ctx_embed.weight.T).squeeze(0)
-            logits = logits + 0.1 * ctx_logits
-
-        if gen_settings.anchor_amp > 0.0:
-            anchor_bias = self.anchor_layer.step(step_idx, anchor_ids, gen_settings.anchor_amp)
-            logits = logits + anchor_bias
-
-        if gen_settings.target_entropy > 0.0:
-            temp = self.entropy_ctrl(logits)
-        else:
-            temp = torch.tensor(max(gen_settings.temp, 1e-3))
-
-        return logits, temp
-
-
+# ---------------------------------------------------------------------------
+# Generation settings
+# ---------------------------------------------------------------------------
 @dataclass
 class Gen:
     max_len: int = 40
     temp: float = 0.9
     top_k: int = 40
-    target_entropy: float = 0.0
-    beam: int = 0
+    target_entropy: float = 0.0   # >0 -> entropy-targeted temperature (overrides temp)
+    beam: int = 0                 # >0 -> beam search instead of sampling
     min_len: int = 0
-    length_alpha: float = 0.7
-    anchor_amp: float = 0.0
+    length_alpha: float = 0.7     # beam final ranking: score / len**alpha
+    anchor_amp: float = 0.0       # >0 -> leaky anchor on prompt content words
     anchor_decay: float = 0.9
     anchor_interval: int = 16
     slack: int = 20
 
 
+# ---------------------------------------------------------------------------
+# Criticality control: pick the temperature that yields a target entropy
+# ---------------------------------------------------------------------------
+def entropy(logits, temp):
+    z = logits / temp
+    p = np.exp(z - z.max())
+    p /= p.sum()
+    nz = p[p > 0]
+    return float(-(nz * np.log(nz)).sum())
+
+
+def temperature_for_entropy(logits, target, lo=0.05, hi=3.0, iters=24):
+    """Bisection; entropy is monotone increasing in temperature."""
+    for _ in range(iters):
+        mid = (lo + hi) / 2
+        if entropy(logits, mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2
+
+
+def top_k_mask(lg, k):
+    if 0 < k < len(lg):
+        cut = np.partition(lg, -k)[-k]
+        lg = np.where(lg < cut, -np.inf, lg)
+    return lg
+
+
+def pick(lg, gen):
+    lg = top_k_mask(lg, gen.top_k)
+    t = (temperature_for_entropy(lg, gen.target_entropy)
+         if gen.target_entropy > 0 else max(gen.temp, 1e-3))
+    z = lg / t
+    p = np.exp(z - z.max())
+    p /= p.sum()
+    return int(np.random.choice(len(p), p=p)), t
+
+
+# ---------------------------------------------------------------------------
+# Leaky anchor with periodic re-injection (precomputed so beams share it)
+# ---------------------------------------------------------------------------
+class AnchorSchedule:
+    def __init__(self, amp, decay, interval, n):
+        level, self.levels = amp, []
+        for t in range(n):
+            self.levels.append(level)
+            level *= decay                       # leak
+            if (t + 1) % interval == 0:           # periodic pulse
+                level += amp
+
+    def level(self, t):
+        return self.levels[min(t, len(self.levels) - 1)]
+
+
 def anchor_ids(vocab, toks, skip_top=20):
+    """Prompt content words: alphanumeric, in vocab, not among the most frequent tokens."""
     common = set(np.argsort(-vocab.counts)[:skip_top].tolist())
-    ids = sorted({vocab.stoi[t] for t in toks
-                  if t in vocab.stoi and WORD_RE.match(t) and vocab.stoi[t] not in common})
-    return torch.tensor(ids, dtype=torch.long)
+    return sorted({vocab.stoi[t] for t in toks
+                   if t in vocab.stoi and WORD_RE.match(t) and vocab.stoi[t] not in common})
 
 
-def top_k_mask_torch(logits, k):
-    if 0 < k < logits.size(-1):
-        v, _ = torch.topk(logits, k)
-        min_val = v[-1]
-        logits = torch.where(logits < min_val, torch.full_like(logits, -float("inf")), logits)
-    return logits
-
-
-def pick_torch(logits, temp, top_k):
-    masked_logits = top_k_mask_torch(logits, top_k)
-    probs = F.softmax(masked_logits / temp, dim=-1)
-    nxt = torch.multinomial(probs, num_samples=1).item()
-    return nxt, temp.item()
-
-
+# ---------------------------------------------------------------------------
+# Beam search: heapq pruning + linked-list paths + exact state dedup
+# ---------------------------------------------------------------------------
 def materialize(node):
     out = []
     while node is not None:
@@ -191,34 +195,28 @@ def materialize(node):
     return out[::-1]
 
 
-def beam_search(engine, model, ctx0, eos, max_new, width, top_k, alpha, anchor_ids_tensor, gen):
+def log_softmax(lg):
+    m = lg.max()
+    return lg - (m + np.log(np.exp(lg - m).sum()))
+
+
+def beam_search(step_fn, ctx0, eos, max_new, width, top_k, alpha, order):
     path0 = None
     for t in ctx0:
         path0 = (t, path0)
-    state_len = max(model.order, 1)
+    state_len = max(order, 1)  # a Markov model's future depends only on this tail
     beam, done = [(0.0, path0)], []
-
     for step in range(max_new):
         cands = {}
         for score, path in beam:
             seq = materialize(path)
-            seq_tensor = torch.tensor(seq, dtype=torch.long)
-            raw_logits = model.logits(seq)
-            
-            if len(seq) - len(ctx0) < gen.min_len:
-                raw_logits[eos] = -float("inf")
-
-            logits, _ = engine(raw_logits, seq_tensor, step, anchor_ids_tensor, gen)
-            logp = F.log_softmax(logits, dim=-1)
-
+            logp = log_softmax(step_fn(seq))
             k = min(top_k if top_k > 0 else 16, len(logp) - 1)
-            top_vals, top_indices = torch.topk(logp, k)
-
-            for val, idx in zip(top_vals, top_indices):
-                if torch.isinf(val):
+            for tok in np.argpartition(-logp, k)[:k]:
+                if not np.isfinite(logp[tok]):
                     continue
-                tok = idx.item()
-                s = score + val.item()
+                tok = int(tok)
+                s = score + float(logp[tok])
                 newp = (tok, path)
                 if tok == eos:
                     done.append((s / (step + 1) ** alpha, newp))
@@ -229,42 +227,31 @@ def beam_search(engine, model, ctx0, eos, max_new, width, top_k, alpha, anchor_i
         if not cands or len(done) >= width:
             break
         beam = heapq.nlargest(width, cands.values(), key=lambda c: c[0])
-
     pool = done or [(s / max_new ** alpha, p) for s, p in beam]
     out = materialize(max(pool, key=lambda c: c[0])[1])[len(ctx0):]
     return out[:-1] if out and out[-1] == eos else out
 
 
-def generate(engine, model, vocab, toks, gen):
-    ctx0 = [vocab.bos] + vocab.encode(toks)
-    anchors = anchor_ids(vocab, toks) if gen.anchor_amp > 0 else torch.tensor([], dtype=torch.long)
-    engine.anchor_layer.reset()
+def calibrate_beam(model, vocab, sents, widths=(1, 2, 4, 8, 16, 32), ref=64,
+                   n_prompts=6, max_len=25, top_k=20):
+    """Smallest width whose outputs match a wide-beam reference on sentence starts."""
+    rng = random.Random(0)
+    starts = [s[:2] for s in rng.sample(sents, min(n_prompts, len(sents)))]
 
-    if gen.beam > 0:
-        out_ids = beam_search(engine, model, ctx0, vocab.eos, gen.max_len, gen.beam,
-                              gen.top_k, gen.length_alpha, anchors, gen)
-        return out_ids, []
+    def run(w):
+        g = Gen(max_len=max_len, top_k=top_k, beam=w)
+        return [tuple(generate(model, vocab, s, g)[0]) for s in starts]
 
-    ctx, out, temps = list(ctx0), [], []
-    for step_idx in range(gen.max_len):
-        seq_tensor = torch.tensor(ctx, dtype=torch.long)
-        raw_logits = model.logits(ctx)
-        
-        if step_idx < gen.min_len:
-            raw_logits[vocab.eos] = -float("inf")
-
-        logits, temp = engine(raw_logits, seq_tensor, step_idx, anchors, gen)
-        nxt, t = pick_torch(logits, temp, gen.top_k)
-        
-        if nxt == vocab.eos:
-            break
-        out.append(nxt)
-        ctx.append(nxt)
-        temps.append(t)
-
-    return out, temps
+    reference = run(ref)
+    for w in widths:
+        if run(w) == reference:
+            return w
+    return ref
 
 
+# ---------------------------------------------------------------------------
+# Feasibility: shortest observed path from the prompt's last token to end-of-text
+# ---------------------------------------------------------------------------
 def min_steps_to_eos(model, vocab, start):
     if model.order < 1:
         return None
@@ -284,7 +271,41 @@ def min_steps_to_eos(model, vocab, start):
     return None
 
 
-def complete(engine, model, vocab, prompt, gen):
+# ---------------------------------------------------------------------------
+# Generation
+# ---------------------------------------------------------------------------
+def generate(model, vocab, toks, gen):
+    """Continue token list `toks`. Returns (generated ids, per-step temperatures)."""
+    ctx0 = [vocab.bos] + vocab.encode(toks)
+    anchors = anchor_ids(vocab, toks) if gen.anchor_amp > 0 else []
+    sched = (AnchorSchedule(gen.anchor_amp, gen.anchor_decay,
+                            gen.anchor_interval, gen.max_len + 1) if anchors else None)
+
+    def step(seq):
+        t = len(seq) - len(ctx0)
+        lg = model.logits(seq)
+        if t < gen.min_len:
+            lg[vocab.eos] = -np.inf
+        if sched:
+            lg[anchors] += sched.level(t)
+        return lg
+
+    if gen.beam > 0:
+        return beam_search(step, ctx0, vocab.eos, gen.max_len, gen.beam,
+                           gen.top_k, gen.length_alpha, model.order), []
+    ctx, out, temps = list(ctx0), [], []
+    for _ in range(gen.max_len):
+        nxt, t = pick(step(ctx), gen)
+        if nxt == vocab.eos:
+            break
+        out.append(nxt)
+        ctx.append(nxt)
+        temps.append(t)
+    return out, temps
+
+
+def complete(model, vocab, prompt, gen):
+    """Continue a prompt. Returns (text, oov_words, note)."""
     toks = TOKEN_RE.findall(prompt.lower())
     if not toks:
         raise ValueError("prompt has no usable tokens")
@@ -296,8 +317,34 @@ def complete(engine, model, vocab, prompt, gen):
         note = "no observed path to end-of-text from the last prompt token"
     else:
         gen = replace(gen, max_len=max(gen.max_len, d + gen.slack))
-    out, _ = generate(engine, model, vocab, toks, gen)
+    out, _ = generate(model, vocab, toks, gen)
     return detok(toks + [vocab.itos[i] for i in out]), oov, note
+
+
+def diagnose(model, vocab, prompt, gen, n=30):
+    """Is the anchor doing anything real? Compare prompt-word recurrence on vs off."""
+    toks = TOKEN_RE.findall(prompt.lower())
+    anchors = set(anchor_ids(vocab, toks))
+    if not anchors:
+        print("  diagnose: prompt has no content words to anchor on")
+        return
+    base = replace(gen, anchor_amp=0.0, beam=0)
+    on = replace(gen, anchor_amp=gen.anchor_amp or 2.0, beam=0)
+    rates = {}
+    for label, g in (("anchor off", base), ("anchor on ", on)):
+        hits = total = 0
+        temps = []
+        for _ in range(n):
+            out, t = generate(model, vocab, toks, g)
+            hits += sum(o in anchors for o in out)
+            total += len(out)
+            temps += t
+        rates[label] = hits / max(total, 1)
+        mt = f"{np.mean(temps):.2f}" if temps else "n/a"
+        print(f"  {label}: anchor-word rate {rates[label]:.4f}  "
+              f"mean len {total / n:.1f}  mean T {mt}")
+    if rates["anchor on "] <= rates["anchor off"]:
+        print("  warning: anchor did not raise recurrence; the signal is decorative here")
 
 
 def main():
@@ -305,34 +352,32 @@ def main():
     ap.add_argument("path")
     ap.add_argument("--order", type=int, default=2)
     ap.add_argument("--min-count", type=int, default=1)
-    ap.add_argument("--n", type=int, default=1)
+    ap.add_argument("--n", type=int, default=1, help="completions per prompt")
     ap.add_argument("--temp", type=float, default=0.9)
     ap.add_argument("--top-k", type=int, default=40)
     ap.add_argument("--max-len", type=int, default=400)
     ap.add_argument("--min-len", type=int, default=0)
-    ap.add_argument("--target-entropy", type=float, default=2.0)
-    ap.add_argument("--anchor", type=float, default=2.0)
+    ap.add_argument("--target-entropy", type=float, default=0.0)
+    ap.add_argument("--anchor", type=float, default=0.0, help="anchor amplitude")
     ap.add_argument("--anchor-decay", type=float, default=0.9)
     ap.add_argument("--anchor-interval", type=int, default=16)
     ap.add_argument("--beam", type=int, default=0)
     ap.add_argument("--length-alpha", type=float, default=0.7)
     ap.add_argument("--slack", type=int, default=20)
     ap.add_argument("--base-clip", type=float, default=100.0)
+    ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--prompt", default=None)
     ap.add_argument("--interactive", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-
     random.seed(args.seed)
     np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
 
     sents = load_sentences(args.path)
     vocab = Vocab(sents, args.min_count)
     model = NGram(vocab, args.order, base_clip=args.base_clip)
     model.fit([[vocab.bos] + vocab.encode(s) + [vocab.eos] for s in sents])
-
-    engine = NeuralMarkovEngine(vocab.V)
 
     gen = Gen(max_len=args.max_len, temp=args.temp, top_k=args.top_k,
               target_entropy=args.target_entropy, beam=args.beam,
@@ -340,20 +385,26 @@ def main():
               anchor_amp=args.anchor, anchor_decay=args.anchor_decay,
               anchor_interval=args.anchor_interval, slack=args.slack)
 
+    if args.calibrate:
+        w = calibrate_beam(model, vocab, sents)
+        print(f"calibrated beam width: {w} (matches a width-64 reference); use --beam {w}")
+
     def run(prompt):
         oov, note = set(), None
         for _ in range(args.n):
-            text, o, note = complete(engine, model, vocab, prompt, gen)
+            text, o, note = complete(model, vocab, prompt, gen)
             oov.update(o)
             print(" ", text)
         if note:
             print(f"  ({note})")
         if oov:
             print(f"  (not in vocab, treated as <unk>: {sorted(oov)})")
+        if args.diagnose:
+            diagnose(model, vocab, prompt, gen)
 
     if args.prompt:
         run(args.prompt)
-    if args.interactive or not args.prompt:
+    if args.interactive or not (args.prompt or args.calibrate):
         print("Type a prompt (empty line to quit).")
         while True:
             try:
