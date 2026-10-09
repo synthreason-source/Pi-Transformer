@@ -11,8 +11,8 @@ Pipeline
   4. DOT PRODUCTS:  G[i, j] = r_i . r_j   (unit-norm rows, so cosine similarity
      through the brain's wiring). G is extracted once and cached.
   5. PER-WORD MRI CONTEXT: every word keeps its own context read off the scan:
-     where its node sits (region), the local tissue intensity, how far its
-     pulse spreads (footprint), and its nearest words through the wiring.
+     where its node sits (region/atlas parcellation), local tissue intensity,
+     how far its pulse spreads (footprint), and its nearest words through the wiring.
      `--explain WORD` prints it; `--trace` prints it for each generated word.
   6. NOODLE CONTEXT CURVES: noodles (streamlines) are traced through the scan from
      each word's node, following the local structure-tensor orientation. A
@@ -28,6 +28,13 @@ Pipeline
      age (`--curves exp` swaps in a plain exponential decay), so the context
      evolves word by word instead of being fixed by the prompt.
 
+Word recognition
+  * Up to --circuit-vocab content words get their own brain vector.
+  * Inflections of those words (rivers/river, flowing/flow) are aliased onto
+    their sibling's vector via a crude suffix stemmer.
+  * Unseen prompt words are matched to a known word by shared stem, then by
+    close spelling (difflib), before falling back to <unk>.
+
 Other generation controls: entropy-targeted temperature, direct leaky anchor,
 beam search (heapq + linked-list paths + exact state dedup), min-len,
 feasibility-based length floor, beam calibration, and an ablation `--diagnose`
@@ -41,6 +48,7 @@ that compares: no bias / direct anchor / PPMI dots (no brain) / circuit dots.
   python neural_llm.py data.txt --interactive --dots circuit --target-entropy 1.5
 """
 import argparse
+import difflib
 import heapq
 import json
 import os
@@ -59,6 +67,19 @@ PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", ""
 TOKEN_RE = re.compile(r"[a-z0-9']+|[.,!?;:]")
 SENT_SPLIT = re.compile(r"(?<=[.!?])\s+|\n{2,}")
 WORD_RE = re.compile(r"[a-z0-9']")
+
+_SUFFIXES = ("ing", "ed", "es", "s", "ly")
+
+
+def stem(w):
+    """Crude suffix stripper: enough to link rivers/river, flowing/flow."""
+    for suf in _SUFFIXES:
+        if suf == "s" and w.endswith("ss"):      # glass != glas
+            continue
+        if w.endswith(suf) and len(w) - len(suf) >= 3:
+            return w[:-len(suf)]
+    return w
+
 
 def explain_words(values):
     """Expand one or more command-line values into individual explainable words."""
@@ -96,6 +117,24 @@ def load_volume(path, downsample=4):
         return np.clip(data / np.percentile(data[data > 0], 99), 0, 1), codes
     print(f"[circuit] MRI '{path}' not found; using a synthetic volume (region labels nominal)")
     return synthesize_volume(), ("R", "A", "S")
+
+
+def load_atlas(path, downsample=4):
+    """Load an anatomical parcellation NIfTI file, downsampled to match the volume."""
+    if path and os.path.exists(path):
+        import nibabel as nib
+        img = nib.load(path)
+        data = img.get_fdata().astype(np.int32)[::downsample, ::downsample, ::downsample]
+        return data
+    return None
+
+
+def load_label_map(path):
+    """Load an integer-to-name label dictionary from JSON if provided."""
+    if path and os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return {int(k): v for k, v in json.load(f).items()}
+    return None
 
 
 def build_graph(vol, threshold, edges_path):
@@ -192,9 +231,25 @@ class Vocab:
         self.counts = np.zeros(self.V)
         for t in kept:
             self.counts[self.stoi[t]] = counts[t]
+        self.by_stem = {}
+        for i in range(4, self.V):                # itos is frequency-sorted
+            self.by_stem.setdefault(stem(self.itos[i]), i)
 
     def encode(self, toks):
         return [self.stoi.get(t, self.unk) for t in toks]
+
+    def resolve(self, tok):
+        """Known word -> itself. Otherwise try a shared stem, then a close spelling.
+        Returns a vocabulary token or None."""
+        if tok in self.stoi:
+            return tok
+        if not WORD_RE.match(tok) or len(tok) < 4:
+            return None
+        i = self.by_stem.get(stem(tok))
+        if i is not None:
+            return self.itos[i]
+        m = difflib.get_close_matches(tok, self.itos[4:], n=1, cutoff=0.85)
+        return m[0] if m else None
 
 
 class NGram:
@@ -242,8 +297,8 @@ class NGram:
 # ===========================================================================
 @dataclass
 class Circuit:
-    ids: np.ndarray        # vocab ids that have a circuit vector
-    row_of: np.ndarray     # vocab id -> row in G (or -1)
+    ids: np.ndarray        # vocab ids that have their own circuit vector
+    row_of: np.ndarray     # vocab id -> row in G (or -1); inflections alias a sibling's row
     G: np.ndarray          # circuit dot products  r_i . r_j   (diag = 0)
     Gp: np.ndarray         # ablation: PPMI-cosine dots, no brain (diag = 0)
     ppmi: np.ndarray       # raw PPMI (used only by the diagnostic metric)
@@ -327,7 +382,7 @@ def region_label(xyz, mid, codes):
     return "-".join(sorted(parts, key=_AXIS_ORDER.get))
 
 
-def word_context_table(R, seeds, coords_all, vals, keep_cc, codes):
+def word_context_table(R, seeds, coords_all, vals, keep_cc, codes, atlas=None, label_map=None):
     """Per-word context read from the scan: seed position/region/tissue band and
     the footprint of the word's pulse (size, centroid, mean intensity)."""
     mid = (keep_cc.min(0) + keep_cc.max(0)) / 2
@@ -336,19 +391,35 @@ def word_context_table(R, seeds, coords_all, vals, keep_cc, codes):
     # relative thirds of this scan's tissue intensities (not a tissue classification)
     band = np.where(seed_int < lo, "low intensity",
                     np.where(seed_int < hi, "mid intensity", "high intensity"))
+    
+    regions = []
+    for n in seeds:
+        coord = tuple(coords_all[n])
+        reg_name = None
+        if atlas is not None:
+            val = int(atlas[coord])
+            if label_map:
+                reg_name = label_map.get(val, f"Region {val}")
+            else:
+                reg_name = f"Parcellation ID {val}" if val > 0 else "Background / Unlabeled"
+        if not reg_name:
+            reg_name = region_label(coords_all[n], mid, codes)
+        regions.append(reg_name)
+
     mass = np.asarray(R.sum(axis=1)).ravel() + 1e-8
     return dict(
         xyz=coords_all[seeds].astype(np.int32),
         seed_int=seed_int.astype(np.float32),
         band=band.astype("U32"),
-        region=np.array([region_label(coords_all[n], mid, codes) for n in seeds], dtype="U40"),
+        region=np.array(regions, dtype="U64"),
         foot_n=np.diff(R.indptr).astype(np.int32),
         foot_cent=((R @ coords_all.astype(np.float64)) / mass[:, None]).astype(np.float32),
         foot_int=((R @ vals.astype(np.float64)) / mass).astype(np.float32))
 
 
 def word_context(circ, vocab, word, top=5):
-    """Everything the MRI says about one word, or None if it has no circuit vector."""
+    """Everything the MRI says about one word, or None if it has no circuit vector.
+    Inflections share their sibling's vector, so they report the sibling's context."""
     i = vocab.stoi.get(word, -1)
     r = circ.row_of[i] if i >= 0 else -1
     if r < 0 or not circ.info:
@@ -381,27 +452,44 @@ def build_circuit(sents, vocab, a):
     row_of = np.full(vocab.V, -1, np.int64)
     row_of[ids] = np.arange(Vc)
 
-    # --- PPMI over sentence co-occurrence
+    # --- PPMI over sentence co-occurrence (float32 to keep the dense Vc x Vc matrices small)
     r, c = [], []
     for si, s in enumerate(sents):
         for t in set(vocab.encode(s)):
             if row_of[t] >= 0:
                 r.append(si); c.append(row_of[t])
     X = sp.csr_matrix((np.ones(len(r), np.float32), (r, c)), shape=(len(sents), Vc))
-    C = (X.T @ X).toarray().astype(np.float64)
+    C = (X.T @ X).toarray().astype(np.float32)
     np.fill_diagonal(C, 0)
     rs = C.sum(1, keepdims=True)
+    tot = np.float32(C.sum(dtype=np.float64))
     with np.errstate(divide="ignore", invalid="ignore"):
-        pmi = np.log(C * C.sum() / (rs * rs.T))
+        pmi = np.log(C * tot / (rs * rs.T))
+    del C
     P = np.where(np.isfinite(pmi) & (pmi > 0), pmi, 0).astype(np.float32)
+    del pmi
     Pn = P / (np.linalg.norm(P, axis=1, keepdims=True) + 1e-8)
     Gp = (Pn @ Pn.T).astype(np.float32)
     np.fill_diagonal(Gp, 0)
+    del Pn
+
+    # --- alias inflections of circuit words onto their sibling's row (done after PPMI so
+    #     co-occurrence counts aren't merged; function words in `skip` are never aliased)
+    by_stem = {}
+    for i in ids:
+        by_stem.setdefault(stem(vocab.itos[i]), row_of[i])
+    for i in range(4, vocab.V):
+        if row_of[i] < 0 and i not in skip and WORD_RE.match(vocab.itos[i]):
+            rr = by_stem.get(stem(vocab.itos[i]))
+            if rr is not None:
+                row_of[i] = rr
+    print(f"[circuit] {int((row_of >= 0).sum())} vocab words resolve to a circuit vector "
+          f"({Vc} direct, rest via stems)")
 
     # cache keyed by every parameter that affects G
     nd = dict(L=getattr(a, "noodle_steps", 24), K=getattr(a, "noodle_count", 16),
               ang=getattr(a, "noodle_angle", 70.0), pct=getattr(a, "noodle_tube_pct", 25.0))
-    sig = json.dumps(dict(v=3, nd=nd, mri=a.mri, ds=a.downsample, vt=a.voxel_threshold, steps=a.steps,
+    sig = json.dumps(dict(v=4, nd=nd, mri=a.mri, ds=a.downsample, vt=a.voxel_threshold, steps=a.steps,
                           decay=a.decay, gain=a.gain, fire=a.fire_threshold,
                           toks=[vocab.itos[i] for i in ids]), sort_keys=True)
     if a.dots_cache and os.path.exists(a.dots_cache):
@@ -424,8 +512,15 @@ def build_circuit(sents, vocab, a):
           f"largest component {len(keep)}/{n}, mean edge weight {wbar:.2f}, "
           f"gain {gain:.2f} (spreads only if gain*w > threshold {a.fire_threshold})")
 
+    # --- load optional anatomical atlas parcellation
+    atlas = load_atlas(a.atlas, a.downsample)
+    label_map = load_label_map(a.atlas_labels)
+    if atlas is not None:
+        print(f"[circuit] loaded anatomical atlas from '{a.atlas}'")
+
     # --- place tokens on the brain: PPMI -> 3 SVD dims -> uniform [0,1] -> bbox -> nearest node
-    U, S, _ = svds(P.astype(np.float64), k=3, v0=np.random.default_rng(0).normal(size=Vc))  # seeded: reproducible placement
+    Ps = sp.csr_matrix(P).astype(np.float64)       # PPMI is sparse; avoids a dense float64 copy
+    U, S, _ = svds(Ps, k=3, v0=np.random.default_rng(0).normal(size=Vc))  # seeded: reproducible placement
     pos = np.stack([rank01(v) for v in (U * S).T], axis=1)
     cc = coords[keep].astype(np.float64)
     target = cc.min(0) + pos * (cc.max(0) - cc.min(0))
@@ -435,7 +530,7 @@ def build_circuit(sents, vocab, a):
     R = circuit_responses(W, seeds, a.steps, a.decay, gain, a.fire_threshold)
     G = (R @ R.T).toarray().astype(np.float32)
     np.fill_diagonal(G, 0)
-    info = word_context_table(R, seeds, coords, vals, cc, codes)
+    info = word_context_table(R, seeds, coords, vals, cc, codes, atlas=atlas, label_map=label_map)
     field = noodle_field(vol, vol > a.voxel_threshold, nd["pct"])
     info["curve"] = trace_noodles(field, coords[seeds], nd["K"], nd["L"], nd["ang"])
     hl = [(np.flatnonzero(c < 0.5)[:1].tolist() or [nd["L"]])[0] for c in info["curve"]]
@@ -454,6 +549,19 @@ def build_circuit(sents, vocab, a):
     return Circuit(ids, row_of, G, Gp, P, stats, info)
 
 
+def expand_bias(circ, vocab, s):
+    """Row scores -> full-vocab bias, robustly normalised to [0, 1].
+    Aliased inflections share their sibling's score."""
+    pos = s[s > 0]
+    if not pos.size:
+        return None
+    x = np.clip(s / np.percentile(pos, 99), 0, 1)
+    full = np.zeros(vocab.V, np.float32)
+    has = circ.row_of >= 0
+    full[has] = x[circ.row_of[has]]
+    return full
+
+
 def prompt_bias(circ, vocab, toks, source):
     """Dot products between the prompt's content tokens and every token,
     robustly normalised to [0, 1] and expanded to the full vocabulary."""
@@ -464,13 +572,7 @@ def prompt_bias(circ, vocab, toks, source):
             if t in vocab.stoi and circ.row_of[vocab.stoi[t]] >= 0]
     if not rows:
         return None
-    s = M[:, rows].sum(axis=1)
-    pos = s[s > 0]
-    if not pos.size:
-        return None
-    full = np.zeros(vocab.V, np.float32)
-    full[circ.ids] = np.clip(s / np.percentile(pos, 99), 0, 1)
-    return full
+    return expand_bias(circ, vocab, M[:, rows].sum(axis=1))
 
 
 def context_bias(circ, M, vocab, gen_ids, decay, curves=False, stride=3):
@@ -485,13 +587,7 @@ def context_bias(circ, M, vocab, gen_ids, decay, curves=False, stride=3):
             u[r] += C[r, min(age * stride, C.shape[1] - 1)] if curves else decay ** age
     if not u.any():
         return None
-    s = M @ u
-    pos = s[s > 0]
-    if not pos.size:
-        return None
-    full = np.zeros(vocab.V, np.float32)
-    full[circ.ids] = np.clip(s / np.percentile(pos, 99), 0, 1)
-    return full
+    return expand_bias(circ, vocab, M @ u)
 
 
 # ===========================================================================
@@ -691,11 +787,24 @@ def generate(model, vocab, toks, gen, circ=None, trace=None):
     return out, temps
 
 
+def resolve_prompt(vocab, toks):
+    """Map each prompt token to a known word where possible.
+    Returns (resolved tokens, list of 'typed→matched' strings)."""
+    resolved, mapped = [], []
+    for t in toks:
+        r = vocab.resolve(t)
+        if r is not None and r != t:
+            mapped.append(f"{t}→{r}")
+        resolved.append(r if r is not None else t)
+    return resolved, mapped
+
+
 def complete(model, vocab, prompt, gen, circ=None, trace=None):
     toks = TOKEN_RE.findall(prompt.lower())
     if not toks:
         raise ValueError("prompt has no usable tokens")
-    ids = vocab.encode(toks)
+    resolved, mapped = resolve_prompt(vocab, toks)
+    ids = vocab.encode(resolved)
     oov = [t for t, i in zip(toks, ids) if i == vocab.unk]
     d = min_steps_to_eos(model, vocab, ids[-1])
     note = None
@@ -703,7 +812,9 @@ def complete(model, vocab, prompt, gen, circ=None, trace=None):
         note = "no observed path to end-of-text from the last prompt token"
     else:
         gen = replace(gen, max_len=max(gen.max_len, d + gen.slack))
-    out, _ = generate(model, vocab, toks, gen, circ, trace)
+    out, _ = generate(model, vocab, resolved, gen, circ, trace)
+    if mapped:
+        note = (note + "; " if note else "") + "matched unseen words: " + ", ".join(mapped)
     return detok(toks + [vocab.itos[i] for i in out]), oov, note
 
 
@@ -725,7 +836,7 @@ def diagnose(model, vocab, prompt, gen, circ, n=30):
     content words (a direct corpus statistic). Caveat: PPMI also builds both dot-product
     sources, so the 'ppmi' arm is favoured by construction; use a labelled-topic corpus
     for an independent check."""
-    toks = TOKEN_RE.findall(prompt.lower())
+    toks, _ = resolve_prompt(vocab, TOKEN_RE.findall(prompt.lower()))
     prompt_rows = [circ.row_of[vocab.stoi[t]] for t in toks
                    if t in vocab.stoi and circ.row_of[vocab.stoi[t]] >= 0] if circ else []
     anchors = set(anchor_ids(vocab, toks))
@@ -811,11 +922,14 @@ def main():
     g.add_argument("--decay", type=float, default=0.6)
     g.add_argument("--gain", type=float, default=0.0, help="0 = auto (1.5 x threshold / mean weight)")
     g.add_argument("--fire-threshold", type=float, default=0.55)
-    g.add_argument("--circuit-vocab", type=int, default=2000)
+    g.add_argument("--circuit-vocab", type=int, default=8000,
+                   help="max content words with their own brain vector (dense Vc x Vc matrices: memory ~ Vc^2)")
     g.add_argument("--circuit-min-count", type=int, default=2)
     g.add_argument("--skip-top", type=int, default=20)
     g.add_argument("--dots-cache", default=None)
     g.add_argument("--sim-report", action="store_true")
+    g.add_argument("--atlas", default=None, help="Anatomical parcellation NIfTI file (optional)")
+    g.add_argument("--atlas-labels", default=None, help="JSON file mapping integer atlas IDs to region names")
     g.add_argument("--noodle-steps", type=int, default=24)
     g.add_argument("--noodle-count", type=int, default=16, help="noodles traced per word")
     g.add_argument("--noodle-angle", type=float, default=70.0, help="max turn per step, degrees")
@@ -828,7 +942,7 @@ def main():
     g.add_argument("--fb-window", type=int, default=4)
     g.add_argument("--fb-decay", type=float, default=0.7, help="decay for --curves exp")
     g.add_argument("--curves", choices=["noodle", "exp"], default="noodle")
-    g.add_argument("--curve-stride", type=int, default=3, help="noodle steps per word of age")
+    g.add_argument("--curve-stride", type=int, default=9, help="noodle steps per word of age")
     g.add_argument("--n", type=int, default=1)
     g.add_argument("--temp", type=float, default=0.9)
     g.add_argument("--top-k", type=int, default=40)
@@ -896,7 +1010,7 @@ def main():
         explain_tokens = explain_words(a.explain)
         print("[explain] per-word MRI context (node = grid coordinates after downsampling)")
         for word in explain_tokens:
-            c = word_context(circ, vocab, word, top=5) if circ else None
+            c = word_context(circ, vocab, word, top=50) if circ else None
             if c:
                 show_context(c)
             else:
@@ -908,7 +1022,7 @@ def main():
             explain_tokens
             if explain_tokens
             else [
-                t for t in TOKEN_RE.findall((a.prompt or "").lower())
+                t for t in resolve_prompt(vocab, TOKEN_RE.findall((a.prompt or "").lower()))[0]
                 if t in vocab.stoi
             ][:6]
         )
@@ -940,7 +1054,21 @@ def main():
         if a.diagnose:
             diagnose(model, vocab, prompt, gen, circ)
 
-  
+    if a.prompt:
+        run(a.prompt)
+    if a.interactive:
+        print("interactive mode: type a prompt, empty line to quit")
+        while True:
+            try:
+                line = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not line:
+                break
+            try:
+                run(line)
+            except ValueError as e:
+                print(f"  ({e})")
 
 
 if __name__ == "__main__":
