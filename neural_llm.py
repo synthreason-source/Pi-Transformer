@@ -425,16 +425,43 @@ def build_circuit(sents, vocab, a):
           f"gain {gain:.2f} (spreads only if gain*w > threshold {a.fire_threshold})")
 
     # --- place tokens on the brain: PPMI -> 3 SVD dims -> uniform [0,1] -> bbox -> nearest node
-    U, S, _ = svds(P.astype(np.float64), k=3, v0=np.random.default_rng(0).normal(size=Vc))  # seeded: reproducible placement
+    # --- Place tokens using PPMI -> 3 SVD dims -> [0,1] -> brain bbox.
+    # Avoid duplicate seed nodes: collisions make unrelated tokens have
+    # identical circuit responses and therefore spuriously high similarity.
+    U, S, _ = svds(
+        P.astype(np.float64),
+        k=3,
+        v0=np.random.default_rng(0).normal(size=Vc),
+    )
     pos = np.stack([rank01(v) for v in (U * S).T], axis=1)
+
     cc = coords[keep].astype(np.float64)
-    target = cc.min(0) + pos * (cc.max(0) - cc.min(0))
-    seeds = keep[cKDTree(cc).query(target)[1]]
+    span = cc.max(0) - cc.min(0)
+    target = cc.min(0) + pos * span
+
+    # Deterministic sub-voxel jitter reduces nearest-node ties/collisions.
+    rng = np.random.default_rng(0)
+    target += rng.uniform(-0.5, 0.5, size=target.shape)
+
+    tree = cKDTree(cc)
+    seeds = np.empty(Vc, dtype=np.int64)
+    used = set()
+
+    # Assign the closest unused brain node to each token.
+    for i, point in enumerate(target):
+        for node in tree.query(point, k=min(16, len(keep)))[1]:
+            node = int(node)
+            if node not in used:
+                seeds[i] = keep[node]
+                used.add(node)
+                break
+        else:
+            # Only reachable if there are fewer brain nodes than tokens.
+            seeds[i] = keep[int(tree.query(point)[1])]
 
     # --- circuit responses -> dot products
     R = circuit_responses(W, seeds, a.steps, a.decay, gain, a.fire_threshold)
     G = (R @ R.T).toarray().astype(np.float32)
-    np.fill_diagonal(G, 0)
     info = word_context_table(R, seeds, coords, vals, cc, codes)
     field = noodle_field(vol, vol > a.voxel_threshold, nd["pct"])
     info["curve"] = trace_noodles(field, coords[seeds], nd["K"], nd["L"], nd["ang"])
@@ -896,7 +923,7 @@ def main():
         explain_tokens = explain_words(a.explain)
         print("[explain] per-word MRI context (node = grid coordinates after downsampling)")
         for word in explain_tokens:
-            c = word_context(circ, vocab, word, top=5) if circ else None
+            c = word_context(circ, vocab, word, top=50) if circ else None
             if c:
                 show_context(c)
             else:
