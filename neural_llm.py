@@ -537,7 +537,7 @@ def main():
         explain_tokens = explain_words(a.explain)
         print("[explain] Detailed MRI Circuit Intent & Context Analysis:")
         for word in explain_tokens:
-            c = word_context(circ, vocab, word, top=5) if circ else None
+            c = word_context(circ, vocab, word, top=50) if circ else None
             if c:
                 show_circuit_intent_explanation(c)
             else:
